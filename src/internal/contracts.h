@@ -53,6 +53,7 @@ typedef struct ftun_tls_context ftun_tls_context_t;
 typedef struct ftun_tls_options ftun_tls_options_t;
 typedef struct ftun_tun_spec ftun_tun_spec_t;
 typedef struct ftun_worker_job ftun_worker_job_t;
+typedef struct ftun_worker ftun_worker_t;
 typedef uintptr_t ftun_native_socket_t; /* 仅内部平台包装，不假定为 POSIX fd。 */
 typedef struct { const char *data; size_t length; } ftun_string_t;
 typedef struct { const uint8_t *data; size_t length; } ftun_bytes_t;
