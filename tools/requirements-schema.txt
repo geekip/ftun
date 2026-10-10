@@ -1,0 +1,2 @@
+# Development-only validator; not linked into FTUN or needed by C builds.
+jsonschema==4.23.0

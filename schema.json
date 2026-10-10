@@ -1,0 +1,1037 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FTUN v1.0 配置",
+  "description": "BASE-001 首版配置模型：Linux x86_64、IPv4。用于编辑器补全及静态结构校验；当前 C 骨架不加载配置，Schema 通过不等于运行时验收通过。",
+  "$comment": "参考 https://sing-box.sagernet.org/schema.json 的 Draft 2020-12、$defs 与类型分支组织；字段和约束依据 FTUN 配置规范独立编写。尚未发布固定远程 URL，不设置虚构的 $id。",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "minLength": 1,
+      "format": "uri-reference",
+      "description": "编辑器使用的 Schema 引用，可为本地相对路径；FTUN 运行时忽略该元数据，不联网下载。",
+      "examples": [
+        "../schema.json"
+      ]
+    },
+    "base": {
+      "$ref": "#/$defs/Base"
+    },
+    "log": {
+      "$ref": "#/$defs/Log"
+    },
+    "dns": {
+      "$ref": "#/$defs/DNS"
+    },
+    "geo": {
+      "$ref": "#/$defs/Geo"
+    },
+    "sniff": {
+      "$ref": "#/$defs/Sniff"
+    },
+    "inbounds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Inbound"
+      },
+      "default": [],
+      "contains": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "const": "tun"
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      "minContains": 0,
+      "maxContains": 1,
+      "description": "v1 同时最多一个 TUN。空数组可表示配置片段，但 CLI run 还要求至少一个入口。"
+    },
+    "outbounds": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Outbound"
+      },
+      "default": []
+    },
+    "rules": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/Rule"
+      },
+      "default": [],
+      "description": "按顺序匹配；空数组/无命中使用 DIRECT。"
+    }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "contains": {
+              "type": "string",
+              "pattern": "^GEOIP,"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "geo"
+        ],
+        "properties": {
+          "geo": {
+            "required": [
+              "geoip"
+            ],
+            "properties": {
+              "geoip": {
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "rules"
+        ],
+        "properties": {
+          "rules": {
+            "contains": {
+              "type": "string",
+              "pattern": "^GEOSITE,"
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "geo"
+        ],
+        "properties": {
+          "geo": {
+            "required": [
+              "geosite"
+            ],
+            "properties": {
+              "geosite": {
+                "required": [
+                  "path"
+                ]
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "Name": {
+      "type": "string",
+      "pattern": "^(?:[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "minLength": 1,
+      "description": "区分大小写的名称。可以使用中文和空格；不得含逗号或控制字符。名称唯一性及引用由运行时检查。"
+    },
+    "OutboundName": {
+      "$ref": "#/$defs/Name",
+      "not": {
+        "enum": [
+          "DIRECT",
+          "REJECT"
+        ]
+      },
+      "description": "自定义出站/组名称，不可重定义内置 DIRECT 或 REJECT。"
+    },
+    "OptionalDNSName": {
+      "anyOf": [
+        {
+          "const": ""
+        },
+        {
+          "$ref": "#/$defs/Name"
+        }
+      ],
+      "default": "",
+      "description": "空值或省略按所在字段的缺省规则选择解析器；DNS 总开关关闭时忽略该引用。"
+    },
+    "Path": {
+      "type": "string",
+      "pattern": "^(?:[^\\u0000]+)(?![\\s\\S])",
+      "minLength": 1,
+      "description": "本地路径；~ 展开当前用户目录，相对路径以配置文件目录为基准。Schema 不检查文件存在性或权限。"
+    },
+    "IPv4": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3})(?![\\s\\S])",
+      "description": "IPv4 点分十进制地址，不使用前导零。"
+    },
+    "IPv4CIDR": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]))(?![\\s\\S])",
+      "description": "IPv4 地址/前缀，前缀 0–32；网络地址规范化、地址冲突及用途检查由运行时执行。",
+      "examples": [
+        "10.0.0.0/8"
+      ]
+    },
+    "ListenAddress": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}:(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))(?![\\s\\S])",
+      "description": "IPv4:port，端口 1–65535；不接受域名或 IPv6 监听地址。",
+      "examples": [
+        "127.0.0.1:10808"
+      ]
+    },
+    "BootstrapAddress": {
+      "type": "string",
+      "pattern": "^(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?)(?![\\s\\S])",
+      "description": "Bootstrap 仅接受 IPv4 或 IPv4:port，默认端口 53；始终真实直连解析。"
+    },
+    "ServerAddress": {
+      "type": "string",
+      "pattern": "^(?:(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}|(?=[A-Za-z0-9.-]{1,253}\\.?(?=[:/?#]|(?![\\s\\S])))(?![0-9]+(?:\\.[0-9]+){3}\\.?(?=[:/?#]|(?![\\s\\S])))(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?):(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))(?![\\s\\S])",
+      "description": "IPv4/ASCII 域名:port。域名使用 ASCII A-label；端口 1–65535。",
+      "examples": [
+        "proxy.example.com:1080"
+      ]
+    },
+    "DNSAddress": {
+      "type": "string",
+      "pattern": "^(?:(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}|(?=[A-Za-z0-9.-]{1,253}\\.?(?=[:/?#]|(?![\\s\\S])))(?![0-9]+(?:\\.[0-9]+){3}\\.?(?=[:/?#]|(?![\\s\\S])))(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?)(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?)(?![\\s\\S])",
+      "description": "IPv4/ASCII 域名及可选端口，默认 53。上游域名由 Bootstrap 解析。",
+      "examples": [
+        "192.0.2.53",
+        "dns.example.com:53"
+      ]
+    },
+    "Duration": {
+      "type": "string",
+      "pattern": "^(?:[1-9][0-9]*(?:ms|s|m|h))(?![\\s\\S])",
+      "description": "正整数与 ms/s/m/h 单位，不接受 0、负数、小数或无单位；整数溢出及字段之间的大小关系由运行时检查。",
+      "examples": [
+        "500ms",
+        "5s",
+        "5m",
+        "24h"
+      ]
+    },
+    "HTTPURL": {
+      "type": "string",
+      "pattern": "^(?:https?://(?:(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}|(?=[A-Za-z0-9.-]{1,253}\\.?(?=[:/?#]|(?![\\s\\S])))(?![0-9]+(?:\\.[0-9]+){3}\\.?(?=[:/?#]|(?![\\s\\S])))(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?)(?::(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]))?(?:[/?#][^\\s]*)?)(?![\\s\\S])",
+      "format": "uri",
+      "description": "HTTP/HTTPS URL，IPv4 或 ASCII 域名主机；HTTPS 必须验证证书和主机名。",
+      "examples": [
+        "https://probe.example.invalid/generate_204"
+      ]
+    },
+    "Credential": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 255,
+      "description": "SOCKS5 认证值；Schema 限制字符数，运行时还须验证 UTF-8 编码后为 1–255 字节。"
+    },
+    "Users": {
+      "title": "入站用户",
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/Credential"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/Credential",
+        "writeOnly": true
+      },
+      "default": {},
+      "description": "用户名到密码的映射。空对象表示无需认证；非空时必须认证。密码不得输出到日志。"
+    },
+    "Base": {
+      "title": "基础配置",
+      "type": "object",
+      "properties": {
+        "ipv6": {
+          "type": "boolean",
+          "const": false,
+          "default": false,
+          "description": "FTUN v1.0 仅支持 IPv4；真实 DNS 回答不因此删除 AAAA 记录。"
+        },
+        "allow-lan": {
+          "type": "boolean",
+          "default": false,
+          "description": "允许 Mixed/SOCKS5 的非回环客户端；不控制 TUN 或 DNS Listener。"
+        },
+        "cache-file": {
+          "$ref": "#/$defs/Path",
+          "default": "~/.ftun/ftun.cache",
+          "description": "状态逻辑路径；普通快照与 FakeIP 耐久身份分开存储。"
+        },
+        "state-cache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Group/Health 状态持久化开关，独立于 FakeIP persist 和未来 api.cache。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Log": {
+      "title": "日志",
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "silent",
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "warn",
+          "description": "silent 关闭日志格式化及输出。"
+        },
+        "file": {
+          "$ref": "#/$defs/Path",
+          "default": "~/.ftun/ftun.log"
+        }
+      },
+      "additionalProperties": false
+    },
+    "FakeIP": {
+      "title": "全局 FakeIP",
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否允许合成 FakeIP；dns.enable=false 时本开关不生效。"
+        },
+        "range": {
+          "$ref": "#/$defs/IPv4CIDR",
+          "default": "198.18.0.0/15"
+        },
+        "persist": {
+          "type": "boolean",
+          "default": true,
+          "description": "先耐久预留地址，再批量保存映射；首次显式初始化，缺失/损坏不自动重建。池范围与持久化模式更改需要重启。"
+        }
+      },
+      "additionalProperties": false,
+      "description": "所有 fake-ip server 共用域名身份池；不自动复用，满池拒绝新映射。"
+    },
+    "DNSListener": {
+      "title": "DNS 监听入口",
+      "type": "object",
+      "properties": {
+        "listen": {
+          "$ref": "#/$defs/ListenAddress"
+        },
+        "server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "非空为固定 DNS Server；空值或省略为策略入口。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "listen"
+      ]
+    },
+    "DNSServer": {
+      "title": "DNS 上游与回答策略",
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "udp",
+            "tcp"
+          ],
+          "description": "v1 仅支持 UDP/TCP DNS。"
+        },
+        "address": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSAddress"
+          },
+          "minItems": 1
+        },
+        "outbound": {
+          "$ref": "#/$defs/Name",
+          "default": "DIRECT",
+          "description": "只决定 DNS 查询的传输路径，不决定查询域名的业务出口。"
+        },
+        "fake-ip": {
+          "type": "boolean",
+          "default": false,
+          "description": "客户端回答策略；内部 REAL 查询仍通过 address/outbound 获取真实地址。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "address"
+      ]
+    },
+    "DNS": {
+      "title": "DNS",
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "false 时停用 FTUN DNS 入口、缓存、Hijack 与 FakeIP；必要本地解析使用系统解析器。"
+        },
+        "cache": {
+          "type": "boolean",
+          "default": true,
+          "description": "缓存真实答案；不控制 FakeIP 身份寿命。"
+        },
+        "bootstrap": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BootstrapAddress"
+          },
+          "default": [],
+          "description": "空数组/省略使用系统解析配置，不硬编码公共 DNS。显式来源失败不静默切换来源。"
+        },
+        "default-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "默认服务及路由前 REAL 解析器；空值/省略为 Bootstrap。"
+        },
+        "fake-ip": {
+          "$ref": "#/$defs/FakeIP"
+        },
+        "listeners": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSListener"
+          },
+          "default": []
+        },
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSServer"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "description": "关闭后仍检查字段形状和语法，但不建立失效 DNS 引用或资源依赖。"
+    },
+    "GeoData": {
+      "title": "FTUN Geo 数据文件",
+      "type": "object",
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/Path",
+          "description": "FTUN 私有二进制索引，不是原始 V2Ray .dat；使用该数据时必填。"
+        },
+        "url": {
+          "$ref": "#/$defs/HTTPURL",
+          "description": "已转换的 FTUN 二进制下载地址；启用更新时必填。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Geo": {
+      "title": "Geo",
+      "type": "object",
+      "properties": {
+        "auto-update": {
+          "type": "boolean",
+          "default": false,
+          "description": "后台更新已转换的二进制；失败保留旧数据。"
+        },
+        "update-interval": {
+          "$ref": "#/$defs/Duration",
+          "default": "24h"
+        },
+        "update-outbound": {
+          "$ref": "#/$defs/Name",
+          "default": "DIRECT"
+        },
+        "dns-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "下载端点的本地解析器；空值 Bootstrap，DNS 关闭时使用系统解析器。"
+        },
+        "geoip": {
+          "$ref": "#/$defs/GeoData"
+        },
+        "geosite": {
+          "$ref": "#/$defs/GeoData"
+        }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "auto-update": {
+                "const": true
+              }
+            },
+            "required": [
+              "auto-update"
+            ]
+          },
+          "then": {
+            "properties": {
+              "geoip": {
+                "required": [
+                  "path",
+                  "url"
+                ]
+              },
+              "geosite": {
+                "required": [
+                  "path",
+                  "url"
+                ]
+              }
+            }
+          }
+        }
+      ],
+      "description": "C 工具离线生成私有索引；v1 无正则、无 Go 生成工具。未使用的数据对象不要求文件路径。"
+    },
+    "Sniff": {
+      "title": "有界嗅探",
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": false,
+          "description": "仅缺少域名时嗅探；失败/超时继续原元数据，不改变原始真实目的 IP。"
+        },
+        "tls-sni": {
+          "type": "boolean",
+          "default": true,
+          "description": "解析 TLS ClientHello SNI，不解密 TLS。"
+        },
+        "http-host": {
+          "type": "boolean",
+          "default": true,
+          "description": "解析 HTTP Host；预读字节按序交还。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "MixedInbound": {
+      "title": "Mixed 入站",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "mixed"
+        },
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "outbound": {
+          "$ref": "#/$defs/Name",
+          "description": "强制绑定出口；指定后跳过 rules，但仍执行身份、能力和防回环检查。"
+        },
+        "listen": {
+          "$ref": "#/$defs/ListenAddress"
+        },
+        "users": {
+          "$ref": "#/$defs/Users"
+        },
+        "udp": {
+          "type": "boolean",
+          "default": true,
+          "description": "允许 SOCKS5 UDP ASSOCIATE；Mixed 的 HTTP 分支不提供 UDP。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "listen"
+      ]
+    },
+    "Socks5Inbound": {
+      "title": "SOCKS5 入站",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "socks5"
+        },
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "outbound": {
+          "$ref": "#/$defs/Name",
+          "description": "强制绑定出口；指定后跳过 rules，但仍执行身份、能力和防回环检查。"
+        },
+        "listen": {
+          "$ref": "#/$defs/ListenAddress"
+        },
+        "users": {
+          "$ref": "#/$defs/Users"
+        },
+        "udp": {
+          "type": "boolean",
+          "default": true,
+          "description": "允许 SOCKS5 UDP ASSOCIATE；Mixed 的 HTTP 分支不提供 UDP。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "listen"
+      ]
+    },
+    "TunInterface": {
+      "title": "TUN 设备",
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "平台 TUN 设备名，平台长度/字符限制由运行时校验。"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1500,
+          "description": "MTU 字节数；具体设备支持范围由平台校验。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name"
+      ]
+    },
+    "TunIPv4": {
+      "title": "TUN IPv4",
+      "type": "object",
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/IPv4CIDR",
+          "description": "设备 IPv4 地址及前缀；保留主机地址语义，不能将此字段当路由网络地址清除主机位。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "address"
+      ]
+    },
+    "TunInbound": {
+      "title": "TUN 入站",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "tun"
+        },
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "outbound": {
+          "$ref": "#/$defs/Name",
+          "description": "强制绑定出口；指定后跳过 rules，但仍执行身份、能力和防回环检查。"
+        },
+        "interface": {
+          "$ref": "#/$defs/TunInterface"
+        },
+        "stack": {
+          "type": "string",
+          "const": "lwip",
+          "default": "lwip"
+        },
+        "ipv4": {
+          "$ref": "#/$defs/TunIPv4"
+        },
+        "tcp": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用 TCP。"
+        },
+        "udp": {
+          "type": "boolean",
+          "default": true,
+          "description": "启用按目标隔离的 UDP flow；Full Cone 后续。"
+        },
+        "auto-route": {
+          "type": "boolean",
+          "default": false,
+          "description": "管理本次拥有的系统路由资源。"
+        },
+        "strict-route": {
+          "type": "boolean",
+          "default": false,
+          "description": "必须同时启用 auto-route；保护受管路径并阻止 IPv6 绕行，不能实现时启动失败。"
+        },
+        "dns-hijack": {
+          "type": "boolean",
+          "default": true,
+          "description": "dns.enable=true 时接管进入 TUN 的 TCP/UDP 53，采用策略入口。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "interface",
+        "ipv4"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "strict-route": {
+                "const": true
+              }
+            },
+            "required": [
+              "strict-route"
+            ]
+          },
+          "then": {
+            "required": [
+              "auto-route"
+            ],
+            "properties": {
+              "auto-route": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "not": {
+            "required": [
+              "tcp",
+              "udp"
+            ],
+            "properties": {
+              "tcp": {
+                "const": false
+              },
+              "udp": {
+                "const": false
+              }
+            }
+          }
+        }
+      ],
+      "description": "三层设备，无 listen/users；不受 allow-lan 影响。"
+    },
+    "Inbound": {
+      "title": "入站类型",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/MixedInbound"
+        },
+        {
+          "$ref": "#/$defs/Socks5Inbound"
+        },
+        {
+          "$ref": "#/$defs/TunInbound"
+        }
+      ]
+    },
+    "Socks5Outbound": {
+      "title": "SOCKS5 出站",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "socks5"
+        },
+        "name": {
+          "$ref": "#/$defs/OutboundName"
+        },
+        "dns-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "需要本地解析且尚无真实候选时使用；已有真实候选不得重新解析。"
+        },
+        "server": {
+          "$ref": "#/$defs/ServerAddress"
+        },
+        "username": {
+          "$ref": "#/$defs/Credential"
+        },
+        "password": {
+          "$ref": "#/$defs/Credential",
+          "writeOnly": true
+        },
+        "udp": {
+          "type": "boolean",
+          "default": true,
+          "description": "允许 UDP ASSOCIATE，不支持 SOCKS5 分片。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "server"
+      ],
+      "dependentRequired": {
+        "username": [
+          "password"
+        ],
+        "password": [
+          "username"
+        ]
+      }
+    },
+    "SelectOutbound": {
+      "title": "Select 组",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "select"
+        },
+        "name": {
+          "$ref": "#/$defs/OutboundName"
+        },
+        "dns-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "需要本地解析且尚无真实候选时使用；已有真实候选不得重新解析。"
+        },
+        "outbounds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "minItems": 1,
+          "description": "成员可为节点、其他组或 DIRECT/REJECT；引用、default 属于成员及无环检查由运行时完成。"
+        },
+        "default": {
+          "$ref": "#/$defs/Name",
+          "description": "必须是 outbounds 中的成员，防止成员顺序隐式改变默认出口。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "outbounds",
+        "default"
+      ],
+      "description": "更改 default 后 SIGHUP，或通过宿主 C 接口切换；仅影响新连接。"
+    },
+    "URLTestOutbound": {
+      "title": "URL-Test 组",
+      "type": "object",
+      "properties": {
+        "type": {
+          "const": "url-test"
+        },
+        "name": {
+          "$ref": "#/$defs/OutboundName"
+        },
+        "dns-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "需要本地解析且尚无真实候选时使用；已有真实候选不得重新解析。"
+        },
+        "outbounds": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Name"
+          },
+          "minItems": 1,
+          "description": "成员可为节点、其他组或 DIRECT/REJECT；引用、default 属于成员及无环检查由运行时完成。"
+        },
+        "default": {
+          "$ref": "#/$defs/Name",
+          "description": "必须是 outbounds 中的成员，防止成员顺序隐式改变默认出口。"
+        },
+        "url": {
+          "$ref": "#/$defs/HTTPURL"
+        },
+        "interval": {
+          "$ref": "#/$defs/Duration",
+          "default": "5m"
+        },
+        "timeout": {
+          "$ref": "#/$defs/Duration",
+          "default": "5s",
+          "description": "单次探测超时，不大于 interval；跨字段比较由运行时执行。"
+        },
+        "tolerance": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 50,
+          "description": "切换延迟优势阈值，毫秒。"
+        },
+        "lazy": {
+          "type": "boolean",
+          "default": true,
+          "description": "未使用时可暂停周期探测；业务请求不等待完整测速。"
+        },
+        "expected-status": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 599,
+          "default": 204,
+          "description": "探测期望 HTTP 状态码。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "outbounds",
+        "default",
+        "url"
+      ],
+      "description": "无有效结果时用 default；新鲜结果全失败时尝试上次合法选择/default，标记 degraded；不自动直连。"
+    },
+    "Outbound": {
+      "title": "出站类型",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Socks5Outbound"
+        },
+        {
+          "$ref": "#/$defs/SelectOutbound"
+        },
+        {
+          "$ref": "#/$defs/URLTestOutbound"
+        }
+      ]
+    },
+    "SourceIPRule": {
+      "type": "string",
+      "pattern": "^(?:SRC-IP-CIDR,(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "SourceIPRule",
+      "description": "匹配实际客户端源 IPv4。",
+      "examples": [
+        "SRC-IP-CIDR,192.168.1.0/24,DIRECT"
+      ]
+    },
+    "IPRule": {
+      "type": "string",
+      "pattern": "^(?:IP-CIDR,(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "IPRule",
+      "description": "匹配真实目的地址；缺 IP 时按当前规则等待真实解析。",
+      "examples": [
+        "IP-CIDR,10.0.0.0/8,DIRECT"
+      ]
+    },
+    "DomainRule": {
+      "type": "string",
+      "pattern": "^(?:DOMAIN,(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "DomainRule",
+      "description": "完整域名匹配；ASCII A-label。",
+      "examples": [
+        "DOMAIN,a.com,proxy"
+      ]
+    },
+    "DomainSuffixRule": {
+      "type": "string",
+      "pattern": "^(?:DOMAIN-SUFFIX,(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "DomainSuffixRule",
+      "description": "本域及标签边界的子域。",
+      "examples": [
+        "DOMAIN-SUFFIX,example.com,proxy"
+      ]
+    },
+    "DomainKeywordRule": {
+      "type": "string",
+      "pattern": "^(?:DOMAIN-KEYWORD,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "DomainKeywordRule",
+      "description": "ASCII 域名子串，无正则解释。",
+      "examples": [
+        "DOMAIN-KEYWORD,example,proxy"
+      ]
+    },
+    "GeoIPRule": {
+      "type": "string",
+      "pattern": "^(?:GEOIP,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "GeoIPRule",
+      "description": "匹配本地 IPv4 CIDR 数据集；已有 IP 不需要 DNS。",
+      "examples": [
+        "GEOIP,private,DIRECT"
+      ]
+    },
+    "GeoSiteRule": {
+      "type": "string",
+      "pattern": "^(?:GEOSITE,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "GeoSiteRule",
+      "description": "匹配本地 exact/suffix/keyword 域名集合；不天然触发 DNS。",
+      "examples": [
+        "GEOSITE,proxy,proxy"
+      ]
+    },
+    "PortRule": {
+      "type": "string",
+      "pattern": "^(?:DST-PORT,(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "PortRule",
+      "description": "已知业务目标端口；v1 单个端口。",
+      "examples": [
+        "DST-PORT,443,proxy"
+      ]
+    },
+    "NetworkRule": {
+      "type": "string",
+      "pattern": "^(?:NETWORK,(?:tcp|udp),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "NetworkRule",
+      "description": "匹配已知业务网络，不用 DNS 的网络/端口冒充未来业务元数据。",
+      "examples": [
+        "NETWORK,udp,DIRECT"
+      ]
+    },
+    "MatchRule": {
+      "type": "string",
+      "pattern": "^(?:MATCH,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "MatchRule",
+      "description": "兜底匹配。",
+      "examples": [
+        "MATCH,DIRECT"
+      ]
+    },
+    "Rule": {
+      "title": "顺序规则",
+      "oneOf": [
+        {
+          "$ref": "#/$defs/SourceIPRule"
+        },
+        {
+          "$ref": "#/$defs/IPRule"
+        },
+        {
+          "$ref": "#/$defs/DomainRule"
+        },
+        {
+          "$ref": "#/$defs/DomainSuffixRule"
+        },
+        {
+          "$ref": "#/$defs/DomainKeywordRule"
+        },
+        {
+          "$ref": "#/$defs/GeoIPRule"
+        },
+        {
+          "$ref": "#/$defs/GeoSiteRule"
+        },
+        {
+          "$ref": "#/$defs/PortRule"
+        },
+        {
+          "$ref": "#/$defs/NetworkRule"
+        },
+        {
+          "$ref": "#/$defs/MatchRule"
+        }
+      ],
+      "description": "First Match Wins。保留配置顺序，解析失败终止；IP 命中后只拨命中子集。无正则、no-resolve 或 INBOUND matcher。"
+    }
+  }
+}

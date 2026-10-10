@@ -1,0 +1,146 @@
+{
+  "$schema": "../schema.json",
+  "base": {
+    "ipv6": false,
+    "allow-lan": false,
+    "cache-file": "./state/ftun.cache",
+    "state-cache": true
+  },
+  "log": {
+    "level": "warn",
+    "file": "./state/ftun.log"
+  },
+  "dns": {
+    "enable": true,
+    "cache": true,
+    "fake-ip": {
+      "enable": true,
+      "range": "198.18.0.0/15",
+      "persist": true
+    },
+    "bootstrap": [],
+    "default-server": "real",
+    "listeners": [
+      {
+        "listen": "127.0.0.1:5353"
+      },
+      {
+        "listen": "127.0.0.1:5354",
+        "server": "real"
+      }
+    ],
+    "servers": [
+      {
+        "name": "real",
+        "type": "udp",
+        "address": [
+          "192.0.2.53:53"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
+        "name": "fake",
+        "fake-ip": true,
+        "type": "tcp",
+        "address": [
+          "192.0.2.53:53"
+        ],
+        "outbound": "proxy"
+      }
+    ]
+  },
+  "sniff": {
+    "enable": true,
+    "tls-sni": true,
+    "http-host": true
+  },
+  "inbounds": [
+    {
+      "name": "mixed-in",
+      "type": "mixed",
+      "listen": "127.0.0.1:7890",
+      "udp": true
+    },
+    {
+      "name": "socks-in",
+      "type": "socks5",
+      "listen": "127.0.0.1:10808",
+      "udp": true
+    },
+    {
+      "name": "tun-in",
+      "type": "tun",
+      "interface": {
+        "name": "ftun0",
+        "mtu": 1500
+      },
+      "stack": "lwip",
+      "ipv4": {
+        "address": "172.19.0.1/30"
+      },
+      "tcp": true,
+      "udp": true,
+      "auto-route": true,
+      "strict-route": true,
+      "dns-hijack": true
+    }
+  ],
+  "outbounds": [
+    {
+      "name": "node-a",
+      "type": "socks5",
+      "server": "192.0.2.10:1080",
+      "udp": true
+    },
+    {
+      "name": "node-b",
+      "type": "socks5",
+      "server": "192.0.2.11:1080",
+      "udp": true
+    },
+    {
+      "name": "auto",
+      "type": "url-test",
+      "outbounds": [
+        "node-a",
+        "node-b"
+      ],
+      "default": "node-a",
+      "url": "https://probe.example.invalid/generate_204",
+      "interval": "5m",
+      "timeout": "5s",
+      "tolerance": 50,
+      "lazy": true,
+      "expected-status": 204
+    },
+    {
+      "name": "proxy",
+      "type": "select",
+      "outbounds": [
+        "auto",
+        "node-a",
+        "node-b"
+      ],
+      "default": "auto",
+      "dns-server": "fake"
+    }
+  ],
+  "rules": [
+    "GEOSITE,private,DIRECT",
+    "GEOIP,private,DIRECT",
+    "GEOSITE,proxy,proxy",
+    "MATCH,DIRECT"
+  ],
+  "geo": {
+    "auto-update": false,
+    "update-interval": "24h",
+    "update-outbound": "proxy",
+    "dns-server": "real",
+    "geoip": {
+      "path": "./data/geoip.ftgeo"
+    },
+    "geosite": {
+      "path": "./data/geosite.ftgeo"
+    }
+  }
+}

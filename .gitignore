@@ -1,0 +1,26 @@
+# Local AI/agent workspace
+/.harness/
+/AGENTS.md
+
+# Local caches and build outputs
+__pycache__/
+*.py[cod]
+build/
+*.d
+*.o
+*.obj
+*.a
+*.gch
+a.out
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.tmp
+*.log
+
+CMakeUserPresets.json
+
+.DS_Store
+todo
