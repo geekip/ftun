@@ -95,6 +95,18 @@ typedef struct { bool matched, needs_resolve; } ftun_match_result_t;
 typedef struct { ftun_endpoint_t original, dial; ftun_string_t identity; } ftun_target_t;
 typedef struct { uint64_t generation; uint32_t leaf_id; bool degraded; } ftun_group_choice_t;
 typedef struct { ftun_error_t error; ftun_string_t message; } ftun_diagnostic_t;
+typedef enum {
+  FTUN_BUILD_MODULE_CORE = 1u << 0,
+  FTUN_BUILD_MODULE_DNS = 1u << 1,
+  FTUN_BUILD_MODULE_TUN = 1u << 2
+} ftun_build_module_t;
+#define FTUN_BUILD_MODULE_ALL \
+  (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS | FTUN_BUILD_MODULE_TUN)
+typedef struct {
+  uint32_t builtins;
+  const char *const *names;
+  size_t name_count;
+} ftun_build_capabilities_t;
 typedef struct { ftun_buffer_t *owner; size_t offset, length; } ftun_buffer_slice_t;
 typedef struct { bool complete; size_t consumed; ftun_endpoint_t target; } ftun_protocol_result_t;
 typedef struct { bool found, need_more; ftun_string_t domain; } ftun_sniff_result_t;

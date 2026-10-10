@@ -10,12 +10,25 @@ option(FTUN_LTO "Require supported interprocedural optimization" OFF)
 option(FTUN_SECTION_GC "Remove unused code and data on supported toolchains" ON)
 option(FTUN_STATIC "Build fully static Linux executables" OFF)
 option(FTUN_BUILD_GEO_TOOL "Build the standalone C converter skeleton" ON)
+set(FTUN_MODULE_DNS "OFF" CACHE STRING "Build the DNS module: OFF or BUILTIN")
+set(FTUN_MODULE_TUN "OFF" CACHE STRING "Build the TUN module: OFF or BUILTIN")
+set_property(CACHE FTUN_MODULE_DNS PROPERTY STRINGS OFF BUILTIN)
+set_property(CACHE FTUN_MODULE_TUN PROPERTY STRINGS OFF BUILTIN)
 set(FTUN_OPTIMIZATION "balanced" CACHE STRING "balanced, speed or size")
 set_property(CACHE FTUN_OPTIMIZATION PROPERTY STRINGS balanced speed size)
 set(FTUN_EXTRA_COMPILE_OPTIONS "" CACHE STRING "Additional target options as a CMake list")
 set(FTUN_EXTRA_LINK_OPTIONS "" CACHE STRING "Additional target link options as a CMake list")
 if(NOT FTUN_OPTIMIZATION MATCHES "^(balanced|speed|size)$")
   message(FATAL_ERROR "Unsupported FTUN_OPTIMIZATION")
+endif()
+foreach(ftun_module DNS TUN)
+  if(NOT FTUN_MODULE_${ftun_module} MATCHES "^(OFF|BUILTIN)$")
+    message(FATAL_ERROR
+      "FTUN_MODULE_${ftun_module} must be OFF or BUILTIN; dynamic modules are not supported")
+  endif()
+endforeach()
+if(FTUN_MODULE_TUN STREQUAL "BUILTIN" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "FTUN_MODULE_TUN=BUILTIN requires a Linux target")
 endif()
 if(FTUN_STATIC AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "FTUN_STATIC requires a Linux target toolchain")
@@ -65,15 +78,13 @@ if(FTUN_LTO)
     message(FATAL_ERROR "Requested LTO is unavailable: ${ftun_ipo_error}")
   endif()
 endif()
-# 0.1 骨架不发现/下载第三方库。未来逐模块接入须验证锁文件与目标 ABI。
-# DEC-025 / TASK-BUILD-MODULES-002：真实模块接入时按 OFF/BUILTIN 分组源码、
-# 注册项与依赖；不提供动态功能插件。下列骨架清单不代表已实现的能力。
-add_library(ftun_core STATIC
+# 当前库不发现或下载第三方库。后续引入依赖时必须和所属模块同时裁剪。
+# 核心保留 SystemResolver、通用 Datagram 和 SOCKS5，不反向依赖 TUN。
+set(ftun_core_sources
   src/core/core.c
   src/util/error.c
   src/core/runtime.c
   src/core/session.c
-  src/core/state.c
   src/core/budget.c
   src/core/operation.c
   src/core/worker.c
@@ -82,43 +93,18 @@ add_library(ftun_core STATIC
   src/config/validate.c
   src/config/compile.c
   src/inbound/inbound.c
-  src/inbound/mixed.c
   src/inbound/socks5.c
-  src/inbound/anytls.c
-  src/inbound/tun.c
   src/outbound/outbound.c
   src/outbound/direct.c
   src/outbound/reject.c
   src/outbound/socks5.c
-  src/outbound/anytls.c
   src/route/router.c
   src/route/rule.c
   src/route/target.c
-  src/route/group.c
-  src/dns/dns.c
-  src/dns/server.c
-  src/dns/listener.c
-  src/dns/bootstrap.c
   src/dns/resolver.c
-  src/dns/cache.c
-  src/dns/fakeip.c
-  src/dns/wire.c
-  src/group/select.c
-  src/group/url_test.c
-  src/group/health.c
-  src/geo/geo.c
-  src/geo/geoip.c
-  src/geo/geosite.c
-  src/geo/update.c
-  src/tun/tun.c
-  src/tun/lwip_adapter.c
-  src/tun/udp_session.c
-  src/platform/linux/tun.c
-  src/platform/linux/route.c
   src/platform/linux/socket_protect.c
   src/platform/system_resolver.c
   src/platform/file.c
-  src/api/api.c
   src/util/logger.c
   src/util/buffer.c
   src/util/hash.c
@@ -130,6 +116,26 @@ add_library(ftun_core STATIC
   src/transport/datagram.c
   src/transport/relay.c
   src/protocol/socks5.c
+)
+
+# 这些源码属于后续版本的可选模块，当前不加入任何 target。
+# 各模块交付时再与其注册项、独占依赖和 OFF/BUILTIN 测试一起接入。
+set(ftun_deferred_module_sources
+  src/core/state.c
+  src/inbound/mixed.c
+  src/inbound/anytls.c
+  src/outbound/anytls.c
+  src/route/group.c
+  src/dns/fakeip.c
+  src/group/select.c
+  src/group/url_test.c
+  src/group/health.c
+  src/geo/geo.c
+  src/geo/geoip.c
+  src/geo/geosite.c
+  src/geo/update.c
+  src/geo/format.c
+  src/api/api.c
   src/protocol/http.c
   src/protocol/anytls.c
   src/protocol/uot.c
@@ -141,11 +147,39 @@ add_library(ftun_core STATIC
   src/state/fakeip_store.c
   src/state/snapshot.c
   src/state/group_cache.c
-  src/geo/format.c
 )
+
+set(ftun_module_definitions)
+if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+  list(APPEND ftun_core_sources
+    src/dns/dns.c
+    src/dns/server.c
+    src/dns/listener.c
+    src/dns/bootstrap.c
+    src/dns/cache.c
+    src/dns/wire.c
+  )
+  list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_DNS=1)
+endif()
+if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
+  list(APPEND ftun_core_sources
+    src/inbound/tun.c
+    src/tun/tun.c
+    src/tun/lwip_adapter.c
+    src/tun/udp_session.c
+    src/platform/linux/tun.c
+    src/platform/linux/route.c
+  )
+  list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_TUN=1)
+endif()
+
+add_library(ftun_core STATIC ${ftun_core_sources})
 target_include_directories(ftun_core PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_compile_definitions(ftun_core PRIVATE ${ftun_module_definitions})
 target_link_libraries(ftun_core PRIVATE ftun_options)
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ftun-build-modules.txt" CONTENT
+  "core=BUILTIN\ndns=${FTUN_MODULE_DNS}\ntun=${FTUN_MODULE_TUN}\n")
 add_executable(ftun src/main.c src/cli/cli.c)
 target_include_directories(ftun PRIVATE src)
 target_link_libraries(ftun PRIVATE ftun_core ftun_options)
@@ -178,6 +212,19 @@ if(BUILD_TESTING)
     target_link_options(ftun-contract-test PRIVATE -static)
   endif()
   add_test(NAME skeleton-contract COMMAND ftun-contract-test)
+  add_executable(ftun-build-modules-test tests/build_modules.c)
+  target_include_directories(ftun-build-modules-test PRIVATE src)
+  target_link_libraries(ftun-build-modules-test PRIVATE ftun_core ftun_options)
+  if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_DNS=1)
+  endif()
+  if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_TUN=1)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-build-modules-test PRIVATE -static)
+  endif()
+  add_test(NAME build-modules-capabilities COMMAND ftun-build-modules-test)
   if(UNIX)
     add_executable(ftun-time-test tests/monotonic_time.c)
     target_include_directories(ftun-time-test PRIVATE src)
@@ -201,6 +248,13 @@ if(BUILD_TESTING)
     # Optional development dependency: skip explicitly if jsonschema is absent.
     set_tests_properties(config-schema PROPERTIES SKIP_RETURN_CODE 77)
   endif()
+  add_test(NAME build-modules-matrix
+    COMMAND ${CMAKE_COMMAND}
+      -DFTUN_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}
+      -DFTUN_MATRIX_DIR=${CMAKE_CURRENT_BINARY_DIR}/module-matrix
+      -DFTUN_MATRIX_GENERATOR=${CMAKE_GENERATOR}
+      -DFTUN_MATRIX_COMPILER=${CMAKE_C_COMPILER}
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_modules.cmake)
   # 工程检查不能因运行环境或工具故障无限阻塞。
   get_property(ftun_tests DIRECTORY PROPERTY TESTS)
   set_tests_properties(${ftun_tests} PROPERTIES TIMEOUT 30)
