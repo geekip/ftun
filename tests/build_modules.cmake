@@ -49,6 +49,11 @@ foreach(source
     message(FATAL_ERROR "OFF module source entered core-only build: ${source}")
   endif()
 endforeach()
+string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/third_party/lwip/src/core/init.c"
+  lwip_found)
+if(NOT lwip_found EQUAL -1)
+  message(FATAL_ERROR "TUN-only lwIP entered core-only build")
+endif()
 foreach(source src/dns/resolver.c src/platform/system_resolver.c
                src/transport/datagram.c src/protocol/socks5.c)
   string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
@@ -84,6 +89,11 @@ foreach(source src/dns/dns.c src/dns/wire.c src/inbound/tun.c src/tun/lwip_adapt
     message(FATAL_ERROR "BUILTIN module source is missing: ${source}")
   endif()
 endforeach()
+string(FIND "${builtin_commands}" "${FTUN_SOURCE_DIR}/third_party/lwip/src/core/init.c"
+  lwip_found)
+if(lwip_found EQUAL -1)
+  message(FATAL_ERROR "BUILTIN TUN dependency lwIP is missing")
+endif()
 file(READ "${builtin_dir}/ftun-build-modules.txt" manifest)
 if(NOT manifest STREQUAL "core=BUILTIN\ndns=BUILTIN\ntun=BUILTIN\n")
   message(FATAL_ERROR "unexpected builtin manifest:\n${manifest}")

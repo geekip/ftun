@@ -1,0 +1,395 @@
+#include "transport/relay.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#define CHECK(x) do { \
+  if (!(x)) { \
+    fprintf(stderr, "relay contract failed at line %d: %s\n", __LINE__, #x); \
+    return 1; \
+  } \
+} while (0)
+
+typedef struct {
+  uint8_t input[64];
+  size_t input_length;
+  size_t input_offset;
+  size_t read_chunk;
+  ftun_status_t read_status;
+  int eof_when_empty;
+  ftun_stream_write_t *write;
+  uint8_t pending[64];
+  size_t pending_length;
+  size_t accept_limit;
+  ftun_status_t write_status;
+  ftun_status_t cancel_status;
+  ftun_status_t shutdown_status;
+  uint8_t output[128];
+  size_t output_length;
+  int read_calls;
+  int write_calls;
+  int cancel_calls;
+  int shutdown_calls;
+  int destroy_calls;
+} stream_backend_state_t;
+
+typedef struct {
+  ftun_budget_t *budget;
+  ftun_operation_queue_t *operations;
+  ftun_stream_t *left;
+  ftun_stream_t *right;
+  ftun_relay_t *relay;
+  stream_backend_state_t left_backend;
+  stream_backend_state_t right_backend;
+} fixture_t;
+
+static ftun_status_t backend_read(void *user, void *buffer, size_t capacity,
+                                  size_t *out_length)
+{
+  stream_backend_state_t *state = (stream_backend_state_t *)user;
+  size_t available;
+  size_t amount;
+  state->read_calls++;
+  *out_length = 0u;
+  if (state->read_status != FTUN_OK) return state->read_status;
+  if (state->input_offset == state->input_length) {
+    return state->eof_when_empty ? FTUN_E_EOF : FTUN_E_AGAIN;
+  }
+  available = state->input_length - state->input_offset;
+  amount = available < capacity ? available : capacity;
+  if (state->read_chunk != 0u && amount > state->read_chunk) {
+    amount = state->read_chunk;
+  }
+  memcpy(buffer, state->input + state->input_offset, amount);
+  state->input_offset += amount;
+  *out_length = amount;
+  return FTUN_OK;
+}
+
+static ftun_status_t backend_write_start(void *user,
+                                         ftun_stream_write_t *write,
+                                         const ftun_buffer_slice_t *slice,
+                                         size_t *accepted)
+{
+  stream_backend_state_t *state = (stream_backend_state_t *)user;
+  ftun_bytes_t bytes;
+  (void)slice;
+  state->write_calls++;
+  *accepted = 0u;
+  if (state->write_status != FTUN_OK) return state->write_status;
+  if (state->write != NULL ||
+      ftun_stream_write_data(write, &bytes) != FTUN_OK || bytes.length == 0u) {
+    return FTUN_E_STATE_CORRUPT;
+  }
+  state->pending_length = bytes.length;
+  if (state->accept_limit != 0u && state->pending_length > state->accept_limit) {
+    state->pending_length = state->accept_limit;
+  }
+  if (state->pending_length > sizeof(state->pending)) return FTUN_E_LIMIT;
+  memcpy(state->pending, bytes.data, state->pending_length);
+  state->write = write;
+  *accepted = state->pending_length;
+  return FTUN_OK;
+}
+
+static ftun_status_t backend_write_cancel(void *user,
+                                          ftun_stream_write_t *write)
+{
+  stream_backend_state_t *state = (stream_backend_state_t *)user;
+  state->cancel_calls++;
+  if (state->write != write) return FTUN_E_STATE_CORRUPT;
+  if (state->cancel_status != FTUN_OK) return state->cancel_status;
+  state->write = NULL;
+  state->pending_length = 0u;
+  return FTUN_OK;
+}
+
+static ftun_status_t backend_shutdown(void *user)
+{
+  stream_backend_state_t *state = (stream_backend_state_t *)user;
+  state->shutdown_calls++;
+  return state->shutdown_status;
+}
+
+static void backend_destroy(void *user)
+{
+  stream_backend_state_t *state = (stream_backend_state_t *)user;
+  state->destroy_calls++;
+}
+
+static void unused_completion(ftun_operation_t *operation,
+                              ftun_error_t error, void *user)
+{
+  int *calls = (int *)user;
+  (void)operation;
+  (void)error;
+  (*calls)++;
+}
+
+static int create_stream(fixture_t *fixture, stream_backend_state_t *state,
+                         ftun_stream_t **out, int *unused_calls)
+{
+  ftun_stream_options_t options;
+  ftun_stream_backend_t backend;
+  memset(&options, 0, sizeof(options));
+  memset(&backend, 0, sizeof(backend));
+  options.budget = fixture->budget;
+  options.operations = fixture->operations;
+  options.max_pending_writes = 2u;
+  options.max_pending_bytes = 64u;
+  options.completion = unused_completion;
+  options.completion_user = unused_calls;
+  backend.read = backend_read;
+  backend.write_start = backend_write_start;
+  backend.write_cancel = backend_write_cancel;
+  backend.shutdown_write = backend_shutdown;
+  backend.destroy = backend_destroy;
+  backend.context = state;
+  return ftun_stream_create(&options, &backend, out) == FTUN_OK ? 0 : 1;
+}
+
+static int fixture_start(fixture_t *fixture, size_t high, size_t low,
+                         size_t max_work)
+{
+  ftun_relay_options_t options;
+  static int unused_calls;
+  memset(fixture, 0, sizeof(*fixture));
+  unused_calls = 0;
+  fixture->left_backend.accept_limit = SIZE_MAX;
+  fixture->right_backend.accept_limit = SIZE_MAX;
+  fixture->left_backend.read_chunk = SIZE_MAX;
+  fixture->right_backend.read_chunk = SIZE_MAX;
+  if (ftun_budget_create(NULL, 32768u, 0u, &fixture->budget) != FTUN_OK) return 1;
+  if (ftun_operation_queue_create(fixture->budget, 8u,
+                                  &fixture->operations) != FTUN_OK) return 1;
+  if (create_stream(fixture, &fixture->left_backend, &fixture->left,
+                    &unused_calls) != 0) return 1;
+  if (create_stream(fixture, &fixture->right_backend, &fixture->right,
+                    &unused_calls) != 0) return 1;
+  options.high_water_bytes = high;
+  options.low_water_bytes = low;
+  options.max_work_per_round = max_work;
+  return ftun_relay_start_with_options(NULL, fixture->left, fixture->right,
+                                       &options, &fixture->relay) == FTUN_OK
+    ? 0 : 1;
+}
+
+static int dispatch_all(fixture_t *fixture, size_t expected)
+{
+  size_t dispatched = 0u;
+  if (ftun_operation_dispatch(fixture->operations, SIZE_MAX,
+                              &dispatched) != FTUN_OK) return 1;
+  return dispatched == expected ? 0 : 1;
+}
+
+static int complete_write(stream_backend_state_t *state, ftun_status_t status)
+{
+  ftun_stream_write_t *write = state->write;
+  ftun_error_t error = {status, 0u, 0};
+  if (write == NULL) return 1;
+  if (status == FTUN_OK) {
+    if (state->output_length > sizeof(state->output) - state->pending_length) {
+      return 1;
+    }
+    memcpy(state->output + state->output_length, state->pending,
+           state->pending_length);
+    state->output_length += state->pending_length;
+  }
+  state->write = NULL;
+  state->pending_length = 0u;
+  return ftun_stream_write_complete(write, error) == FTUN_OK ? 0 : 1;
+}
+
+static int fixture_destroy(fixture_t *fixture, int stop_relay)
+{
+  ftun_budget_usage_t usage;
+  if (stop_relay && fixture->relay != NULL &&
+      ftun_relay_stop(fixture->relay) != FTUN_OK) return 1;
+  if (fixture->relay != NULL &&
+      ftun_relay_destroy(&fixture->relay) != FTUN_OK) return 1;
+  if (ftun_stream_stop(fixture->left) != FTUN_OK ||
+      ftun_stream_stop(fixture->right) != FTUN_OK) return 1;
+  if (ftun_stream_destroy(&fixture->left) != FTUN_OK ||
+      ftun_stream_destroy(&fixture->right) != FTUN_OK) return 1;
+  if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
+  if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
+      usage.used != 0u) return 1;
+  if (ftun_budget_destroy(&fixture->budget) != FTUN_OK) return 1;
+  return 0;
+}
+
+static int process(fixture_t *fixture, uint32_t left_events,
+                   uint32_t right_events, size_t expected_work)
+{
+  size_t work = SIZE_MAX;
+  if (ftun_relay_process(fixture->relay, left_events, right_events,
+                         &work) != FTUN_OK) return 1;
+  return work == expected_work ? 0 : 1;
+}
+
+static int test_backpressure_and_half_close(void)
+{
+  fixture_t fixture;
+  ftun_relay_usage_t usage;
+  const uint8_t left_input[8] = {'a','b','c','d','e','f','g','h'};
+  size_t index;
+  CHECK(fixture_start(&fixture, 8u, 3u, 1u) == 0);
+  memcpy(fixture.left_backend.input, left_input, sizeof(left_input));
+  fixture.left_backend.input_length = sizeof(left_input);
+  fixture.left_backend.read_chunk = 4u;
+  fixture.left_backend.eof_when_empty = 1;
+  fixture.right_backend.eof_when_empty = 1;
+  fixture.right_backend.accept_limit = 2u;
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+  CHECK(usage.left_interests == FTUN_EVENT_READ &&
+        usage.right_interests == FTUN_EVENT_READ);
+
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  CHECK(process(&fixture, 0u, 0u, 1u) == 0);
+  CHECK(fixture.right_backend.write != NULL);
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+  CHECK(usage.left_to_right_buffered == 8u &&
+        (usage.left_interests & FTUN_EVENT_READ) == 0u &&
+        (usage.right_interests & FTUN_EVENT_WRITE) == 0u);
+
+  for (index = 0u; index < 4u; index++) {
+    CHECK(complete_write(&fixture.right_backend, FTUN_OK) == 0);
+    CHECK(dispatch_all(&fixture, 1u) == 0);
+    if (index != 3u) CHECK(process(&fixture, 0u, 0u, 1u) == 0);
+    if (index == 1u) {
+      CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+      CHECK(usage.left_to_right_buffered == 4u &&
+            (usage.left_interests & FTUN_EVENT_READ) == 0u);
+    }
+    if (index == 2u) {
+      CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+      CHECK(usage.left_to_right_buffered == 2u &&
+            (usage.left_interests & FTUN_EVENT_READ) != 0u);
+    }
+  }
+  CHECK(fixture.right_backend.output_length == sizeof(left_input) &&
+        memcmp(fixture.right_backend.output, left_input, sizeof(left_input)) == 0);
+  CHECK(fixture.right_backend.shutdown_calls == 0);
+
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  fixture.right_backend.shutdown_status = FTUN_E_AGAIN;
+  CHECK(process(&fixture, 0u, 0u, 1u) == 0);
+  CHECK(fixture.right_backend.shutdown_calls == 1);
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK &&
+        (usage.right_interests & FTUN_EVENT_WRITE) != 0u &&
+        !usage.right_write_shutdown);
+  CHECK(process(&fixture, 0u, 0u, 0u) == 0);
+  fixture.right_backend.shutdown_status = FTUN_OK;
+  CHECK(process(&fixture, 0u, FTUN_EVENT_WRITE, 1u) == 0);
+  CHECK(fixture.right_backend.shutdown_calls == 2);
+
+  CHECK(process(&fixture, 0u, FTUN_EVENT_READ, 1u) == 0);
+  CHECK(process(&fixture, 0u, 0u, 1u) == 0);
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+  CHECK(usage.complete && usage.left_eof && usage.right_eof &&
+        usage.left_write_shutdown && usage.right_write_shutdown &&
+        usage.total_read_bytes == 8u && usage.total_written_bytes == 8u);
+  CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK && fixture.relay == NULL);
+  CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
+static int test_write_interest_and_cancel_retry(void)
+{
+  fixture_t fixture;
+  ftun_relay_usage_t usage;
+  CHECK(fixture_start(&fixture, 8u, 3u, 4u) == 0);
+  fixture.left_backend.input[0] = 'x';
+  fixture.left_backend.input_length = 1u;
+  fixture.right_backend.write_status = FTUN_E_AGAIN;
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 3u) == 0);
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK &&
+        usage.left_to_right_buffered == 1u &&
+        (usage.right_interests & FTUN_EVENT_WRITE) != 0u);
+  CHECK(process(&fixture, 0u, 0u, 0u) == 0);
+  fixture.right_backend.write_status = FTUN_OK;
+  CHECK(process(&fixture, 0u, FTUN_EVENT_WRITE, 1u) == 0);
+  CHECK((fixture.right_backend.write != NULL) &&
+        ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK &&
+        (usage.right_interests & FTUN_EVENT_WRITE) == 0u);
+  fixture.right_backend.cancel_status = FTUN_E_IO;
+  CHECK(ftun_relay_stop(fixture.relay) == FTUN_E_IO);
+  CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_E_AGAIN);
+  fixture.right_backend.cancel_status = FTUN_OK;
+  CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
+  CHECK(dispatch_all(&fixture, 1u) == 0);
+  CHECK(fixture.right_backend.cancel_calls == 2);
+  CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
+static int test_lazy_budget_and_error(void)
+{
+  fixture_t fixture;
+  ftun_reservation_t *blocker = NULL;
+  ftun_budget_usage_t usage;
+  ftun_relay_usage_t relay_usage;
+  size_t work = SIZE_MAX;
+  CHECK(fixture_start(&fixture, 8u, 3u, 2u) == 0);
+  fixture.left_backend.input[0] = 'z';
+  fixture.left_backend.input_length = 1u;
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK &&
+        usage.normal_available > 0u);
+  CHECK(ftun_budget_reserve(fixture.budget, usage.normal_available,
+                            &blocker) == FTUN_OK);
+  CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_READ, 0u,
+                           &work) == FTUN_E_LIMIT && work == 0u);
+  CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK &&
+        !relay_usage.stopped && relay_usage.left_to_right_buffered == 0u);
+  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 2u) == 0);
+  CHECK(fixture.right_backend.write != NULL);
+  CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_ERROR, 0u,
+                           &work) == FTUN_E_IO);
+  CHECK(dispatch_all(&fixture, 1u) == 0);
+  CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK &&
+        relay_usage.stopped && relay_usage.terminal_status == FTUN_E_IO);
+  CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
+static int test_boundaries_and_default(void)
+{
+  fixture_t fixture;
+  ftun_relay_options_t options = {8u, 3u, 1u};
+  ftun_relay_t *relay = (ftun_relay_t *)(uintptr_t)1;
+  ftun_relay_usage_t usage;
+  size_t work = 99u;
+  CHECK(fixture_start(&fixture, 8u, 3u, 2u) == 0);
+  CHECK(ftun_relay_start(NULL, fixture.left, fixture.right, &relay) == FTUN_OK);
+  CHECK(relay != NULL);
+  CHECK(ftun_relay_stop(relay) == FTUN_OK);
+  CHECK(ftun_relay_destroy(&relay) == FTUN_OK && relay == NULL);
+  CHECK(ftun_relay_start_with_options(NULL, fixture.left, fixture.left,
+                                      &options, &relay) == FTUN_E_INVALID &&
+        relay == NULL);
+  options.low_water_bytes = options.high_water_bytes;
+  CHECK(ftun_relay_start_with_options(NULL, fixture.left, fixture.right,
+                                      &options, &relay) == FTUN_E_INVALID);
+  CHECK(ftun_relay_process(NULL, 0u, 0u, &work) == FTUN_E_INVALID && work == 0u);
+  CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_TIMER, 0u,
+                           &work) == FTUN_E_INVALID && work == 0u);
+  CHECK(ftun_relay_stop(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_relay_get_usage(NULL, &usage) == FTUN_E_INVALID &&
+        usage.total_read_bytes == 0u);
+  CHECK(ftun_relay_destroy(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_relay_destroy(&relay) == FTUN_OK);
+  CHECK(fixture_destroy(&fixture, 1) == 0);
+  return 0;
+}
+
+/* TASK-TRANSPORT-004 / TEST-TRANSPORT-004：水位、工作上限与排空 half-close。 */
+int main(void)
+{
+  CHECK(test_backpressure_and_half_close() == 0);
+  CHECK(test_write_interest_and_cancel_retry() == 0);
+  CHECK(test_lazy_budget_and_error() == 0);
+  CHECK(test_boundaries_and_default() == 0);
+  return 0;
+}

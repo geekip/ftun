@@ -1,15 +1,45 @@
 #include "reject.h"
+
 #include <string.h>
 
-/* 策略拒绝。
- * 需求 REQ-OUT-001；任务 TASK-OUTBOUND-003；目标 0.2.0；验收 TEST-OUTBOUND-003。
- * 实现路径：将策略拒绝交入站映射到协议错误；DNS REFUSED、UDP 丢包、TCP 拒绝分开处理；不建立物理 socket。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
+#define FTUN_DNS_RCODE_REFUSED 5u
+
+/* TASK-OUTBOUND-003 / TEST-OUTBOUND-003，目标 0.2.0：纯策略终结映射。 */
+ftun_status_t ftun_reject_classify(const ftun_metadata_t *metadata,
+                                   bool dns_query,
+                                   ftun_reject_result_t *out)
+{
+  const uint32_t known = FTUN_META_SOURCE | FTUN_META_PORT |
+                         FTUN_META_NETWORK | FTUN_META_DOMAIN;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (metadata == NULL || out == NULL ||
+      (metadata->known_fields & ~known) != 0u) return FTUN_E_INVALID;
+  if (dns_query) {
+    if ((metadata->known_fields & FTUN_META_NETWORK) != 0u ||
+        metadata->network != 0u) return FTUN_E_INVALID;
+    out->action = FTUN_REJECT_DNS_REFUSED;
+    out->terminal_status = FTUN_E_REJECTED;
+    out->dns_rcode = FTUN_DNS_RCODE_REFUSED;
+    return FTUN_OK;
+  }
+  if ((metadata->known_fields & FTUN_META_NETWORK) == 0u) {
+    return FTUN_E_INVALID;
+  }
+  if (metadata->network == 1u) {
+    out->action = FTUN_REJECT_TCP_REFUSE;
+  } else if (metadata->network == 2u) {
+    out->action = FTUN_REJECT_UDP_DROP;
+  } else {
+    return FTUN_E_INVALID;
+  }
+  out->terminal_status = FTUN_E_REJECTED;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_reject_request(const ftun_metadata_t *metadata)
 {
-  (void)metadata;
-  return FTUN_E_NOT_IMPLEMENTED;
+  ftun_reject_result_t result;
+  ftun_status_t status = ftun_reject_classify(metadata, false, &result);
+  if (status != FTUN_OK) return status;
+  return result.terminal_status;
 }

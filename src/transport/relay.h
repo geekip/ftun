@@ -1,12 +1,55 @@
 #ifndef FTUN_TRANSPORT_RELAY_H
 #define FTUN_TRANSPORT_RELAY_H
 #include "internal/contracts.h"
+#include "event/event.h"
+#include "transport/stream.h"
+
+#define FTUN_RELAY_DEFAULT_HIGH_WATER 65536u
+#define FTUN_RELAY_DEFAULT_LOW_WATER 32768u
+#define FTUN_RELAY_DEFAULT_MAX_WORK 64u
+
+typedef struct {
+  size_t high_water_bytes;
+  size_t low_water_bytes;
+  size_t max_work_per_round;
+} ftun_relay_options_t;
+
+typedef struct {
+  size_t left_to_right_buffered;
+  size_t right_to_left_buffered;
+  size_t total_read_bytes;
+  size_t total_written_bytes;
+  uint32_t left_interests;
+  uint32_t right_interests;
+  ftun_status_t terminal_status;
+  bool left_eof;
+  bool right_eof;
+  bool left_write_shutdown;
+  bool right_write_shutdown;
+  bool stopped;
+  bool complete;
+} ftun_relay_usage_t;
+
 /* 双向背压中继。
  * 需求 REQ-PERF-001；任务 TASK-TRANSPORT-004；目标 0.2.0；验收 TEST-TRANSPORT-004。
- * 实现路径：按需缓冲，高低水位贯穿所有 adapter；先排空再 half-close；只在待写时监听 WRITE，每轮限定工作量。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
+ * 缓冲首次 READ 时才申请；达到高水位暂停源 READ，降至低水位恢复。
+ * WRITE 只在未接纳数据或 half-close 返回 AGAIN 时进入 interests。
+ * EOF 方向必须先排空已接纳/待接纳数据，再向另一侧 shutdown-write。
+ * left/right 由调用方拥有，必须比 relay session 长寿且使用同一 Budget。
  */
-ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right, ftun_session_t **out);
+ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left,
+                               ftun_stream_t *right, ftun_relay_t **out);
+ftun_status_t ftun_relay_start_with_options(
+  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
+  const ftun_relay_options_t *options, ftun_relay_t **out);
+/* events 是本轮已就绪位；单次最多执行 options.max_work_per_round 个动作。 */
+ftun_status_t ftun_relay_process(ftun_relay_t *relay,
+                                 uint32_t left_events,
+                                 uint32_t right_events,
+                                 size_t *out_work);
+ftun_status_t ftun_relay_stop(ftun_relay_t *relay);
+ftun_status_t ftun_relay_get_usage(const ftun_relay_t *relay,
+                                   ftun_relay_usage_t *out);
+ftun_status_t ftun_relay_destroy(ftun_relay_t **relay);
+
 #endif

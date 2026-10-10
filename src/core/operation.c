@@ -14,6 +14,8 @@ struct ftun_operation {
   ftun_operation_t *next;
   ftun_completion_fn callback;
   void *user;
+  ftun_operation_cancel_hook_fn cancel_hook;
+  void *cancel_user;
   ftun_reservation_t *reservation;
   ftun_error_t result;
   ftun_operation_state_t state;
@@ -114,12 +116,55 @@ ftun_status_t ftun_operation_complete(ftun_operation_t *operation, ftun_error_t 
   return FTUN_OK;
 }
 
+ftun_status_t ftun_operation_set_cancel_hook(
+  ftun_operation_t *operation, ftun_operation_cancel_hook_fn hook, void *user)
+{
+  if (operation == NULL || (hook == NULL && user != NULL)) return FTUN_E_INVALID;
+  if (operation->state == FTUN_OPERATION_CALLBACK) return FTUN_E_STALE;
+  operation->cancel_hook = hook;
+  operation->cancel_user = user;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_operation_reject(ftun_operation_t **operation)
+{
+  ftun_operation_t *owned;
+  ftun_operation_queue_t *queue;
+  ftun_reservation_t *reservation;
+  ftun_status_t status;
+  if (operation == NULL) return FTUN_E_INVALID;
+  owned = *operation;
+  if (owned == NULL) return FTUN_OK;
+  if (owned->state != FTUN_OPERATION_ACCEPTED || owned->queue == NULL) {
+    return FTUN_E_STALE;
+  }
+  queue = owned->queue;
+  if (queue->inflight == 0u) return FTUN_E_STATE_CORRUPT;
+  reservation = owned->reservation;
+  status = ftun_reservation_release(&reservation);
+  if (status != FTUN_OK) return status;
+  owned->reservation = NULL;
+  ftun_operation_unlink(owned);
+  queue->inflight--;
+  memset(owned, 0, sizeof(*owned));
+  free(owned);
+  *operation = NULL;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
 {
+  ftun_status_t status;
   if (operation == NULL) return FTUN_E_INVALID;
   if (operation->state == FTUN_OPERATION_CALLBACK) return FTUN_E_STALE;
   if (operation->state == FTUN_OPERATION_TERMINAL &&
       operation->result.status == FTUN_E_CANCELLED) return FTUN_E_STALE;
+  if (operation->cancel_hook != NULL) {
+    status = operation->cancel_hook(operation->cancel_user);
+    if (status != FTUN_OK) return status;
+    operation->cancel_hook = NULL;
+    operation->cancel_user = NULL;
+  }
   operation->result = ftun_cancelled_error();
   operation->state = FTUN_OPERATION_TERMINAL;
   return FTUN_OK;
@@ -148,6 +193,8 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
     callback = operation->callback;
     user = operation->user;
     result = operation->result;
+    operation->cancel_hook = NULL;
+    operation->cancel_user = NULL;
     callback(operation, result, user);
     reservation = operation->reservation;
     operation->queue = NULL;
@@ -170,13 +217,23 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
 ftun_status_t ftun_operation_queue_stop(ftun_operation_queue_t *queue)
 {
   ftun_operation_t *operation;
+  ftun_status_t result = FTUN_OK;
   if (queue == NULL) return FTUN_E_INVALID;
   queue->accepting = 0;
   for (operation = queue->head; operation != NULL; operation = operation->next) {
+    if (operation->cancel_hook != NULL) {
+      ftun_status_t status = operation->cancel_hook(operation->cancel_user);
+      if (status != FTUN_OK) {
+        if (result == FTUN_OK) result = status;
+        continue;
+      }
+      operation->cancel_hook = NULL;
+      operation->cancel_user = NULL;
+    }
     operation->result = ftun_cancelled_error();
     operation->state = FTUN_OPERATION_TERMINAL;
   }
-  return FTUN_OK;
+  return result;
 }
 
 ftun_status_t ftun_operation_queue_get_usage(const ftun_operation_queue_t *queue,

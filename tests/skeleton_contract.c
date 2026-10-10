@@ -23,7 +23,7 @@ int main(void) {
   CHECK(operation == NULL && callbacks == 0);
   CHECK(ftun_route_evaluate(NULL, NULL, 0, &route) == FTUN_E_NOT_IMPLEMENTED);
   CHECK(route.kind == FTUN_ROUTE_UNSET && route.allowed == NULL);
-  CHECK(ftun_stream_write_ref(NULL, NULL, &accepted, &operation) == FTUN_E_NOT_IMPLEMENTED);
+  CHECK(ftun_stream_write_ref(NULL, NULL, &accepted, &operation) == FTUN_E_INVALID);
   CHECK(accepted == 0 && operation == NULL);
   CHECK(ftun_core_destroy(&core) == FTUN_OK);
   CHECK(ftun_core_create(NULL, &core) == FTUN_E_INVALID && core == NULL);

@@ -17,6 +17,22 @@ typedef struct {
   ftun_status_t expected;
 } callback_state_t;
 
+typedef struct {
+  int calls;
+  int failures;
+} cancel_hook_state_t;
+
+static ftun_status_t cancel_hook(void *user)
+{
+  cancel_hook_state_t *state = (cancel_hook_state_t *)user;
+  state->calls++;
+  if (state->failures > 0) {
+    state->failures--;
+    return FTUN_E_IO;
+  }
+  return FTUN_OK;
+}
+
 static void completed(ftun_operation_t *operation, ftun_error_t result, void *user)
 {
   callback_state_t *state = (callback_state_t *)user;
@@ -38,6 +54,7 @@ int main(void)
   ftun_operation_queue_usage_t queue_usage;
   ftun_budget_usage_t budget_usage;
   callback_state_t one = {0}, two = {0}, three = {0};
+  cancel_hook_state_t hook = {0};
   ftun_error_t success = {FTUN_OK, 7u, 9};
   size_t baseline;
   size_t dispatched = 99u;
@@ -88,10 +105,37 @@ int main(void)
 
   one.calls = one.cancel_was_stale = one.recursive_was_again = 0;
   one.expected = FTUN_E_CANCELLED;
+  hook.calls = 0;
+  hook.failures = 1;
+  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
+  CHECK(ftun_operation_set_cancel_hook(first, cancel_hook, &hook) == FTUN_OK);
+  CHECK(ftun_operation_cancel(first) == FTUN_E_IO);
+  CHECK(hook.calls == 1 && one.calls == 0);
+  CHECK(ftun_operation_cancel(first) == FTUN_OK);
+  CHECK(hook.calls == 2);
+  CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
+  CHECK(dispatched == 1u && one.calls == 1);
+
+  one.calls = one.cancel_was_stale = one.recursive_was_again = 0;
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
+  baseline = budget_usage.used;
+  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
+  CHECK(ftun_operation_reject(&first) == FTUN_OK && first == NULL);
+  CHECK(one.calls == 0);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
+  CHECK(budget_usage.used == baseline);
+
+  one.calls = one.cancel_was_stale = one.recursive_was_again = 0;
+  one.expected = FTUN_E_CANCELLED;
+  hook.calls = 0;
+  hook.failures = 1;
   CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
   CHECK(ftun_operation_complete(first, success) == FTUN_OK);
+  CHECK(ftun_operation_set_cancel_hook(first, cancel_hook, &hook) == FTUN_OK);
+  CHECK(ftun_operation_queue_stop(queue) == FTUN_E_IO);
+  CHECK(one.calls == 0 && hook.calls == 1);
   CHECK(ftun_operation_queue_stop(queue) == FTUN_OK);
-  CHECK(ftun_operation_queue_stop(queue) == FTUN_OK);
+  CHECK(hook.calls == 2);
   CHECK(ftun_operation_accept(queue, completed, &two, &second) == FTUN_E_CANCELLED);
   CHECK(second == NULL);
   CHECK(ftun_operation_dispatch(queue, SIZE_MAX, &dispatched) == FTUN_OK);
@@ -101,6 +145,8 @@ int main(void)
 
   CHECK(ftun_operation_cancel(NULL) == FTUN_E_INVALID);
   CHECK(ftun_operation_complete(NULL, success) == FTUN_E_INVALID);
+  CHECK(ftun_operation_set_cancel_hook(NULL, cancel_hook, &hook) == FTUN_E_INVALID);
+  CHECK(ftun_operation_reject(NULL) == FTUN_E_INVALID);
   CHECK(ftun_operation_dispatch(queue, 0u, &dispatched) == FTUN_E_INVALID);
   CHECK(dispatched == 0u);
   CHECK(ftun_operation_dispatch(queue, 1u, NULL) == FTUN_E_INVALID);

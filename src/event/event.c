@@ -1,17 +1,479 @@
 #include "event.h"
+#include "util/time.h"
+#include <pthread.h>
+#include <stdlib.h>
 #include <string.h>
 
-/* 可移植事件接口。
- * 需求 REQ-CORE-001；任务 TASK-EVENT-001；目标 0.2.0；验收 TEST-EVENT-001。
- * 实现路径：封装 I/O/timer/wakeup，不向公共 API 暴露 watcher；只唤醒有工作对象，停止时排空终结队列。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
+#define FTUN_EVENT_DEFERRED_CAPACITY 256u
+#define FTUN_EVENT_SOURCE_CAPACITY 256u
+
+typedef enum {
+  FTUN_EVENT_SOURCE_IO = 1,
+  FTUN_EVENT_SOURCE_TIMER
+} ftun_event_source_kind_t;
+
+typedef struct {
+  ftun_event_deferred_fn callback;
+  void *user;
+} ftun_event_deferred_t;
+
+struct ftun_event_source {
+  ftun_event_loop_t *loop;
+  ftun_event_source_t *previous;
+  ftun_event_source_t *next;
+  ftun_event_callback_fn callback;
+  void *user;
+  ftun_event_source_kind_t kind;
+  ftun_native_socket_t socket;
+  uint64_t deadline_ms;
+  uint32_t interests;
+  uint32_t pending;
+  int active;
+};
+
+struct ftun_event_loop {
+  ftun_core_t *core;
+  ftun_event_source_t *sources;
+  ftun_event_deferred_t deferred[FTUN_EVENT_DEFERRED_CAPACITY];
+  pthread_mutex_t mutex;
+  ftun_event_wakeup_fn wakeup;
+  void *wakeup_user;
+  const ftun_event_backend_ops_t *backend;
+  void *backend_context;
+  size_t deferred_head;
+  size_t deferred_tail;
+  size_t deferred_count;
+  size_t source_count;
+  size_t wakeups;
+  int accepting;
+  int dispatching;
+  int stopped;
+};
+
+/* TASK-EVENT-001 / TEST-EVENT-001，目标 0.2.0：后端无关的有界事件前端。 */
 ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out)
 {
+  ftun_event_loop_t *loop;
   if (out != NULL) *out = NULL;
-  (void)core;
-  (void)out;
-  return FTUN_E_NOT_IMPLEMENTED;
+  if (out == NULL) return FTUN_E_INVALID;
+  loop = (ftun_event_loop_t *)calloc(1u, sizeof(*loop));
+  if (loop == NULL) return FTUN_E_LIMIT;
+  if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
+    free(loop);
+    return FTUN_E_IO;
+  }
+  loop->core = core;
+  loop->accepting = 1;
+  *out = loop;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_set_wakeup(ftun_event_loop_t *loop,
+                                         ftun_event_wakeup_fn wakeup, void *user)
+{
+  if (loop == NULL || (wakeup == NULL && user != NULL)) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->stopped) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_CANCELLED;
+  }
+  if (loop->backend != NULL) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_AGAIN;
+  }
+  loop->wakeup = wakeup;
+  loop->wakeup_user = user;
+  if (wakeup != NULL && loop->deferred_count != 0u) {
+    loop->wakeups++;
+    wakeup(user);
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
+static int ftun_event_backend_ops_valid(const ftun_event_backend_ops_t *ops)
+{
+  return ops != NULL && ops->io_start != NULL && ops->timer_start != NULL &&
+    ops->source_cancel != NULL && ops->wakeup != NULL && ops->run_once != NULL &&
+    ops->stop != NULL && ops->destroy != NULL;
+}
+
+ftun_status_t ftun_event_loop_attach_backend(ftun_event_loop_t *loop,
+                                             const ftun_event_backend_ops_t *ops,
+                                             void *context)
+{
+  if (loop == NULL || !ftun_event_backend_ops_valid(ops) || context == NULL) {
+    return FTUN_E_INVALID;
+  }
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (!loop->accepting || loop->stopped) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_CANCELLED;
+  }
+  if (loop->backend != NULL || loop->wakeup != NULL || loop->source_count != 0u ||
+      loop->deferred_count != 0u) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_AGAIN;
+  }
+  loop->backend = ops;
+  loop->backend_context = context;
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_backend_context(ftun_event_loop_t *loop,
+                                              const ftun_event_backend_ops_t *ops,
+                                              void **out)
+{
+  if (out != NULL) *out = NULL;
+  if (loop == NULL || ops == NULL || out == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->backend != ops || loop->backend_context == NULL) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_UNSUPPORTED;
+  }
+  *out = loop->backend_context;
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_detach_backend(ftun_event_loop_t *loop)
+{
+  const ftun_event_backend_ops_t *backend;
+  void *context;
+  if (loop == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->backend == NULL) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_OK;
+  }
+  if (!loop->stopped || loop->dispatching || loop->source_count != 0u ||
+      loop->deferred_count != 0u) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_AGAIN;
+  }
+  backend = loop->backend;
+  context = loop->backend_context;
+  loop->backend = NULL;
+  loop->backend_context = NULL;
+  (void)pthread_mutex_unlock(&loop->mutex);
+  backend->destroy(context);
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
+                                           ftun_event_source_kind_t kind,
+                                           ftun_event_callback_fn callback, void *user,
+                                           ftun_event_source_t **out)
+{
+  ftun_event_source_t *source;
+  if (out != NULL) *out = NULL;
+  if (loop == NULL || callback == NULL || out == NULL) return FTUN_E_INVALID;
+  if (!loop->accepting) return FTUN_E_CANCELLED;
+  if (loop->source_count >= FTUN_EVENT_SOURCE_CAPACITY) return FTUN_E_LIMIT;
+  source = (ftun_event_source_t *)calloc(1u, sizeof(*source));
+  if (source == NULL) return FTUN_E_LIMIT;
+  source->loop = loop;
+  source->kind = kind;
+  source->callback = callback;
+  source->user = user;
+  source->active = 1;
+  source->next = loop->sources;
+  if (loop->sources != NULL) loop->sources->previous = source;
+  loop->sources = source;
+  loop->source_count++;
+  *out = source;
+  return FTUN_OK;
+}
+
+static void ftun_event_source_unlink(ftun_event_source_t *source)
+{
+  ftun_event_loop_t *loop = source->loop;
+  if (source->previous != NULL) source->previous->next = source->next;
+  else loop->sources = source->next;
+  if (source->next != NULL) source->next->previous = source->previous;
+  loop->source_count--;
+  source->loop = NULL;
+  source->previous = NULL;
+  source->next = NULL;
+}
+
+ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
+                                  uint32_t interests, ftun_event_callback_fn callback,
+                                  void *user, ftun_event_source_t **out)
+{
+  ftun_event_source_t *source;
+  ftun_status_t status;
+  uint32_t allowed = FTUN_EVENT_READ | FTUN_EVENT_WRITE | FTUN_EVENT_ERROR;
+  if (out != NULL) *out = NULL;
+  if (out == NULL || interests == 0u || (interests & ~allowed) != 0u) {
+    return FTUN_E_INVALID;
+  }
+  status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_IO, callback, user, &source);
+  if (status != FTUN_OK) return status;
+  source->socket = socket;
+  source->interests = interests;
+  if (loop->backend != NULL) {
+    status = loop->backend->io_start(loop->backend_context, source, socket, interests);
+    if (status != FTUN_OK) {
+      ftun_event_source_unlink(source);
+      free(source);
+      return status;
+    }
+  }
+  *out = source;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
+                                     ftun_event_callback_fn callback, void *user,
+                                     ftun_event_source_t **out)
+{
+  ftun_event_source_t *source;
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (out == NULL) return FTUN_E_INVALID;
+  status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_TIMER,
+                                 callback, user, &source);
+  if (status != FTUN_OK) return status;
+  source->deadline_ms = deadline_ms;
+  if (loop->backend != NULL) {
+    status = loop->backend->timer_start(loop->backend_context, source, deadline_ms);
+    if (status != FTUN_OK) {
+      ftun_event_source_unlink(source);
+      free(source);
+      return status;
+    }
+  }
+  *out = source;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_io_ready(ftun_event_source_t *source, uint32_t events)
+{
+  uint32_t allowed = FTUN_EVENT_READ | FTUN_EVENT_WRITE | FTUN_EVENT_ERROR;
+  if (source == NULL || source->loop == NULL || source->kind != FTUN_EVENT_SOURCE_IO ||
+      events == 0u || (events & ~allowed) != 0u) return FTUN_E_INVALID;
+  if (!source->active) return FTUN_E_STALE;
+  source->pending |= events & source->interests;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_timer_ready(ftun_event_source_t *source)
+{
+  if (source == NULL || source->loop == NULL ||
+      source->kind != FTUN_EVENT_SOURCE_TIMER) return FTUN_E_INVALID;
+  if (!source->active) return FTUN_E_STALE;
+  source->pending = FTUN_EVENT_TIMER;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_defer(ftun_event_loop_t *loop,
+                               ftun_event_deferred_fn callback, void *user)
+{
+  int needs_wakeup;
+  if (loop == NULL || callback == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (!loop->accepting) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_CANCELLED;
+  }
+  if (loop->deferred_count >= FTUN_EVENT_DEFERRED_CAPACITY) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_LIMIT;
+  }
+  needs_wakeup = loop->deferred_count == 0u;
+  loop->deferred[loop->deferred_tail].callback = callback;
+  loop->deferred[loop->deferred_tail].user = user;
+  loop->deferred_tail = (loop->deferred_tail + 1u) % FTUN_EVENT_DEFERRED_CAPACITY;
+  loop->deferred_count++;
+  if (needs_wakeup && loop->backend != NULL) {
+    loop->wakeups++;
+    loop->backend->wakeup(loop->backend_context);
+  } else if (needs_wakeup && loop->wakeup != NULL) {
+    loop->wakeups++;
+    loop->wakeup(loop->wakeup_user);
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
+static int ftun_event_pop_deferred(ftun_event_loop_t *loop,
+                                   ftun_event_deferred_t *out)
+{
+  int found = 0;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->deferred_count != 0u) {
+    *out = loop->deferred[loop->deferred_head];
+    memset(&loop->deferred[loop->deferred_head], 0,
+           sizeof(loop->deferred[loop->deferred_head]));
+    loop->deferred_head = (loop->deferred_head + 1u) % FTUN_EVENT_DEFERRED_CAPACITY;
+    loop->deferred_count--;
+    found = 1;
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return found;
+}
+
+static ftun_event_source_t *ftun_event_ready_source(ftun_event_loop_t *loop,
+                                                     uint64_t now_ms,
+                                                     uint32_t *events)
+{
+  ftun_event_source_t *source;
+  for (source = loop->sources; source != NULL; source = source->next) {
+    if (!source->active) continue;
+    if (source->kind == FTUN_EVENT_SOURCE_IO && source->pending != 0u) {
+      *events = source->pending;
+      source->pending = 0u;
+      return source;
+    }
+    if (source->kind == FTUN_EVENT_SOURCE_TIMER &&
+        (source->pending == FTUN_EVENT_TIMER || now_ms >= source->deadline_ms)) {
+      source->active = 0;
+      source->pending = 0u;
+      *events = FTUN_EVENT_TIMER;
+      return source;
+    }
+  }
+  return NULL;
+}
+
+ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
+                                   size_t max_callbacks, size_t *out_callbacks)
+{
+  size_t callbacks = 0u;
+  if (out_callbacks != NULL) *out_callbacks = 0u;
+  if (loop == NULL || max_callbacks == 0u || out_callbacks == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (loop->dispatching) return FTUN_E_AGAIN;
+  loop->dispatching = 1;
+  while (callbacks < max_callbacks) {
+    ftun_event_deferred_t deferred;
+    ftun_event_source_t *source;
+    uint32_t events = 0u;
+    if (ftun_event_pop_deferred(loop, &deferred)) {
+      deferred.callback(deferred.user);
+      callbacks++;
+      continue;
+    }
+    source = ftun_event_ready_source(loop, now_ms, &events);
+    if (source == NULL) break;
+    source->callback(source, events, source->user);
+    callbacks++;
+  }
+  loop->dispatching = 0;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->deferred_count != 0u && loop->backend != NULL) {
+    loop->wakeups++;
+    loop->backend->wakeup(loop->backend_context);
+  } else if (loop->deferred_count != 0u && loop->wakeup != NULL) {
+    loop->wakeups++;
+    loop->wakeup(loop->wakeup_user);
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  *out_callbacks = callbacks;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
+                                       size_t max_callbacks, size_t *out_callbacks)
+{
+  ftun_status_t status;
+  uint64_t now_ms = 0u;
+  if (out_callbacks != NULL) *out_callbacks = 0u;
+  if (loop == NULL || max_callbacks == 0u || out_callbacks == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (loop->backend == NULL) return FTUN_E_UNSUPPORTED;
+  if (loop->stopped) return FTUN_E_CANCELLED;
+  status = loop->backend->run_once(loop->backend_context, block);
+  if (status != FTUN_OK) return status;
+  status = ftun_monotonic_now(&now_ms);
+  if (status != FTUN_OK) return status;
+  return ftun_event_loop_poll(loop, now_ms, max_callbacks, out_callbacks);
+}
+
+ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source)
+{
+  ftun_event_source_t *owned;
+  ftun_event_loop_t *loop;
+  ftun_status_t status;
+  if (source == NULL) return FTUN_E_INVALID;
+  owned = *source;
+  if (owned == NULL) return FTUN_OK;
+  loop = owned->loop;
+  if (loop == NULL || loop->source_count == 0u) return FTUN_E_STATE_CORRUPT;
+  if (loop->backend != NULL) {
+    status = loop->backend->source_cancel(loop->backend_context, owned);
+    if (status != FTUN_OK) return status;
+  }
+  ftun_event_source_unlink(owned);
+  owned->callback = NULL;
+  owned->user = NULL;
+  free(owned);
+  *source = NULL;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop)
+{
+  ftun_event_source_t *source;
+  int first_stop;
+  if (loop == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  first_stop = !loop->stopped;
+  loop->accepting = 0;
+  loop->stopped = 1;
+  loop->wakeup = NULL;
+  loop->wakeup_user = NULL;
+  if (first_stop && loop->backend != NULL) {
+    loop->backend->stop(loop->backend_context);
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  for (source = loop->sources; source != NULL; source = source->next) {
+    source->active = 0;
+    source->pending = 0u;
+  }
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
+                                        ftun_event_loop_usage_t *out)
+{
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (loop == NULL || out == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  out->deferred_capacity = FTUN_EVENT_DEFERRED_CAPACITY;
+  out->deferred_count = loop->deferred_count;
+  out->source_capacity = FTUN_EVENT_SOURCE_CAPACITY;
+  out->source_count = loop->source_count;
+  out->wakeups = loop->wakeups;
+  out->accepting = loop->accepting != 0;
+  out->dispatching = loop->dispatching != 0;
+  out->stopped = loop->stopped != 0;
+  out->backend_attached = loop->backend != NULL;
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop)
+{
+  ftun_event_loop_t *owned;
+  if (loop == NULL) return FTUN_E_INVALID;
+  owned = *loop;
+  if (owned == NULL) return FTUN_OK;
+  (void)pthread_mutex_lock(&owned->mutex);
+  if (!owned->stopped || owned->dispatching || owned->deferred_count != 0u ||
+      owned->source_count != 0u || owned->backend != NULL) {
+    (void)pthread_mutex_unlock(&owned->mutex);
+    return FTUN_E_AGAIN;
+  }
+  (void)pthread_mutex_unlock(&owned->mutex);
+  if (owned->sources != NULL) return FTUN_E_STATE_CORRUPT;
+  if (pthread_mutex_destroy(&owned->mutex) != 0) return FTUN_E_STATE_CORRUPT;
+  owned->core = NULL;
+  free(owned);
+  *loop = NULL;
+  return FTUN_OK;
 }

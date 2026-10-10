@@ -1,12 +1,79 @@
 #ifndef FTUN_EVENT_EVENT_H
 #define FTUN_EVENT_EVENT_H
 #include "internal/contracts.h"
+
+#define FTUN_EVENT_READ 1u
+#define FTUN_EVENT_WRITE 2u
+#define FTUN_EVENT_ERROR 4u
+#define FTUN_EVENT_TIMER 8u
+
+typedef void (*ftun_event_callback_fn)(ftun_event_source_t *source,
+                                       uint32_t events, void *user);
+typedef void (*ftun_event_deferred_fn)(void *user);
+/* wakeup 可在任意提交线程中被调用，不得回调 loop 或阻塞。 */
+typedef void (*ftun_event_wakeup_fn)(void *user);
+
+typedef struct {
+  ftun_status_t (*io_start)(void *context, ftun_event_source_t *source,
+                            ftun_native_socket_t socket, uint32_t interests);
+  ftun_status_t (*timer_start)(void *context, ftun_event_source_t *source,
+                               uint64_t deadline_ms);
+  ftun_status_t (*source_cancel)(void *context, ftun_event_source_t *source);
+  void (*wakeup)(void *context);
+  ftun_status_t (*run_once)(void *context, bool block);
+  void (*stop)(void *context);
+  void (*destroy)(void *context);
+} ftun_event_backend_ops_t;
+
+typedef struct {
+  size_t deferred_capacity;
+  size_t deferred_count;
+  size_t source_capacity;
+  size_t source_count;
+  size_t wakeups;
+  bool accepting;
+  bool dispatching;
+  bool stopped;
+  bool backend_attached;
+} ftun_event_loop_usage_t;
+
 /* 可移植事件接口。
  * 需求 REQ-CORE-001；任务 TASK-EVENT-001；目标 0.2.0；验收 TEST-EVENT-001。
- * 实现路径：封装 I/O/timer/wakeup，不向公共 API 暴露 watcher；只唤醒有工作对象，停止时排空终结队列。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
+ * source 仅是内部句柄，不进入公开 C API。I/O readiness 由后端投递，
+ * timer 使用绝对单调毫秒。defer 可跨线程接纳，固定队列从空变为
+ * 非空时才唤醒后端。除 defer 外的可变状态只由 owner loop 访问。
  */
 ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out);
+ftun_status_t ftun_event_loop_set_wakeup(ftun_event_loop_t *loop,
+                                         ftun_event_wakeup_fn wakeup, void *user);
+/* backend 必须在创建 source 前附加，ops/context 保持有效至 detach。 */
+ftun_status_t ftun_event_loop_attach_backend(ftun_event_loop_t *loop,
+                                             const ftun_event_backend_ops_t *ops,
+                                             void *context);
+ftun_status_t ftun_event_loop_backend_context(ftun_event_loop_t *loop,
+                                              const ftun_event_backend_ops_t *ops,
+                                              void **out);
+ftun_status_t ftun_event_loop_detach_backend(ftun_event_loop_t *loop);
+ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
+                                  uint32_t interests, ftun_event_callback_fn callback,
+                                  void *user, ftun_event_source_t **out);
+ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
+                                     ftun_event_callback_fn callback, void *user,
+                                     ftun_event_source_t **out);
+/* 由后端在 owner loop 上投递 readiness，不直接调用业务回调。 */
+ftun_status_t ftun_event_io_ready(ftun_event_source_t *source, uint32_t events);
+ftun_status_t ftun_event_timer_ready(ftun_event_source_t *source);
+/* 接纳成功后 user 必须保持有效至 callback 返回；同步拒绝零回调。 */
+ftun_status_t ftun_event_defer(ftun_event_loop_t *loop,
+                               ftun_event_deferred_fn callback, void *user);
+ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
+                                   size_t max_callbacks, size_t *out_callbacks);
+ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
+                                       size_t max_callbacks, size_t *out_callbacks);
+ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source);
+ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop);
+ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
+                                        ftun_event_loop_usage_t *out);
+/* 必须已 stop、deferred 已排空且所有 source 句柄已取消。 */
+ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop);
 #endif

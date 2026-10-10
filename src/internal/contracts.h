@@ -8,13 +8,16 @@
  * DEC-025：可选实现仅按构建选择静态内置；这些类型不作为动态插件 ABI。
  * 基础参数同步借用；将来异步接纳时复制输入并 retain 依赖。
  * 完成回调统一由 owner loop 延迟投递一次，取消不提前释放 user。
- * 当前所有数据面入口返回 NOT_IMPLEMENTED/UNSUPPORTED，输出为无效空值。 */
+ * 未交付的骨架入口返回 NOT_IMPLEMENTED/UNSUPPORTED；已交付入口以各模块头文件
+ * 的所有权、失败输出和回调契约为准。 */
 typedef struct ftun_api_spec ftun_api_spec_t;
 typedef struct ftun_budget ftun_budget_t;
 typedef struct ftun_buffer ftun_buffer_t;
+typedef struct ftun_buffer_pool ftun_buffer_pool_t;
 typedef struct ftun_config ftun_config_t;
 typedef struct ftun_datagram ftun_datagram_t;
 typedef struct ftun_dial_request ftun_dial_request_t;
+typedef struct ftun_direct_request ftun_direct_request_t;
 typedef struct ftun_dns_answer ftun_dns_answer_t;
 typedef struct ftun_dns_cache ftun_dns_cache_t;
 typedef struct ftun_dns_listener_spec ftun_dns_listener_spec_t;
@@ -23,6 +26,7 @@ typedef struct ftun_dns_message ftun_dns_message_t;
 typedef struct ftun_dns_query ftun_dns_query_t;
 typedef struct ftun_dns_server ftun_dns_server_t;
 typedef struct ftun_event_loop ftun_event_loop_t;
+typedef struct ftun_event_source ftun_event_source_t;
 typedef struct ftun_fakeip_handle ftun_fakeip_handle_t;
 typedef struct ftun_fakeip_snapshot ftun_fakeip_snapshot_t;
 typedef struct ftun_fakeip_store ftun_fakeip_store_t;
@@ -42,6 +46,7 @@ typedef struct ftun_probe_request ftun_probe_request_t;
 typedef struct ftun_proxy_spec ftun_proxy_spec_t;
 typedef struct ftun_reservation ftun_reservation_t;
 typedef struct ftun_resolve_request ftun_resolve_request_t;
+typedef struct ftun_relay ftun_relay_t;
 typedef struct ftun_route_policy ftun_route_policy_t;
 typedef struct ftun_route_transaction ftun_route_transaction_t;
 typedef struct ftun_rule ftun_rule_t;
@@ -94,9 +99,26 @@ typedef struct {
   size_t allowed_count;
 } ftun_route_result_t;
 typedef struct { bool matched, needs_resolve; } ftun_match_result_t;
-typedef struct { ftun_endpoint_t original, dial; ftun_string_t identity; } ftun_target_t;
+typedef struct {
+  uint64_t generation;
+  ftun_endpoint_t original;
+  ftun_string_t identity;
+  ftun_domain_source_t identity_source;
+  const ftun_endpoint_t *candidates;
+  size_t candidate_count;
+  const ftun_endpoint_t *allowed;
+  size_t allowed_count;
+  ftun_endpoint_t dial;
+  bool original_is_fake;
+  bool dial_selected;
+} ftun_target_t;
 typedef struct { uint64_t generation; uint32_t leaf_id; bool degraded; } ftun_group_choice_t;
-typedef struct { ftun_error_t error; ftun_string_t message; } ftun_diagnostic_t;
+/* message 与 path 均为静态借用视图；path 使用 JSON Pointer。 */
+typedef struct {
+  ftun_error_t error;
+  ftun_string_t message;
+  ftun_string_t path;
+} ftun_diagnostic_t;
 typedef enum {
   FTUN_BUILD_MODULE_CORE = 1u << 0,
   FTUN_BUILD_MODULE_DNS = 1u << 1,

@@ -1,4 +1,6 @@
 #include "config/compile.h"
+#include "config/parser.h"
+#include "config/validate.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,6 +40,33 @@ static int check_module(const ftun_build_capabilities_t *capabilities,
   return 0;
 }
 
+static int check_config_capability(const char *text, int expected)
+{
+  ftun_bytes_t bytes;
+  ftun_config_t *config = NULL;
+  ftun_feature_plan_t *plan = NULL;
+  ftun_diagnostic_t diagnostic;
+  ftun_status_t status;
+  bytes.data = (const uint8_t *)text;
+  bytes.length = strlen(text);
+  CHECK(ftun_config_parse(bytes, &config) == FTUN_OK && config != NULL);
+  status = ftun_config_validate(config, &diagnostic);
+  if (expected) {
+    CHECK(status == FTUN_OK);
+    CHECK(diagnostic.message.data == NULL && diagnostic.path.data == NULL);
+    CHECK(ftun_config_compile(config, &plan) == FTUN_OK && plan != NULL);
+    CHECK((plan->required_modules & ~plan->built_modules) == 0u);
+    CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK && plan == NULL);
+  } else {
+    CHECK(status == FTUN_E_UNSUPPORTED);
+    CHECK(diagnostic.error.status == FTUN_E_UNSUPPORTED);
+    CHECK(diagnostic.message.data != NULL && diagnostic.path.data != NULL);
+    CHECK(ftun_config_compile(config, &plan) == FTUN_E_UNSUPPORTED && plan == NULL);
+  }
+  CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
+  return 0;
+}
+
 int main(void)
 {
   const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
@@ -67,5 +96,11 @@ int main(void)
   CHECK(ftun_build_require_modules(1u << 31, &diagnostic) == FTUN_E_INVALID);
   CHECK(diagnostic.error.status == FTUN_E_INVALID);
   CHECK(diagnostic.message.data != NULL && diagnostic.message.length > 0u);
+  CHECK(check_config_capability("{\"dns\":{\"enable\":false}}", 1) == 0);
+  CHECK(check_config_capability("{}", expect_dns) == 0);
+  CHECK(check_config_capability(
+    "{\"dns\":{\"enable\":false},\"inbounds\":[{\"name\":\"t\","
+    "\"type\":\"tun\",\"interface\":{\"name\":\"t0\"},"
+    "\"ipv4\":{\"address\":\"10.0.0.1/30\"}}]}", expect_tun) == 0);
   return 0;
 }

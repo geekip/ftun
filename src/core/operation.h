@@ -10,6 +10,9 @@ typedef struct {
   bool dispatching;
 } ftun_operation_queue_usage_t;
 
+/* 取消 hook 在 owner loop 同步释放生产者资源；失败时操作保持原状态，可重试。 */
+typedef ftun_status_t (*ftun_operation_cancel_hook_fn)(void *user);
+
 /* 异步接纳与取消。
  * 需求 REQ-CORE-001；任务 TASK-CORE-005；目标 0.2.0；验收 TEST-CORE-005。
  * 所有可变状态只在 owner loop 中访问。接纳时预留终结槽位和预算，
@@ -21,6 +24,10 @@ ftun_status_t ftun_operation_queue_create(ftun_budget_t *budget, size_t capacity
 ftun_status_t ftun_operation_accept(ftun_operation_queue_t *queue,
                                     ftun_completion_fn callback, void *user,
                                     ftun_operation_t **out);
+ftun_status_t ftun_operation_set_cancel_hook(
+  ftun_operation_t *operation, ftun_operation_cancel_hook_fn hook, void *user);
+/* 仅供生产者在入口返回成功前撤销已接纳项；零回调并消费句柄。 */
+ftun_status_t ftun_operation_reject(ftun_operation_t **operation);
 ftun_status_t ftun_operation_complete(ftun_operation_t *operation, ftun_error_t result);
 ftun_status_t ftun_operation_cancel(ftun_operation_t *operation);
 /* max_callbacks 必须大于零；未终结的 operation 不阻塞已终结项。 */

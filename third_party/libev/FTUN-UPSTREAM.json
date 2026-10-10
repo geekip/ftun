@@ -1,0 +1,12 @@
+{
+  "name": "libev",
+  "version": "4.33",
+  "archive": "https://dist.schmorp.de/libev/libev-4.33.tar.gz",
+  "sha256": "507eb7b8d1015fbec5b935f34ebed15bf346bed04a11ab82b8eee848c4205aea",
+  "signature": "https://dist.schmorp.de/libev/libev-4.33.tar.gz.sig",
+  "signature_key": "https://dist.schmorp.de/signing-key.pub",
+  "signature_key_id": "940438b32e6fc629",
+  "signature_verified": true,
+  "license": "BSD-2-Clause OR GPL-2.0-or-later",
+  "local_patches": []
+}
