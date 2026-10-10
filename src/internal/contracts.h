@@ -35,6 +35,7 @@ typedef struct ftun_inbound_spec ftun_inbound_spec_t;
 typedef struct ftun_inbound ftun_inbound_t;
 typedef struct ftun_index ftun_index_t;
 typedef struct ftun_lwip ftun_lwip_t;
+typedef struct ftun_operation_queue ftun_operation_queue_t;
 typedef struct ftun_packet_port ftun_packet_port_t;
 typedef struct ftun_packet ftun_packet_t;
 typedef struct ftun_probe_request ftun_probe_request_t;
