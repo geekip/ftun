@@ -565,6 +565,30 @@ ftun_status_t ftun_tun_ingress_tick(ftun_tun_ingress_context_t *context,
   return ftun_lwip_tick(context->stack, now_ms);
 }
 
+ftun_status_t ftun_tun_ingress_set_generation(
+  ftun_tun_ingress_context_t *context, uint64_t generation)
+{
+  if (context == NULL) return FTUN_E_INVALID;
+  return ftun_tun_ingress_set_identity(context, generation,
+                                       context->inbound_id);
+}
+
+ftun_status_t ftun_tun_ingress_set_identity(
+  ftun_tun_ingress_context_t *context, uint64_t generation,
+  uint32_t inbound_id)
+{
+  ftun_status_t status;
+  if (context == NULL || generation == 0u || !context->accepting ||
+      inbound_id == 0u || generation <= context->generation) {
+    return FTUN_E_INVALID;
+  }
+  status = ftun_lwip_set_packet_source(context->stack, inbound_id);
+  if (status != FTUN_OK) return status;
+  context->generation = generation;
+  context->inbound_id = inbound_id;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_tun_ingress_get_usage(
   const ftun_tun_ingress_context_t *context, ftun_tun_ingress_usage_t *out)
 {

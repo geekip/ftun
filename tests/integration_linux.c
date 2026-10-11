@@ -55,6 +55,7 @@
 #define MAIN_ADDRESS "192.0.2.1"
 #define DIRECT_TCP_PORT 18080u
 #define DIRECT_UDP_PORT 18081u
+#define HTTP_PORT 18082u
 #define SOCKS_PORT 11080u
 #define PROTECTION_MARK 77u
 #define TUN_MTU 1400u
@@ -64,6 +65,7 @@
 static volatile sig_atomic_t peer_stopping;
 static pthread_mutex_t peer_threads_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t peer_threads;
+static const char *peer_frs_path;
 
 static uint64_t deadline_after(uint64_t milliseconds)
 {
@@ -189,6 +191,92 @@ static void *peer_echo_thread(void *argument)
   return NULL;
 }
 
+static void *peer_http_thread(void *argument)
+{
+  int descriptor = *(int *)argument;
+  uint8_t request[4096];
+  size_t request_length = 0u;
+  free(argument);
+  while (request_length < sizeof(request) - 1u) {
+    ssize_t amount = recv(descriptor, request + request_length,
+                          sizeof(request) - 1u - request_length, 0);
+    if (amount > 0) {
+      request_length += (size_t)amount;
+      request[request_length] = '\0';
+      if (strstr((const char *)request, "\r\n\r\n") != NULL) break;
+    } else if (amount < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
+    }
+  }
+  if (request_length >= 16u &&
+      memcmp(request, "GET /health ", 12u) == 0) {
+    static const uint8_t response[] =
+      "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n"
+      "Connection: close\r\n\r\n";
+    (void)write_exact(descriptor, response, sizeof(response) - 1u);
+    fputs("http-health\n", stderr);
+  } else if (request_length >= 18u &&
+             memcmp(request, "GET /redirect ", 14u) == 0) {
+    static const uint8_t response[] =
+      "HTTP/1.1 302 Found\r\nLocation: /rules.frs\r\n"
+      "Content-Length: 0\r\nConnection: close\r\n\r\n";
+    (void)write_exact(descriptor, response, sizeof(response) - 1u);
+    fputs("http-rules-redirect\n", stderr);
+  } else if (request_length >= 18u &&
+             memcmp(request, "GET /rules.frs ", 15u) == 0 &&
+             peer_frs_path != NULL) {
+    if (strstr((const char *)request, "If-None-Match: \"fixture-1\"") !=
+        NULL) {
+      static const uint8_t response[] =
+        "HTTP/1.1 304 Not Modified\r\nETag: \"fixture-1\"\r\n"
+        "Connection: close\r\n\r\n";
+      (void)write_exact(descriptor, response, sizeof(response) - 1u);
+      fputs("http-rules-conditional\n", stderr);
+    } else {
+      struct stat metadata;
+      uint8_t *contents = NULL;
+      char header[256];
+      int file = open(peer_frs_path, O_RDONLY | O_CLOEXEC);
+      if (file >= 0 && fstat(file, &metadata) == 0 &&
+          metadata.st_size > 0 &&
+          (uintmax_t)metadata.st_size <= (uintmax_t)SIZE_MAX) {
+        size_t length = (size_t)metadata.st_size;
+        size_t offset = 0u;
+        contents = (uint8_t *)malloc(length);
+        while (contents != NULL && offset < length) {
+          ssize_t amount = read(file, contents + offset, length - offset);
+          if (amount > 0) offset += (size_t)amount;
+          else if (amount < 0 && errno == EINTR) continue;
+          else break;
+        }
+        if (contents != NULL && offset == length) {
+          int header_length = snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\n"
+            "ETag: \"fixture-1\"\r\nConnection: close\r\n\r\n", length);
+          if (header_length > 0 && (size_t)header_length < sizeof(header)) {
+            (void)write_exact(descriptor, (const uint8_t *)header,
+                              (size_t)header_length);
+            (void)write_exact(descriptor, contents, length);
+            fputs("http-rules-full\n", stderr);
+          }
+        }
+      }
+      if (file >= 0) (void)close(file);
+      free(contents);
+    }
+  } else {
+    static const uint8_t response[] =
+      "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n"
+      "Connection: close\r\n\r\n";
+    (void)write_exact(descriptor, response, sizeof(response) - 1u);
+  }
+  (void)close(descriptor);
+  peer_thread_finished();
+  return NULL;
+}
+
 static int peer_socks_read_endpoint(int descriptor, uint8_t type,
                                     uint16_t *port)
 {
@@ -214,8 +302,10 @@ static void peer_udp_association(int control)
   struct sockaddr_in source;
   uint16_t port = 0u;
   int datagram = socket_bound(SOCK_DGRAM, PEER_ADDRESS, 0u);
-  if (datagram < 0 || !socket_port(datagram, &port)) {
+  int outbound = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  if (datagram < 0 || outbound < 0 || !socket_port(datagram, &port)) {
     if (datagram >= 0) (void)close(datagram);
+    if (outbound >= 0) (void)close(outbound);
     return;
   }
   (void)inet_pton(AF_INET, PEER_ADDRESS, reply + 4u);
@@ -223,6 +313,7 @@ static void peer_udp_association(int control)
   reply[9] = (uint8_t)port;
   if (!write_exact(control, reply, sizeof(reply))) {
     (void)close(datagram);
+    (void)close(outbound);
     return;
   }
   while (!peer_stopping) {
@@ -242,11 +333,52 @@ static void peer_udp_association(int control)
       ssize_t length = recvfrom(datagram, buffer, sizeof(buffer), 0,
         (struct sockaddr *)&source, &source_length);
       if (length > 0) {
-        (void)sendto(datagram, buffer, (size_t)length, 0,
-                     (const struct sockaddr *)&source, source_length);
+        ftun_socks5_udp_datagram_t request;
+        size_t consumed = 0u;
+        if (ftun_socks5_decode_udp_datagram(
+              (ftun_bytes_t){buffer, (size_t)length}, &request,
+              &consumed) == FTUN_OK && consumed == (size_t)length &&
+            request.endpoint.kind == FTUN_ADDRESS_IPV4) {
+          struct sockaddr_in target;
+          struct sockaddr_in remote;
+          struct pollfd item;
+          uint8_t response[2048];
+          uint8_t framed[2300];
+          socklen_t remote_length = (socklen_t)sizeof(remote);
+          ssize_t response_length;
+          size_t framed_length = 0u;
+          memset(&target, 0, sizeof(target));
+          target.sin_family = AF_INET;
+          target.sin_port = htons(request.endpoint.port);
+          memcpy(&target.sin_addr.s_addr, request.endpoint.address, 4u);
+          if (sendto(outbound, request.payload.data, request.payload.length, 0,
+                (const struct sockaddr *)&target,
+                (socklen_t)sizeof(target)) < 0) continue;
+          memset(&item, 0, sizeof(item));
+          item.fd = outbound;
+          item.events = POLLIN;
+          if (poll(&item, 1u, 1000) != 1 ||
+              (item.revents & POLLIN) == 0) continue;
+          response_length = recvfrom(outbound, response, sizeof(response), 0,
+            (struct sockaddr *)&remote, &remote_length);
+          if (response_length < 0 || remote.sin_family != AF_INET) continue;
+          {
+            ftun_endpoint_t response_source;
+            memset(&response_source, 0, sizeof(response_source));
+            response_source.kind = FTUN_ADDRESS_IPV4;
+            response_source.port = ntohs(remote.sin_port);
+            memcpy(response_source.address, &remote.sin_addr.s_addr, 4u);
+            if (ftun_socks5_encode_udp_datagram(&response_source,
+                  (ftun_bytes_t){response, (size_t)response_length}, framed,
+                  sizeof(framed), &framed_length) != FTUN_OK) continue;
+          }
+          (void)sendto(datagram, framed, framed_length, 0,
+                       (const struct sockaddr *)&source, source_length);
+        }
       }
     }
   }
+  (void)close(outbound);
   (void)close(datagram);
 }
 
@@ -264,6 +396,7 @@ static void *peer_socks_thread(void *argument)
       !read_exact(descriptor, header, 4u) || header[0] != 5u ||
       header[2] != 0u || !peer_socks_read_endpoint(
         descriptor, header[3], &target_port)) goto done;
+  if (header[3] == 3u) fputs("socks-domain-target\n", stderr);
   if (target_port == 9u) {
     reply[1] = 5u;
     (void)write_exact(descriptor, reply, sizeof(reply));
@@ -313,6 +446,10 @@ static int peer_accept_thread(int listener, void *(*entry)(void *))
 
 static void peer_dns_reply(int descriptor)
 {
+  static const uint8_t upstream_name[] = {
+    3u, 'd', 'n', 's', 7u, 'r', 'e', 'l', 'e', 'a', 's', 'e',
+    4u, 't', 'e', 's', 't', 0u
+  };
   uint8_t query[512];
   uint8_t response[528];
   struct sockaddr_in source;
@@ -340,7 +477,11 @@ static void peer_dns_reply(int descriptor)
   response[length + 9] = 1u;
   response[length + 10] = 0u;
   response[length + 11] = 4u;
-  (void)inet_pton(AF_INET, PEER_ADDRESS, response + length + 12u);
+  (void)inet_pton(AF_INET,
+    (size_t)length >= 12u + sizeof(upstream_name) &&
+    memcmp(query + 12u, upstream_name, sizeof(upstream_name)) == 0
+      ? DNS_ADDRESS : PEER_ADDRESS,
+    response + length + 12u);
   (void)sendto(descriptor, response, output_length, 0,
                (const struct sockaddr *)&source, source_length);
 }
@@ -351,19 +492,22 @@ static void peer_signal(int signal_number)
   peer_stopping = 1;
 }
 
-static int peer_main(const char *ready_path)
+static int peer_main(const char *ready_path, const char *frs_path)
 {
-  struct pollfd descriptors[4];
+  struct pollfd descriptors[5];
   struct sigaction action;
   uint8_t buffer[2048];
   int direct_tcp = socket_bound(SOCK_STREAM, PEER_ADDRESS, DIRECT_TCP_PORT);
   int direct_udp = socket_bound(SOCK_DGRAM, PEER_ADDRESS, DIRECT_UDP_PORT);
   int socks = socket_bound(SOCK_STREAM, PEER_ADDRESS, SOCKS_PORT);
+  int http = socket_bound(SOCK_STREAM, PEER_ADDRESS, HTTP_PORT);
   int dns = socket_bound(SOCK_DGRAM, DNS_ADDRESS, 53u);
   int ready;
-  if (direct_tcp < 0 || direct_udp < 0 || socks < 0 || dns < 0 ||
-      listen(direct_tcp, 8) != 0 || listen(socks, 8) != 0 ||
-      !set_nonblocking(direct_tcp) || !set_nonblocking(socks)) return 1;
+  peer_frs_path = frs_path;
+  if (direct_tcp < 0 || direct_udp < 0 || socks < 0 || http < 0 || dns < 0 ||
+      listen(direct_tcp, 128) != 0 || listen(socks, 128) != 0 ||
+      listen(http, 128) != 0 || !set_nonblocking(direct_tcp) ||
+      !set_nonblocking(socks) || !set_nonblocking(http)) return 1;
   memset(&action, 0, sizeof(action));
   action.sa_handler = peer_signal;
   (void)sigemptyset(&action.sa_mask);
@@ -380,8 +524,10 @@ static int peer_main(const char *ready_path)
   descriptors[2].events = POLLIN;
   descriptors[3].fd = dns;
   descriptors[3].events = POLLIN;
+  descriptors[4].fd = http;
+  descriptors[4].events = POLLIN;
   while (!peer_stopping) {
-    int count = poll(descriptors, 4u, 100);
+    int count = poll(descriptors, 5u, 100);
     if (count < 0 && errno == EINTR) continue;
     if (count < 0) break;
     if ((descriptors[0].revents & POLLIN) != 0 &&
@@ -397,7 +543,10 @@ static int peer_main(const char *ready_path)
     if ((descriptors[2].revents & POLLIN) != 0 &&
         !peer_accept_thread(socks, peer_socks_thread)) break;
     if ((descriptors[3].revents & POLLIN) != 0) peer_dns_reply(dns);
+    if ((descriptors[4].revents & POLLIN) != 0 &&
+        !peer_accept_thread(http, peer_http_thread)) break;
   }
+  (void)close(http);
   (void)close(dns);
   (void)close(socks);
   (void)close(direct_udp);
@@ -427,7 +576,8 @@ static int wait_socket(int descriptor, short events, int timeout_ms)
   return result == 1 && (poll_descriptor.revents & events) != 0;
 }
 
-static int client_main(const char *transport, const char *tag)
+static int client_main(const char *transport, const char *tag,
+                       const char *target_address)
 {
   static const char suffix[] = "-through-ftun";
   struct sockaddr_in target;
@@ -464,7 +614,7 @@ static int client_main(const char *transport, const char *tag)
   memset(&target, 0, sizeof(target));
   target.sin_family = AF_INET;
   target.sin_port = htons(port);
-  if (inet_pton(AF_INET, PEER_ADDRESS, &target.sin_addr) != 1 ||
+  if (inet_pton(AF_INET, target_address, &target.sin_addr) != 1 ||
       connect(descriptor, (const struct sockaddr *)&target,
               (socklen_t)sizeof(target)) != 0 ||
       !write_exact(descriptor, (const uint8_t *)message, expected)) {
@@ -482,6 +632,685 @@ static int client_main(const char *transport, const char *tag)
   (void)close(descriptor);
   return received == expected && memcmp(response, message, expected) == 0
     ? 0 : 1;
+}
+
+static int parse_ipv4_target(const char *text, struct sockaddr_in *out,
+                             char *normalized, size_t normalized_capacity)
+{
+  const char *colon = strrchr(text, ':');
+  char address[INET_ADDRSTRLEN];
+  char *tail = NULL;
+  unsigned long port;
+  size_t length;
+  if (colon == NULL || colon == text || out == NULL) return 0;
+  length = (size_t)(colon - text);
+  if (length >= sizeof(address)) return 0;
+  memcpy(address, text, length);
+  address[length] = '\0';
+  errno = 0;
+  port = strtoul(colon + 1u, &tail, 10);
+  if (errno != 0 || tail == colon + 1u || *tail != '\0' ||
+      port == 0u || port > UINT16_MAX) return 0;
+  memset(out, 0, sizeof(*out));
+  out->sin_family = AF_INET;
+  out->sin_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET, address, &out->sin_addr) != 1) return 0;
+  if (normalized != NULL && (snprintf(normalized, normalized_capacity,
+      "%s:%lu", address, port) <= 0 || strlen(normalized) >=
+      normalized_capacity)) return 0;
+  return 1;
+}
+
+static int proxy_connect(uint16_t port)
+{
+  struct sockaddr_in address;
+  struct timeval timeout;
+  int descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return -1;
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout));
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout));
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_port = htons(port);
+  (void)inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+  if (connect(descriptor, (const struct sockaddr *)&address,
+              (socklen_t)sizeof(address)) != 0) {
+    (void)close(descriptor);
+    return -1;
+  }
+  return descriptor;
+}
+
+static int proxy_echo(int descriptor, const char *tag)
+{
+  uint8_t response[128];
+  size_t length = strlen(tag);
+  if (!write_exact(descriptor, (const uint8_t *)tag, length)) return 0;
+  (void)shutdown(descriptor, SHUT_WR);
+  return read_exact(descriptor, response, length) &&
+         memcmp(response, tag, length) == 0;
+}
+
+static int socks_client_with_hold_main(const char *port_text,
+                                       const char *target_text,
+                                       const char *hold_text)
+{
+  uint8_t offer[3] = {5u, 1u, 0u};
+  uint8_t selected[2];
+  uint8_t request[10] = {5u, 1u, 0u, 1u};
+  uint8_t reply[10];
+  struct sockaddr_in target;
+  char *tail = NULL;
+  unsigned long port = strtoul(port_text, &tail, 10);
+  unsigned long hold_ms = 0u;
+  int descriptor;
+  int step = 0;
+  if (tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
+                                               NULL, 0u)) return 1;
+  if (hold_text != NULL) {
+    errno = 0;
+    hold_ms = strtoul(hold_text, &tail, 10);
+    if (errno != 0 || tail == hold_text || *tail != '\0' ||
+        hold_ms > 60000u) return 1;
+  }
+  descriptor = proxy_connect((uint16_t)port);
+  if (descriptor < 0) return 1;
+  memcpy(request + 4u, &target.sin_addr.s_addr, 4u);
+  memcpy(request + 8u, &target.sin_port, 2u);
+  if (!write_exact(descriptor, offer, sizeof(offer))) step = 1;
+  else if (!read_exact(descriptor, selected, sizeof(selected))) step = 2;
+  else if (selected[0] != 5u || selected[1] != 0u) step = 3;
+  else if (!write_exact(descriptor, request, sizeof(request))) step = 4;
+  else if (!read_exact(descriptor, reply, sizeof(reply))) step = 5;
+  else if (reply[0] != 5u || reply[1] != 0u) step = 6;
+  else {
+    if (hold_ms != 0u) {
+      struct timespec delay;
+      delay.tv_sec = (time_t)(hold_ms / 1000u);
+      delay.tv_nsec = (long)(hold_ms % 1000u) * 1000000L;
+      while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+    }
+    if (!proxy_echo(descriptor, "socks-production")) step = 7;
+  }
+  if (step != 0) {
+    fprintf(stderr, "SOCKS production client failed at step %d (errno=%d)\n",
+            step, errno);
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return 0;
+}
+
+static int socks_client_main(const char *port_text, const char *target_text)
+{
+  return socks_client_with_hold_main(port_text, target_text, NULL);
+}
+
+typedef struct {
+  int descriptor;
+  size_t length;
+  uint8_t payload[16384];
+  int succeeded;
+} socks_load_writer_t;
+
+static void *socks_load_writer(void *argument)
+{
+  socks_load_writer_t *writer = (socks_load_writer_t *)argument;
+  size_t remaining = writer->length;
+  writer->succeeded = 0;
+  while (remaining != 0u) {
+    size_t amount = remaining < sizeof(writer->payload)
+      ? remaining : sizeof(writer->payload);
+    if (!write_exact(writer->descriptor, writer->payload, amount)) return NULL;
+    remaining -= amount;
+  }
+  writer->succeeded = 1;
+  return NULL;
+}
+
+static int socks_load_client_main(const char *port_text,
+                                  const char *target_text,
+                                  const char *bytes_text)
+{
+  uint8_t offer[3] = {5u, 1u, 0u};
+  uint8_t selected[2];
+  uint8_t request[10] = {5u, 1u, 0u, 1u};
+  uint8_t reply[10];
+  uint8_t response[16384];
+  struct sockaddr_in target;
+  socks_load_writer_t writer;
+  pthread_t writer_thread;
+  char *tail = NULL;
+  unsigned long port = strtoul(port_text, &tail, 10);
+  unsigned long long requested;
+  uint64_t started;
+  uint64_t finished;
+  uint64_t elapsed;
+  size_t remaining;
+  size_t index;
+  int reader_succeeded = 1;
+  int descriptor;
+  if (tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
+                                               NULL, 0u)) return 1;
+  errno = 0;
+  requested = strtoull(bytes_text, &tail, 10);
+  if (errno != 0 || tail == bytes_text || *tail != '\0' || requested == 0u ||
+      requested > (unsigned long long)SIZE_MAX) return 1;
+  descriptor = proxy_connect((uint16_t)port);
+  if (descriptor < 0) return 1;
+  memcpy(request + 4u, &target.sin_addr.s_addr, 4u);
+  memcpy(request + 8u, &target.sin_port, 2u);
+  if (!write_exact(descriptor, offer, sizeof(offer)) ||
+      !read_exact(descriptor, selected, sizeof(selected)) ||
+      selected[0] != 5u || selected[1] != 0u ||
+      !write_exact(descriptor, request, sizeof(request)) ||
+      !read_exact(descriptor, reply, sizeof(reply)) ||
+      reply[0] != 5u || reply[1] != 0u) {
+    (void)close(descriptor);
+    return 1;
+  }
+  memset(&writer, 0, sizeof(writer));
+  writer.descriptor = descriptor;
+  writer.length = (size_t)requested;
+  for (index = 0u; index < sizeof(writer.payload); index++) {
+    writer.payload[index] = (uint8_t)(index * 31u + 17u);
+  }
+  if (ftun_monotonic_now(&started) != FTUN_OK ||
+      pthread_create(&writer_thread, NULL, socks_load_writer, &writer) != 0) {
+    (void)close(descriptor);
+    return 1;
+  }
+  remaining = (size_t)requested;
+  while (remaining != 0u) {
+    size_t amount = remaining < sizeof(writer.payload)
+      ? remaining : sizeof(writer.payload);
+    if (!read_exact(descriptor, response, amount) ||
+        memcmp(writer.payload, response, amount) != 0) {
+      reader_succeeded = 0;
+      break;
+    }
+    remaining -= amount;
+  }
+  if (!reader_succeeded) (void)shutdown(descriptor, SHUT_RDWR);
+  if (pthread_join(writer_thread, NULL) != 0 || !reader_succeeded ||
+      !writer.succeeded) {
+    (void)close(descriptor);
+    return 1;
+  }
+  if (ftun_monotonic_now(&finished) != FTUN_OK || finished < started) {
+    (void)close(descriptor);
+    return 1;
+  }
+  elapsed = finished - started;
+  if (elapsed == 0u) elapsed = 1u;
+  printf("production-data-plane bytes=%llu elapsed-ms=%llu "
+         "throughput-mib-s=%.2f\n",
+         requested, (unsigned long long)elapsed,
+         ((double)requested * 1000.0) /
+           ((double)elapsed * 1024.0 * 1024.0));
+  (void)close(descriptor);
+  return 0;
+}
+
+static int socks_domain_client_main(const char *port_text,
+                                    const char *target_text)
+{
+  uint8_t offer[3] = {5u, 1u, 0u};
+  uint8_t selected[2];
+  uint8_t request[262] = {5u, 1u, 0u, 3u};
+  uint8_t reply[10];
+  const char *colon = strrchr(target_text, ':');
+  char *tail = NULL;
+  unsigned long listener_port = strtoul(port_text, &tail, 10);
+  unsigned long target_port;
+  size_t domain_length;
+  int descriptor;
+  if (tail == port_text || *tail != '\0' || listener_port == 0u ||
+      listener_port > UINT16_MAX || colon == NULL || colon == target_text) {
+    return 1;
+  }
+  domain_length = (size_t)(colon - target_text);
+  if (domain_length == 0u || domain_length > 253u) return 1;
+  errno = 0;
+  target_port = strtoul(colon + 1u, &tail, 10);
+  if (errno != 0 || tail == colon + 1u || *tail != '\0' ||
+      target_port == 0u || target_port > UINT16_MAX) return 1;
+  descriptor = proxy_connect((uint16_t)listener_port);
+  if (descriptor < 0) return 1;
+  request[4] = (uint8_t)domain_length;
+  memcpy(request + 5u, target_text, domain_length);
+  request[5u + domain_length] = (uint8_t)(target_port >> 8u);
+  request[6u + domain_length] = (uint8_t)target_port;
+  if (!write_exact(descriptor, offer, sizeof(offer)) ||
+      !read_exact(descriptor, selected, sizeof(selected)) ||
+      selected[0] != 5u || selected[1] != 0u ||
+      !write_exact(descriptor, request, domain_length + 7u) ||
+      !read_exact(descriptor, reply, sizeof(reply)) ||
+      reply[0] != 5u || reply[1] != 0u ||
+      !proxy_echo(descriptor, "socks-domain-production")) {
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return 0;
+}
+
+static int socks_udp_client_main(const char *port_text,
+                                 const char *target_text)
+{
+  static const uint8_t payload_bytes[] = "socks-udp-production";
+  uint8_t offer[3] = {5u, 1u, 0u};
+  uint8_t selected[2];
+  uint8_t request[10] = {5u, 3u, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
+  uint8_t reply[10];
+  uint8_t wire[512];
+  uint8_t response[512];
+  struct sockaddr_in target;
+  struct sockaddr_in relay;
+  struct timeval timeout;
+  ftun_endpoint_t endpoint;
+  ftun_socks5_udp_datagram_t datagram;
+  size_t written = 0u;
+  size_t consumed = 0u;
+  char *tail = NULL;
+  unsigned long port = strtoul(port_text, &tail, 10);
+  ssize_t length;
+  int control;
+  int udp;
+  if (tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
+                                               NULL, 0u)) return 1;
+  control = proxy_connect((uint16_t)port);
+  if (control < 0) return 1;
+  if (!write_exact(control, offer, sizeof(offer)) ||
+      !read_exact(control, selected, sizeof(selected)) ||
+      selected[0] != 5u || selected[1] != 0u ||
+      !write_exact(control, request, sizeof(request)) ||
+      !read_exact(control, reply, sizeof(reply)) ||
+      reply[0] != 5u || reply[1] != 0u || reply[3] != 1u) {
+    (void)close(control);
+    return 1;
+  }
+  memset(&relay, 0, sizeof(relay));
+  relay.sin_family = AF_INET;
+  memcpy(&relay.sin_addr.s_addr, reply + 4u, 4u);
+  memcpy(&relay.sin_port, reply + 8u, 2u);
+  if (relay.sin_addr.s_addr == htonl(INADDR_ANY)) {
+    (void)inet_pton(AF_INET, "127.0.0.1", &relay.sin_addr);
+  }
+  udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  if (udp < 0) {
+    (void)close(control);
+    return 1;
+  }
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+  (void)setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+  (void)setsockopt(udp, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+  if (connect(udp, (const struct sockaddr *)&relay,
+              (socklen_t)sizeof(relay)) != 0) goto fail;
+  memset(&endpoint, 0, sizeof(endpoint));
+  endpoint.kind = FTUN_ADDRESS_IPV4;
+  endpoint.port = ntohs(target.sin_port);
+  memcpy(endpoint.address, &target.sin_addr.s_addr, 4u);
+  if (ftun_socks5_encode_udp_datagram(&endpoint,
+      (ftun_bytes_t){payload_bytes, sizeof(payload_bytes) - 1u},
+      wire, sizeof(wire), &written) != FTUN_OK ||
+      send(udp, wire, written, MSG_NOSIGNAL) != (ssize_t)written) goto fail;
+  length = recv(udp, response, sizeof(response), 0);
+  if (length <= 0 || ftun_socks5_decode_udp_datagram(
+      (ftun_bytes_t){response, (size_t)length}, &datagram, &consumed) !=
+      FTUN_OK || consumed != (size_t)length ||
+      datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
+      datagram.endpoint.port != endpoint.port ||
+      memcmp(datagram.endpoint.address, endpoint.address, 4u) != 0 ||
+      datagram.payload.length != sizeof(payload_bytes) - 1u ||
+      memcmp(datagram.payload.data, payload_bytes,
+             sizeof(payload_bytes) - 1u) != 0) goto fail;
+  (void)close(udp);
+  (void)close(control);
+  return 0;
+fail:
+  (void)close(udp);
+  (void)close(control);
+  return 1;
+}
+
+static int mixed_connect_client_main(const char *port_text,
+                                     const char *target_text)
+{
+  static const char established[] =
+    "HTTP/1.1 200 Connection Established\r\n\r\n";
+  struct sockaddr_in target;
+  char request[512];
+  uint8_t reply[sizeof(established) - 1u];
+  char normalized[64];
+  char *tail = NULL;
+  unsigned long port = strtoul(port_text, &tail, 10);
+  int descriptor;
+  if (tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
+        normalized, sizeof(normalized)) || snprintf(request, sizeof(request),
+        "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n",
+        normalized, normalized) <= 0) return 1;
+  descriptor = proxy_connect((uint16_t)port);
+  if (descriptor < 0) return 1;
+  if (!write_exact(descriptor, (const uint8_t *)request, strlen(request)) ||
+      !read_exact(descriptor, reply, sizeof(reply)) ||
+      memcmp(reply, established, sizeof(reply)) != 0 ||
+      !proxy_echo(descriptor, "mixed-connect-production")) {
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return 0;
+}
+
+static int mixed_forward_client_main(const char *port_text,
+                                     const char *target_text)
+{
+  struct sockaddr_in target;
+  char request[1024];
+  char expected[512];
+  uint8_t response[512];
+  char normalized[64];
+  char *tail = NULL;
+  unsigned long port = strtoul(port_text, &tail, 10);
+  int descriptor;
+  if (tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
+        normalized, sizeof(normalized)) || snprintf(request, sizeof(request),
+        "GET http://%s/release?q=1 HTTP/1.1\r\nHost: %s\r\n"
+        "Proxy-Authorization: Basic dTpw\r\n"
+        "Proxy-Connection: keep-alive\r\n\r\n", normalized, normalized) <= 0 ||
+      snprintf(expected, sizeof(expected),
+        "GET /release?q=1 HTTP/1.1\r\nHost: %s\r\n\r\n", normalized) <= 0) {
+    return 1;
+  }
+  descriptor = proxy_connect((uint16_t)port);
+  if (descriptor < 0) return 1;
+  if (!write_exact(descriptor, (const uint8_t *)request, strlen(request)) ||
+      !read_exact(descriptor, response, strlen(expected)) ||
+      memcmp(response, expected, strlen(expected)) != 0) {
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return 0;
+}
+
+static int echo_server_main(const char *target_text, const char *ready_path)
+{
+  struct sockaddr_in address;
+  struct sigaction action;
+  FILE *ready;
+  int descriptor;
+  int udp_descriptor;
+  int one = 1;
+  if (!parse_ipv4_target(target_text, &address, NULL, 0u)) return 1;
+  descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return 1;
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  if (bind(descriptor, (const struct sockaddr *)&address,
+           (socklen_t)sizeof(address)) != 0 || listen(descriptor, 16) != 0) {
+    (void)close(descriptor);
+    return 1;
+  }
+  udp_descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  if (udp_descriptor < 0 ||
+      bind(udp_descriptor, (const struct sockaddr *)&address,
+           (socklen_t)sizeof(address)) != 0) {
+    if (udp_descriptor >= 0) (void)close(udp_descriptor);
+    (void)close(descriptor);
+    return 1;
+  }
+  memset(&action, 0, sizeof(action));
+  action.sa_handler = peer_signal;
+  (void)sigemptyset(&action.sa_mask);
+  if (sigaction(SIGTERM, &action, NULL) != 0) {
+    (void)close(udp_descriptor);
+    (void)close(descriptor);
+    return 1;
+  }
+  ready = fopen(ready_path, "wb");
+  if (ready == NULL) {
+    (void)close(udp_descriptor);
+    (void)close(descriptor);
+    return 1;
+  }
+  if (fputs("ready\n", ready) < 0) {
+    (void)fclose(ready);
+    (void)close(udp_descriptor);
+    (void)close(descriptor);
+    return 1;
+  }
+  if (fclose(ready) != 0) {
+    (void)close(udp_descriptor);
+    (void)close(descriptor);
+    return 1;
+  }
+  while (!peer_stopping) {
+    struct pollfd items[2];
+    int result;
+    memset(items, 0, sizeof(items));
+    items[0].fd = descriptor;
+    items[0].events = POLLIN;
+    items[1].fd = udp_descriptor;
+    items[1].events = POLLIN;
+    result = poll(items, 2u, 100);
+    if (result < 0 && errno == EINTR) continue;
+    if (result < 0) break;
+    if ((items[0].revents & POLLIN) != 0 &&
+        !peer_accept_thread(descriptor, peer_echo_thread)) break;
+    if ((items[1].revents & POLLIN) != 0) {
+      uint8_t packet[65535];
+      struct sockaddr_in peer;
+      socklen_t peer_length = (socklen_t)sizeof(peer);
+      ssize_t length = recvfrom(udp_descriptor, packet, sizeof(packet), 0,
+                                (struct sockaddr *)&peer, &peer_length);
+      if (length >= 0) {
+        (void)sendto(udp_descriptor, packet, (size_t)length, MSG_NOSIGNAL,
+                     (const struct sockaddr *)&peer, peer_length);
+      }
+    }
+  }
+  (void)close(udp_descriptor);
+  (void)close(descriptor);
+  for (;;) {
+    struct timespec delay = {0, 1000000L};
+    size_t active;
+    (void)pthread_mutex_lock(&peer_threads_mutex);
+    active = peer_threads;
+    (void)pthread_mutex_unlock(&peer_threads_mutex);
+    if (active == 0u) break;
+    (void)nanosleep(&delay, NULL);
+  }
+  return 0;
+}
+
+static int dns_client_main(const char *address_text, const char *port_text,
+                           const char *expected_text)
+{
+  static const uint8_t question[] = {
+    0x44u, 0x55u, 0x01u, 0x00u, 0x00u, 0x01u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u,
+    0x01u, 'a', 0x07u, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00u,
+    0x00u, 0x01u, 0x00u, 0x01u
+  };
+  struct sockaddr_in target;
+  struct timeval timeout;
+  uint8_t response[512];
+  uint8_t expected[4];
+  char *tail = NULL;
+  unsigned long port;
+  ssize_t length;
+  int descriptor;
+  errno = 0;
+  port = strtoul(port_text, &tail, 10);
+  if (errno != 0 || tail == port_text || *tail != '\0' ||
+      port == 0u || port > UINT16_MAX ||
+      inet_pton(AF_INET, expected_text, expected) != 1) return 1;
+  descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return 1;
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout));
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET, address_text, &target.sin_addr) != 1 ||
+      sendto(descriptor, question, sizeof(question), 0,
+        (const struct sockaddr *)&target, (socklen_t)sizeof(target)) !=
+        (ssize_t)sizeof(question)) {
+    (void)close(descriptor);
+    return 1;
+  }
+  do {
+    length = recv(descriptor, response, sizeof(response), 0);
+  } while (length < 0 && errno == EINTR);
+  (void)close(descriptor);
+  return length >= 43 && response[0] == 0x44u && response[1] == 0x55u &&
+    (response[2] & 0x80u) != 0u && response[7] == 1u &&
+    memcmp(response + length - 4, expected, 4u) == 0 ? 0 : 1;
+}
+
+static int dns_tcp_client_main(const char *address_text,
+                               const char *port_text,
+                               const char *expected_text)
+{
+  static const uint8_t question[] = {
+    0x44u, 0x56u, 0x01u, 0x00u, 0x00u, 0x01u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u,
+    0x01u, 'a', 0x07u, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00u,
+    0x00u, 0x01u, 0x00u, 0x01u
+  };
+  struct sockaddr_in target;
+  struct timeval timeout;
+  uint8_t frame[sizeof(question) + 2u];
+  uint8_t response[512];
+  uint8_t expected[4];
+  uint8_t prefix[2];
+  char *tail = NULL;
+  unsigned long port;
+  size_t length;
+  int descriptor;
+  errno = 0;
+  port = strtoul(port_text, &tail, 10);
+  if (errno != 0 || tail == port_text || *tail != '\0' ||
+      port == 0u || port > UINT16_MAX ||
+      inet_pton(AF_INET, expected_text, expected) != 1) return 1;
+  descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return 1;
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout));
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout));
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons((uint16_t)port);
+  frame[0] = (uint8_t)(sizeof(question) >> 8u);
+  frame[1] = (uint8_t)sizeof(question);
+  memcpy(frame + 2u, question, sizeof(question));
+  if (inet_pton(AF_INET, address_text, &target.sin_addr) != 1 ||
+      connect(descriptor, (const struct sockaddr *)&target,
+              (socklen_t)sizeof(target)) != 0 ||
+      !write_exact(descriptor, frame, sizeof(frame)) ||
+      !read_exact(descriptor, prefix, sizeof(prefix))) {
+    (void)close(descriptor);
+    return 1;
+  }
+  length = ((size_t)prefix[0] << 8u) | prefix[1];
+  if (length > sizeof(response) || !read_exact(descriptor, response, length)) {
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return length >= 43u && response[0] == 0x44u && response[1] == 0x56u &&
+    (response[2] & 0x80u) != 0u && response[7] == 1u &&
+    memcmp(response + length - 4u, expected, 4u) == 0 ? 0 : 1;
+}
+
+static int dns_tcp_pipeline_main(const char *address_text,
+                                 const char *port_text,
+                                 const char *expected_text)
+{
+  static const uint8_t question[] = {
+    0x00u, 0x00u, 0x01u, 0x00u, 0x00u, 0x01u, 0x00u, 0x00u,
+    0x00u, 0x00u, 0x00u, 0x00u,
+    0x01u, 'a', 0x07u, 'e', 'x', 'a', 'm', 'p', 'l', 'e', 0x00u,
+    0x00u, 0x01u, 0x00u, 0x01u
+  };
+  uint8_t frames[6u * (sizeof(question) + 2u)];
+  uint8_t response[512];
+  uint8_t prefix[2];
+  uint8_t expected[4];
+  struct sockaddr_in target;
+  struct timeval timeout;
+  char *tail = NULL;
+  unsigned long port;
+  size_t index;
+  int descriptor;
+  errno = 0;
+  port = strtoul(port_text, &tail, 10);
+  if (errno != 0 || tail == port_text || *tail != '\0' ||
+      port == 0u || port > UINT16_MAX ||
+      inet_pton(AF_INET, expected_text, expected) != 1) return 1;
+  descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return 1;
+  timeout.tv_sec = 5;
+  timeout.tv_usec = 0;
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                   &timeout, sizeof(timeout));
+  (void)setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                   &timeout, sizeof(timeout));
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET, address_text, &target.sin_addr) != 1 ||
+      connect(descriptor, (const struct sockaddr *)&target,
+              (socklen_t)sizeof(target)) != 0) {
+    (void)close(descriptor);
+    return 1;
+  }
+  for (index = 0u; index < 6u; index++) {
+    uint8_t *frame = frames + index * (sizeof(question) + 2u);
+    frame[0] = (uint8_t)(sizeof(question) >> 8u);
+    frame[1] = (uint8_t)sizeof(question);
+    memcpy(frame + 2u, question, sizeof(question));
+    frame[2] = 0x55u;
+    frame[3] = (uint8_t)(0x60u + index);
+  }
+  if (!write_exact(descriptor, frames, sizeof(frames))) {
+    (void)close(descriptor);
+    return 1;
+  }
+  for (index = 0u; index < 6u; index++) {
+    size_t length;
+    if (!read_exact(descriptor, prefix, sizeof(prefix))) {
+      (void)close(descriptor);
+      return 1;
+    }
+    length = ((size_t)prefix[0] << 8u) | prefix[1];
+    if (length > sizeof(response) ||
+        !read_exact(descriptor, response, length) || length < 43u ||
+        response[0] != 0x55u || response[1] != (uint8_t)(0x60u + index) ||
+        memcmp(response + length - 4u, expected, 4u) != 0) {
+      (void)close(descriptor);
+      return 1;
+    }
+  }
+  (void)close(descriptor);
+  return 0;
 }
 
 typedef struct integration integration_t;
@@ -1830,15 +2659,65 @@ static int integration_main(const char *self)
 int main(int argc, char **argv)
 {
   if (argc == 3 && strcmp(argv[1], "--peer") == 0) {
-    return peer_main(argv[2]);
+    return peer_main(argv[2], NULL);
+  }
+  if (argc == 4 && strcmp(argv[1], "--peer") == 0) {
+    return peer_main(argv[2], argv[3]);
   }
   if (argc == 4 && strcmp(argv[1], "--client") == 0) {
-    return client_main(argv[2], argv[3]);
+    return client_main(argv[2], argv[3], PEER_ADDRESS);
+  }
+  if (argc == 5 && strcmp(argv[1], "--client-to") == 0) {
+    return client_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--dns-client") == 0) {
+    return dns_client_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--dns-tcp-client") == 0) {
+    return dns_tcp_client_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--dns-tcp-pipeline") == 0) {
+    return dns_tcp_pipeline_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--socks-client") == 0) {
+    return socks_client_main(argv[2], argv[3]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--socks-hold-client") == 0) {
+    return socks_client_with_hold_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--socks-load-client") == 0) {
+    return socks_load_client_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--socks-domain-client") == 0) {
+    return socks_domain_client_main(argv[2], argv[3]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--socks-udp-client") == 0) {
+    return socks_udp_client_main(argv[2], argv[3]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--mixed-connect-client") == 0) {
+    return mixed_connect_client_main(argv[2], argv[3]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--mixed-forward-client") == 0) {
+    return mixed_forward_client_main(argv[2], argv[3]);
+  }
+  if (argc == 4 && strcmp(argv[1], "--echo-server") == 0) {
+    return echo_server_main(argv[2], argv[3]);
   }
   if (argc == 2 && strcmp(argv[1], "--run") == 0) {
     return integration_main(argv[0]);
   }
-  fprintf(stderr, "usage: %s --peer READY | --client tcp|udp TAG | --run\n",
+  fprintf(stderr, "usage: %s --peer READY | --client tcp|udp TAG | "
+                  "--client-to tcp|udp TAG ADDRESS | "
+                  "--dns-client ADDRESS PORT EXPECTED | "
+                  "--dns-tcp-client ADDRESS PORT EXPECTED | "
+                  "--socks-client PORT TARGET | "
+                  "--socks-hold-client PORT TARGET HOLD_MS | "
+                  "--socks-load-client PORT TARGET BYTES | "
+                  "--socks-domain-client PORT DOMAIN:PORT | "
+                  "--socks-udp-client PORT TARGET | "
+                  "--mixed-connect-client PORT TARGET | "
+                  "--mixed-forward-client PORT TARGET | "
+                  "--echo-server TARGET READY | --run\n",
           argv[0]);
   return 2;
 }

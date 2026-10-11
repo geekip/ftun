@@ -3,6 +3,7 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/runtime.h"
+#include "route/rule.h"
 #include "transport/datagram.h"
 #include "tun/udp_session.h"
 #include "util/buffer.h"
@@ -524,8 +525,9 @@ static int test_boundaries(void)
         FTUN_E_STATE_CORRUPT && fixture.slots[0].destroyed == 1);
   fixture.corrupt_remote = 0;
   fixture.corrupt_outbound_id = 1;
-  CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) ==
-        FTUN_E_STATE_CORRUPT && fixture.slots[1].destroyed == 1);
+  CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK &&
+        fixture.opened_outbound_id == FTUN_OUTBOUND_ID_DIRECT &&
+        fixture.slots[1].destroyed == 0);
   CHECK(ftun_udp_flow_tick(fixture.table, 999u) == FTUN_E_INVALID);
   memset(&spec, 0, sizeof(spec));
   spec.core = fixture.core;

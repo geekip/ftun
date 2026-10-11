@@ -7,7 +7,7 @@
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/runtime.h"
-#if defined(FTUN_HAVE_MODULE_DNS)
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
 #include "state/fakeip_store.h"
 #endif
 
@@ -23,11 +23,15 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unistd.h>
-#if defined(FTUN_HAVE_MODULE_DNS)
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
 #include <sys/random.h>
 #endif
 
 #define FTUN_CLI_MEMORY_LIMIT (64u * 1024u * 1024u)
+
+#ifndef FTUN_SOURCE_REVISION
+#define FTUN_SOURCE_REVISION "unknown"
+#endif
 
 typedef struct {
   ftun_core_t *core;
@@ -48,6 +52,25 @@ static void ftun_cli_usage(FILE *output)
     "  ftun reload PID\n"
     "  ftun fakeip init -c CONFIG\n",
     output);
+}
+
+static void ftun_cli_print_version(void)
+{
+  printf("FTUN %s\nsource: %s\ncapabilities: core", ftun_version(),
+         FTUN_SOURCE_REVISION);
+#if defined(FTUN_HAVE_MODULE_DNS)
+  fputs(",dns", stdout);
+#endif
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  fputs(",fakeip", stdout);
+#endif
+#if defined(FTUN_HAVE_MODULE_TUN)
+  fputs(",tun", stdout);
+#endif
+#if defined(FTUN_HAVE_MODULE_FRS)
+  fputs(",frs", stdout);
+#endif
+  fputc('\n', stdout);
 }
 
 static int ftun_cli_error(const char *operation, ftun_status_t status)
@@ -72,7 +95,9 @@ static ftun_status_t ftun_cli_core_create(ftun_core_t **out)
   options.struct_size = sizeof(options);
   options.abi_version = FTUN_ABI_VERSION;
   options.owned_memory_limit = FTUN_CLI_MEMORY_LIMIT;
-  options.operation_capacity = 64u;
+  /* 256 production TCP flows can each hold a write per direction while DNS,
+   * health, FRS and control operations remain live. */
+  options.operation_capacity = 1024u;
   options.retained_runtime_limit = 4u;
   return ftun_core_create(&options, out);
 }
@@ -94,6 +119,14 @@ static ftun_status_t ftun_cli_check_config(const char *path,
   /* prepare also checks required FRS files and compiled feature resources;
    * abort makes check read-only with respect to the active runtime. */
   if (status == FTUN_OK) status = ftun_runtime_prepare(core, config, &candidate);
+  /* `run` performs the configured first-download transaction in Core.  Its
+   * read-only preflight may therefore accept only a genuinely missing FRS;
+   * an existing corrupt or unbindable file still fails here. */
+  if (status == FTUN_E_EOF && require_inbound && config != NULL &&
+      config->frs.active && config->frs.auto_update &&
+      config->frs.url != NULL && config->frs.url[0] != '\0') {
+    status = FTUN_OK;
+  }
   if (candidate != NULL) (void)ftun_runtime_abort(core, &candidate);
   if (status == FTUN_OK && out_config != NULL) {
     *out_config = config;
@@ -257,7 +290,7 @@ static int ftun_cli_signal_process(const char *text, int signal_number,
   return 0;
 }
 
-#if defined(FTUN_HAVE_MODULE_DNS)
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
 static int ftun_cli_random_uuid(uint8_t uuid[FTUN_FAKEIP_UUID_BYTES])
 {
   size_t offset = 0u;
@@ -323,7 +356,7 @@ static int ftun_cli_fakeip_range(const char *range,
 
 static int ftun_cli_fakeip_init(const char *path)
 {
-#if defined(FTUN_HAVE_MODULE_DNS)
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
   ftun_config_t *config = NULL;
   ftun_fakeip_store_identity_t identity;
   char *directory = NULL;
@@ -372,7 +405,7 @@ int ftun_cli_main(int argc, char **argv)
   const char *path;
   if (argc == 2 &&
       (strcmp(argv[1], "version") == 0 || strcmp(argv[1], "--version") == 0)) {
-    printf("FTUN %s\n", ftun_version());
+    ftun_cli_print_version();
     return 0;
   }
   if (argc == 2 &&

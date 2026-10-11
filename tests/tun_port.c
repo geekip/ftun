@@ -1,10 +1,10 @@
 #define _GNU_SOURCE 1
 #include "platform/linux/tun.h"
+#include "platform/linux/uapi.h"
 #include "tun/tun.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
+#include <net/if.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -54,7 +54,7 @@ static int mock_ioctl(void *context, int descriptor, unsigned long request,
   (void)descriptor;
   (void)error_code;
   mock->ioctl_calls++;
-  if (request == TUNSETIFF) return 0;
+  if (request == FTUN_TUNSETIFF) return 0;
   if (request == SIOCSIFMTU) return interface_request->ifr_mtu == 128 ? 0 : -1;
   if (request == SIOCGIFFLAGS) {
     interface_request->ifr_flags = 0;

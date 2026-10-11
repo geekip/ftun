@@ -74,6 +74,10 @@ typedef struct {
 ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out);
 ftun_status_t ftun_lwip_input(ftun_lwip_t *stack, ftun_packet_t *packet);
 ftun_status_t ftun_lwip_tick(ftun_lwip_t *stack, uint64_t now_ms);
+/* Reload identity affects only packets/flows accepted after the owner-loop
+ * commit; existing bridge metadata remains pinned to its original Runtime. */
+ftun_status_t ftun_lwip_set_packet_source(ftun_lwip_t *stack,
+                                          uint32_t packet_source_id);
 ftun_status_t ftun_lwip_get_usage(const ftun_lwip_t *stack,
                                   ftun_lwip_usage_t *out);
 ftun_status_t ftun_lwip_destroy(ftun_lwip_t **stack);

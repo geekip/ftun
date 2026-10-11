@@ -641,23 +641,36 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
   return ftun_runtime_prepare_internal(core, config, view, out);
 }
 
+ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
+                                      const ftun_runtime_t *candidate)
+{
+  const ftun_runtime_t *previous;
+  if (!ftun_runtime_core_valid(core) || candidate == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (candidate != core->candidate || candidate->owner != core ||
+      candidate->state != FTUN_RUNTIME_CANDIDATE ||
+      candidate->reference_count != 1u) return FTUN_E_STALE;
+  previous = core->active;
+  if (core->generation == UINT64_MAX) return FTUN_E_LIMIT;
+  if (previous != NULL && previous->reference_count > 1u &&
+      core->retained_count >= core->retained_limit) return FTUN_E_LIMIT;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_runtime_commit(ftun_core_t *core,
                                   ftun_runtime_t **candidate)
 {
   ftun_runtime_t *next;
   ftun_runtime_t *previous;
+  ftun_status_t status;
   if (!ftun_runtime_core_valid(core) || candidate == NULL || *candidate == NULL) {
     return FTUN_E_INVALID;
   }
   next = *candidate;
-  if (next != core->candidate || next->owner != core ||
-      next->state != FTUN_RUNTIME_CANDIDATE || next->reference_count != 1u) {
-    return FTUN_E_STALE;
-  }
+  status = ftun_runtime_can_commit(core, next);
+  if (status != FTUN_OK) return status;
   previous = core->active;
-  if (core->generation == UINT64_MAX) return FTUN_E_LIMIT;
-  if (previous != NULL && previous->reference_count > 1u &&
-      core->retained_count >= core->retained_limit) return FTUN_E_LIMIT;
   if (ftun_route_table_set_generation(next->routes,
                                       core->generation + 1u) != FTUN_OK) {
     return FTUN_E_STATE_CORRUPT;
@@ -754,6 +767,27 @@ ftun_status_t ftun_runtime_route_table(const ftun_runtime_t *runtime,
       !ftun_runtime_core_valid(runtime->owner)) return FTUN_E_INVALID;
   *out = runtime->routes;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_config(const ftun_runtime_t *runtime,
+                                  const ftun_config_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (runtime == NULL || out == NULL || runtime->config == NULL ||
+      runtime->state == FTUN_RUNTIME_CANDIDATE || runtime->generation == 0u ||
+      !ftun_runtime_core_valid(runtime->owner)) return FTUN_E_INVALID;
+  *out = runtime->config;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_resolve_outbound_name(
+  const ftun_runtime_t *runtime, ftun_string_t name, uint32_t *out)
+{
+  if (out != NULL) *out = 0u;
+  if (runtime == NULL || out == NULL || runtime->config == NULL ||
+      runtime->state == FTUN_RUNTIME_CANDIDATE || runtime->generation == 0u ||
+      !ftun_runtime_core_valid(runtime->owner)) return FTUN_E_INVALID;
+  return ftun_runtime_resolve_outbound(name, out, (void *)runtime->config);
 }
 
 ftun_status_t ftun_runtime_frs_view(const ftun_runtime_t *runtime,

@@ -101,7 +101,13 @@ int main(void)
         event.http.kind == FTUN_HTTP_PROXY_FORWARD &&
         event.http.target.kind == FTUN_ADDRESS_DOMAIN &&
         event.http.target.domain.length == strlen("one.example") &&
-        event.body_remaining == 2u && event.wire.length == strlen(first));
+        event.body_remaining == 2u &&
+        event.wire.length == strlen(
+          "POST /a HTTP/1.1\r\nHost: one.example\r\n"
+          "Content-Length: 3\r\n\r\nx") &&
+        memcmp(event.wire.data,
+          "POST /a HTTP/1.1\r\nHost: one.example\r\n"
+          "Content-Length: 3\r\n\r\nx", event.wire.length) == 0);
   CHECK(ftun_mixed_http_finish(connection, FTUN_OK, &event) == FTUN_OK &&
         event.kind == FTUN_MIXED_EVENT_HTTP_REPLY && event.wire.length == 0u &&
         event.body_remaining == 2u);

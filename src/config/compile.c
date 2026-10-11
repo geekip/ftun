@@ -9,6 +9,9 @@ static const char *const ftun_builtin_module_names[] = {
 #if defined(FTUN_HAVE_MODULE_DNS)
   "dns",
 #endif
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  "fakeip",
+#endif
 #if defined(FTUN_HAVE_MODULE_TUN)
   "tun",
 #endif
@@ -21,6 +24,9 @@ static const ftun_build_capabilities_t ftun_capabilities = {
   FTUN_BUILD_MODULE_CORE
 #if defined(FTUN_HAVE_MODULE_DNS)
     | FTUN_BUILD_MODULE_DNS
+#endif
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+    | FTUN_BUILD_MODULE_FAKEIP
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
     | FTUN_BUILD_MODULE_TUN
@@ -530,6 +536,14 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
   plan->built_modules = ftun_build_capabilities()->builtins;
   plan->required_modules = FTUN_BUILD_MODULE_CORE;
   if (config->dns.enable) plan->required_modules |= FTUN_BUILD_MODULE_DNS;
+  if (config->dns.enable) {
+    for (index = 0u; index < config->dns.server_count; index++) {
+      if (config->dns.servers[index].fake_ip) {
+        plan->required_modules |= FTUN_BUILD_MODULE_FAKEIP;
+        break;
+      }
+    }
+  }
   if (config->frs.active) plan->required_modules |= FTUN_BUILD_MODULE_FRS;
   for (index = 0u; index < config->inbound_count; index++) {
     if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {

@@ -16,6 +16,7 @@
         "FTUN_SANITIZERS": false,
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -31,6 +32,7 @@
         "FTUN_SANITIZERS": true,
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -46,6 +48,7 @@
         "FTUN_SANITIZERS": false,
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -61,6 +64,7 @@
         "FTUN_SANITIZERS": false,
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -76,6 +80,7 @@
         "FTUN_SANITIZERS": false,
         "FTUN_LTO": true,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -90,8 +95,9 @@
         "CMAKE_BUILD_TYPE": "MinSizeRel",
         "FTUN_OPTIMIZATION": "size",
         "FTUN_STATIC": true,
-        "FTUN_LTO": true,
+        "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
@@ -156,6 +162,13 @@
     {
       "name": "release-lto",
       "configurePreset": "release-lto",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "linux-x86_64-musl",
+      "configurePreset": "linux-x86_64-musl",
       "output": {
         "outputOnFailure": true
       }

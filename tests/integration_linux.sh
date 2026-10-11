@@ -16,7 +16,7 @@ if [ "${FTUN_INTEGRATION_NAMESPACE:-0}" != 1 ]; then
   exec env FTUN_INTEGRATION_NAMESPACE=1 unshare -Urnm sh "$0" "$test_binary"
 fi
 
-temporary=$(mktemp -d /tmp/ftun-integration.XXXXXX)
+temporary=$(mktemp -d "${TMPDIR:-/tmp}/ftun-integration.XXXXXX")
 peer_pid=
 
 cleanup()

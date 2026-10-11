@@ -82,6 +82,10 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
                                             ftun_runtime_t **out);
 /* commit 不分配；成功清空 candidate 句柄并由 manager 持有 active。 */
 ftun_status_t ftun_runtime_commit(ftun_core_t *core, ftun_runtime_t **candidate);
+/* 持久化先于指针切换的事务可先执行只读提交门禁；成功后到 commit 之间不得
+ * 穿插其他 Runtime 操作。 */
+ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
+                                      const ftun_runtime_t *candidate);
 ftun_status_t ftun_runtime_abort(ftun_core_t *core, ftun_runtime_t **candidate);
 /* acquire/release 表示 Session 等旧代消费者的引用。 */
 ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core, ftun_runtime_t **out);
@@ -91,6 +95,12 @@ ftun_status_t ftun_runtime_get_info(const ftun_runtime_t *runtime,
 /* 返回 Runtime 拥有的不可变规则表；借用期不超过 Runtime 引用。 */
 ftun_status_t ftun_runtime_route_table(const ftun_runtime_t *runtime,
                                        const ftun_route_table_t **out);
+/* 返回指定 Runtime 拥有的不可变配置；调用方必须持有 Runtime 引用。 */
+ftun_status_t ftun_runtime_config(const ftun_runtime_t *runtime,
+                                  const ftun_config_t **out);
+/* 将内置或配置名称解析为该 Runtime 的稳定出口 ID。 */
+ftun_status_t ftun_runtime_resolve_outbound_name(
+  const ftun_runtime_t *runtime, ftun_string_t name, uint32_t *out);
 /* 借用不可变 FRSView；仅在 Runtime 引用期内有效。无 FRS 返回 AGAIN。 */
 ftun_status_t ftun_runtime_frs_view(const ftun_runtime_t *runtime,
                                     ftun_frs_view_t **out);

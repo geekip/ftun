@@ -83,6 +83,10 @@ ftun_status_t ftun_socks5_connection_decode_udp(
   const ftun_socks5_connection_t *connection,
   const ftun_endpoint_t *physical_source, ftun_bytes_t input,
   ftun_socks5_udp_datagram_t *out, size_t *consumed);
+/* TCP 成功后把已协商的数据 socket 转移给统一 Relay，并消费 connection。
+ * UDP association 不能经此入口拆分控制/数据 socket。 */
+ftun_status_t ftun_socks5_connection_take_tcp(
+  ftun_socks5_connection_t **connection, ftun_native_socket_t *out);
 /* close 总是消费 connection，并尝试关闭控制与数据 socket。 */
 ftun_status_t ftun_socks5_connection_close(
   ftun_socks5_connection_t **connection);

@@ -71,6 +71,12 @@ ftun_status_t ftun_tun_ingress(ftun_core_t *core, ftun_packet_port_t *port,
                                ftun_packet_t *packet);
 ftun_status_t ftun_tun_ingress_tick(ftun_tun_ingress_context_t *context,
                                     uint64_t now_ms);
+/* 事务重载提交后只影响后续新 flow；已有 Stream/Datagram 已固定旧代。 */
+ftun_status_t ftun_tun_ingress_set_generation(
+  ftun_tun_ingress_context_t *context, uint64_t generation);
+ftun_status_t ftun_tun_ingress_set_identity(
+  ftun_tun_ingress_context_t *context, uint64_t generation,
+  uint32_t inbound_id);
 ftun_status_t ftun_tun_ingress_get_usage(
   const ftun_tun_ingress_context_t *context, ftun_tun_ingress_usage_t *out);
 ftun_status_t ftun_tun_ingress_close(ftun_tun_ingress_context_t **context);

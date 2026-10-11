@@ -271,6 +271,7 @@ ftun_status_t ftun_dns_dispatch(ftun_core_t *core,
   selected = *query;
   selected.server_fingerprint = server_info.fingerprint;
   selected.outbound_id = server_info.outbound_id;
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
   if (!query->real_only && server_info.fakeip && dispatcher->fakeip != NULL) {
     if (query->question.type == 1u) {
       char domain[254];
@@ -299,6 +300,7 @@ ftun_status_t ftun_dns_dispatch(ftun_core_t *core,
       return ftun_dns_local_answer(dispatcher, query, 0u, 0, 0u, out);
     }
   }
+#endif
   selected.resolution_mode = 1u;
   return ftun_dns_exchange(core, dispatcher->servers[server_index],
                            &selected, out);

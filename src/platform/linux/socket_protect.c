@@ -6,7 +6,7 @@
 
 #ifdef __linux__
 #include <errno.h>
-#include <linux/if.h>
+#include <net/if.h>
 #include <sys/socket.h>
 
 #if IFNAMSIZ != FTUN_LINUX_SOCKET_DEVICE_BYTES

@@ -139,11 +139,12 @@ typedef enum {
   FTUN_BUILD_MODULE_CORE = 1u << 0,
   FTUN_BUILD_MODULE_DNS = 1u << 1,
   FTUN_BUILD_MODULE_TUN = 1u << 2,
-  FTUN_BUILD_MODULE_FRS = 1u << 3
+  FTUN_BUILD_MODULE_FRS = 1u << 3,
+  FTUN_BUILD_MODULE_FAKEIP = 1u << 4
 } ftun_build_module_t;
 #define FTUN_BUILD_MODULE_ALL \
   (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS | FTUN_BUILD_MODULE_TUN | \
-   FTUN_BUILD_MODULE_FRS)
+   FTUN_BUILD_MODULE_FRS | FTUN_BUILD_MODULE_FAKEIP)
 typedef struct {
   uint32_t builtins;
   const char *const *names;

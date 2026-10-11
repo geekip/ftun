@@ -371,6 +371,103 @@ ftun_status_t ftun_http_decode_request(ftun_bytes_t input,
   return FTUN_OK;
 }
 
+static ftun_status_t ftun_http_append(uint8_t *output, size_t capacity,
+                                      size_t *written, const uint8_t *data,
+                                      size_t length)
+{
+  if (length > capacity - *written) return FTUN_E_LIMIT;
+  if (length != 0u) memcpy(output + *written, data, length);
+  *written += length;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_http_rewrite_forward(
+  ftun_bytes_t input, const ftun_http_request_t *request,
+  uint8_t *output, size_t capacity, size_t *written)
+{
+  const uint8_t *target;
+  size_t authority_length = 0u;
+  size_t origin_offset;
+  size_t origin_length;
+  size_t request_line_end;
+  size_t cursor;
+  size_t output_length = 0u;
+  ftun_status_t status;
+  if (written != NULL) *written = 0u;
+  if (request == NULL || output == NULL || written == NULL ||
+      input.data == NULL || request->kind != FTUN_HTTP_PROXY_FORWARD ||
+      request->header_bytes > input.length || request->header_bytes < 4u ||
+      request->method.data == NULL || request->request_target.data == NULL ||
+      request->request_target.length < 8u || capacity == 0u) {
+    return FTUN_E_INVALID;
+  }
+  target = (const uint8_t *)request->request_target.data;
+  if (!ftun_http_equal_ci(target, 7u, "http://")) return FTUN_E_INVALID;
+  while (7u + authority_length < request->request_target.length &&
+         target[7u + authority_length] != (uint8_t)'/' &&
+         target[7u + authority_length] != (uint8_t)'?') {
+    authority_length++;
+  }
+  if (authority_length == 0u) return FTUN_E_INVALID;
+  origin_offset = 7u + authority_length;
+  origin_length = request->request_target.length - origin_offset;
+  request_line_end = ftun_http_find_crlf(input.data, 0u,
+                                          request->header_bytes);
+  if (request_line_end == SIZE_MAX) return FTUN_E_INVALID;
+  status = ftun_http_append(output, capacity, &output_length,
+    (const uint8_t *)request->method.data, request->method.length);
+  if (status == FTUN_OK) status = ftun_http_append(output, capacity,
+    &output_length, (const uint8_t *)" ", 1u);
+  if (status == FTUN_OK && origin_length == 0u) {
+    status = ftun_http_append(output, capacity, &output_length,
+      (const uint8_t *)"/", 1u);
+  } else if (status == FTUN_OK && target[origin_offset] == (uint8_t)'?') {
+    status = ftun_http_append(output, capacity, &output_length,
+      (const uint8_t *)"/", 1u);
+    if (status == FTUN_OK) status = ftun_http_append(output, capacity,
+      &output_length, target + origin_offset, origin_length);
+  } else if (status == FTUN_OK) {
+    status = ftun_http_append(output, capacity, &output_length,
+      target + origin_offset, origin_length);
+  }
+  if (status == FTUN_OK) {
+    const uint8_t *version = target + request->request_target.length;
+    size_t version_length;
+    if (version < input.data || version > input.data + request_line_end) {
+      return FTUN_E_INVALID;
+    }
+    version_length = request_line_end - (size_t)(version - input.data);
+    status = ftun_http_append(output, capacity, &output_length,
+      version, version_length + 2u);
+  }
+  cursor = request_line_end + 2u;
+  while (status == FTUN_OK && cursor + 1u < request->header_bytes) {
+    size_t end = ftun_http_find_crlf(input.data, cursor,
+                                     request->header_bytes);
+    size_t colon = cursor;
+    bool drop;
+    if (end == SIZE_MAX) return FTUN_E_INVALID;
+    if (end == cursor) {
+      status = ftun_http_append(output, capacity, &output_length,
+        input.data + cursor, 2u);
+      cursor += 2u;
+      break;
+    }
+    while (colon < end && input.data[colon] != (uint8_t)':') colon++;
+    if (colon == end) return FTUN_E_INVALID;
+    drop = ftun_http_equal_ci(input.data + cursor, colon - cursor,
+                              "Proxy-Authorization") ||
+           ftun_http_equal_ci(input.data + cursor, colon - cursor,
+                              "Proxy-Connection");
+    if (!drop) status = ftun_http_append(output, capacity, &output_length,
+      input.data + cursor, end + 2u - cursor);
+    cursor = end + 2u;
+  }
+  if (status != FTUN_OK || cursor != request->header_bytes) return status;
+  *written = output_length;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_http_decode(ftun_bytes_t input, ftun_protocol_result_t *out)
 {
   ftun_http_request_t request;

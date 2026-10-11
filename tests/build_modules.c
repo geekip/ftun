@@ -73,10 +73,14 @@ int main(void)
   ftun_diagnostic_t diagnostic;
   size_t left, right;
   int expect_dns = 0;
+  int expect_fakeip = 0;
   int expect_tun = 0;
   int expect_frs = 0;
 #if defined(FTUN_EXPECT_DNS)
   expect_dns = 1;
+#endif
+#if defined(FTUN_EXPECT_FAKEIP)
+  expect_fakeip = 1;
 #endif
 #if defined(FTUN_EXPECT_TUN)
   expect_tun = 1;
@@ -88,7 +92,7 @@ int main(void)
   CHECK((capabilities->builtins & FTUN_BUILD_MODULE_CORE) != 0u);
   CHECK(has_name(capabilities, "core"));
   CHECK(capabilities->name_count ==
-        (size_t)(1 + expect_dns + expect_tun + expect_frs));
+        (size_t)(1 + expect_dns + expect_fakeip + expect_tun + expect_frs));
   for (left = 0; left < capabilities->name_count; left++) {
     CHECK(capabilities->names[left] != NULL && capabilities->names[left][0] != '\0');
     for (right = left + 1; right < capabilities->name_count; right++) {
@@ -96,6 +100,8 @@ int main(void)
     }
   }
   CHECK(check_module(capabilities, FTUN_BUILD_MODULE_DNS, "dns", expect_dns) == 0);
+  CHECK(check_module(capabilities, FTUN_BUILD_MODULE_FAKEIP, "fakeip",
+                     expect_fakeip) == 0);
   CHECK(check_module(capabilities, FTUN_BUILD_MODULE_TUN, "tun", expect_tun) == 0);
   CHECK(check_module(capabilities, FTUN_BUILD_MODULE_FRS, "frs", expect_frs) == 0);
   CHECK(ftun_build_require_modules(FTUN_BUILD_MODULE_CORE, &diagnostic) == FTUN_OK);
@@ -104,6 +110,10 @@ int main(void)
   CHECK(diagnostic.message.data != NULL && diagnostic.message.length > 0u);
   CHECK(check_config_capability("{\"dns\":{\"enable\":false}}", 1) == 0);
   CHECK(check_config_capability("{}", expect_dns) == 0);
+  CHECK(check_config_capability(
+    "{\"dns\":{\"servers\":[{\"name\":\"f\",\"type\":\"udp\","
+    "\"address\":[\"192.0.2.53\"],\"fake-ip\":true}],"
+    "\"default-server\":\"f\"}}", expect_dns && expect_fakeip) == 0);
   CHECK(check_config_capability(
     "{\"dns\":{\"enable\":false},\"inbounds\":[{\"name\":\"t\","
     "\"type\":\"tun\",\"interface\":{\"name\":\"t0\"},"

@@ -1,10 +1,7 @@
 #define _GNU_SOURCE 1
 #include "route.h"
+#include "uapi.h"
 #include <errno.h>
-#include <linux/fib_rules.h>
-#include <linux/if_addr.h>
-#include <linux/netlink.h>
-#include <linux/rtnetlink.h>
 #include <net/if.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -31,8 +28,8 @@ struct ftun_route_transaction {
 };
 
 typedef struct {
-  struct nlmsghdr header;
-  uint8_t body[FTUN_NETLINK_MESSAGE_BYTES - sizeof(struct nlmsghdr)];
+  struct ftun_nlmsghdr header;
+  uint8_t body[FTUN_NETLINK_MESSAGE_BYTES - sizeof(struct ftun_nlmsghdr)];
 } ftun_netlink_message_t;
 
 static ftun_status_t ftun_linux_route_errno(int error_code, bool removing)
@@ -89,10 +86,10 @@ static int ftun_route_policy_valid(const ftun_route_policy_t *policy)
       ftun_route_names_equal(policy->tun_interface, policy->lan_interface) ||
       (!policy->manage_local && policy->lan_interface.length == 0u) ||
       policy->tun_prefix_length == 0u || policy->tun_prefix_length > 32u ||
-      policy->route_table == RT_TABLE_UNSPEC ||
-      policy->route_table == RT_TABLE_DEFAULT ||
-      policy->route_table == RT_TABLE_MAIN ||
-      policy->route_table == RT_TABLE_LOCAL ||
+      policy->route_table == FTUN_RT_TABLE_UNSPEC ||
+      policy->route_table == FTUN_RT_TABLE_DEFAULT ||
+      policy->route_table == FTUN_RT_TABLE_MAIN ||
+      policy->route_table == FTUN_RT_TABLE_LOCAL ||
       policy->rule_priority == 0u ||
       policy->rule_priority > UINT32_MAX - 2u ||
       policy->protection_mark == 0u || policy->protection_mark_mask == 0u ||
@@ -135,7 +132,7 @@ static int ftun_route_build(const ftun_route_policy_t *policy,
 
   resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_MARK_RULE, AF_INET);
   if (resource == NULL) return 0;
-  resource->table = RT_TABLE_MAIN;
+  resource->table = FTUN_RT_TABLE_MAIN;
   resource->priority = policy->rule_priority;
   resource->mark = policy->protection_mark;
   resource->mark_mask = policy->protection_mark_mask;
@@ -179,19 +176,20 @@ static int ftun_route_build(const ftun_route_policy_t *policy,
   return 1;
 }
 
-static int ftun_netlink_add_attribute(struct nlmsghdr *header, size_t capacity,
+static int ftun_netlink_add_attribute(struct ftun_nlmsghdr *header,
+                                      size_t capacity,
                                       uint16_t type, const void *data,
                                       size_t length)
 {
-  size_t offset = NLMSG_ALIGN(header->nlmsg_len);
-  size_t attribute_length = RTA_LENGTH(length);
-  size_t total = offset + RTA_ALIGN(attribute_length);
-  struct rtattr *attribute;
+  size_t offset = FTUN_NLMSG_ALIGN(header->nlmsg_len);
+  size_t attribute_length = FTUN_RTA_LENGTH(length);
+  size_t total = offset + FTUN_RTA_ALIGN(attribute_length);
+  struct ftun_rtattr *attribute;
   if (total > capacity || attribute_length > UINT16_MAX) return 0;
-  attribute = (struct rtattr *)((uint8_t *)header + offset);
+  attribute = (struct ftun_rtattr *)((uint8_t *)header + offset);
   attribute->rta_type = type;
   attribute->rta_len = (uint16_t)attribute_length;
-  if (length != 0u) memcpy(RTA_DATA(attribute), data, length);
+  if (length != 0u) memcpy(FTUN_RTA_DATA(attribute), data, length);
   header->nlmsg_len = (uint32_t)total;
   return 1;
 }
@@ -200,22 +198,24 @@ static ftun_status_t ftun_netlink_address(ftun_netlink_message_t *message,
                                           const ftun_linux_route_resource_t *resource,
                                           bool add)
 {
-  struct ifaddrmsg *address;
+  struct ftun_ifaddrmsg *address;
   unsigned int interface_index = if_nametoindex(resource->interface_name);
   if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
-  message->header.nlmsg_type = add ? RTM_NEWADDR : RTM_DELADDR;
-  message->header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-  if (add) message->header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
-  message->header.nlmsg_len = NLMSG_LENGTH(sizeof(*address));
-  address = (struct ifaddrmsg *)NLMSG_DATA(&message->header);
+  message->header.nlmsg_type = add ? FTUN_RTM_NEWADDR : FTUN_RTM_DELADDR;
+  message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
+  if (add) message->header.nlmsg_flags |= FTUN_NLM_F_CREATE | FTUN_NLM_F_EXCL;
+  message->header.nlmsg_len = FTUN_NLMSG_LENGTH(sizeof(*address));
+  address = (struct ftun_ifaddrmsg *)FTUN_NLMSG_DATA(&message->header);
   memset(address, 0, sizeof(*address));
   address->ifa_family = AF_INET;
   address->ifa_prefixlen = resource->prefix_length;
-  address->ifa_scope = RT_SCOPE_UNIVERSE;
+  address->ifa_scope = FTUN_RT_SCOPE_UNIVERSE;
   address->ifa_index = interface_index;
-  if (!ftun_netlink_add_attribute(&message->header, sizeof(*message), IFA_LOCAL,
+  if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_IFA_LOCAL,
                                   resource->address, 4u) ||
-      !ftun_netlink_add_attribute(&message->header, sizeof(*message), IFA_ADDRESS,
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_IFA_ADDRESS,
                                   resource->address, 4u)) return FTUN_E_LIMIT;
   return FTUN_OK;
 }
@@ -224,40 +224,44 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                                        const ftun_linux_route_resource_t *resource,
                                        bool add)
 {
-  struct fib_rule_hdr *rule;
+  struct ftun_fib_rule_hdr *rule;
   uint8_t table_byte;
-  message->header.nlmsg_type = add ? RTM_NEWRULE : RTM_DELRULE;
-  message->header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-  if (add) message->header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
-  message->header.nlmsg_len = NLMSG_LENGTH(sizeof(*rule));
-  rule = (struct fib_rule_hdr *)NLMSG_DATA(&message->header);
+  message->header.nlmsg_type = add ? FTUN_RTM_NEWRULE : FTUN_RTM_DELRULE;
+  message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
+  if (add) message->header.nlmsg_flags |= FTUN_NLM_F_CREATE | FTUN_NLM_F_EXCL;
+  message->header.nlmsg_len = FTUN_NLMSG_LENGTH(sizeof(*rule));
+  rule = (struct ftun_fib_rule_hdr *)FTUN_NLMSG_DATA(&message->header);
   memset(rule, 0, sizeof(*rule));
   rule->family = (uint8_t)resource->family;
   rule->action = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
-                 FR_ACT_UNREACHABLE : FR_ACT_TO_TBL;
+                 FTUN_FR_ACT_UNREACHABLE : FTUN_FR_ACT_TO_TBL;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
-               (uint8_t)RT_TABLE_UNSPEC;
+               (uint8_t)FTUN_RT_TABLE_UNSPEC;
   rule->table = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
-                (uint8_t)RT_TABLE_UNSPEC : table_byte;
+                (uint8_t)FTUN_RT_TABLE_UNSPEC : table_byte;
   if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
-                                  FRA_PRIORITY, &resource->priority,
+                                  FTUN_FRA_PRIORITY, &resource->priority,
                                   sizeof(resource->priority)) ||
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
-                                  FRA_PROTOCOL, &resource->protocol,
+                                  FTUN_FRA_PROTOCOL, &resource->protocol,
                                   sizeof(resource->protocol))) return FTUN_E_LIMIT;
   if (resource->kind != FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
-      !ftun_netlink_add_attribute(&message->header, sizeof(*message), FRA_TABLE,
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_FRA_TABLE,
                                   &resource->table,
                                   sizeof(resource->table))) return FTUN_E_LIMIT;
   if (resource->kind == FTUN_LINUX_ROUTE_MARK_RULE &&
-      (!ftun_netlink_add_attribute(&message->header, sizeof(*message), FRA_FWMARK,
+      (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                   FTUN_FRA_FWMARK,
                                    &resource->mark, sizeof(resource->mark)) ||
-       !ftun_netlink_add_attribute(&message->header, sizeof(*message), FRA_FWMASK,
+       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                   FTUN_FRA_FWMASK,
                                    &resource->mark_mask,
                                    sizeof(resource->mark_mask)))) return FTUN_E_LIMIT;
   if ((resource->kind == FTUN_LINUX_ROUTE_CAPTURE_RULE ||
        resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6) &&
-      !ftun_netlink_add_attribute(&message->header, sizeof(*message), FRA_IIFNAME,
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_FRA_IIFNAME,
                                   resource->interface_name,
                                   strlen(resource->interface_name) + 1u)) {
     return FTUN_E_LIMIT;
@@ -269,26 +273,28 @@ static ftun_status_t ftun_netlink_default_route(
   ftun_netlink_message_t *message,
   const ftun_linux_route_resource_t *resource, bool add)
 {
-  struct rtmsg *route;
+  struct ftun_rtmsg *route;
   unsigned int interface_index = if_nametoindex(resource->interface_name);
   uint8_t table_byte;
   if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
-  message->header.nlmsg_type = add ? RTM_NEWROUTE : RTM_DELROUTE;
-  message->header.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK;
-  if (add) message->header.nlmsg_flags |= NLM_F_CREATE | NLM_F_EXCL;
-  message->header.nlmsg_len = NLMSG_LENGTH(sizeof(*route));
-  route = (struct rtmsg *)NLMSG_DATA(&message->header);
+  message->header.nlmsg_type = add ? FTUN_RTM_NEWROUTE : FTUN_RTM_DELROUTE;
+  message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
+  if (add) message->header.nlmsg_flags |= FTUN_NLM_F_CREATE | FTUN_NLM_F_EXCL;
+  message->header.nlmsg_len = FTUN_NLMSG_LENGTH(sizeof(*route));
+  route = (struct ftun_rtmsg *)FTUN_NLMSG_DATA(&message->header);
   memset(route, 0, sizeof(*route));
   route->rtm_family = AF_INET;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
-               (uint8_t)RT_TABLE_UNSPEC;
+               (uint8_t)FTUN_RT_TABLE_UNSPEC;
   route->rtm_table = table_byte;
   route->rtm_protocol = resource->protocol;
-  route->rtm_scope = RT_SCOPE_LINK;
-  route->rtm_type = RTN_UNICAST;
-  if (!ftun_netlink_add_attribute(&message->header, sizeof(*message), RTA_TABLE,
+  route->rtm_scope = FTUN_RT_SCOPE_LINK;
+  route->rtm_type = FTUN_RTN_UNICAST;
+  if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_RTA_TABLE,
                                   &resource->table, sizeof(resource->table)) ||
-      !ftun_netlink_add_attribute(&message->header, sizeof(*message), RTA_OIF,
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_RTA_OIF,
                                   &interface_index,
                                   sizeof(interface_index))) return FTUN_E_LIMIT;
   return FTUN_OK;
@@ -312,14 +318,15 @@ static ftun_status_t ftun_netlink_build(ftun_netlink_message_t *message,
 static ftun_status_t ftun_netlink_exchange(ftun_netlink_message_t *message,
                                            bool removing)
 {
-  struct sockaddr_nl address;
+  struct ftun_sockaddr_nl address;
   struct timeval timeout;
   uint8_t response[FTUN_NETLINK_MESSAGE_BYTES];
-  struct nlmsghdr *header;
+  struct ftun_nlmsghdr *header;
   ssize_t result;
   int descriptor;
   int error_code;
-  descriptor = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+  descriptor = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC,
+                      FTUN_NETLINK_ROUTE);
   if (descriptor < 0) return ftun_linux_route_errno(errno, removing);
   memset(&address, 0, sizeof(address));
   address.nl_family = AF_NETLINK;
@@ -354,12 +361,15 @@ static ftun_status_t ftun_netlink_exchange(ftun_netlink_message_t *message,
     return ftun_linux_route_errno(error_code, removing);
   }
   (void)close(descriptor);
-  for (header = (struct nlmsghdr *)response;
-       NLMSG_OK(header, (unsigned int)result);
-       header = NLMSG_NEXT(header, result)) {
-    if (header->nlmsg_seq == 1u && header->nlmsg_type == NLMSG_ERROR) {
-      const struct nlmsgerr *error = (const struct nlmsgerr *)NLMSG_DATA(header);
-      if (header->nlmsg_len < NLMSG_LENGTH(sizeof(*error))) return FTUN_E_IO;
+  for (header = (struct ftun_nlmsghdr *)response;
+       FTUN_NLMSG_OK(header, result);
+       header = FTUN_NLMSG_NEXT(header, result)) {
+    if (header->nlmsg_seq == 1u && header->nlmsg_type == FTUN_NLMSG_ERROR) {
+      const struct ftun_nlmsgerr *error =
+        (const struct ftun_nlmsgerr *)FTUN_NLMSG_DATA(header);
+      if (header->nlmsg_len < FTUN_NLMSG_LENGTH(sizeof(*error))) {
+        return FTUN_E_IO;
+      }
       return error->error == 0 ? FTUN_OK :
              ftun_linux_route_errno(-error->error, removing);
     }

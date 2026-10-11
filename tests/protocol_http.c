@@ -19,6 +19,8 @@ int main(void)
 {
   ftun_http_request_t request;
   ftun_protocol_result_t generic;
+  uint8_t rewritten[512];
+  size_t rewritten_length = 0u;
   size_t consumed = 99u;
   const char *forward =
     "GET http://Example.com:80/a?q=1 HTTP/1.1\r\n"
@@ -35,6 +37,24 @@ int main(void)
   CHECK(consumed + 3u == strlen(forward));
   CHECK(ftun_http_decode(bytes(forward), &generic) == FTUN_OK);
   CHECK(generic.complete && generic.consumed == consumed);
+  CHECK(ftun_http_rewrite_forward(bytes(forward), &request, rewritten,
+        sizeof(rewritten), &rewritten_length) == FTUN_OK);
+  CHECK(rewritten_length == strlen(
+    "GET /a?q=1 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\n"));
+  CHECK(memcmp(rewritten,
+    "GET /a?q=1 HTTP/1.1\r\nHost: example.com\r\nContent-Length: 3\r\n\r\n",
+    rewritten_length) == 0);
+  CHECK(ftun_http_decode_request(bytes(
+    "GET http://a?x=1 HTTP/1.1\r\nHost: a\r\n"
+    "Proxy-Authorization: Basic dTpw\r\nProxy-Connection: keep-alive\r\n\r\n"),
+    &request, &consumed) == FTUN_OK);
+  CHECK(ftun_http_rewrite_forward(bytes(
+    "GET http://a?x=1 HTTP/1.1\r\nHost: a\r\n"
+    "Proxy-Authorization: Basic dTpw\r\nProxy-Connection: keep-alive\r\n\r\n"),
+    &request, rewritten, sizeof(rewritten), &rewritten_length) == FTUN_OK);
+  CHECK(rewritten_length == strlen("GET /?x=1 HTTP/1.1\r\nHost: a\r\n\r\n"));
+  CHECK(memcmp(rewritten, "GET /?x=1 HTTP/1.1\r\nHost: a\r\n\r\n",
+               rewritten_length) == 0);
   CHECK(ftun_http_decode_request(bytes(connect), &request, &consumed) == FTUN_OK);
   CHECK(request.kind == FTUN_HTTP_PROXY_CONNECT && request.target.port == 443u);
   CHECK(consumed + 3u == strlen(connect));

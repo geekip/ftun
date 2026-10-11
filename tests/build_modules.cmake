@@ -23,7 +23,8 @@ file(REMOVE_RECURSE "${FTUN_MATRIX_DIR}")
 
 set(core_dir "${FTUN_MATRIX_DIR}/core")
 ftun_configure(result output "${core_dir}"
-  -DFTUN_MODULE_DNS=OFF -DFTUN_MODULE_TUN=OFF -DFTUN_MODULE_FRS=OFF)
+  -DFTUN_MODULE_DNS=OFF -DFTUN_MODULE_FAKEIP=OFF
+  -DFTUN_MODULE_TUN=OFF -DFTUN_MODULE_FRS=OFF)
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "core-only configure failed:\n${output}")
 endif()
@@ -40,8 +41,10 @@ endif()
 file(READ "${core_dir}/compile_commands.json" core_commands)
 foreach(source
     src/dns/dns.c src/dns/server.c src/dns/listener.c src/dns/bootstrap.c
-    src/dns/cache.c src/dns/wire.c src/inbound/tun.c src/tun/tun.c
-    src/tun/lwip_adapter.c src/tun/udp_session.c src/platform/linux/tun.c
+    src/dns/cache.c src/dns/wire.c src/dns/fakeip.c
+    src/state/fakeip_store.c src/state/snapshot.c
+    src/inbound/tun.c src/tun/tun.c
+    src/tun/lwip_adapter.c src/platform/linux/tun.c
     src/platform/linux/route.c src/frs/format.c src/frs/frs.c src/frs/ip.c
     src/frs/domain.c src/frs/update.c)
   string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
@@ -55,20 +58,23 @@ if(NOT lwip_found EQUAL -1)
   message(FATAL_ERROR "TUN-only lwIP entered core-only build")
 endif()
 foreach(source src/dns/resolver.c src/platform/system_resolver.c
-               src/transport/datagram.c src/protocol/socks5.c)
+               src/transport/datagram.c src/protocol/socks5.c
+               src/tun/udp_session.c)
   string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
   if(found EQUAL -1)
     message(FATAL_ERROR "required core source is missing: ${source}")
   endif()
 endforeach()
 file(READ "${core_dir}/ftun-build-modules.txt" manifest)
-if(NOT manifest STREQUAL "core=BUILTIN\ndns=OFF\ntun=OFF\nfrs=OFF\n")
+if(NOT manifest STREQUAL
+   "core=BUILTIN\ndns=OFF\nfakeip=OFF\ntun=OFF\nfrs=OFF\n")
   message(FATAL_ERROR "unexpected core-only manifest:\n${manifest}")
 endif()
 
 set(builtin_dir "${FTUN_MATRIX_DIR}/builtin")
 ftun_configure(result output "${builtin_dir}"
-  -DFTUN_MODULE_DNS=BUILTIN -DFTUN_MODULE_TUN=BUILTIN
+  -DFTUN_MODULE_DNS=BUILTIN -DFTUN_MODULE_FAKEIP=BUILTIN
+  -DFTUN_MODULE_TUN=BUILTIN
   -DFTUN_MODULE_FRS=BUILTIN)
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "builtin configure failed:\n${output}")
@@ -84,7 +90,9 @@ if(NOT result EQUAL 0)
   message(FATAL_ERROR "builtin capability check failed:\n${output}\n${error}")
 endif()
 file(READ "${builtin_dir}/compile_commands.json" builtin_commands)
-foreach(source src/dns/dns.c src/dns/wire.c src/inbound/tun.c src/tun/lwip_adapter.c
+foreach(source src/dns/dns.c src/dns/wire.c src/dns/fakeip.c
+               src/state/fakeip_store.c src/state/snapshot.c
+               src/inbound/tun.c src/tun/lwip_adapter.c
                src/frs/format.c src/frs/frs.c src/frs/ip.c src/frs/domain.c
                src/frs/update.c)
   string(FIND "${builtin_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
@@ -99,13 +107,63 @@ if(lwip_found EQUAL -1)
 endif()
 file(READ "${builtin_dir}/ftun-build-modules.txt" manifest)
 if(NOT manifest STREQUAL
-   "core=BUILTIN\ndns=BUILTIN\ntun=BUILTIN\nfrs=BUILTIN\n")
+   "core=BUILTIN\ndns=BUILTIN\nfakeip=BUILTIN\ntun=BUILTIN\nfrs=BUILTIN\n")
   message(FATAL_ERROR "unexpected builtin manifest:\n${manifest}")
+endif()
+
+function(ftun_check_variant name dns fakeip tun frs excluded_source)
+  set(build_dir "${FTUN_MATRIX_DIR}/${name}")
+  ftun_configure(result output "${build_dir}"
+    -DFTUN_MODULE_DNS=${dns} -DFTUN_MODULE_FAKEIP=${fakeip}
+    -DFTUN_MODULE_TUN=${tun} -DFTUN_MODULE_FRS=${frs})
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "${name} configure failed:\n${output}")
+  endif()
+  execute_process(
+    COMMAND "${CMAKE_COMMAND}" --build "${build_dir}"
+      --target ftun-build-modules-test
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "${name} build failed:\n${output}\n${error}")
+  endif()
+  execute_process(COMMAND "${build_dir}/ftun-build-modules-test"
+    RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+  if(NOT result EQUAL 0)
+    message(FATAL_ERROR "${name} capability check failed:\n${output}\n${error}")
+  endif()
+  file(READ "${build_dir}/compile_commands.json" commands)
+  string(FIND "${commands}" "${FTUN_SOURCE_DIR}/${excluded_source}" found)
+  if(NOT found EQUAL -1)
+    message(FATAL_ERROR "${name} retained disabled source: ${excluded_source}")
+  endif()
+  foreach(source src/inbound/socks5.c src/protocol/socks5.c
+                 src/transport/datagram.c src/platform/system_resolver.c)
+    string(FIND "${commands}" "${FTUN_SOURCE_DIR}/${source}" found)
+    if(found EQUAL -1)
+      message(FATAL_ERROR "${name} lost core SOCKS/SystemResolver source: ${source}")
+    endif()
+  endforeach()
+endfunction()
+
+# Each shipped optional capability has an independently verified legal OFF
+# profile. DNS OFF also turns off its dependent FakeIP capability.
+ftun_check_variant(no-tun BUILTIN BUILTIN OFF BUILTIN src/inbound/tun.c)
+ftun_check_variant(no-dns OFF OFF BUILTIN BUILTIN src/dns/dns.c)
+ftun_check_variant(no-fakeip BUILTIN OFF BUILTIN BUILTIN src/dns/fakeip.c)
+ftun_check_variant(no-frs BUILTIN BUILTIN BUILTIN OFF src/frs/frs.c)
+
+set(fakeip_dependency_dir "${FTUN_MATRIX_DIR}/illegal-fakeip-dependency")
+ftun_configure(result output "${fakeip_dependency_dir}"
+  -DFTUN_MODULE_DNS=OFF -DFTUN_MODULE_FAKEIP=BUILTIN
+  -DFTUN_MODULE_TUN=OFF -DFTUN_MODULE_FRS=OFF)
+if(result EQUAL 0 OR NOT output MATCHES "requires FTUN_MODULE_DNS=BUILTIN")
+  message(FATAL_ERROR "illegal FakeIP dependency was not rejected:\n${output}")
 endif()
 
 set(dynamic_dir "${FTUN_MATRIX_DIR}/dynamic")
 ftun_configure(result output "${dynamic_dir}"
-  -DFTUN_MODULE_DNS=MODULE -DFTUN_MODULE_TUN=OFF -DFTUN_MODULE_FRS=OFF)
+  -DFTUN_MODULE_DNS=MODULE -DFTUN_MODULE_FAKEIP=OFF
+  -DFTUN_MODULE_TUN=OFF -DFTUN_MODULE_FRS=OFF)
 if(result EQUAL 0 OR NOT output MATCHES "must be OFF or BUILTIN")
   message(FATAL_ERROR "dynamic module mode was not explicitly rejected:\n${output}")
 endif()
@@ -119,6 +177,7 @@ execute_process(
     -DFTUN_SECTION_GC=OFF
     -DBUILD_TESTING=OFF
     -DFTUN_MODULE_DNS=OFF
+    -DFTUN_MODULE_FAKEIP=OFF
     -DFTUN_MODULE_TUN=BUILTIN
     -DFTUN_MODULE_FRS=OFF
   RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
@@ -135,6 +194,7 @@ execute_process(
     -DFTUN_SECTION_GC=OFF
     -DBUILD_TESTING=OFF
     -DFTUN_MODULE_DNS=OFF
+    -DFTUN_MODULE_FAKEIP=OFF
     -DFTUN_MODULE_TUN=OFF
     -DFTUN_MODULE_FRS=BUILTIN
   RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)

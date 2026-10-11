@@ -1,0 +1,68 @@
+{
+  "schema": "ftun.third-party-lock/v1",
+  "status": "locked-and-reviewed",
+  "offline_build": true,
+  "target_abi": "linux-x86_64-musl",
+  "dependencies": [
+    {
+      "name": "libev",
+      "version": "4.33",
+      "source": "https://dist.schmorp.de/libev/libev-4.33.tar.gz",
+      "archive_sha256": "507eb7b8d1015fbec5b935f34ebed15bf346bed04a11ab82b8eee848c4205aea",
+      "path": "third_party/libev",
+      "metadata": "third_party/libev/FTUN-UPSTREAM.json",
+      "license": "BSD-2-Clause",
+      "license_file": "third_party/libev/LICENSE",
+      "license_sha256": "c4dd1a5bc38b041a320b93c5d6c08f5c41a63f2ce718ee16cfcb757fad448199",
+      "local_patches": [],
+      "build_boundary": "single static ev.c; epoll only; threads enabled"
+    },
+    {
+      "name": "cJSON",
+      "version": "1.7.19",
+      "revision": "c859b25da02955fef659d658b8f324b5cde87be3",
+      "source": "https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.19.tar.gz",
+      "archive_sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
+      "path": "third_party/cjson",
+      "metadata": "third_party/cjson/FTUN-UPSTREAM.json",
+      "license": "MIT",
+      "license_file": "third_party/cjson/LICENSE",
+      "license_sha256": "a36dda207c36db5818729c54e7ad4e8b0c6fba847491ba64f372c1a2037b6d5c",
+      "local_patches": [],
+      "build_boundary": "cJSON.c only; nesting limit 32"
+    },
+    {
+      "name": "heiher/lwIP",
+      "revision": "150d2b1a2658612741b4ac002578d440e7874540",
+      "source": "https://github.com/heiher/lwip/archive/150d2b1a2658612741b4ac002578d440e7874540.tar.gz",
+      "archive_sha256": "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416",
+      "vendored_tree_sha256": "beaa0b74d1660d0997a2f79e0918ecddd2b1c9548ced43ece8da83869d988eba",
+      "path": "third_party/lwip",
+      "metadata": "third_party/lwip/FTUN-UPSTREAM.json",
+      "license": "BSD-3-Clause",
+      "license_file": "third_party/lwip/LICENSE",
+      "license_sha256": "ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b",
+      "local_patches": [
+        {
+          "path": "third_party/lwip/patches/0001-ipv4-only-pretend-udp.patch",
+          "sha256": "5e3663e11424b874e284bb2a1c6d9b1bdd2a11985125eb49398536d874297f59"
+        }
+      ],
+      "build_boundary": "static raw IPv4 core; no socket, app, netif or OS-port sources"
+    },
+    {
+      "name": "wolfSSL",
+      "version": "5.8.4",
+      "tag": "v5.8.4-stable",
+      "revision": "59f4fa568615396fbf381b073b220d1e8d61e4c2",
+      "source": "https://github.com/wolfSSL/wolfssl.git",
+      "path": "third_party/wolfssl",
+      "source_form": "git-submodule",
+      "license": "GPL-3.0-only OR commercial",
+      "license_file": "third_party/wolfssl/COPYING",
+      "license_sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903",
+      "local_patches": [],
+      "build_boundary": "static client library; TLS 1.3 and SNI; no DTLS, obsolete TLS, examples, tests or install"
+    }
+  ]
+}

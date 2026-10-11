@@ -41,7 +41,7 @@ static int ftun_dial_transport_valid(ftun_dial_transport_t transport)
 static int ftun_dial_purpose_valid(ftun_dial_purpose_t purpose)
 {
   return purpose >= FTUN_DIAL_PURPOSE_BUSINESS &&
-         purpose <= FTUN_DIAL_PURPOSE_GEO_UPDATE;
+         purpose <= FTUN_DIAL_PURPOSE_FRS_UPDATE;
 }
 
 static int ftun_dial_io_valid(const ftun_dial_io_t *io)

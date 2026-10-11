@@ -1,6 +1,6 @@
 #include "platform/linux/route.h"
 #include "platform/linux/tun.h"
-#include <linux/rtnetlink.h>
+#include "platform/linux/uapi.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -93,7 +93,7 @@ static int check_resource_plan(const route_mock_t *mock)
         mock->applied[0].address[0] == 10u &&
         mock->applied[0].prefix_length == 30u);
   CHECK(mock->applied[1].kind == FTUN_LINUX_ROUTE_MARK_RULE &&
-        mock->applied[1].table == RT_TABLE_MAIN &&
+        mock->applied[1].table == FTUN_RT_TABLE_MAIN &&
         mock->applied[1].priority == 12340u &&
         mock->applied[1].mark == UINT32_C(0x46000001) &&
         mock->applied[1].mark_mask == UINT32_MAX);
@@ -244,7 +244,7 @@ int main(int argc, char **argv)
   CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID && transaction == NULL);
   policy = route_policy(false, false);
-  policy.route_table = RT_TABLE_MAIN;
+  policy.route_table = FTUN_RT_TABLE_MAIN;
   CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);

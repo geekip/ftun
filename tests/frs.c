@@ -26,7 +26,7 @@ static ftun_string_t text(const char *value)
   return result;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
   uint8_t *fixture = NULL;
   size_t fixture_bytes = 0u;
@@ -44,6 +44,13 @@ int main(void)
   ftun_core_t *core = NULL;
   ftun_frs_view_t *mapped = NULL;
   ftun_frs_view_t *read_view = NULL;
+  if (argc == 3 && strcmp(argv[1], "--write") == 0) {
+    CHECK(ftun_test_frs_fixture(&fixture, &fixture_bytes));
+    CHECK(ftun_test_write_file(argv[2], fixture, fixture_bytes));
+    free(fixture);
+    return 0;
+  }
+  CHECK(argc == 1);
   CHECK(ftun_test_frs_fixture(&fixture, &fixture_bytes));
   CHECK(ftun_frs_xxh64((ftun_bytes_t){NULL, 0u}, 0u) ==
         UINT64_C(0xef46db3751d8e999));

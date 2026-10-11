@@ -1,0 +1,28 @@
+{
+  "base": {
+    "state-cache": false
+  },
+  "log": {
+    "level": "silent"
+  },
+  "dns": {
+    "enable": false
+  },
+  "inbounds": [
+    {
+      "name": "socks",
+      "type": "socks5",
+      "listen": "127.0.0.1:21081",
+      "udp": true
+    },
+    {
+      "name": "mixed",
+      "type": "mixed",
+      "listen": "127.0.0.1:21082",
+      "udp": true
+    }
+  ],
+  "rules": [
+    "MATCH,DIRECT"
+  ]
+}

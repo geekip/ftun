@@ -758,6 +758,15 @@ ftun_status_t ftun_lwip_tick(ftun_lwip_t *stack, uint64_t now_ms)
   return stack->corrupt ? FTUN_E_STATE_CORRUPT : FTUN_OK;
 }
 
+ftun_status_t ftun_lwip_set_packet_source(ftun_lwip_t *stack,
+                                          uint32_t packet_source_id)
+{
+  if (stack == NULL || stack != ftun_lwip_active || packet_source_id == 0u ||
+      stack->destroying || stack->corrupt) return FTUN_E_INVALID;
+  stack->packet_source_id = packet_source_id;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_lwip_get_usage(const ftun_lwip_t *stack,
                                   ftun_lwip_usage_t *out)
 {

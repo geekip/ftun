@@ -15,10 +15,14 @@ typedef ftun_status_t (*ftun_udp_flow_open_fn)(
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out);
 typedef ftun_status_t (*ftun_udp_flow_inbound_fn)(
   void *user, const ftun_metadata_t *metadata, ftun_datagram_t **out);
+typedef ftun_status_t (*ftun_udp_flow_reply_fn)(
+  void *user, ftun_datagram_t *inbound, const ftun_metadata_t *metadata,
+  const ftun_endpoint_t *source, const ftun_packet_t *packet);
 
 typedef struct {
   ftun_udp_flow_open_fn open;
   ftun_udp_flow_inbound_fn inbound;
+  ftun_udp_flow_reply_fn reply;
   void *user;
 } ftun_udp_flow_backend_t;
 
@@ -61,6 +65,8 @@ ftun_status_t ftun_udp_flow_input_on(ftun_udp_flow_table_t *table,
                                      ftun_packet_t *packet);
 ftun_status_t ftun_udp_flow_tick(ftun_udp_flow_table_t *table,
                                  uint64_t now_ms);
+ftun_status_t ftun_udp_flow_close_inbound(ftun_udp_flow_table_t *table,
+                                          ftun_datagram_t *inbound);
 ftun_status_t ftun_udp_flow_get_usage(const ftun_udp_flow_table_t *table,
                                       ftun_udp_flow_usage_t *out);
 ftun_status_t ftun_udp_flow_table_destroy(ftun_udp_flow_table_t **table);

@@ -21,6 +21,7 @@ struct ftun_mixed_connection {
   ftun_mixed_state_t state;
   ftun_socks5_server_t *socks5;
   uint8_t http_buffer[FTUN_HTTP_MAX_HEADER_BYTES];
+  uint8_t http_wire[FTUN_HTTP_MAX_HEADER_BYTES];
   size_t http_length;
   size_t http_header_bytes;
   size_t http_preread_body;
@@ -227,6 +228,7 @@ ftun_status_t ftun_mixed_connection_feed(ftun_mixed_connection_t *connection,
     size_t header = 0u;
     size_t body_available;
     size_t body_preread;
+    size_t wire_header = 0u;
     bool requires_auth = false;
     if (input.length > sizeof(connection->http_buffer) -
                        connection->http_length) return FTUN_E_LIMIT;
@@ -266,11 +268,25 @@ ftun_status_t ftun_mixed_connection_feed(ftun_mixed_connection_t *connection,
     }
     connection->http_header_bytes = header;
     connection->http_preread_body = body_preread;
+    if (connection->request.kind == FTUN_HTTP_PROXY_FORWARD) {
+      status = ftun_http_rewrite_forward(buffered, &connection->request,
+        connection->http_wire, sizeof(connection->http_wire), &wire_header);
+      if (status != FTUN_OK || body_preread >
+          sizeof(connection->http_wire) - wire_header) {
+        return status != FTUN_OK ? status : FTUN_E_LIMIT;
+      }
+      if (body_preread != 0u) {
+        memcpy(connection->http_wire + wire_header,
+               connection->http_buffer + header, body_preread);
+      }
+    }
     connection->state = FTUN_MIXED_HTTP_WAIT;
     event->kind = FTUN_MIXED_EVENT_HTTP_REQUEST;
     event->http = connection->request;
-    event->wire.data = connection->http_buffer;
-    event->wire.length = header + body_preread;
+    event->wire.data = connection->request.kind == FTUN_HTTP_PROXY_FORWARD
+      ? connection->http_wire : connection->http_buffer;
+    event->wire.length = connection->request.kind == FTUN_HTTP_PROXY_FORWARD
+      ? wire_header + body_preread : header + body_preread;
     event->body_remaining = connection->request.has_content_length
       ? connection->request.content_length - body_preread : 0u;
     return FTUN_OK;

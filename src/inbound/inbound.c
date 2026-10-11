@@ -105,7 +105,7 @@ static ftun_status_t ftun_inbound_listener_unavailable(
   (void)context;
   (void)spec;
   if (out != NULL) *out = FTUN_INBOUND_INVALID_SOCKET;
-  return FTUN_E_NOT_IMPLEMENTED;
+  return FTUN_E_UNSUPPORTED;
 }
 
 static ftun_status_t ftun_inbound_listener_close(
@@ -153,7 +153,7 @@ static ftun_status_t ftun_inbound_stream_unavailable(
   (void)core;
   (void)kind;
   (void)stream;
-  return FTUN_E_NOT_IMPLEMENTED;
+  return FTUN_E_UNSUPPORTED;
 }
 
 static ftun_status_t ftun_inbound_packet_ingress_default(

@@ -1038,3 +1038,26 @@ ftun_status_t ftun_socks5_connection_close(
   *connection = NULL;
   return status;
 }
+
+ftun_status_t ftun_socks5_connection_take_tcp(
+  ftun_socks5_connection_t **connection, ftun_native_socket_t *out)
+{
+  ftun_socks5_connection_t *owned;
+  ftun_native_socket_t socket;
+  if (out != NULL) *out = FTUN_INVALID_SOCKET;
+  if (connection == NULL || out == NULL) return FTUN_E_INVALID;
+  owned = *connection;
+  if (owned == NULL || !owned->ready || owned->operation != NULL ||
+      owned->child != NULL || owned->io_source != NULL ||
+      owned->timer_source != NULL || owned->transport != FTUN_DIAL_TCP ||
+      owned->control_socket == FTUN_INVALID_SOCKET ||
+      owned->data_socket != owned->control_socket) return FTUN_E_AGAIN;
+  socket = owned->data_socket;
+  owned->data_socket = FTUN_INVALID_SOCKET;
+  owned->control_socket = FTUN_INVALID_SOCKET;
+  owned->ready = 0;
+  ftun_socks5_release_context(owned);
+  *connection = NULL;
+  *out = socket;
+  return FTUN_OK;
+}

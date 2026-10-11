@@ -1,9 +1,9 @@
 #define _GNU_SOURCE 1
 #include "tun.h"
+#include "uapi.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
+#include <net/if.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -211,8 +211,9 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
   memcpy(port->name, spec->name.data, spec->name.length);
   port->name[spec->name.length] = '\0';
   ftun_linux_ifreq_name(&request, port->name);
-  request.ifr_flags = (short)(IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL);
-  if (ftun_linux_ioctl(&port->io, port->descriptor, TUNSETIFF, &request,
+  request.ifr_flags = (short)(FTUN_IFF_TUN | FTUN_IFF_NO_PI |
+                              FTUN_IFF_TUN_EXCL);
+  if (ftun_linux_ioctl(&port->io, port->descriptor, FTUN_TUNSETIFF, &request,
                        &error_code) < 0) {
     status = ftun_linux_error_status(error_code);
     ftun_linux_close_ignored(&port->io, port->descriptor);

@@ -1,7 +1,7 @@
 #define _GNU_SOURCE 1
 #include "platform/linux/socket_protect.h"
 #include <limits.h>
-#include <linux/if.h>
+#include <net/if.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

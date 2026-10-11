@@ -430,7 +430,7 @@ static int test_all_purposes_protected(void)
 {
   int purpose;
   for (purpose = (int)FTUN_DIAL_PURPOSE_BUSINESS;
-       purpose <= (int)FTUN_DIAL_PURPOSE_GEO_UPDATE; purpose++) {
+       purpose <= (int)FTUN_DIAL_PURPOSE_FRS_UPDATE; purpose++) {
     fixture_t fixture;
     ftun_operation_t *operation = NULL;
     CHECK(fixture_start(&fixture, 16384u, 2u) == 0);

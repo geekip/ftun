@@ -35,6 +35,12 @@ ftun_status_t ftun_http_decode_request(ftun_bytes_t input,
                                        ftun_http_request_t *out,
                                        size_t *consumed);
 
+/* 将已校验的 absolute-form 正向代理请求改写为 origin-form，并移除只应在
+ * 客户端与代理之间出现的代理认证/连接头。body 不在本函数处理范围内。 */
+ftun_status_t ftun_http_rewrite_forward(
+  ftun_bytes_t input, const ftun_http_request_t *request,
+  uint8_t *output, size_t capacity, size_t *written);
+
 /* 保留统一协议入口，只导出完成、消费长度和目标。 */
 ftun_status_t ftun_http_decode(ftun_bytes_t input, ftun_protocol_result_t *out);
 

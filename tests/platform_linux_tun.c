@@ -1,9 +1,9 @@
 #define _GNU_SOURCE 1
 #include "platform/linux/tun.h"
+#include "platform/linux/uapi.h"
 #include <errno.h>
 #include <fcntl.h>
-#include <linux/if.h>
-#include <linux/if_tun.h>
+#include <net/if.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -103,7 +103,7 @@ static int mock_ioctl(void *context, int descriptor, unsigned long request,
   }
   state->requests[state->ioctl_calls] = request;
   state->ioctl_calls++;
-  if (request == TUNSETIFF) {
+  if (request == FTUN_TUNSETIFF) {
     stage = 2;
     state->tun_flags = interface_request->ifr_flags;
   } else if (request == SIOCSIFMTU) {
@@ -294,10 +294,12 @@ int main(int argc, char **argv)
   CHECK(state.control_domain == AF_INET &&
         (state.control_type & (SOCK_DGRAM | SOCK_CLOEXEC)) ==
         (SOCK_DGRAM | SOCK_CLOEXEC));
-  CHECK(state.requests[0] == TUNSETIFF && state.requests[1] == SIOCSIFMTU &&
+  CHECK(state.requests[0] == FTUN_TUNSETIFF &&
+        state.requests[1] == SIOCSIFMTU &&
         state.requests[2] == SIOCGIFFLAGS && state.requests[3] == SIOCSIFFLAGS);
-  CHECK((state.tun_flags & (IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL)) ==
-        (IFF_TUN | IFF_NO_PI | IFF_TUN_EXCL));
+  CHECK((state.tun_flags & (FTUN_IFF_TUN | FTUN_IFF_NO_PI |
+                            FTUN_IFF_TUN_EXCL)) ==
+        (FTUN_IFF_TUN | FTUN_IFF_NO_PI | FTUN_IFF_TUN_EXCL));
   CHECK(state.configured_mtu == 1500 && (state.up_flags & IFF_UP) != 0);
   CHECK(ftun_linux_tun_get_info(port, &info) == FTUN_OK);
   CHECK(strcmp(info.name, "ftun0") == 0 && info.mtu == 1500u &&

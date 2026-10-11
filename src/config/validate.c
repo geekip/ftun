@@ -929,6 +929,14 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
                                   "configuration is missing");
   }
   if (config->dns.enable) required |= FTUN_BUILD_MODULE_DNS;
+  if (config->dns.enable) {
+    for (index = 0u; index < config->dns.server_count; index++) {
+      if (config->dns.servers[index].fake_ip) {
+        required |= FTUN_BUILD_MODULE_FAKEIP;
+        break;
+      }
+    }
+  }
   if (config->frs.active) required |= FTUN_BUILD_MODULE_FRS;
   for (index = 0u; index < config->inbound_count; index++) {
     if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
@@ -940,12 +948,17 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
     if (out != NULL) {
       const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
       static const char dns_path[] = "/dns/enable";
+      static const char fakeip_path[] = "/dns/servers";
       static const char tun_path[] = "/inbounds";
       static const char frs_path[] = "/rules";
       if ((required & FTUN_BUILD_MODULE_DNS) != 0u &&
           (capabilities->builtins & FTUN_BUILD_MODULE_DNS) == 0u) {
         out->path.data = dns_path;
         out->path.length = sizeof(dns_path) - 1u;
+      } else if ((required & FTUN_BUILD_MODULE_FAKEIP) != 0u &&
+                 (capabilities->builtins & FTUN_BUILD_MODULE_FAKEIP) == 0u) {
+        out->path.data = fakeip_path;
+        out->path.length = sizeof(fakeip_path) - 1u;
       } else if ((required & FTUN_BUILD_MODULE_TUN) != 0u &&
                  (capabilities->builtins & FTUN_BUILD_MODULE_TUN) == 0u) {
         out->path.data = tun_path;

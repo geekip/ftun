@@ -344,7 +344,7 @@ static int test_request_failures(void)
     0x05u, 0x01u, 0x00u, 0x01u, 127u, 0u, 0u, 1u, 0u, 80u
   };
   uint8_t output[32];
-  char too_long[256];
+  char too_long[256] = {0};
   ftun_socks5_request_t request;
   ftun_socks5_reply_t reply;
   ftun_endpoint_t endpoint = ipv4_endpoint(80u);
