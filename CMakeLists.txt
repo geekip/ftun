@@ -171,6 +171,7 @@ list(APPEND ftun_internal_dependencies wolfssl::wolfssl)
 # 核心保留 SystemResolver、通用 Datagram 和 SOCKS5，不反向依赖 TUN。
 set(ftun_core_sources
   src/core/core.c
+  src/core/state.c
   src/util/error.c
   src/core/runtime.c
   src/core/session.c
@@ -213,21 +214,20 @@ set(ftun_core_sources
   src/transport/relay.c
   src/protocol/socks5.c
   src/protocol/http.c
+  src/sniff/sniff.c
+  src/sniff/tls_sni.c
+  src/sniff/http_host.c
+  src/state/group_cache.c
 )
 
 # 这些源码属于后续版本的可选模块，当前不加入任何 target。
 # 各模块交付时再与其注册项、独占依赖和 OFF/BUILTIN 测试一起接入。
 set(ftun_deferred_module_sources
-  src/core/state.c
   src/inbound/anytls.c
   src/outbound/anytls.c
   src/api/api.c
   src/protocol/anytls.c
   src/protocol/uot.c
-  src/sniff/sniff.c
-  src/sniff/tls_sni.c
-  src/sniff/http_host.c
-  src/state/group_cache.c
 )
 
 set(ftun_module_definitions)
@@ -313,6 +313,7 @@ file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ftun-build-modules.txt" CONTEN
   "core=BUILTIN\ndns=${FTUN_MODULE_DNS}\ntun=${FTUN_MODULE_TUN}\nfrs=${FTUN_MODULE_FRS}\n")
 add_executable(ftun src/main.c src/cli/cli.c)
 target_include_directories(ftun PRIVATE src)
+target_compile_definitions(ftun PRIVATE ${ftun_module_definitions})
 target_link_libraries(ftun PRIVATE ftun_core ftun_options)
 set(ftun_targets ftun_core ftun)
 list(APPEND ftun_targets ftun_cjson wolfssl)
@@ -345,7 +346,8 @@ install(FILES third_party/cjson/LICENSE
 install(FILES third_party/wolfssl/COPYING
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES THIRD_PARTY_NOTICES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
+install(FILES README.md document/control.md THIRD_PARTY_NOTICES.md
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 if(TARGET ftun_libev)
   install(FILES third_party/libev/LICENSE
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-libev)
@@ -484,6 +486,36 @@ if(BUILD_TESTING)
   target_include_directories(ftun-v04-group-test PRIVATE src)
   target_link_libraries(ftun-v04-group-test PRIVATE ftun_core ftun_options)
   add_test(NAME group-contract COMMAND ftun-v04-group-test)
+  add_executable(ftun-sniff-tls-test tests/sniff_tls.c)
+  target_include_directories(ftun-sniff-tls-test PRIVATE src)
+  target_link_libraries(ftun-sniff-tls-test PRIVATE ftun_core ftun_options)
+  add_test(NAME sniff-tls-contract COMMAND ftun-sniff-tls-test)
+  add_executable(ftun-sniff-http-test tests/sniff_http.c)
+  target_include_directories(ftun-sniff-http-test PRIVATE src)
+  target_link_libraries(ftun-sniff-http-test PRIVATE ftun_core ftun_options)
+  add_test(NAME sniff-http-contract COMMAND ftun-sniff-http-test)
+  add_executable(ftun-sniff-test tests/sniff.c)
+  target_include_directories(ftun-sniff-test PRIVATE src)
+  target_link_libraries(ftun-sniff-test PRIVATE ftun_core ftun_options)
+  add_test(NAME sniff-contract COMMAND ftun-sniff-test)
+  add_executable(ftun-group-cache-test tests/group_cache.c)
+  target_include_directories(ftun-group-cache-test PRIVATE src)
+  target_link_libraries(ftun-group-cache-test PRIVATE ftun_core ftun_options)
+  add_test(NAME group-cache-contract COMMAND ftun-group-cache-test)
+  add_executable(ftun-core-state-test tests/core_state.c)
+  target_include_directories(ftun-core-state-test PRIVATE src)
+  target_link_libraries(ftun-core-state-test PRIVATE ftun_core ftun_options)
+  add_test(NAME core-state-contract COMMAND ftun-core-state-test)
+  add_executable(ftun-logger-test tests/logger.c)
+  target_include_directories(ftun-logger-test PRIVATE src)
+  target_link_libraries(ftun-logger-test PRIVATE
+    ftun_core ftun_options Threads::Threads)
+  add_test(NAME logger-contract COMMAND ftun-logger-test)
+  add_executable(ftun-v05-integration-test tests/integration_v05.c)
+  target_include_directories(ftun-v05-integration-test PRIVATE src)
+  target_link_libraries(ftun-v05-integration-test PRIVATE
+    ftun_core ftun_options Threads::Threads)
+  add_test(NAME integration-v05-contract COMMAND ftun-v05-integration-test)
   if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
     add_executable(ftun-v04-frs-test tests/frs.c tests/frs_fixture.c)
     target_include_directories(ftun-v04-frs-test PRIVATE src tests)
@@ -796,9 +828,24 @@ if(BUILD_TESTING)
     add_test(NAME monotonic-time COMMAND ftun-time-test)
   endif()
   add_test(NAME cli-version COMMAND ftun version)
-  set_tests_properties(cli-version PROPERTIES PASS_REGULAR_EXPRESSION "skeleton; proxy features: none")
+  set_tests_properties(cli-version PROPERTIES PASS_REGULAR_EXPRESSION "FTUN 0.5.0-dev")
+  add_test(NAME cli-help COMMAND ftun help)
+  set_tests_properties(cli-help PROPERTIES PASS_REGULAR_EXPRESSION "ftun check -c CONFIG")
   add_test(NAME cli-refuses-run COMMAND ftun run)
   set_tests_properties(cli-refuses-run PROPERTIES WILL_FAIL TRUE)
+  if(UNIX)
+    if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+      set(ftun_cli_dns_enabled 1)
+    else()
+      set(ftun_cli_dns_enabled 0)
+    endif()
+    add_test(NAME cli-v05-contract
+      COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_v05.sh
+        $<TARGET_FILE:ftun> ${ftun_cli_dns_enabled}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-run.json.in
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-fakeip.json.in)
+    set_tests_properties(cli-v05-contract PROPERTIES TIMEOUT 10)
+  endif()
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     add_test(NAME config-schema COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/config_schema.py)

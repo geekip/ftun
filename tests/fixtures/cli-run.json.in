@@ -1,0 +1,23 @@
+{
+  "base": {
+    "cache-file": "@CACHE@",
+    "state-cache": false
+  },
+  "log": {
+    "level": "silent"
+  },
+  "dns": {
+    "enable": false
+  },
+  "inbounds": [
+    {
+      "name": "control-test",
+      "type": "socks5",
+      "listen": "127.0.0.1:19080",
+      "udp": false
+    }
+  ],
+  "rules": [
+    "MATCH,DIRECT"
+  ]
+}

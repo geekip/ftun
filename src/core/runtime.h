@@ -1,6 +1,7 @@
 #ifndef FTUN_CORE_RUNTIME_H
 #define FTUN_CORE_RUNTIME_H
 #include "core/budget.h"
+#include "group/url_test.h"
 #include "internal/contracts.h"
 
 typedef enum {
@@ -25,6 +26,22 @@ typedef struct {
   size_t retained_limit;
 } ftun_runtime_manager_info_t;
 
+typedef enum {
+  FTUN_RUNTIME_GROUP_SELECT = 1,
+  FTUN_RUNTIME_GROUP_URL_TEST
+} ftun_runtime_group_kind_t;
+
+typedef struct {
+  ftun_string_t group;
+  ftun_string_t member;
+  ftun_runtime_group_kind_t kind;
+  bool degraded;
+  bool health_valid;
+  bool health_success;
+  uint32_t latency_ms;
+  uint64_t observed_ms;
+} ftun_runtime_group_record_t;
+
 /* 0.2 内部 owner-loop 管理器；budget 借用且必须比 manager 长寿。 */
 ftun_status_t ftun_runtime_manager_create(ftun_budget_t *budget,
                                           size_t retained_limit,
@@ -44,6 +61,10 @@ ftun_status_t ftun_runtime_manager_set_dns(ftun_core_t *core,
                                            ftun_dns_dispatcher_t *dispatcher);
 ftun_status_t ftun_runtime_manager_dns(ftun_core_t *core,
                                        ftun_dns_dispatcher_t **out);
+ftun_status_t ftun_runtime_manager_set_logger(ftun_core_t *core,
+                                              ftun_logger_t *logger);
+ftun_status_t ftun_runtime_manager_logger(ftun_core_t *core,
+                                          ftun_logger_t **out);
 /* candidate/retained 或 active 外部引用存在时返回 AGAIN。 */
 ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core);
 /* 编译结果的准备与快照生命周期。
@@ -77,6 +98,9 @@ ftun_status_t ftun_runtime_frs_view(const ftun_runtime_t *runtime,
 ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
                                       uint32_t group_id,
                                       uint32_t member_id);
+ftun_status_t ftun_runtime_select_names(ftun_core_t *core,
+                                        ftun_string_t group,
+                                        ftun_string_t member);
 ftun_status_t ftun_runtime_group_selected(const ftun_runtime_t *runtime,
                                            uint32_t group_id,
                                            uint32_t *member_id,
@@ -86,4 +110,24 @@ ftun_status_t ftun_runtime_group_selected(const ftun_runtime_t *runtime,
 ftun_status_t ftun_runtime_group_publish(ftun_core_t *core,
                                          uint32_t group_id,
                                          const ftun_group_choice_t *choice);
+/* 状态缓存桥接。返回值中的字符串借用 active Runtime；只允许 owner loop
+ * 同步读取。restore 再次校验组类型和成员身份。 */
+ftun_status_t ftun_runtime_active_config(const ftun_core_t *core,
+                                         const ftun_config_t **out);
+ftun_status_t ftun_runtime_group_records(const ftun_core_t *core,
+                                         ftun_runtime_group_record_t *records,
+                                         size_t capacity, size_t *out_count);
+ftun_status_t ftun_runtime_group_restore(ftun_core_t *core,
+                                         const ftun_runtime_group_record_t *record,
+                                         bool restore_health);
+ftun_status_t ftun_runtime_candidate_group_restore(
+  ftun_core_t *core, const ftun_runtime_group_record_t *record,
+  bool restore_health);
+ftun_status_t ftun_runtime_group_publish_health(
+  ftun_core_t *core, uint32_t group_id, const ftun_group_choice_t *choice,
+  const ftun_health_sample_t *sample);
+/* 公共 Core 生命周期的私有 sidecar；普通 Runtime manager 使用者保持 NULL。 */
+ftun_status_t ftun_runtime_manager_set_control(ftun_core_t *core,
+                                               void *control);
+ftun_status_t ftun_runtime_manager_control(ftun_core_t *core, void **out);
 #endif

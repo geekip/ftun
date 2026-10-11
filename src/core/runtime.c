@@ -4,6 +4,7 @@
 #include "config/parser.h"
 #include "route/router.h"
 #include "route/rule.h"
+#include "group/url_test.h"
 #if defined(FTUN_HAVE_MODULE_FRS)
 #include "frs/frs.h"
 #endif
@@ -19,8 +20,12 @@ typedef struct {
 
 typedef struct {
   uint32_t selected_member_id;
+  uint32_t latency_ms;
+  uint64_t observed_ms;
   bool selected;
   bool degraded;
+  bool health_valid;
+  bool health_success;
 } ftun_runtime_group_choice_state_t;
 
 struct ftun_runtime {
@@ -44,6 +49,8 @@ struct ftun_core {
   ftun_budget_t *budget;
   ftun_fakeip_service_t *fakeip;
   ftun_dns_dispatcher_t *dns;
+  ftun_logger_t *logger;
+  void *control;
   ftun_runtime_t *active;
   ftun_runtime_t *candidate;
   ftun_runtime_t *retained;
@@ -383,6 +390,41 @@ ftun_status_t ftun_runtime_manager_dns(ftun_core_t *core,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_runtime_manager_set_logger(ftun_core_t *core,
+                                              ftun_logger_t *logger)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  core->logger = logger;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_logger(ftun_core_t *core,
+                                          ftun_logger_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
+  if (core->logger == NULL) return FTUN_E_AGAIN;
+  *out = core->logger;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_set_control(ftun_core_t *core,
+                                               void *control)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  core->control = control;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_control(ftun_core_t *core, void **out)
+{
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
+  if (core->control == NULL) return FTUN_E_AGAIN;
+  *out = core->control;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
 {
   ftun_core_t *owned;
@@ -404,6 +446,8 @@ ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
   owned->budget = NULL;
   owned->fakeip = NULL;
   owned->dns = NULL;
+  owned->logger = NULL;
+  owned->control = NULL;
   free(owned);
   *core = NULL;
   return FTUN_OK;
@@ -765,6 +809,8 @@ static int ftun_runtime_group_has_member(const ftun_runtime_t *runtime,
   return 0;
 }
 
+static int ftun_runtime_string_equal(ftun_string_t value, const char *text);
+
 ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
                                       uint32_t group_id,
                                       uint32_t member_id)
@@ -787,6 +833,36 @@ ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
   runtime->group_choices[index].selected = true;
   runtime->group_choices[index].degraded = false;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_select_names(ftun_core_t *core,
+                                        ftun_string_t group,
+                                        ftun_string_t member)
+{
+  ftun_runtime_t *runtime;
+  size_t index;
+  uint32_t member_id;
+  if (!ftun_runtime_core_valid(core) || group.data == NULL ||
+      group.length == 0u || member.data == NULL || member.length == 0u) {
+    return FTUN_E_INVALID;
+  }
+  runtime = core->active;
+  if (runtime == NULL) return FTUN_E_AGAIN;
+  for (index = 0u; index < runtime->config->outbound_count; index++) {
+    const ftun_config_outbound_t *outbound = &runtime->config->outbounds[index];
+    if (!ftun_runtime_string_equal(group, outbound->name)) continue;
+    if (outbound->kind != FTUN_CONFIG_OUTBOUND_SELECT) {
+      return FTUN_E_UNSUPPORTED;
+    }
+    if (ftun_runtime_resolve_outbound(member, &member_id,
+                                      (void *)runtime->config) != FTUN_OK) {
+      return FTUN_E_REJECTED;
+    }
+    if (index > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) return FTUN_E_LIMIT;
+    return ftun_runtime_select_set(
+      core, (uint32_t)index + FTUN_OUTBOUND_ID_NAMED_BASE, member_id);
+  }
+  return FTUN_E_REJECTED;
 }
 
 ftun_status_t ftun_runtime_group_selected(const ftun_runtime_t *runtime,
@@ -851,5 +927,161 @@ ftun_status_t ftun_runtime_group_publish(ftun_core_t *core,
   runtime->group_choices[index].selected_member_id = choice->leaf_id;
   runtime->group_choices[index].selected = true;
   runtime->group_choices[index].degraded = choice->degraded;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_active_config(const ftun_core_t *core,
+                                         const ftun_config_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
+  if (core->active == NULL || core->active->config == NULL) return FTUN_E_AGAIN;
+  *out = core->active->config;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_group_records(const ftun_core_t *core,
+                                         ftun_runtime_group_record_t *records,
+                                         size_t capacity, size_t *out_count)
+{
+  const ftun_runtime_t *runtime;
+  size_t index;
+  size_t count = 0u;
+  if (out_count != NULL) *out_count = 0u;
+  if (!ftun_runtime_core_valid(core) || out_count == NULL ||
+      (capacity != 0u && records == NULL)) return FTUN_E_INVALID;
+  runtime = core->active;
+  if (runtime == NULL || runtime->config == NULL) return FTUN_E_AGAIN;
+  for (index = 0u; index < runtime->config->outbound_count; index++) {
+    const ftun_config_outbound_t *group = &runtime->config->outbounds[index];
+    const ftun_runtime_group_choice_state_t *state =
+      &runtime->group_choices[index];
+    size_t member_index;
+    const char *member_name = NULL;
+    if (group->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
+    if (!state->selected) return FTUN_E_STATE_CORRUPT;
+    for (member_index = 0u; member_index < group->members.count;
+         member_index++) {
+      uint32_t member_id = 0u;
+      if (ftun_runtime_member_id(runtime, group->members.items[member_index],
+                                 &member_id) == FTUN_OK &&
+          member_id == state->selected_member_id) {
+        member_name = group->members.items[member_index];
+        break;
+      }
+    }
+    if (member_name == NULL) return FTUN_E_STATE_CORRUPT;
+    if (count < capacity) {
+      ftun_runtime_group_record_t *record = &records[count];
+      memset(record, 0, sizeof(*record));
+      record->group.data = group->name;
+      record->group.length = strlen(group->name);
+      record->member.data = member_name;
+      record->member.length = strlen(member_name);
+      record->kind = group->kind == FTUN_CONFIG_OUTBOUND_SELECT
+        ? FTUN_RUNTIME_GROUP_SELECT : FTUN_RUNTIME_GROUP_URL_TEST;
+      record->degraded = state->degraded;
+      record->health_valid = state->health_valid;
+      record->health_success = state->health_success;
+      record->latency_ms = state->latency_ms;
+      record->observed_ms = state->observed_ms;
+    }
+    count++;
+  }
+  *out_count = count;
+  return count > capacity ? FTUN_E_LIMIT : FTUN_OK;
+}
+
+static int ftun_runtime_string_equal(ftun_string_t value, const char *text)
+{
+  return text != NULL && strlen(text) == value.length &&
+    memcmp(text, value.data, value.length) == 0;
+}
+
+static ftun_status_t ftun_runtime_group_restore_into(
+  ftun_runtime_t *runtime, const ftun_runtime_group_record_t *record,
+  bool restore_health)
+{
+  size_t index;
+  uint32_t member_id = 0u;
+  if (runtime == NULL || record == NULL ||
+      record->group.data == NULL || record->group.length == 0u ||
+      record->member.data == NULL || record->member.length == 0u) {
+    return FTUN_E_INVALID;
+  }
+  for (index = 0u; index < runtime->config->outbound_count; index++) {
+    const ftun_config_outbound_t *group = &runtime->config->outbounds[index];
+    ftun_runtime_group_kind_t kind;
+    size_t member_index;
+    if (!ftun_runtime_string_equal(record->group, group->name)) continue;
+    if (group->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) return FTUN_E_REJECTED;
+    kind = group->kind == FTUN_CONFIG_OUTBOUND_SELECT
+      ? FTUN_RUNTIME_GROUP_SELECT : FTUN_RUNTIME_GROUP_URL_TEST;
+    if (kind != record->kind) return FTUN_E_REJECTED;
+    for (member_index = 0u; member_index < group->members.count;
+         member_index++) {
+      if (!ftun_runtime_string_equal(record->member,
+                                     group->members.items[member_index])) {
+        continue;
+      }
+      if (ftun_runtime_member_id(runtime, group->members.items[member_index],
+                                 &member_id) != FTUN_OK) {
+        return FTUN_E_STATE_CORRUPT;
+      }
+      runtime->group_choices[index].selected_member_id = member_id;
+      runtime->group_choices[index].selected = true;
+      runtime->group_choices[index].degraded = record->degraded;
+      if (restore_health && kind == FTUN_RUNTIME_GROUP_URL_TEST &&
+          record->health_valid) {
+        runtime->group_choices[index].health_valid = true;
+        runtime->group_choices[index].health_success = record->health_success;
+        runtime->group_choices[index].latency_ms = record->latency_ms;
+        runtime->group_choices[index].observed_ms = record->observed_ms;
+      }
+      return FTUN_OK;
+    }
+    return FTUN_E_REJECTED;
+  }
+  return FTUN_E_REJECTED;
+}
+
+ftun_status_t ftun_runtime_group_restore(ftun_core_t *core,
+                                         const ftun_runtime_group_record_t *record,
+                                         bool restore_health)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  if (core->active == NULL) return FTUN_E_AGAIN;
+  return ftun_runtime_group_restore_into(core->active, record, restore_health);
+}
+
+ftun_status_t ftun_runtime_candidate_group_restore(
+  ftun_core_t *core, const ftun_runtime_group_record_t *record,
+  bool restore_health)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  if (core->candidate == NULL) return FTUN_E_AGAIN;
+  return ftun_runtime_group_restore_into(core->candidate, record,
+                                         restore_health);
+}
+
+ftun_status_t ftun_runtime_group_publish_health(
+  ftun_core_t *core, uint32_t group_id, const ftun_group_choice_t *choice,
+  const ftun_health_sample_t *sample)
+{
+  ftun_runtime_t *runtime;
+  size_t index;
+  ftun_status_t status;
+  if (sample == NULL || sample->member_id != choice->leaf_id) {
+    return FTUN_E_INVALID;
+  }
+  status = ftun_runtime_group_publish(core, group_id, choice);
+  if (status != FTUN_OK) return status;
+  runtime = core->active;
+  status = ftun_runtime_outbound_index(runtime, group_id, &index);
+  if (status != FTUN_OK) return status;
+  runtime->group_choices[index].health_valid = true;
+  runtime->group_choices[index].health_success = sample->success;
+  runtime->group_choices[index].latency_ms = sample->latency_ms;
+  runtime->group_choices[index].observed_ms = sample->observed_ms;
   return FTUN_OK;
 }

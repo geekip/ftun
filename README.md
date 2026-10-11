@@ -6,11 +6,14 @@ FTUN 的目标是成为轻量、可裁剪的跨平台代理内核，提供命令
 
 ## 当前状态
 
-命令行版本仍为 **0.1.0 开发预览**。内部模块已经推进到 v0.4 合约范围，包括 Linux TUN/lwIP、SOCKS5、DNS/FakeIP、顺序路由、Mixed 入站、代理组、FRS 1.0 loader/query/update 和 wolfSSL TLS，并有受控集成测试；生产 listener、Event、Session、Router、Outbound 与 CLI 的自动装配尚未完成，因此当前二进制仍不能作为实际代理运行。Linux x86_64 是首个正式验收目标。
+当前源码版本为 **0.5.0-dev**。v0.5 已提供配置检查、进程信号控制、事务重载、Select 选择、组状态缓存、TLS SNI/HTTP Host 嗅探、有界异步日志，以及可由宿主调用的 C 生命周期接口；已有模块和受控集成测试覆盖 Linux TUN/lwIP、SOCKS5、DNS/FakeIP、顺序路由、Mixed 入站、代理组、FRS 1.0 和 wolfSSL TLS。
+
+当前 `ftun run` 只运行已验证的控制面 Runtime，还没有自动装配生产 listener/socket/Event、Session、Router 与 Outbound 数据面，因此不会接管或代理实际流量。它适合验证配置、进程控制和重载边界，不应被当作可部署代理。Linux x86_64 仍是首个正式验收目标。
 
 ## 文档
 
 - [公开 C API](include/ftun/ftun.h)
+- [v0.5 CLI 与宿主控制](document/control.md)
 - [配置 JSON Schema](schema.json)
 - [配置样例](examples/)
 - [用户手册目录](document/)（随可用功能逐步补充）
@@ -24,6 +27,7 @@ cmake --preset debug
 cmake --build --preset debug --parallel
 ctest --preset debug
 ./build/debug/ftun version
+./build/debug/ftun check -c /path/to/config.json
 ```
 
 公开接口位于 [include/ftun/ftun.h](include/ftun/ftun.h)，内部接口位于各模块目录。FRS 配置和规则示例见 [examples/frs.json](examples/frs.json)；`.frs` 生成工具属于独立项目，不随 FTUN 构建或安装。

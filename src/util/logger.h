@@ -1,12 +1,50 @@
 #ifndef FTUN_UTIL_LOGGER_H
 #define FTUN_UTIL_LOGGER_H
 #include "internal/contracts.h"
-/* 有界日志。
- * 需求 REQ-OBS-001；任务 TASK-UTIL-001；目标 0.5.0；验收 TEST-UTIL-001。
- * 实现路径：先判断级别再格式化；脱敏、限流和有界队列；慢磁盘不阻塞 loop，丢弃计数保留。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
+
+/* REQ-OBS-001 / TASK-UTIL-001 / TEST-UTIL-001，目标 0.5.0：
+ * ftun_log_emit 不把秘密或慢 writer 带入 owner-loop 热路径。 */
+
+typedef enum {
+  FTUN_LOG_SILENT = 0,
+  FTUN_LOG_ERROR,
+  FTUN_LOG_WARN,
+  FTUN_LOG_INFO,
+  FTUN_LOG_DEBUG,
+  FTUN_LOG_TRACE
+} ftun_log_level_t;
+
+typedef ftun_status_t (*ftun_log_writer_fn)(void *user, ftun_bytes_t line);
+
+typedef struct {
+  ftun_log_level_t level;
+  const char *path;
+  size_t queue_capacity;
+  size_t line_capacity;
+  ftun_log_writer_fn writer;
+  void *writer_user;
+} ftun_logger_options_t;
+
+typedef struct {
+  size_t capacity;
+  size_t queued;
+  uint64_t emitted;
+  uint64_t filtered;
+  uint64_t dropped;
+  uint64_t io_errors;
+  bool accepting;
+} ftun_logger_usage_t;
+
+ftun_status_t ftun_log_level_parse(const char *name, ftun_log_level_t *out);
+ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
+                                 ftun_logger_t **out);
+/* 成功只表示日志已过滤或已接纳；队列满时丢弃新项并返回 OK。 */
+ftun_status_t ftun_logger_write(ftun_logger_t *logger, ftun_log_level_t level,
+                                const ftun_diagnostic_t *diagnostic);
+ftun_status_t ftun_logger_flush(ftun_logger_t *logger);
+ftun_status_t ftun_logger_get_usage(ftun_logger_t *logger,
+                                    ftun_logger_usage_t *out);
+ftun_status_t ftun_logger_destroy(ftun_logger_t **logger);
+/* Core 便利入口；保留 diagnostic 内已捕获的 stage/native_code。 */
 ftun_status_t ftun_log_emit(ftun_core_t *core, const ftun_diagnostic_t *diagnostic);
 #endif

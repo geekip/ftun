@@ -1,0 +1,17 @@
+{
+  "base": {
+    "cache-file": "@CACHE@",
+    "state-cache": false
+  },
+  "log": {
+    "level": "silent"
+  },
+  "dns": {
+    "enable": true,
+    "fake-ip": {
+      "enable": true,
+      "range": "198.18.0.0/15",
+      "persist": true
+    }
+  }
+}

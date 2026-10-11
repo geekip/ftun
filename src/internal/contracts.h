@@ -43,6 +43,7 @@ typedef struct ftun_inbound_spec ftun_inbound_spec_t;
 typedef struct ftun_inbound ftun_inbound_t;
 typedef struct ftun_index ftun_index_t;
 typedef struct ftun_lwip ftun_lwip_t;
+typedef struct ftun_logger ftun_logger_t;
 typedef struct ftun_operation_queue ftun_operation_queue_t;
 typedef struct ftun_packet_port ftun_packet_port_t;
 typedef struct ftun_packet ftun_packet_t;
@@ -150,5 +151,11 @@ typedef struct {
 } ftun_build_capabilities_t;
 typedef struct { ftun_buffer_t *owner; size_t offset, length; } ftun_buffer_slice_t;
 typedef struct { bool complete; size_t consumed; ftun_endpoint_t target; } ftun_protocol_result_t;
-typedef struct { bool found, need_more; ftun_string_t domain; } ftun_sniff_result_t;
+#define FTUN_SNIFF_DOMAIN_BYTES 254u
+typedef struct {
+  bool found;
+  bool need_more;
+  ftun_string_t domain;
+  char domain_storage[FTUN_SNIFF_DOMAIN_BYTES];
+} ftun_sniff_result_t;
 #endif
