@@ -51,11 +51,35 @@ typedef enum {
   FTUN_DNS_TRANSPORT_TCP
 } ftun_dns_transport_t;
 
+typedef void (*ftun_dns_query_completion_fn)(ftun_operation_t *operation,
+                                             ftun_error_t error,
+                                             ftun_bytes_t response,
+                                             void *user);
+
+typedef enum {
+  FTUN_DNS_ENTRY_FIXED = 1,
+  FTUN_DNS_ENTRY_POLICY
+} ftun_dns_entry_t;
+
 struct ftun_dns_query {
   uint16_t id;
+  uint16_t flags; /* 不含 ID 的客户端请求标志；缓存按完整值隔离。 */
   ftun_dns_transport_t transport;
   ftun_endpoint_t upstream;
   ftun_dns_question_t question;
+  ftun_bytes_t wire; /* 可选的拥有者借用请求报文，异步接纳者必须复制。 */
+  uint64_t deadline_ms; /* 绝对单调时刻。 */
+  uint64_t policy_fingerprint;
+  uint64_t server_fingerprint;
+  uint32_t outbound_id;
+  uint8_t resolution_mode; /* 1 REAL，2 FakeIP 合成。 */
+  bool dnssec_ok; /* EDNS DO；与 CD 等影响语义的标志一起隔离缓存。 */
+  ftun_dns_query_completion_fn completion;
+  void *completion_user;
+  ftun_dns_entry_t entry;
+  size_t fixed_server;
+  const ftun_metadata_t *metadata; /* 仅 dispatch 同步选择期间借用。 */
+  bool real_only;
 };
 
 struct ftun_dns_message {

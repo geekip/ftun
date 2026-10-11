@@ -1,5 +1,9 @@
 #include "resolver.h"
 
+#if defined(FTUN_HAVE_MODULE_DNS)
+#include "dns/dns.h"
+#endif
+
 #include <string.h>
 
 static int ftun_resolver_backend_valid(const ftun_resolver_backend_t *backend)
@@ -129,18 +133,18 @@ static ftun_status_t ftun_resolver_bootstrap(
 #endif
 }
 
-static ftun_status_t ftun_resolver_server_unavailable(
+static ftun_status_t ftun_resolver_server(
   void *context, ftun_core_t *core, ftun_string_t server,
   const ftun_bootstrap_request_t *request, ftun_operation_t **out)
 {
   (void)context;
+#if defined(FTUN_HAVE_MODULE_DNS)
+  return ftun_dns_resolve_named(core, server, request, out);
+#else
   (void)core;
   (void)server;
   (void)request;
   if (out != NULL) *out = NULL;
-#if defined(FTUN_HAVE_MODULE_DNS)
-  return FTUN_E_NOT_IMPLEMENTED;
-#else
   return FTUN_E_UNSUPPORTED;
 #endif
 }
@@ -148,7 +152,7 @@ static ftun_status_t ftun_resolver_server_unavailable(
 static const ftun_resolver_backend_t ftun_resolver_default_backend = {
   ftun_resolver_system,
   ftun_resolver_bootstrap,
-  ftun_resolver_server_unavailable,
+  ftun_resolver_server,
   NULL
 };
 

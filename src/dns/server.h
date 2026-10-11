@@ -1,12 +1,71 @@
 #ifndef FTUN_DNS_SERVER_H
 #define FTUN_DNS_SERVER_H
-#include "internal/contracts.h"
+
+#include "core/budget.h"
+#include "core/operation.h"
+#include "dns/cache.h"
+
+typedef void (*ftun_dns_transport_completion_fn)(
+  void *user, ftun_status_t status, ftun_dns_transport_t transport,
+  const ftun_endpoint_t *source, ftun_bytes_t response);
+
+typedef struct {
+  /* 成功接纳后不得在 submit 返回前同步回调；response 仅借到回调返回。 */
+  ftun_status_t (*submit)(void *context, uint32_t outbound_id,
+                          const ftun_endpoint_t *upstream,
+                          ftun_dns_transport_t transport,
+                          ftun_bytes_t query, uint64_t deadline_ms,
+                          ftun_dns_transport_completion_fn completion,
+                          void *user, void **out_request);
+  /* 成功后 transport 不再回调并清空句柄；AGAIN 表示稍后重试取消。 */
+  ftun_status_t (*cancel)(void *context, void **request);
+  void *context;
+} ftun_dns_query_transport_t;
+
+typedef uint64_t (*ftun_dns_server_now_fn)(void *user);
+
+typedef struct {
+  ftun_budget_t *budget;
+  ftun_operation_queue_t *operations;
+  ftun_endpoint_t upstream;
+  uint32_t outbound_id;
+  uint64_t fingerprint;
+  ftun_dns_transport_t transport;
+  bool tcp_fallback;
+  bool fakeip;
+  size_t max_response_bytes;
+  ftun_dns_query_transport_t query_transport;
+  ftun_dns_cache_t *cache; /* 可选借用。 */
+  ftun_dns_server_now_fn now;
+  void *now_user;
+} ftun_dns_server_options_t;
+
+typedef struct {
+  uint32_t outbound_id;
+  uint64_t fingerprint;
+  size_t inflight;
+  ftun_dns_transport_t transport;
+  bool tcp_fallback;
+  bool fakeip;
+} ftun_dns_server_info_t;
+
+ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
+                                     ftun_dns_server_t **out);
+ftun_status_t ftun_dns_server_get_info(const ftun_dns_server_t *server,
+                                       ftun_dns_server_info_t *out);
+
 /* 真实 DNS 传输。
  * 需求 REQ-DNS-001；任务 TASK-DNS-002；目标 0.3.0；验收 TEST-DNS-002。
- * 实现路径：server.outbound 仅决定查询通道；内部 REAL 绕过 FakeIP；固定一次事务出口，校验响应，使用绝对 deadline。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
+ * server.outbound 只固定 QueryTransport 通道，入口只接受 REAL 请求；响应按
+ * ID、Question、实际端点和 transport 关联。UDP TC 在同一 server/出口和
+ * 原绝对 deadline 下切 TCP，不重新进行策略选择。接纳后复制全部请求字节，
+ * 最终 completion 在 operation queue dispatch 时恰好一次收到借用响应。
  */
-ftun_status_t ftun_dns_exchange(ftun_core_t *core, const ftun_dns_server_t *server, const ftun_dns_query_t *query, ftun_operation_t **out);
+ftun_status_t ftun_dns_exchange(ftun_core_t *core,
+                                const ftun_dns_server_t *server,
+                                const ftun_dns_query_t *query,
+                                ftun_operation_t **out);
+/* 有在途请求时返回 AGAIN。cache/queue/transport 均由调用者拥有。 */
+ftun_status_t ftun_dns_server_destroy(ftun_dns_server_t **server);
+
 #endif

@@ -20,6 +20,8 @@ typedef struct ftun_dial_request ftun_dial_request_t;
 typedef struct ftun_direct_request ftun_direct_request_t;
 typedef struct ftun_dns_answer ftun_dns_answer_t;
 typedef struct ftun_dns_cache ftun_dns_cache_t;
+typedef struct ftun_dns_connection ftun_dns_connection_t;
+typedef struct ftun_dns_dispatcher ftun_dns_dispatcher_t;
 typedef struct ftun_dns_listener_spec ftun_dns_listener_spec_t;
 typedef struct ftun_dns_listener ftun_dns_listener_t;
 typedef struct ftun_dns_message ftun_dns_message_t;
@@ -28,6 +30,7 @@ typedef struct ftun_dns_server ftun_dns_server_t;
 typedef struct ftun_event_loop ftun_event_loop_t;
 typedef struct ftun_event_source ftun_event_source_t;
 typedef struct ftun_fakeip_handle ftun_fakeip_handle_t;
+typedef struct ftun_fakeip_service ftun_fakeip_service_t;
 typedef struct ftun_fakeip_snapshot ftun_fakeip_snapshot_t;
 typedef struct ftun_fakeip_store ftun_fakeip_store_t;
 typedef struct ftun_feature_plan ftun_feature_plan_t;
@@ -48,6 +51,7 @@ typedef struct ftun_reservation ftun_reservation_t;
 typedef struct ftun_resolve_request ftun_resolve_request_t;
 typedef struct ftun_relay ftun_relay_t;
 typedef struct ftun_route_policy ftun_route_policy_t;
+typedef struct ftun_route_table ftun_route_table_t;
 typedef struct ftun_route_transaction ftun_route_transaction_t;
 typedef struct ftun_rule ftun_rule_t;
 typedef struct ftun_runtime ftun_runtime_t;
@@ -90,6 +94,8 @@ typedef struct {
 } ftun_metadata_t;
 typedef enum { FTUN_ROUTE_UNSET=0, FTUN_ROUTE_READY, FTUN_ROUTE_NEED_RESOLVE,
                FTUN_ROUTE_DENY } ftun_route_kind_t;
+/* 与 Session 的首版解析上限一致，避免 Router 产生下游无法保存的集合。 */
+#define FTUN_ROUTE_MAX_CANDIDATES 16u
 typedef struct {
   ftun_route_kind_t kind;
   uint64_t generation;
@@ -97,6 +103,9 @@ typedef struct {
   uint32_t outbound_id;
   const ftun_endpoint_t *allowed;
   size_t allowed_count;
+  /* IP/GEOIP 规则可能从非连续候选中选择子集。指针指向这里时，result
+   * 不得按值复制后继续使用旧 allowed 指针。 */
+  ftun_endpoint_t allowed_storage[FTUN_ROUTE_MAX_CANDIDATES];
 } ftun_route_result_t;
 typedef struct { bool matched, needs_resolve; } ftun_match_result_t;
 typedef struct {

@@ -34,6 +34,16 @@ ftun_status_t ftun_runtime_manager_get_info(const ftun_core_t *core,
 /* 返回 manager 创建时借用的全局 Budget，供同一 owner loop 的 Session 准入。 */
 ftun_status_t ftun_runtime_manager_budget(ftun_core_t *core,
                                           ftun_budget_t **out);
+/* FakeIP 服务由装配层拥有；manager 仅借用并为公共 ftun_fakeip_acquire
+ * 提供唯一入口。替换或清空必须在 owner loop、无并发调用时完成。 */
+ftun_status_t ftun_runtime_manager_set_fakeip(ftun_core_t *core,
+                                              ftun_fakeip_service_t *service);
+ftun_status_t ftun_runtime_manager_fakeip(ftun_core_t *core,
+                                          ftun_fakeip_service_t **out);
+ftun_status_t ftun_runtime_manager_set_dns(ftun_core_t *core,
+                                           ftun_dns_dispatcher_t *dispatcher);
+ftun_status_t ftun_runtime_manager_dns(ftun_core_t *core,
+                                       ftun_dns_dispatcher_t **out);
 /* candidate/retained 或 active 外部引用存在时返回 AGAIN。 */
 ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core);
 /* 编译结果的准备与快照生命周期。
@@ -51,4 +61,7 @@ ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core, ftun_runtime_t **ou
 ftun_status_t ftun_runtime_release(ftun_runtime_t **runtime);
 ftun_status_t ftun_runtime_get_info(const ftun_runtime_t *runtime,
                                     ftun_runtime_info_t *out);
+/* 返回 Runtime 拥有的不可变规则表；借用期不超过 Runtime 引用。 */
+ftun_status_t ftun_runtime_route_table(const ftun_runtime_t *runtime,
+                                       const ftun_route_table_t **out);
 #endif

@@ -21,7 +21,8 @@ int main(void) {
   CHECK(operation == NULL && callbacks == 0);
   CHECK(ftun_core_select(NULL, "proxy", "node", done, NULL, &operation) == FTUN_E_NOT_IMPLEMENTED);
   CHECK(operation == NULL && callbacks == 0);
-  CHECK(ftun_route_evaluate(NULL, NULL, 0, &route) == FTUN_E_NOT_IMPLEMENTED);
+  /* 已交付的 Router 对无效输入同步拒绝，仍保持失败输出清空。 */
+  CHECK(ftun_route_evaluate(NULL, NULL, 0, &route) == FTUN_E_INVALID);
   CHECK(route.kind == FTUN_ROUTE_UNSET && route.allowed == NULL);
   CHECK(ftun_stream_write_ref(NULL, NULL, &accepted, &operation) == FTUN_E_INVALID);
   CHECK(accepted == 0 && operation == NULL);

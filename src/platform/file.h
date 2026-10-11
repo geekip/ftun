@@ -1,12 +1,40 @@
 #ifndef FTUN_PLATFORM_FILE_H
 #define FTUN_PLATFORM_FILE_H
+
 #include "internal/contracts.h"
+
+typedef struct ftun_file_lock ftun_file_lock_t;
+
+typedef enum {
+  FTUN_FILE_STAGE_TEMP_SYNCED = 1,
+  FTUN_FILE_STAGE_RENAMED,
+  FTUN_FILE_STAGE_DIRECTORY_SYNCED
+} ftun_file_stage_t;
+
+typedef ftun_status_t (*ftun_file_stage_hook_fn)(ftun_file_stage_t stage,
+                                                  void *user);
+
+/* 锁文件由调用者选择，通常是 FakeIP identity 目录中的固定 lock 路径。
+ * 成功后持有非阻塞独占锁，release 消费句柄。 */
+ftun_status_t ftun_file_lock_acquire(const char *path, ftun_file_lock_t **out);
+ftun_status_t ftun_file_lock_release(ftun_file_lock_t **lock);
+
 /* 持久文件替换。
  * 需求 REQ-PERSIST-001；任务 TASK-PLATFORM-005；目标 0.3.0；验收 TEST-PLATFORM-005。
- * 实现路径：独占身份锁，同文件系统写入/同步/原子替换/目录同步；错误保留权威旧文件，不把 rename 等同于全部耐久性。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
+ * temporary 必须是普通文件且与 destination 父目录同一文件系统。函数依次
+ * fsync 临时文件、rename、fsync 父目录。rename 前失败保留旧权威文件；
+ * rename 后失败会返回错误，但不会把已替换文件伪报成旧文件仍然权威。
  */
-ftun_status_t ftun_file_replace(const char *temporary, const char *destination);
+ftun_status_t ftun_file_replace(const char *temporary,
+                                const char *destination);
+
+/* 在 destination 同目录创建唯一临时文件、完整写入并执行上述替换。
+ * hook 仅用于故障注入/宿主审计；返回错误立即停止在对应边界。 */
+ftun_status_t ftun_file_write_atomic(const char *destination,
+                                     ftun_bytes_t contents,
+                                     unsigned int mode);
+ftun_status_t ftun_file_write_atomic_with_hook(
+  const char *destination, ftun_bytes_t contents, unsigned int mode,
+  ftun_file_stage_hook_fn hook, void *hook_user);
+
 #endif

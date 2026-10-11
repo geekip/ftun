@@ -2,6 +2,7 @@
 #include "config/compile.h"
 #include "config/model.h"
 #include "config/parser.h"
+#include "route/router.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -17,6 +18,7 @@ struct ftun_runtime {
   const ftun_config_t *config;
   ftun_reservation_t *reservation;
   ftun_runtime_prepared_item_t *prepared_items;
+  ftun_route_table_t *routes;
   size_t prepared_item_count;
   size_t accounted_bytes;
   size_t reference_count;
@@ -28,6 +30,8 @@ struct ftun_runtime {
 struct ftun_core {
   uint32_t runtime_magic;
   ftun_budget_t *budget;
+  ftun_fakeip_service_t *fakeip;
+  ftun_dns_dispatcher_t *dns;
   ftun_runtime_t *active;
   ftun_runtime_t *candidate;
   ftun_runtime_t *retained;
@@ -169,12 +173,18 @@ static int ftun_runtime_layout(const ftun_config_t *config,
   const ftun_feature_plan_t *plan;
   size_t count;
   size_t bytes;
+  size_t route_bytes;
   if (config == NULL || config->plan == NULL || item_count == NULL ||
       accounted_bytes == NULL || !ftun_config_accounted_bytes(config, &bytes)) {
     return 0;
   }
   plan = config->plan;
   count = ftun_feature_count(plan->prepare);
+  if (ftun_route_table_accounted_bytes(
+        (const char *const *)config->rules.items, config->rules.count,
+        &route_bytes) != FTUN_OK || !ftun_size_add(&bytes, route_bytes)) {
+    return 0;
+  }
   if (!ftun_size_add(&count, plan->prepare_listener_count) ||
       !ftun_size_add(&count, plan->prepare_tun_count) ||
       !ftun_size_add(&count, plan->prepare_geo_count) ||
@@ -223,6 +233,8 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
   config = (ftun_config_t *)runtime->config;
   status = ftun_config_destroy(&config);
   if (status != FTUN_OK) return status;
+  status = ftun_route_table_destroy(&runtime->routes);
+  if (status != FTUN_OK) return status;
   free(runtime->prepared_items);
   runtime->prepared_items = NULL;
   status = ftun_reservation_release(&runtime->reservation);
@@ -232,6 +244,28 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
   runtime->reference_count = 0u;
   free(runtime);
   return FTUN_OK;
+}
+
+static ftun_status_t ftun_runtime_resolve_outbound(ftun_string_t name,
+                                                    uint32_t *out,
+                                                    void *user)
+{
+  const ftun_config_t *config = (const ftun_config_t *)user;
+  size_t index;
+  if (config == NULL || out == NULL || name.data == NULL ||
+      name.length == 0u) return FTUN_E_INVALID;
+  for (index = 0u; index < config->outbound_count; index++) {
+    const char *candidate = config->outbounds[index].name;
+    if (candidate != NULL && strlen(candidate) == name.length &&
+        memcmp(candidate, name.data, name.length) == 0) {
+      if (index > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) {
+        return FTUN_E_LIMIT;
+      }
+      *out = (uint32_t)index + FTUN_OUTBOUND_ID_NAMED_BASE;
+      return FTUN_OK;
+    }
+  }
+  return FTUN_E_INVALID;
 }
 
 static int ftun_runtime_unlink_retained(ftun_core_t *core,
@@ -287,6 +321,42 @@ ftun_status_t ftun_runtime_manager_budget(ftun_core_t *core,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_runtime_manager_set_fakeip(ftun_core_t *core,
+                                              ftun_fakeip_service_t *service)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  core->fakeip = service;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_fakeip(ftun_core_t *core,
+                                          ftun_fakeip_service_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
+  if (core->fakeip == NULL) return FTUN_E_AGAIN;
+  *out = core->fakeip;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_set_dns(ftun_core_t *core,
+                                           ftun_dns_dispatcher_t *dispatcher)
+{
+  if (!ftun_runtime_core_valid(core)) return FTUN_E_INVALID;
+  core->dns = dispatcher;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_dns(ftun_core_t *core,
+                                       ftun_dns_dispatcher_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
+  if (core->dns == NULL) return FTUN_E_AGAIN;
+  *out = core->dns;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
 {
   ftun_core_t *owned;
@@ -306,6 +376,8 @@ ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
   }
   owned->runtime_magic = 0u;
   owned->budget = NULL;
+  owned->fakeip = NULL;
+  owned->dns = NULL;
   free(owned);
   *core = NULL;
   return FTUN_OK;
@@ -342,8 +414,18 @@ ftun_status_t ftun_runtime_prepare(ftun_core_t *core,
       return FTUN_E_LIMIT;
     }
   }
+  status = ftun_route_table_create(
+    0u, (const char *const *)config->rules.items, config->rules.count,
+    ftun_runtime_resolve_outbound, (void *)config, &runtime->routes);
+  if (status != FTUN_OK) {
+    free(runtime->prepared_items);
+    free(runtime);
+    (void)ftun_reservation_release(&reservation);
+    return status;
+  }
   status = ftun_config_retain((ftun_config_t *)config);
   if (status != FTUN_OK) {
+    (void)ftun_route_table_destroy(&runtime->routes);
     free(runtime->prepared_items);
     free(runtime);
     (void)ftun_reservation_release(&reservation);
@@ -379,6 +461,10 @@ ftun_status_t ftun_runtime_commit(ftun_core_t *core,
   if (core->generation == UINT64_MAX) return FTUN_E_LIMIT;
   if (previous != NULL && previous->reference_count > 1u &&
       core->retained_count >= core->retained_limit) return FTUN_E_LIMIT;
+  if (ftun_route_table_set_generation(next->routes,
+                                      core->generation + 1u) != FTUN_OK) {
+    return FTUN_E_STATE_CORRUPT;
+  }
   core->generation++;
   next->generation = core->generation;
   next->state = FTUN_RUNTIME_ACTIVE;
@@ -459,5 +545,16 @@ ftun_status_t ftun_runtime_get_info(const ftun_runtime_t *runtime,
   out->reference_count = runtime->reference_count;
   out->accounted_bytes = runtime->accounted_bytes;
   out->prepared_item_count = runtime->prepared_item_count;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_route_table(const ftun_runtime_t *runtime,
+                                       const ftun_route_table_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (runtime == NULL || out == NULL || runtime->routes == NULL ||
+      runtime->state == FTUN_RUNTIME_CANDIDATE || runtime->generation == 0u ||
+      !ftun_runtime_core_valid(runtime->owner)) return FTUN_E_INVALID;
+  *out = runtime->routes;
   return FTUN_OK;
 }
