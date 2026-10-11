@@ -34,8 +34,9 @@ typedef struct ftun_fakeip_service ftun_fakeip_service_t;
 typedef struct ftun_fakeip_snapshot ftun_fakeip_snapshot_t;
 typedef struct ftun_fakeip_store ftun_fakeip_store_t;
 typedef struct ftun_feature_plan ftun_feature_plan_t;
-typedef struct ftun_geo_update_request ftun_geo_update_request_t;
-typedef struct ftun_geo_view ftun_geo_view_t;
+typedef struct ftun_frs_set ftun_frs_set_t;
+typedef struct ftun_frs_update_request ftun_frs_update_request_t;
+typedef struct ftun_frs_view ftun_frs_view_t;
 typedef struct ftun_group_spec ftun_group_spec_t;
 typedef struct ftun_health_snapshot ftun_health_snapshot_t;
 typedef struct ftun_inbound_spec ftun_inbound_spec_t;
@@ -103,7 +104,7 @@ typedef struct {
   uint32_t outbound_id;
   const ftun_endpoint_t *allowed;
   size_t allowed_count;
-  /* IP/GEOIP 规则可能从非连续候选中选择子集。指针指向这里时，result
+  /* IP/FRS-IP 规则可能从非连续候选中选择子集。指针指向这里时，result
    * 不得按值复制后继续使用旧 allowed 指针。 */
   ftun_endpoint_t allowed_storage[FTUN_ROUTE_MAX_CANDIDATES];
 } ftun_route_result_t;
@@ -121,7 +122,12 @@ typedef struct {
   bool original_is_fake;
   bool dial_selected;
 } ftun_target_t;
-typedef struct { uint64_t generation; uint32_t leaf_id; bool degraded; } ftun_group_choice_t;
+typedef struct {
+  uint64_t generation;
+  uint32_t leaf_id; /* 0 是合法的内置 DIRECT，generation 表示有效性。 */
+  bool degraded;
+  ftun_string_t dns_server; /* 借用不可变 Runtime，外层显式值优先。 */
+} ftun_group_choice_t;
 /* message 与 path 均为静态借用视图；path 使用 JSON Pointer。 */
 typedef struct {
   ftun_error_t error;
@@ -131,10 +137,12 @@ typedef struct {
 typedef enum {
   FTUN_BUILD_MODULE_CORE = 1u << 0,
   FTUN_BUILD_MODULE_DNS = 1u << 1,
-  FTUN_BUILD_MODULE_TUN = 1u << 2
+  FTUN_BUILD_MODULE_TUN = 1u << 2,
+  FTUN_BUILD_MODULE_FRS = 1u << 3
 } ftun_build_module_t;
 #define FTUN_BUILD_MODULE_ALL \
-  (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS | FTUN_BUILD_MODULE_TUN)
+  (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS | FTUN_BUILD_MODULE_TUN | \
+   FTUN_BUILD_MODULE_FRS)
 typedef struct {
   uint32_t builtins;
   const char *const *names;
@@ -143,5 +151,4 @@ typedef struct {
 typedef struct { ftun_buffer_t *owner; size_t offset, length; } ftun_buffer_slice_t;
 typedef struct { bool complete; size_t consumed; ftun_endpoint_t target; } ftun_protocol_result_t;
 typedef struct { bool found, need_more; ftun_string_t domain; } ftun_sniff_result_t;
-typedef struct { uint16_t major, minor; uint32_t sections; uint64_t file_bytes; } ftun_geo_layout_t;
 #endif

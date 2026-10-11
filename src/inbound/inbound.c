@@ -58,6 +58,7 @@ static ftun_status_t ftun_inbound_validate(const ftun_inbound_spec_t *spec,
                                            uint32_t kind_mask)
 {
   uint32_t required;
+  size_t user_index;
   if (spec == NULL || spec->budget == NULL || spec->generation == 0u ||
       spec->id == 0u ||
       !ftun_inbound_name_valid(spec->name, FTUN_INBOUND_NAME_BYTES)) {
@@ -72,6 +73,7 @@ static ftun_status_t ftun_inbound_validate(const ftun_inbound_spec_t *spec,
 #else
     if (spec->listen.kind != FTUN_ADDRESS_NONE || spec->listen.port != 0u ||
         spec->listen.domain.length != 0u || (!spec->tcp && !spec->udp) ||
+        spec->user_count != 0u || spec->users != NULL ||
         !ftun_inbound_name_valid(spec->tun.name,
                                  FTUN_PACKET_PORT_NAME_BYTES) ||
         spec->tun.mtu < FTUN_LWIP_MIN_MTU ||
@@ -83,6 +85,16 @@ static ftun_status_t ftun_inbound_validate(const ftun_inbound_spec_t *spec,
       spec->listen.port == 0u || spec->listen.domain.length != 0u ||
       spec->tun.name.length != 0u || spec->tun.mtu != 0u) {
     return FTUN_E_INVALID;
+  }
+  if ((spec->user_count == 0u) != (spec->users == NULL) ||
+      spec->user_count > 64u) return FTUN_E_INVALID;
+  for (user_index = 0u; user_index < spec->user_count; user_index++) {
+    const ftun_inbound_user_t *user = &spec->users[user_index];
+    if (user->username.data == NULL || user->password.data == NULL ||
+        user->username.length == 0u || user->username.length > 255u ||
+        user->password.length == 0u || user->password.length > 255u) {
+      return FTUN_E_INVALID;
+    }
   }
   return FTUN_OK;
 }

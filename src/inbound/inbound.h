@@ -21,6 +21,11 @@ typedef enum {
   FTUN_INBOUND_RESOURCE_PACKET_PORT
 } ftun_inbound_resource_kind_t;
 
+typedef struct {
+  ftun_bytes_t username;
+  ftun_bytes_t password;
+} ftun_inbound_user_t;
+
 struct ftun_inbound_spec {
   ftun_budget_t *budget;
   ftun_inbound_kind_t kind;
@@ -31,6 +36,8 @@ struct ftun_inbound_spec {
   bool tcp;
   bool udp;
   ftun_endpoint_t listen;
+  const ftun_inbound_user_t *users; /* prepare 期间同步借用。 */
+  size_t user_count;
   ftun_tun_spec_t tun;
 };
 

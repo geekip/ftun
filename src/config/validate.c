@@ -41,6 +41,22 @@ static int ftun_span_equal(const char *data, size_t length, const char *value)
   return length == value_length && memcmp(data, value, length) == 0;
 }
 
+static int ftun_span_equal_ascii_fold(const char *data, size_t length,
+                                      const char *value)
+{
+  size_t value_length = strlen(value);
+  size_t index;
+  if (data == NULL || length != value_length) return 0;
+  for (index = 0u; index < length; index++) {
+    unsigned char left = (unsigned char)data[index];
+    unsigned char right = (unsigned char)value[index];
+    if (left >= 'A' && left <= 'Z') left = (unsigned char)(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = (unsigned char)(right + ('a' - 'A'));
+    if (left != right) return 0;
+  }
+  return 1;
+}
+
 static int ftun_name_span_valid(const char *value, size_t length)
 {
   size_t index;
@@ -400,7 +416,7 @@ static ftun_status_t ftun_validate_rule(const ftun_config_t *config,
                                   "rule has invalid field count");
   }
   type_length = (size_t)(first - rule);
-  if (ftun_span_equal(rule, type_length, "MATCH")) {
+  if (ftun_span_equal_ascii_fold(rule, type_length, "MATCH")) {
     outbound = first + 1;
     if (outbound[0] == '\0' || strchr(outbound, ',') != NULL) {
       return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
@@ -415,12 +431,12 @@ static ftun_status_t ftun_validate_rule(const ftun_config_t *config,
     }
     operand_length = (size_t)(second - first - 1);
     outbound = second + 1;
-    if (ftun_span_equal(rule, type_length, "SRC-IP-CIDR") ||
-        ftun_span_equal(rule, type_length, "IP-CIDR")) {
-      char buffer[FTUN_CONFIG_MAX_STRING_BYTES + 1u];
-      if (operand_length > FTUN_CONFIG_MAX_STRING_BYTES) {
-        return ftun_config_diagnostic(out, FTUN_E_LIMIT, "/rules",
-                                      "rule operand exceeds limit");
+    if (ftun_span_equal_ascii_fold(rule, type_length, "SRC-IP-CIDR") ||
+        ftun_span_equal_ascii_fold(rule, type_length, "IP-CIDR")) {
+      char buffer[32];
+      if (operand_length >= sizeof(buffer)) {
+        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
+                                      "rule CIDR is invalid");
       }
       memcpy(buffer, first + 1, operand_length);
       buffer[operand_length] = '\0';
@@ -428,35 +444,29 @@ static ftun_status_t ftun_validate_rule(const ftun_config_t *config,
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
                                       "rule CIDR is invalid");
       }
-    } else if (ftun_span_equal(rule, type_length, "DOMAIN") ||
-               ftun_span_equal(rule, type_length, "DOMAIN-SUFFIX")) {
+    } else if (ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN") ||
+               ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN-SUFFIX")) {
       if (!ftun_domain_span(first + 1, operand_length)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
                                       "rule domain is invalid");
       }
-    } else if (ftun_span_equal(rule, type_length, "DOMAIN-KEYWORD")) {
+    } else if (ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN-KEYWORD")) {
       if (!ftun_ascii_token(first + 1, operand_length)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
                                       "domain keyword is invalid");
       }
-    } else if (ftun_span_equal(rule, type_length, "GEOIP")) {
-      if (!ftun_ascii_token(first + 1, operand_length) ||
-          !config->geo.geoip.present || !ftun_path_valid(config->geo.geoip.path)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo/geoip",
-                                      "GEOIP rule requires geoip path");
+    } else if (ftun_span_equal_ascii_fold(rule, type_length, "FRS-IP") ||
+               ftun_span_equal_ascii_fold(rule, type_length, "FRS-DOMAIN")) {
+      if (!ftun_name_span_valid(first + 1, operand_length)) {
+        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
+                                      "FRS label is invalid");
       }
-    } else if (ftun_span_equal(rule, type_length, "GEOSITE")) {
-      if (!ftun_ascii_token(first + 1, operand_length) ||
-          !config->geo.geosite.present || !ftun_path_valid(config->geo.geosite.path)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo/geosite",
-                                      "GEOSITE rule requires geosite path");
-      }
-    } else if (ftun_span_equal(rule, type_length, "DST-PORT")) {
+    } else if (ftun_span_equal_ascii_fold(rule, type_length, "DST-PORT")) {
       if (!ftun_decimal_span(first + 1, operand_length, 65535u, &ignored) || ignored == 0u) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
                                       "rule port is invalid");
       }
-    } else if (ftun_span_equal(rule, type_length, "NETWORK")) {
+    } else if (ftun_span_equal_ascii_fold(rule, type_length, "NETWORK")) {
       if (!ftun_span_equal(first + 1, operand_length, "tcp") &&
           !ftun_span_equal(first + 1, operand_length, "udp")) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
@@ -867,54 +877,41 @@ static ftun_status_t ftun_validate_listener_conflicts(const ftun_config_t *confi
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_validate_geo(const ftun_config_t *config,
+static ftun_status_t ftun_validate_frs(const ftun_config_t *config,
                                        const ftun_config_cidr_t *fake_range,
                                        ftun_diagnostic_t *out)
 {
   uint64_t ignored;
-  const ftun_config_geo_data_t *data[2];
-  size_t index;
-  if (!config->geo.present) return FTUN_OK;
-  if (!ftun_duration_ms(config->geo.update_interval, &ignored)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo/update-interval",
-                                  "Geo update interval is invalid");
+  uint32_t address = 0u;
+  int is_ipv4 = 0;
+  if (!config->frs.active) return FTUN_OK;
+  if (config->frs.path != NULL && !ftun_path_valid(config->frs.path)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/path",
+                                  "FRS path is invalid");
   }
-  if (config->geo.auto_update && !ftun_outbound_exists(config, config->geo.update_outbound)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo/update-outbound",
-                                  "Geo update outbound does not exist");
+  if (!config->frs.auto_update || config->frs.url == NULL ||
+      config->frs.url[0] == '\0') return FTUN_OK;
+  if (!ftun_http_url(config->frs.url, &address, &is_ipv4)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/url",
+                                  "FRS update URL is invalid");
   }
-  if (config->dns.enable && config->geo.dns_server[0] != '\0' &&
-      !ftun_dns_server_exists(config, config->geo.dns_server)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo/dns-server",
-                                  "Geo DNS server does not exist");
+  if (!ftun_duration_ms(config->frs.update_interval, &ignored)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/update-interval",
+                                  "FRS update interval is invalid");
   }
-  data[0] = &config->geo.geoip;
-  data[1] = &config->geo.geosite;
-  for (index = 0u; index < 2u; index++) {
-    uint32_t address = 0u;
-    int is_ipv4 = 0;
-    if (!data[index]->present) continue;
-    if (data[index]->path != NULL && !ftun_path_valid(data[index]->path)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo",
-                                    "Geo data path is invalid");
-    }
-    if (data[index]->url != NULL &&
-        !ftun_http_url(data[index]->url, &address, &is_ipv4)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo",
-                                    "Geo data URL is invalid");
-    }
-    if (data[index]->url != NULL && config->dns.enable &&
-        config->dns.fake_ip.enable && is_ipv4 &&
-        ftun_cidr_contains(fake_range, address)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo",
-                                    "Geo data URL overlaps FakeIP range");
-    }
-    if (config->geo.auto_update &&
-        (!ftun_path_valid(data[index]->path) ||
-         !ftun_http_url(data[index]->url, NULL, NULL))) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/geo",
-                                    "Geo auto update requires path and URL");
-    }
+  if (!ftun_outbound_exists(config, config->frs.update_outbound)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/update-outbound",
+                                  "FRS update outbound does not exist");
+  }
+  if (config->dns.enable && config->frs.dns_server[0] != '\0' &&
+      !ftun_dns_server_exists(config, config->frs.dns_server)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/dns-server",
+                                  "FRS DNS server does not exist");
+  }
+  if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
+      ftun_cidr_contains(fake_range, address)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/url",
+                                  "FRS update URL overlaps FakeIP range");
   }
   return FTUN_OK;
 }
@@ -932,6 +929,7 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
                                   "configuration is missing");
   }
   if (config->dns.enable) required |= FTUN_BUILD_MODULE_DNS;
+  if (config->frs.active) required |= FTUN_BUILD_MODULE_FRS;
   for (index = 0u; index < config->inbound_count; index++) {
     if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
       required |= FTUN_BUILD_MODULE_TUN;
@@ -943,13 +941,18 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
       const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
       static const char dns_path[] = "/dns/enable";
       static const char tun_path[] = "/inbounds";
+      static const char frs_path[] = "/rules";
       if ((required & FTUN_BUILD_MODULE_DNS) != 0u &&
           (capabilities->builtins & FTUN_BUILD_MODULE_DNS) == 0u) {
         out->path.data = dns_path;
         out->path.length = sizeof(dns_path) - 1u;
-      } else {
+      } else if ((required & FTUN_BUILD_MODULE_TUN) != 0u &&
+                 (capabilities->builtins & FTUN_BUILD_MODULE_TUN) == 0u) {
         out->path.data = tun_path;
         out->path.length = sizeof(tun_path) - 1u;
+      } else {
+        out->path.data = frs_path;
+        out->path.length = sizeof(frs_path) - 1u;
       }
     }
     return status;
@@ -965,7 +968,7 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
   if (status != FTUN_OK) return status;
   status = ftun_validate_listener_conflicts(config, out);
   if (status != FTUN_OK) return status;
-  status = ftun_validate_geo(config, &fake_range, out);
+  status = ftun_validate_frs(config, &fake_range, out);
   if (status != FTUN_OK) return status;
   for (index = 0u; index < config->rules.count; index++) {
     status = ftun_validate_rule(config, config->rules.items[index], out);

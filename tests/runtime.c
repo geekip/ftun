@@ -139,12 +139,13 @@ int main(void)
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   CHECK(ftun_config_destroy(&first) == FTUN_OK);
   CHECK(ftun_runtime_active_acquire(core, &old) == FTUN_OK);
-  CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_OK);
-  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_E_LIMIT && candidate != NULL);
+  CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_E_LIMIT &&
+        candidate == NULL);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
-  CHECK(manager_info.generation == 1u && manager_info.has_candidate &&
+  CHECK(manager_info.generation == 1u && !manager_info.has_candidate &&
         manager_info.retained_count == 0u);
   CHECK(ftun_runtime_release(&old) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK && candidate == NULL);
   CHECK(ftun_config_destroy(&second) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
@@ -166,14 +167,15 @@ int main(void)
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   CHECK(ftun_config_destroy(&second) == FTUN_OK);
   CHECK(ftun_runtime_active_acquire(core, &active) == FTUN_OK);
-  CHECK(ftun_runtime_prepare(core, third, &candidate) == FTUN_OK);
-  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_E_LIMIT && candidate != NULL);
+  CHECK(ftun_runtime_prepare(core, third, &candidate) == FTUN_E_LIMIT &&
+        candidate == NULL);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
   CHECK(manager_info.generation == 2u && manager_info.has_active &&
-        manager_info.has_candidate && manager_info.retained_count == 1u);
+        !manager_info.has_candidate && manager_info.retained_count == 1u);
   CHECK(ftun_runtime_get_info(active, &runtime_info) == FTUN_OK);
   CHECK(runtime_info.state == FTUN_RUNTIME_ACTIVE && runtime_info.generation == 2u);
   CHECK(ftun_runtime_release(&old) == FTUN_OK && old == NULL);
+  CHECK(ftun_runtime_prepare(core, third, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK && candidate == NULL);
   CHECK(ftun_config_destroy(&third) == FTUN_OK);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);

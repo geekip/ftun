@@ -23,8 +23,8 @@
     "dns": {
       "$ref": "#/$defs/DNS"
     },
-    "geo": {
-      "$ref": "#/$defs/Geo"
+    "frs": {
+      "description": "仅 rules 中出现 FRS-IP/FRS-DOMAIN 时解释；否则整个值由运行时忽略。"
     },
     "sniff": {
       "$ref": "#/$defs/Sniff"
@@ -77,27 +77,18 @@
           "rules": {
             "contains": {
               "type": "string",
-              "pattern": "^GEOIP,"
+              "pattern": "^[Ff][Rr][Ss]-[Ii][Pp],"
             }
           }
         }
       },
       "then": {
         "required": [
-          "geo"
+          "rules"
         ],
         "properties": {
-          "geo": {
-            "required": [
-              "geoip"
-            ],
-            "properties": {
-              "geoip": {
-                "required": [
-                  "path"
-                ]
-              }
-            }
+          "frs": {
+            "$ref": "#/$defs/FRS"
           }
         }
       }
@@ -111,27 +102,18 @@
           "rules": {
             "contains": {
               "type": "string",
-              "pattern": "^GEOSITE,"
+              "pattern": "^[Ff][Rr][Ss]-[Dd][Oo][Mm][Aa][Ii][Nn],"
             }
           }
         }
       },
       "then": {
         "required": [
-          "geo"
+          "rules"
         ],
         "properties": {
-          "geo": {
-            "required": [
-              "geosite"
-            ],
-            "properties": {
-              "geosite": {
-                "required": [
-                  "path"
-                ]
-              }
-            }
+          "frs": {
+            "$ref": "#/$defs/FRS"
           }
         }
       }
@@ -432,29 +414,30 @@
       "additionalProperties": false,
       "description": "关闭后仍检查字段形状和语法，但不建立失效 DNS 引用或资源依赖。"
     },
-    "GeoData": {
-      "title": "FTUN Geo 数据文件",
+    "FRS": {
+      "title": "FTUN Rule Set",
       "type": "object",
       "properties": {
         "path": {
           "$ref": "#/$defs/Path",
-          "description": "FTUN 私有二进制索引，不是原始 V2Ray .dat；使用该数据时必填。"
+          "description": "单个多集合 .frs 文件；省略时使用 ftun 可执行文件所在目录的 rules.frs。"
         },
         "url": {
-          "$ref": "#/$defs/HTTPURL",
-          "description": "已转换的 FTUN 二进制下载地址；启用更新时必填。"
-        }
-      },
-      "additionalProperties": false
-    },
-    "Geo": {
-      "title": "Geo",
-      "type": "object",
-      "properties": {
+          "anyOf": [
+            {
+              "const": ""
+            },
+            {
+              "$ref": "#/$defs/HTTPURL"
+            }
+          ],
+          "default": "",
+          "description": "HTTP(S) 更新地址；空值不更新并由运行时告警。"
+        },
         "auto-update": {
           "type": "boolean",
           "default": false,
-          "description": "后台更新已转换的二进制；失败保留旧数据。"
+          "description": "启动后按周期更新完整 .frs；失败保留旧 Runtime。"
         },
         "update-interval": {
           "$ref": "#/$defs/Duration",
@@ -467,46 +450,10 @@
         "dns-server": {
           "$ref": "#/$defs/OptionalDNSName",
           "description": "下载端点的本地解析器；空值 Bootstrap，DNS 关闭时使用系统解析器。"
-        },
-        "geoip": {
-          "$ref": "#/$defs/GeoData"
-        },
-        "geosite": {
-          "$ref": "#/$defs/GeoData"
         }
       },
       "additionalProperties": false,
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "auto-update": {
-                "const": true
-              }
-            },
-            "required": [
-              "auto-update"
-            ]
-          },
-          "then": {
-            "properties": {
-              "geoip": {
-                "required": [
-                  "path",
-                  "url"
-                ]
-              },
-              "geosite": {
-                "required": [
-                  "path",
-                  "url"
-                ]
-              }
-            }
-          }
-        }
-      ],
-      "description": "C 工具离线生成私有索引；v1 无正则、无 Go 生成工具。未使用的数据对象不要求文件路径。"
+      "description": "仅 FRS 规则激活；path 可省略，url 为空时不执行更新。文件完整性和集合引用由运行时校验。"
     },
     "Sniff": {
       "title": "有界嗅探",
@@ -909,7 +856,7 @@
     },
     "SourceIPRule": {
       "type": "string",
-      "pattern": "^(?:SRC-IP-CIDR,(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Ss][Rr][Cc]-[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "SourceIPRule",
       "description": "匹配实际客户端源 IPv4。",
       "examples": [
@@ -918,7 +865,7 @@
     },
     "IPRule": {
       "type": "string",
-      "pattern": "^(?:IP-CIDR,(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "IPRule",
       "description": "匹配真实目的地址；缺 IP 时按当前规则等待真实解析。",
       "examples": [
@@ -927,7 +874,7 @@
     },
     "DomainRule": {
       "type": "string",
-      "pattern": "^(?:DOMAIN,(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Dd][Oo][Mm][Aa][Ii][Nn],(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "DomainRule",
       "description": "完整域名匹配；ASCII A-label。",
       "examples": [
@@ -936,7 +883,7 @@
     },
     "DomainSuffixRule": {
       "type": "string",
-      "pattern": "^(?:DOMAIN-SUFFIX,(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Dd][Oo][Mm][Aa][Ii][Nn]-[Ss][Uu][Ff][Ff][Ii][Xx],(?=[A-Za-z0-9.-]{1,253}\\.?,)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.)*[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\\.?,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "DomainSuffixRule",
       "description": "本域及标签边界的子域。",
       "examples": [
@@ -945,34 +892,34 @@
     },
     "DomainKeywordRule": {
       "type": "string",
-      "pattern": "^(?:DOMAIN-KEYWORD,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Dd][Oo][Mm][Aa][Ii][Nn]-[Kk][Ee][Yy][Ww][Oo][Rr][Dd],[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "DomainKeywordRule",
       "description": "ASCII 域名子串，无正则解释。",
       "examples": [
         "DOMAIN-KEYWORD,example,proxy"
       ]
     },
-    "GeoIPRule": {
+    "FRSIPRule": {
       "type": "string",
-      "pattern": "^(?:GEOIP,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
-      "title": "GeoIPRule",
-      "description": "匹配本地 IPv4 CIDR 数据集；已有 IP 不需要 DNS。",
+      "pattern": "^(?:[Ff][Rr][Ss]-[Ii][Pp],[^,\\u0000-\\u001f\\u007f]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "FRSIPRule",
+      "description": "按区分大小写的 label 匹配 .frs IPv4 区间集合；已有 IP 不需要 DNS。",
       "examples": [
-        "GEOIP,private,DIRECT"
+        "FRS-IP,CN,DIRECT"
       ]
     },
-    "GeoSiteRule": {
+    "FRSDomainRule": {
       "type": "string",
-      "pattern": "^(?:GEOSITE,[\\x21-\\x2b\\x2d-\\x7e]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
-      "title": "GeoSiteRule",
-      "description": "匹配本地 exact/suffix/keyword 域名集合；不天然触发 DNS。",
+      "pattern": "^(?:[Ff][Rr][Ss]-[Dd][Oo][Mm][Aa][Ii][Nn],[^,\\u0000-\\u001f\\u007f]+,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "title": "FRSDomainRule",
+      "description": "按区分大小写的 label 匹配 .frs exact/suffix/keyword 域名集合；不天然触发 DNS。",
       "examples": [
-        "GEOSITE,proxy,proxy"
+        "FRS-DOMAIN,CN,proxy"
       ]
     },
     "PortRule": {
       "type": "string",
-      "pattern": "^(?:DST-PORT,(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Dd][Ss][Tt]-[Pp][Oo][Rr][Tt],(?:[1-9][0-9]{0,3}|[1-5][0-9]{4}|6[0-4][0-9]{3}|65[0-4][0-9]{2}|655[0-2][0-9]|6553[0-5]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "PortRule",
       "description": "已知业务目标端口；v1 单个端口。",
       "examples": [
@@ -981,7 +928,7 @@
     },
     "NetworkRule": {
       "type": "string",
-      "pattern": "^(?:NETWORK,(?:tcp|udp),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Nn][Ee][Tt][Ww][Oo][Rr][Kk],(?:tcp|udp),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "NetworkRule",
       "description": "匹配已知业务网络，不用 DNS 的网络/端口冒充未来业务元数据。",
       "examples": [
@@ -990,7 +937,7 @@
     },
     "MatchRule": {
       "type": "string",
-      "pattern": "^(?:MATCH,[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:[Mm][Aa][Tt][Cc][Hh],[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "MatchRule",
       "description": "兜底匹配。",
       "examples": [
@@ -1016,10 +963,10 @@
           "$ref": "#/$defs/DomainKeywordRule"
         },
         {
-          "$ref": "#/$defs/GeoIPRule"
+          "$ref": "#/$defs/FRSIPRule"
         },
         {
-          "$ref": "#/$defs/GeoSiteRule"
+          "$ref": "#/$defs/FRSDomainRule"
         },
         {
           "$ref": "#/$defs/PortRule"

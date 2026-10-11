@@ -53,6 +53,12 @@ ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core);
  * 输入同步借用；成功后 candidate 保留 config，调用者用 commit 转移或 abort 回滚。
  */
 ftun_status_t ftun_runtime_prepare(ftun_core_t *core, const ftun_config_t *config, ftun_runtime_t **out);
+/* FRS 更新事务使用已完整校验的候选 view 重新准备同一配置；Runtime 成功
+ * 后拥有 view 引用。普通启动必须调用 ftun_runtime_prepare。 */
+ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
+                                            const ftun_config_t *config,
+                                            ftun_frs_view_t *view,
+                                            ftun_runtime_t **out);
 /* commit 不分配；成功清空 candidate 句柄并由 manager 持有 active。 */
 ftun_status_t ftun_runtime_commit(ftun_core_t *core, ftun_runtime_t **candidate);
 ftun_status_t ftun_runtime_abort(ftun_core_t *core, ftun_runtime_t **candidate);
@@ -64,4 +70,20 @@ ftun_status_t ftun_runtime_get_info(const ftun_runtime_t *runtime,
 /* 返回 Runtime 拥有的不可变规则表；借用期不超过 Runtime 引用。 */
 ftun_status_t ftun_runtime_route_table(const ftun_runtime_t *runtime,
                                        const ftun_route_table_t **out);
+/* 借用不可变 FRSView；仅在 Runtime 引用期内有效。无 FRS 返回 AGAIN。 */
+ftun_status_t ftun_runtime_frs_view(const ftun_runtime_t *runtime,
+                                    ftun_frs_view_t **out);
+/* 0.4 代理组 owner-loop 状态。group/member 使用稳定 outbound ID。 */
+ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
+                                      uint32_t group_id,
+                                      uint32_t member_id);
+ftun_status_t ftun_runtime_group_selected(const ftun_runtime_t *runtime,
+                                           uint32_t group_id,
+                                           uint32_t *member_id,
+                                           bool *is_group,
+                                           bool *degraded,
+                                           ftun_string_t *dns_server);
+ftun_status_t ftun_runtime_group_publish(ftun_core_t *core,
+                                         uint32_t group_id,
+                                         const ftun_group_choice_t *choice);
 #endif

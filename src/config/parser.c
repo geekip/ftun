@@ -6,6 +6,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+static int ftun_rule_type_equal(const char *rule, size_t length,
+                                const char *type);
+
 static char *ftun_config_string_copy(const char *value)
 {
   size_t length;
@@ -59,6 +62,86 @@ static int ftun_utf8_valid(const unsigned char *text)
   return 1;
 }
 
+static size_t ftun_name_space_bytes(const unsigned char *text, size_t length)
+{
+  if (text == NULL || length == 0u) return 0u;
+  if (text[0] == 0x20u) return 1u;
+  if (length >= 2u && text[0] == 0xc2u && text[1] == 0xa0u) return 2u;
+  if (length >= 3u && text[0] == 0xe1u && text[1] == 0x9au &&
+      text[2] == 0x80u) return 3u;
+  if (length >= 3u && text[0] == 0xe2u && text[1] == 0x80u &&
+      ((text[2] >= 0x80u && text[2] <= 0x8au) || text[2] == 0xa8u ||
+       text[2] == 0xa9u || text[2] == 0xafu)) return 3u;
+  if (length >= 3u && text[0] == 0xe2u && text[1] == 0x81u &&
+      text[2] == 0x9fu) return 3u;
+  if (length >= 3u && text[0] == 0xe3u && text[1] == 0x80u &&
+      text[2] == 0x80u) return 3u;
+  return 0u;
+}
+
+static void ftun_trim_name(char *value)
+{
+  unsigned char *bytes = (unsigned char *)value;
+  size_t length;
+  size_t start = 0u;
+  size_t end;
+  if (value == NULL) return;
+  length = strlen(value);
+  while (start < length) {
+    size_t space = ftun_name_space_bytes(bytes + start, length - start);
+    if (space == 0u) break;
+    start += space;
+  }
+  end = length;
+  while (end > start) {
+    size_t cursor = end - 1u;
+    size_t space;
+    while (cursor > start && (bytes[cursor] & 0xc0u) == 0x80u) cursor--;
+    space = ftun_name_space_bytes(bytes + cursor, end - cursor);
+    if (space == 0u || cursor + space != end) break;
+    end = cursor;
+  }
+  if (start != 0u && end != start) memmove(value, value + start, end - start);
+  value[end - start] = '\0';
+}
+
+static void ftun_trim_rule_names(char *rule)
+{
+  char *first;
+  char *second;
+  if (rule == NULL || (first = strchr(rule, ',')) == NULL) return;
+  second = strchr(first + 1u, ',');
+  if (second == NULL) {
+    ftun_trim_name(first + 1u);
+    return;
+  }
+  ftun_trim_name(second + 1u);
+  if (ftun_rule_type_equal(rule, (size_t)(first - rule), "FRS-IP") ||
+      ftun_rule_type_equal(rule, (size_t)(first - rule), "FRS-DOMAIN")) {
+    unsigned char *operand = (unsigned char *)(first + 1u);
+    size_t length = (size_t)(second - first - 1u);
+    size_t start = 0u;
+    size_t end = length;
+    while (start < length) {
+      size_t space = ftun_name_space_bytes(operand + start, length - start);
+      if (space == 0u) break;
+      start += space;
+    }
+    while (end > start) {
+      size_t cursor = end - 1u;
+      size_t space;
+      while (cursor > start && (operand[cursor] & 0xc0u) == 0x80u) cursor--;
+      space = ftun_name_space_bytes(operand + cursor, end - cursor);
+      if (space == 0u || cursor + space != end) break;
+      end = cursor;
+    }
+    if (start != 0u && end != start) {
+      memmove(first + 1u, operand + start, end - start);
+    }
+    memmove(first + 1u + (end - start), second, strlen(second) + 1u);
+  }
+}
+
 static ftun_status_t ftun_json_preflight(ftun_bytes_t json)
 {
   size_t index;
@@ -72,10 +155,39 @@ static ftun_status_t ftun_json_preflight(ftun_bytes_t json)
     if (byte == 0u) return FTUN_E_INVALID;
     if (in_string) {
       if (escaped) {
-        if (byte == 'u' && index + 4u < json.length &&
-            json.data[index + 1u] == '0' && json.data[index + 2u] == '0' &&
-            json.data[index + 3u] == '0' && json.data[index + 4u] == '0') {
-          return FTUN_E_INVALID;
+        if (byte == 'u') {
+          uint32_t codepoint = 0u;
+          size_t digit;
+          if (index + 4u >= json.length) return FTUN_E_INVALID;
+          for (digit = 1u; digit <= 4u; digit++) {
+            unsigned char value = json.data[index + digit];
+            uint32_t nibble;
+            if (value >= '0' && value <= '9') nibble = value - '0';
+            else if (value >= 'a' && value <= 'f') nibble = value - 'a' + 10u;
+            else if (value >= 'A' && value <= 'F') nibble = value - 'A' + 10u;
+            else return FTUN_E_INVALID;
+            codepoint = (codepoint << 4u) | nibble;
+          }
+          index += 4u;
+          if (codepoint == 0u || (codepoint >= 0xdc00u && codepoint <= 0xdfffu)) {
+            return FTUN_E_INVALID;
+          }
+          if (codepoint >= 0xd800u && codepoint <= 0xdbffu) {
+            uint32_t low = 0u;
+            if (index + 6u >= json.length || json.data[index + 1u] != '\\' ||
+                json.data[index + 2u] != 'u') return FTUN_E_INVALID;
+            for (digit = 3u; digit <= 6u; digit++) {
+              unsigned char value = json.data[index + digit];
+              uint32_t nibble;
+              if (value >= '0' && value <= '9') nibble = value - '0';
+              else if (value >= 'a' && value <= 'f') nibble = value - 'a' + 10u;
+              else if (value >= 'A' && value <= 'F') nibble = value - 'A' + 10u;
+              else return FTUN_E_INVALID;
+              low = (low << 4u) | nibble;
+            }
+            if (low < 0xdc00u || low > 0xdfffu) return FTUN_E_INVALID;
+            index += 6u;
+          }
         }
         escaped = 0;
       } else if (byte == '\\') {
@@ -241,9 +353,9 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
   config->dns.fake_ip.enable = true;
   config->dns.fake_ip.persist = true;
   FTUN_DEFAULT(config->dns.fake_ip.range, "198.18.0.0/15");
-  FTUN_DEFAULT(config->geo.update_interval, "24h");
-  FTUN_DEFAULT(config->geo.update_outbound, "DIRECT");
-  FTUN_DEFAULT(config->geo.dns_server, "");
+  FTUN_DEFAULT(config->frs.update_interval, "24h");
+  FTUN_DEFAULT(config->frs.update_outbound, "DIRECT");
+  FTUN_DEFAULT(config->frs.dns_server, "");
   config->sniff.tls_sni = true;
   config->sniff.http_host = true;
 #undef FTUN_DEFAULT
@@ -388,42 +500,64 @@ static ftun_status_t ftun_parse_dns(const cJSON *item, ftun_config_t *config)
   return status;
 }
 
-static ftun_status_t ftun_parse_geo_data(const cJSON *item,
-                                         ftun_config_geo_data_t *data)
+static ftun_status_t ftun_parse_frs(const cJSON *item, ftun_config_t *config)
 {
-  static const char *const fields[] = {"path", "url"};
-  ftun_status_t status = ftun_check_fields(item, fields, 2u);
+  static const char *const fields[] = {
+    "path", "url", "auto-update", "update-interval", "update-outbound",
+    "dns-server"
+  };
+  ftun_status_t status = ftun_check_fields(item, fields, 6u);
   if (status != FTUN_OK) return status;
-  data->present = true;
-  status = ftun_replace_string(&data->path,
+  config->frs.present = true;
+  status = ftun_replace_string(&config->frs.path,
     cJSON_GetObjectItemCaseSensitive(item, "path"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&data->url,
+  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.url,
     cJSON_GetObjectItemCaseSensitive(item, "url"), 0);
+  if (status == FTUN_OK) status = ftun_optional_bool(item, "auto-update",
+    &config->frs.auto_update);
+  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.update_interval,
+    cJSON_GetObjectItemCaseSensitive(item, "update-interval"), 0);
+  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.update_outbound,
+    cJSON_GetObjectItemCaseSensitive(item, "update-outbound"), 0);
+  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.dns_server,
+    cJSON_GetObjectItemCaseSensitive(item, "dns-server"), 0);
   return status;
 }
 
-static ftun_status_t ftun_parse_geo(const cJSON *item, ftun_config_t *config)
+static int ftun_rule_type_equal(const char *rule, size_t length,
+                                const char *type)
 {
-  static const char *const fields[] = {
-    "auto-update", "update-interval", "update-outbound", "dns-server",
-    "geoip", "geosite"
-  };
-  const cJSON *child;
-  ftun_status_t status = ftun_check_fields(item, fields, 6u);
-  if (status != FTUN_OK) return status;
-  config->geo.present = true;
-  status = ftun_optional_bool(item, "auto-update", &config->geo.auto_update);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->geo.update_interval,
-    cJSON_GetObjectItemCaseSensitive(item, "update-interval"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->geo.update_outbound,
-    cJSON_GetObjectItemCaseSensitive(item, "update-outbound"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->geo.dns_server,
-    cJSON_GetObjectItemCaseSensitive(item, "dns-server"), 0);
-  child = cJSON_GetObjectItemCaseSensitive(item, "geoip");
-  if (status == FTUN_OK && child != NULL) status = ftun_parse_geo_data(child, &config->geo.geoip);
-  child = cJSON_GetObjectItemCaseSensitive(item, "geosite");
-  if (status == FTUN_OK && child != NULL) status = ftun_parse_geo_data(child, &config->geo.geosite);
-  return status;
+  size_t index;
+  size_t type_length = strlen(type);
+  if (length != type_length) return 0;
+  for (index = 0u; index < length; index++) {
+    unsigned char left = (unsigned char)rule[index];
+    unsigned char right = (unsigned char)type[index];
+    if (left >= 'A' && left <= 'Z') left = (unsigned char)(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = (unsigned char)(right + ('a' - 'A'));
+    if (left != right) return 0;
+  }
+  return 1;
+}
+
+static int ftun_root_has_frs_rule(const cJSON *root)
+{
+  const cJSON *rules = cJSON_GetObjectItemCaseSensitive(root, "rules");
+  const cJSON *item;
+  if (!cJSON_IsArray(rules)) return 0;
+  for (item = rules->child; item != NULL; item = item->next) {
+    const char *comma;
+    if (!cJSON_IsString(item) || item->valuestring == NULL) continue;
+    comma = strchr(item->valuestring, ',');
+    if (comma != NULL &&
+        (ftun_rule_type_equal(item->valuestring,
+                              (size_t)(comma - item->valuestring), "FRS-IP") ||
+         ftun_rule_type_equal(item->valuestring,
+                              (size_t)(comma - item->valuestring), "FRS-DOMAIN"))) {
+      return 1;
+    }
+  }
+  return 0;
 }
 
 static ftun_status_t ftun_parse_sniff(const cJSON *item, ftun_config_t *config)
@@ -680,10 +814,43 @@ static ftun_status_t ftun_parse_outbounds(const cJSON *array, ftun_config_t *con
   return FTUN_OK;
 }
 
+static void ftun_normalize_config_names(ftun_config_t *config)
+{
+  size_t index;
+  if (config == NULL) return;
+  ftun_trim_name(config->dns.default_server);
+  for (index = 0u; index < config->dns.listener_count; index++) {
+    ftun_trim_name(config->dns.listeners[index].server);
+  }
+  for (index = 0u; index < config->dns.server_count; index++) {
+    ftun_trim_name(config->dns.servers[index].name);
+    ftun_trim_name(config->dns.servers[index].outbound);
+  }
+  ftun_trim_name(config->frs.update_outbound);
+  ftun_trim_name(config->frs.dns_server);
+  for (index = 0u; index < config->inbound_count; index++) {
+    ftun_trim_name(config->inbounds[index].name);
+    ftun_trim_name(config->inbounds[index].outbound);
+  }
+  for (index = 0u; index < config->outbound_count; index++) {
+    size_t member;
+    ftun_config_outbound_t *outbound = &config->outbounds[index];
+    ftun_trim_name(outbound->name);
+    ftun_trim_name(outbound->dns_server);
+    ftun_trim_name(outbound->default_member);
+    for (member = 0u; member < outbound->members.count; member++) {
+      ftun_trim_name(outbound->members.items[member]);
+    }
+  }
+  for (index = 0u; index < config->rules.count; index++) {
+    ftun_trim_rule_names(config->rules.items[index]);
+  }
+}
+
 static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
 {
   static const char *const fields[] = {
-    "$schema", "base", "log", "dns", "geo", "sniff", "inbounds", "outbounds",
+    "$schema", "base", "log", "dns", "frs", "sniff", "inbounds", "outbounds",
     "rules"
   };
   const cJSON *item;
@@ -703,8 +870,6 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
   if (status == FTUN_OK && item != NULL) status = ftun_parse_log(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "dns");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_dns(item, config);
-  item = cJSON_GetObjectItemCaseSensitive(root, "geo");
-  if (status == FTUN_OK && item != NULL) status = ftun_parse_geo(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "sniff");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_sniff(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "inbounds");
@@ -713,6 +878,12 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
   if (status == FTUN_OK && item != NULL) status = ftun_parse_outbounds(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "rules");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_string_list(item, &config->rules, 0);
+  config->frs.active = status == FTUN_OK && ftun_root_has_frs_rule(root);
+  item = cJSON_GetObjectItemCaseSensitive(root, "frs");
+  if (status == FTUN_OK && config->frs.active && item != NULL) {
+    status = ftun_parse_frs(item, config);
+  }
+  if (status == FTUN_OK) ftun_normalize_config_names(config);
   return status;
 }
 
@@ -758,13 +929,11 @@ ftun_status_t ftun_config_destroy(ftun_config_t **config)
     free(owned->dns.servers[index].outbound);
   }
   free(owned->dns.servers);
-  free(owned->geo.update_interval);
-  free(owned->geo.update_outbound);
-  free(owned->geo.dns_server);
-  free(owned->geo.geoip.path);
-  free(owned->geo.geoip.url);
-  free(owned->geo.geosite.path);
-  free(owned->geo.geosite.url);
+  free(owned->frs.path);
+  free(owned->frs.url);
+  free(owned->frs.update_interval);
+  free(owned->frs.update_outbound);
+  free(owned->frs.dns_server);
   for (index = 0u; index < owned->inbound_count; index++) {
     ftun_config_inbound_t *inbound = &owned->inbounds[index];
     size_t user_index;
@@ -819,6 +988,15 @@ ftun_status_t ftun_config_parse(ftun_bytes_t json, ftun_config_t **out)
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (out == NULL) return FTUN_E_INVALID;
+  if (json.length >= 3u && json.data != NULL && json.data[0] == 0xefu &&
+      json.data[1] == 0xbbu && json.data[2] == 0xbfu) {
+    json.data += 3u;
+    json.length -= 3u;
+    if (json.length >= 3u && json.data[0] == 0xefu &&
+        json.data[1] == 0xbbu && json.data[2] == 0xbfu) {
+      return FTUN_E_INVALID;
+    }
+  }
   status = ftun_json_preflight(json);
   if (status != FTUN_OK) return status;
   input = (char *)malloc(json.length + 1u);

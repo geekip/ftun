@@ -102,19 +102,21 @@ int main(int argc, char **argv)
     "\"address\":[\"dns.example\"],\"outbound\":\"missing\"}]},"
     "\"outbounds\":[{\"name\":\"p\",\"type\":\"socks5\","
     "\"server\":\"proxy.example:1\",\"dns-server\":\"missing\"}]}";
-  static const char geo_update[] =
-    "{\"dns\":{\"enable\":false},\"geo\":{\"auto-update\":true,"
-    "\"update-outbound\":\"p\",\"geoip\":{\"path\":\"ip.bin\","
-    "\"url\":\"https://geo.example/ip.bin\"}},\"outbounds\":[{\"name\":\"p\","
-    "\"type\":\"socks5\",\"server\":\"192.0.2.1:1\"}]}";
-  static const char geo_rule[] =
-    "{\"dns\":{\"enable\":false},\"geo\":{\"geosite\":{\"path\":\"site.bin\"}},"
-    "\"rules\":[\"GEOSITE,ads,REJECT\",\"MATCH,DIRECT\"]}";
-  static const char geo_dns[] =
-    "{\"dns\":{\"servers\":[{\"name\":\"geo-dns\",\"type\":\"udp\","
-    "\"address\":[\"192.0.2.53\"]}]},\"geo\":{\"auto-update\":true,"
-    "\"dns-server\":\"geo-dns\",\"geoip\":{\"path\":\"ip.bin\","
-    "\"url\":\"https://geo.example/ip.bin\"}}}";
+  static const char frs_update[] =
+    "{\"dns\":{\"enable\":false},\"frs\":{\"auto-update\":true,"
+    "\"update-outbound\":\"p\",\"path\":\"rules.frs\","
+    "\"url\":\"https://frs.example/rules.frs\"},\"outbounds\":[{\"name\":\"p\","
+    "\"type\":\"socks5\",\"server\":\"192.0.2.1:1\"}],"
+    "\"rules\":[\"FRS-IP,CN,DIRECT\"]}";
+  static const char frs_rule[] =
+    "{\"dns\":{\"enable\":false},\"frs\":{\"path\":\"rules.frs\"},"
+    "\"rules\":[\"frs-domain,ads,REJECT\",\"MATCH,DIRECT\"]}";
+  static const char frs_dns[] =
+    "{\"dns\":{\"servers\":[{\"name\":\"frs-dns\",\"type\":\"udp\","
+    "\"address\":[\"192.0.2.53\"]}]},\"frs\":{\"auto-update\":true,"
+    "\"dns-server\":\"frs-dns\",\"path\":\"rules.frs\","
+    "\"url\":\"https://frs.example/rules.frs\"},"
+    "\"rules\":[\"FRS-DOMAIN,CN,REJECT\"]}";
   static const char dns_root[] =
     "{\"dns\":{\"default-server\":\"real\",\"servers\":[{\"name\":\"real\","
     "\"type\":\"udp\",\"address\":[\"192.0.2.53\"]}]},\"inbounds\":[{"
@@ -139,7 +141,7 @@ int main(int argc, char **argv)
         plan->lazy_outbound_count == 2u);
   CHECK(plan->dns_server_count == 2u && plan->reachable_dns_server_count == 2u);
   CHECK(plan->prepare_listener_count == 4u && plan->prepare_tun_count == 1u &&
-        plan->prepare_geo_count == 0u);
+        plan->prepare_frs_count == 1u);
   CHECK(plan->lazy_health_count == 1u && plan->active_health_count == 0u);
   CHECK(feature(plan->compiled, FTUN_PLAN_RULES | FTUN_PLAN_INBOUND |
                 FTUN_PLAN_TUN | FTUN_PLAN_OUTBOUND | FTUN_PLAN_GROUP |
@@ -158,7 +160,7 @@ int main(int argc, char **argv)
     CHECK(plan->rule_order[index] == index);
   }
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
-  CHECK(plan->rule_count == 4u && plan->outbound_states[3] & FTUN_PLAN_ITEM_ACTIVE);
+  CHECK(plan->rule_count == 6u && plan->outbound_states[3] & FTUN_PLAN_ITEM_ACTIVE);
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK && plan == NULL);
   free(file_data);
 
@@ -202,24 +204,23 @@ int main(int argc, char **argv)
   CHECK(no_feature(plan->lazy, FTUN_PLAN_BOOTSTRAP | FTUN_PLAN_SYSTEM_RESOLVER));
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK);
 
-  CHECK(compile_text(geo_update, &plan));
-  CHECK(plan->prepare_geo_count == 1u && plan->reachable_outbound_count == 1u);
-  CHECK(feature(plan->prepare, FTUN_PLAN_GEOIP));
-  CHECK(feature(plan->active, FTUN_PLAN_GEO_UPDATE));
+  CHECK(compile_text(frs_update, &plan));
+  CHECK(plan->prepare_frs_count == 1u && plan->reachable_outbound_count == 1u);
+  CHECK(feature(plan->prepare, FTUN_PLAN_FRS));
+  CHECK(feature(plan->active, FTUN_PLAN_FRS_UPDATE));
   CHECK(feature(plan->lazy, FTUN_PLAN_SYSTEM_RESOLVER));
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK);
 
-  CHECK(compile_text(geo_rule, &plan));
-  CHECK(plan->prepare_geo_count == 1u && plan->rule_count == 2u);
-  CHECK(feature(plan->prepare, FTUN_PLAN_GEOSITE));
-  CHECK(no_feature(plan->prepare, FTUN_PLAN_GEOIP));
+  CHECK(compile_text(frs_rule, &plan));
+  CHECK(plan->prepare_frs_count == 1u && plan->rule_count == 2u);
+  CHECK(feature(plan->prepare, FTUN_PLAN_FRS));
   CHECK(plan->rule_order[0] == 0u && plan->rule_order[1] == 1u);
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK);
 
-  CHECK(compile_text(geo_dns, &plan));
-  CHECK(plan->reachable_dns_server_count == 1u && plan->prepare_geo_count == 1u);
+  CHECK(compile_text(frs_dns, &plan));
+  CHECK(plan->reachable_dns_server_count == 1u && plan->prepare_frs_count == 1u);
   CHECK(feature(plan->prepare, FTUN_PLAN_DNS | FTUN_PLAN_DNS_CACHE |
-                FTUN_PLAN_GEOIP));
+                FTUN_PLAN_FRS));
   CHECK(no_feature(plan->lazy, FTUN_PLAN_BOOTSTRAP));
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK);
 

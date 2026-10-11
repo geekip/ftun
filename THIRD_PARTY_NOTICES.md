@@ -37,3 +37,16 @@ configuration to compile. The patch is retained under
 
 lwIP is distributed under the three-clause BSD license. The complete upstream
 notice is retained in `third_party/lwip/LICENSE`.
+
+## wolfSSL 5.8.4
+
+FTUN includes wolfSSL through a Git submodule pinned to upstream tag
+`v5.8.4-stable`, commit
+`59f4fa568615396fbf381b073b220d1e8d61e4c2`. The submodule is unmodified.
+FTUN builds the static client library with TLS 1.3 enabled, obsolete TLS and
+DTLS disabled, and does not build or install the upstream examples or tests.
+
+The open-source wolfSSL distribution is licensed under GNU GPL version 3;
+wolfSSL also offers separate commercial licensing. This repository uses the
+GPLv3 terms unless a distributor has obtained a suitable commercial license.
+The complete GPLv3 text is retained in `third_party/wolfssl/COPYING`.

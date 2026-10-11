@@ -52,12 +52,14 @@ int main(void)
 {
   static const char valid[] =
     "{\"dns\":{\"enable\":false},\"base\":{\"cache-file\":\"../state/cache\"},"
-    "\"log\":{\"file\":\"logs/ftun.log\"},\"geo\":{\"geoip\":{"
-    "\"path\":\"./geo/ip.bin\"}},\"outbounds\":[{\"name\":\"unused\","
+    "\"log\":{\"file\":\"logs/ftun.log\"},\"frs\":{"
+    "\"path\":\"./data/rules.frs\"},\"rules\":[\"FRS-IP,CN,DIRECT\"],"
+    "\"outbounds\":[{\"name\":\"unused\","
     "\"type\":\"socks5\",\"server\":\"unused.example:1080\"}]}";
   char temporary[] = "/tmp/ftun-config-load-XXXXXX";
   char config_directory[PATH_MAX];
   char config_path[PATH_MAX];
+  char default_path[PATH_MAX];
   char invalid_path[PATH_MAX];
   char semantic_path[PATH_MAX];
   char tilde_path[PATH_MAX];
@@ -66,6 +68,9 @@ int main(void)
   char expected[PATH_MAX];
   char *root;
   char *canonical;
+  char executable[PATH_MAX];
+  char *separator;
+  ssize_t executable_length;
   struct passwd *user;
   ftun_config_t *config = NULL;
   int descriptor;
@@ -76,6 +81,7 @@ int main(void)
   CHECK(mkdir(config_directory, 0700) == 0);
   CHECK(make_path(config_path, sizeof(config_path), config_directory, "valid.json"));
   CHECK(make_path(invalid_path, sizeof(invalid_path), config_directory, "invalid.json"));
+  CHECK(make_path(default_path, sizeof(default_path), config_directory, "default.json"));
   CHECK(make_path(semantic_path, sizeof(semantic_path), config_directory, "semantic.json"));
   CHECK(make_path(tilde_path, sizeof(tilde_path), config_directory, "tilde.json"));
   CHECK(make_path(bad_tilde_path, sizeof(bad_tilde_path), config_directory,
@@ -92,13 +98,30 @@ int main(void)
   CHECK(strcmp(config->base.cache_file, expected) == 0);
   CHECK(make_path(expected, sizeof(expected), config_directory, "logs/ftun.log"));
   CHECK(strcmp(config->log.file, expected) == 0);
-  CHECK(make_path(expected, sizeof(expected), config_directory, "./geo/ip.bin"));
-  CHECK(strcmp(config->geo.geoip.path, expected) == 0);
-  CHECK(config->plan != NULL && config->plan->required_modules == FTUN_BUILD_MODULE_CORE);
+  CHECK(make_path(expected, sizeof(expected), config_directory, "./data/rules.frs"));
+  CHECK(strcmp(config->frs.path, expected) == 0);
+  CHECK(config->plan != NULL && config->plan->required_modules ==
+        (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_FRS));
   CHECK(config->plan->outbound_count == 1u &&
         config->plan->reachable_outbound_count == 0u);
   free(canonical);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
+
+  CHECK(write_file(default_path,
+    "{\"dns\":{\"enable\":false},\"rules\":[\"FRS-IP,CN,DIRECT\"]}",
+    strlen("{\"dns\":{\"enable\":false},\"rules\":[\"FRS-IP,CN,DIRECT\"]}")));
+  CHECK(ftun_config_load(NULL, default_path, &config) == FTUN_OK &&
+        config != NULL);
+  executable_length = readlink("/proc/self/exe", executable,
+                               sizeof(executable) - 1u);
+  CHECK(executable_length > 0 && (size_t)executable_length < sizeof(executable));
+  executable[executable_length] = '\0';
+  separator = strrchr(executable, '/');
+  CHECK(separator != NULL);
+  *separator = '\0';
+  CHECK(make_path(expected, sizeof(expected), executable, "rules.frs"));
+  CHECK(strcmp(config->frs.path, expected) == 0);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
   CHECK(write_file(tilde_path, "{\"dns\":{\"enable\":false}}",
                    strlen("{\"dns\":{\"enable\":false}}")));
@@ -136,6 +159,7 @@ int main(void)
 
   CHECK(unlink(config_path) == 0);
   CHECK(unlink(invalid_path) == 0);
+  CHECK(unlink(default_path) == 0);
   CHECK(unlink(semantic_path) == 0);
   CHECK(unlink(tilde_path) == 0);
   CHECK(unlink(bad_tilde_path) == 0);

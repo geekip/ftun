@@ -9,6 +9,11 @@ ftun_status_t ftun_route_table_create(
   uint64_t generation, const char *const *rules, size_t rule_count,
   ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
   ftun_route_table_t **out);
+ftun_status_t ftun_route_table_create_with_frs(
+  uint64_t generation, const char *const *rules, size_t rule_count,
+  ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
+  ftun_rule_frs_bind_fn frs_bind, void *frs_user,
+  ftun_route_table_t **out);
 ftun_status_t ftun_route_table_set_generation(ftun_route_table_t *table,
                                               uint64_t generation);
 ftun_status_t ftun_route_table_destroy(ftun_route_table_t **table);
@@ -18,7 +23,7 @@ ftun_status_t ftun_route_table_accounted_bytes(const char *const *rules,
 
 /* 保序路由解释器。
  * 需求 REQ-ROUTE-001；任务 TASK-ROUTE-001；目标 0.3.0；验收 TEST-ROUTE-001。
- * 从 resume_rule（含）继续按原序求值。缺真实地址只在当前 IP/GEOIP 规则
+ * 从 resume_rule（含）继续按原序求值。缺真实地址只在当前 IP/FRS-IP 规则
  * 返回 NEED_RESOLVE，成功解析后必须用同一索引恢复；解析失败由调用者终结。
  */
 ftun_status_t ftun_route_table_evaluate(const ftun_route_table_t *table,

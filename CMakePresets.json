@@ -17,6 +17,7 @@
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     },
@@ -31,6 +32,7 @@
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     },
@@ -45,6 +47,7 @@
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     },
@@ -59,6 +62,7 @@
         "FTUN_LTO": false,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     },
@@ -73,6 +77,7 @@
         "FTUN_LTO": true,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     },
@@ -88,6 +93,7 @@
         "FTUN_LTO": true,
         "FTUN_MODULE_DNS": "BUILTIN",
         "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
     }

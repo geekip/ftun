@@ -1,12 +1,37 @@
 #ifndef FTUN_GROUP_URL_TEST_H
 #define FTUN_GROUP_URL_TEST_H
+/* TASK-GROUP-002 / TEST-GROUP-002：ftun_url_test_choose，目标 0.4.0。 */
 #include "internal/contracts.h"
-/* 稳定自动选择。
- * 需求 REQ-GROUP-001；任务 TASK-GROUP-002；目标 0.4.0；验收 TEST-GROUP-002。
- * 实现路径：只比较新鲜成功样本，加容差和最短保持时间；全失败标记 degraded 并保留上次或 default，不按请求切 DIRECT。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
+
+typedef struct {
+  uint32_t member_id;
+  uint32_t latency_ms;
+  uint64_t observed_ms;
+  bool success;
+  bool tcp_only;
+} ftun_health_sample_t;
+
+struct ftun_health_snapshot {
+  uint64_t generation;
+  const ftun_health_sample_t *samples;
+  size_t sample_count;
+};
+
+struct ftun_group_spec {
+  uint64_t generation;
+  uint32_t group_id;
+  const uint32_t *members;
+  size_t member_count;
+  uint32_t default_member_id;
+  uint32_t previous_member_id;
+  uint64_t previous_since_ms;
+  uint64_t now_ms;
+  uint64_t sample_max_age_ms;
+  uint64_t minimum_hold_ms;
+  uint32_t tolerance_ms;
+};
+
+/* TASK-GROUP-002 / TEST-GROUP-002：只比较同代新鲜成功样本；容差与保持
+ * 时间抑制抖动。全失败保留上次合法成员（否则 default）并标 degraded。 */
 ftun_status_t ftun_url_test_choose(const ftun_group_spec_t *group, const ftun_health_snapshot_t *health, ftun_group_choice_t *out);
 #endif

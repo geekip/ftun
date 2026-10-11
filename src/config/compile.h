@@ -21,9 +21,8 @@ typedef enum {
   FTUN_PLAN_BOOTSTRAP = UINT64_C(1) << 9,
   FTUN_PLAN_SYSTEM_RESOLVER = UINT64_C(1) << 10,
   FTUN_PLAN_FAKE_IP = UINT64_C(1) << 11,
-  FTUN_PLAN_GEOIP = UINT64_C(1) << 12,
-  FTUN_PLAN_GEOSITE = UINT64_C(1) << 13,
-  FTUN_PLAN_GEO_UPDATE = UINT64_C(1) << 14,
+  FTUN_PLAN_FRS = UINT64_C(1) << 12,
+  FTUN_PLAN_FRS_UPDATE = UINT64_C(1) << 14,
   FTUN_PLAN_HEALTH = UINT64_C(1) << 15,
   FTUN_PLAN_STATE_CACHE = UINT64_C(1) << 16,
   FTUN_PLAN_SNIFF = UINT64_C(1) << 17
@@ -57,7 +56,7 @@ struct ftun_feature_plan {
   size_t rule_count;
   size_t prepare_listener_count;
   size_t prepare_tun_count;
-  size_t prepare_geo_count;
+  size_t prepare_frs_count;
   size_t lazy_outbound_count;
   size_t active_health_count;
   size_t lazy_health_count;

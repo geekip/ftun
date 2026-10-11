@@ -135,19 +135,19 @@ static char *make_deep_group_config(size_t groups)
 int main(int argc, char **argv)
 {
   static const char valid_rules[] =
-    "{\"dns\":{\"enable\":false},\"geo\":{\"geoip\":{\"path\":\"ip.bin\"},"
-    "\"geosite\":{\"path\":\"site.bin\"}},\"outbounds\":[{\"name\":\"p\","
+    "{\"dns\":{\"enable\":false},\"frs\":{\"path\":\"rules.frs\"},"
+    "\"outbounds\":[{\"name\":\"p\","
     "\"type\":\"socks5\",\"server\":\"proxy.example.:1080\"}],\"rules\":["
     "\"SRC-IP-CIDR,192.168.0.0/16,DIRECT\",\"IP-CIDR,10.0.0.0/8,p\","
     "\"DOMAIN,a.example,p\",\"DOMAIN-SUFFIX,example.com.,p\","
-    "\"DOMAIN-KEYWORD,example,p\",\"GEOIP,private,DIRECT\","
-    "\"GEOSITE,proxy,p\",\"DST-PORT,443,p\",\"NETWORK,udp,p\","
+    "\"DOMAIN-KEYWORD,example,p\",\"FRS-IP,private,DIRECT\","
+    "\"frs-domain,proxy,p\",\"DST-PORT,443,p\",\"NETWORK,udp,p\","
     "\"MATCH,DIRECT\"]}";
   static const char disabled_dns_refs[] =
     "{\"dns\":{\"enable\":false,\"default-server\":\"missing\","
     "\"listeners\":[{\"listen\":\"127.0.0.1:53\",\"server\":\"missing\"}],"
     "\"servers\":[{\"name\":\"s\",\"type\":\"udp\",\"address\":[\"1.1.1.1\"],"
-    "\"outbound\":\"missing\"}]},\"geo\":{\"dns-server\":\"missing\"},"
+    "\"outbound\":\"missing\"}]},\"frs\":{\"dns-server\":\"missing\"},"
     "\"outbounds\":[{\"name\":\"p\",\"type\":\"socks5\","
     "\"server\":\"127.0.0.1:1\",\"dns-server\":\"missing\"}]}";
   ftun_config_t *config = NULL;
@@ -173,6 +173,15 @@ int main(int argc, char **argv)
   CHECK(ftun_config_validate(NULL, &diagnostic) == FTUN_E_INVALID);
   CHECK(diagnostic.path.length == 0u && diagnostic.message.length > 0u);
   CHECK(expect_validation(valid_rules, FTUN_OK, ""));
+  CHECK(expect_validation("{\"dns\":{\"enable\":false},\"outbounds\":[{"
+                          "\"name\":\"　Proxy　\",\"type\":\"socks5\","
+                          "\"server\":\"127.0.0.1:1\"}],\"rules\":["
+                          "\"fRs-DoMaIn, CN , Proxy \" ]}", FTUN_OK, ""));
+  CHECK(expect_validation("{\"dns\":{\"enable\":false},\"outbounds\":[{"
+                          "\"name\":\"Proxy\",\"type\":\"socks5\","
+                          "\"server\":\"127.0.0.1:1\"}],\"rules\":["
+                          "\"FRS-DOMAIN,CN,proxy\"]}", FTUN_E_INVALID,
+                          "/rules"));
   CHECK(expect_validation(disabled_dns_refs, FTUN_OK, ""));
   CHECK(expect_validation("{\"base\":{\"ipv6\":true}}", FTUN_E_UNSUPPORTED,
                           "/base/ipv6"));
@@ -240,9 +249,12 @@ int main(int argc, char **argv)
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
                           "\"MATCH,missing\"]}", FTUN_E_INVALID, "/rules"));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
-                          "\"GEOIP,private,DIRECT\"]}", FTUN_E_INVALID, "/geo/geoip"));
-  CHECK(expect_validation("{\"dns\":{\"enable\":false},\"geo\":{\"auto-update\":true,"
-                          "\"geoip\":{\"path\":\"ip.bin\"}}}", FTUN_E_INVALID, "/geo"));
+                          "\"FRS-IP,private,DIRECT\"]}", FTUN_OK, ""));
+  CHECK(expect_validation("{\"dns\":{\"enable\":false},\"frs\":42}",
+                          FTUN_OK, ""));
+  CHECK(expect_validation("{\"dns\":{\"enable\":false},\"frs\":{"
+                          "\"auto-update\":true},\"rules\":["
+                          "\"FRS-IP,private,DIRECT\"]}", FTUN_OK, ""));
 
   deep_groups = make_deep_group_config(65u);
   CHECK(deep_groups != NULL);

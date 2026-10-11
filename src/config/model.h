@@ -26,12 +26,6 @@ typedef struct {
   bool fake_ip;
 } ftun_config_dns_server_t;
 
-typedef struct {
-  bool present;
-  char *path;
-  char *url;
-} ftun_config_geo_data_t;
-
 typedef enum {
   FTUN_CONFIG_INBOUND_MIXED = 1,
   FTUN_CONFIG_INBOUND_SOCKS5,
@@ -111,14 +105,15 @@ struct ftun_config {
     size_t server_count;
   } dns;
   struct {
+    bool active;
     bool present;
     bool auto_update;
+    char *path;
+    char *url;
     char *update_interval;
     char *update_outbound;
     char *dns_server;
-    ftun_config_geo_data_t geoip;
-    ftun_config_geo_data_t geosite;
-  } geo;
+  } frs;
   struct {
     bool enable;
     bool tls_sni;

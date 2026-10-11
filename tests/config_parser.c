@@ -112,8 +112,7 @@ int main(int argc, char **argv)
 {
   static const char disabled_dns[] =
     "{\"dns\":{\"enable\":false,\"default-server\":\"missing\"},"
-    "\"geo\":{\"auto-update\":true,\"geoip\":{\"path\":\"g\",\"url\":"
-    "\"https://example.com/g\"}},\"inbounds\":[{\"name\":\"本地\","
+    "\"frs\":42,\"inbounds\":[{\"name\":\"本地\","
     "\"type\":\"mixed\",\"listen\":\"127.0.0.1:1\",\"users\":{\"u\":\"p\"}}],"
     "\"outbounds\":[{\"name\":\"p\",\"type\":\"socks5\","
     "\"server\":\"127.0.0.1:2\",\"username\":\"u\",\"password\":\"p\"}]}";
@@ -143,7 +142,7 @@ int main(int argc, char **argv)
         config->outbounds[2].kind == FTUN_CONFIG_OUTBOUND_URL_TEST &&
         config->outbounds[2].expected_status == 204u &&
         config->outbounds[3].members.count == 3u);
-  CHECK(config->rules.count == 4u && strcmp(config->rules.items[1],
+  CHECK(config->rules.count == 6u && strcmp(config->rules.items[3],
         "DOMAIN,a.com,proxy") == 0);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
@@ -157,10 +156,26 @@ int main(int argc, char **argv)
 
   CHECK(parse_text(disabled_dns, &config) == FTUN_OK);
   CHECK(!config->dns.enable && strcmp(config->dns.default_server, "missing") == 0 &&
-        config->geo.present && config->geo.auto_update && config->geo.geoip.present &&
+        !config->frs.active && !config->frs.present &&
         config->inbounds[0].user_count == 1u &&
         strcmp(config->inbounds[0].users[0].name, "u") == 0 &&
         strcmp(config->outbounds[0].password, "p") == 0);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(parse_text("{\"dns\":{\"enable\":false},\"frs\":{"
+                   "\"path\":\"rules.frs\",\"url\":\"https://example.com/rules.frs\","
+                   "\"auto-update\":true},\"rules\":[\"frs-domain,CN,DIRECT\"]}",
+                   &config) == FTUN_OK);
+  CHECK(config->frs.active && config->frs.present && config->frs.auto_update &&
+        strcmp(config->frs.path, "rules.frs") == 0);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(parse_text("{\"dns\":{\"enable\":false},\"outbounds\":[{"
+                   "\"name\":\"　Proxy🚀　\",\"type\":\"socks5\","
+                   "\"server\":\"127.0.0.1:1\"}],\"rules\":["
+                   "\"FrS-DoMaIn, CN ,　Proxy🚀　\"]}", &config) == FTUN_OK);
+  CHECK(strcmp(config->outbounds[0].name, "Proxy🚀") == 0 &&
+        strcmp(config->rules.items[0], "FrS-DoMaIn,CN,Proxy🚀") == 0);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
   CHECK(expect_status("", FTUN_E_INVALID));
@@ -191,6 +206,14 @@ int main(int argc, char **argv)
 
   bytes.data = invalid_utf8;
   bytes.length = sizeof(invalid_utf8);
+  config = (ftun_config_t *)(uintptr_t)1;
+  CHECK(ftun_config_parse(bytes, &config) == FTUN_E_INVALID && config == NULL);
+  bytes.data = (const uint8_t *)"\xef\xbb\xbf{}";
+  bytes.length = 5u;
+  CHECK(ftun_config_parse(bytes, &config) == FTUN_OK && config != NULL);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  bytes.data = (const uint8_t *)"\xef\xbb\xbf\xef\xbb\xbf{}";
+  bytes.length = 8u;
   config = (ftun_config_t *)(uintptr_t)1;
   CHECK(ftun_config_parse(bytes, &config) == FTUN_E_INVALID && config == NULL);
   bytes.data = (const uint8_t *)"{}\0x";

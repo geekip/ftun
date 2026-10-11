@@ -10,11 +10,12 @@ option(FTUN_SANITIZERS "Enable address and undefined behavior checks" OFF)
 option(FTUN_LTO "Require supported interprocedural optimization" OFF)
 option(FTUN_SECTION_GC "Remove unused code and data on supported toolchains" ON)
 option(FTUN_STATIC "Build fully static Linux executables" OFF)
-option(FTUN_BUILD_GEO_TOOL "Build the standalone C converter skeleton" ON)
 set(FTUN_MODULE_DNS "OFF" CACHE STRING "Build the DNS module: OFF or BUILTIN")
 set(FTUN_MODULE_TUN "OFF" CACHE STRING "Build the TUN module: OFF or BUILTIN")
+set(FTUN_MODULE_FRS "OFF" CACHE STRING "Build the FRS module: OFF or BUILTIN")
 set_property(CACHE FTUN_MODULE_DNS PROPERTY STRINGS OFF BUILTIN)
 set_property(CACHE FTUN_MODULE_TUN PROPERTY STRINGS OFF BUILTIN)
+set_property(CACHE FTUN_MODULE_FRS PROPERTY STRINGS OFF BUILTIN)
 set(FTUN_OPTIMIZATION "balanced" CACHE STRING "balanced, speed or size")
 set_property(CACHE FTUN_OPTIMIZATION PROPERTY STRINGS balanced speed size)
 set(FTUN_EXTRA_COMPILE_OPTIONS "" CACHE STRING "Additional target options as a CMake list")
@@ -22,7 +23,7 @@ set(FTUN_EXTRA_LINK_OPTIONS "" CACHE STRING "Additional target link options as a
 if(NOT FTUN_OPTIMIZATION MATCHES "^(balanced|speed|size)$")
   message(FATAL_ERROR "Unsupported FTUN_OPTIMIZATION")
 endif()
-foreach(ftun_module DNS TUN)
+foreach(ftun_module DNS TUN FRS)
   if(NOT FTUN_MODULE_${ftun_module} MATCHES "^(OFF|BUILTIN)$")
     message(FATAL_ERROR
       "FTUN_MODULE_${ftun_module} must be OFF or BUILTIN; dynamic modules are not supported")
@@ -30,6 +31,9 @@ foreach(ftun_module DNS TUN)
 endforeach()
 if(FTUN_MODULE_TUN STREQUAL "BUILTIN" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "FTUN_MODULE_TUN=BUILTIN requires a Linux target")
+endif()
+if(FTUN_MODULE_FRS STREQUAL "BUILTIN" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  message(FATAL_ERROR "FTUN_MODULE_FRS=BUILTIN requires a Linux target")
 endif()
 if(FTUN_STATIC AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "FTUN_STATIC requires a Linux target toolchain")
@@ -133,7 +137,37 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_property(TARGET ftun_libev PROPERTY C_EXTENSIONS ON)
   list(APPEND ftun_internal_dependencies ftun_libev)
 endif()
-# 当前库不发现或下载第三方库。后续引入依赖时必须和所属模块同时裁剪。
+
+# wolfSSL 5.8.4-stable 以精确 gitlink 固定；仅构建静态库，不构建上游示例、
+# benchmark、测试或安装规则。FTUN 适配层强制 TLS 1.2+ 与 peer verification。
+if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/wolfssl/CMakeLists.txt")
+  message(FATAL_ERROR
+    "wolfSSL submodule is missing; run: git submodule update --init third_party/wolfssl")
+endif()
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static dependencies" FORCE)
+set(WOLFSSL_EXAMPLES no CACHE STRING "Disable wolfSSL examples" FORCE)
+set(WOLFSSL_CRYPT_TESTS no CACHE STRING "Disable wolfSSL crypt tests" FORCE)
+set(WOLFSSL_INSTALL no CACHE STRING "Disable wolfSSL install rules" FORCE)
+set(WOLFSSL_TLS13 yes CACHE STRING "Enable wolfSSL TLS 1.3" FORCE)
+set(WOLFSSL_DTLS no CACHE STRING "Disable unused wolfSSL DTLS" FORCE)
+set(WOLFSSL_OLD_TLS no CACHE STRING "Disable obsolete TLS versions" FORCE)
+add_subdirectory(third_party/wolfssl EXCLUDE_FROM_ALL)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  target_compile_definitions(wolfssl PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  if(FTUN_SECTION_GC)
+    target_compile_options(wolfssl PRIVATE
+      -ffunction-sections -fdata-sections)
+  endif()
+  if(FTUN_SANITIZERS)
+    target_compile_options(wolfssl PRIVATE
+      -fsanitize=address,undefined -fno-omit-frame-pointer)
+  endif()
+endif()
+target_compile_options(wolfssl PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
+list(APPEND ftun_internal_dependencies wolfssl::wolfssl)
+# 当前库不在配置期发现或下载第三方库；依赖均由本地锁定源构建。
 # 核心保留 SystemResolver、通用 Datagram 和 SOCKS5，不反向依赖 TUN。
 set(ftun_core_sources
   src/core/core.c
@@ -149,6 +183,7 @@ set(ftun_core_sources
   src/config/compile.c
   src/inbound/inbound.c
   src/inbound/socks5.c
+  src/inbound/mixed.c
   src/outbound/outbound.c
   src/outbound/direct.c
   src/outbound/reject.c
@@ -156,6 +191,12 @@ set(ftun_core_sources
   src/route/router.c
   src/route/rule.c
   src/route/target.c
+  src/route/group.c
+  src/group/select.c
+  src/group/url_test.c
+  src/group/health.c
+  src/tls/tls.c
+  src/tls/wolfssl_adapter.c
   src/dns/resolver.c
   src/platform/linux/socket_protect.c
   src/platform/system_resolver.c
@@ -171,30 +212,18 @@ set(ftun_core_sources
   src/transport/datagram.c
   src/transport/relay.c
   src/protocol/socks5.c
+  src/protocol/http.c
 )
 
 # 这些源码属于后续版本的可选模块，当前不加入任何 target。
 # 各模块交付时再与其注册项、独占依赖和 OFF/BUILTIN 测试一起接入。
 set(ftun_deferred_module_sources
   src/core/state.c
-  src/inbound/mixed.c
   src/inbound/anytls.c
   src/outbound/anytls.c
-  src/route/group.c
-  src/group/select.c
-  src/group/url_test.c
-  src/group/health.c
-  src/geo/geo.c
-  src/geo/geoip.c
-  src/geo/geosite.c
-  src/geo/update.c
-  src/geo/format.c
   src/api/api.c
-  src/protocol/http.c
   src/protocol/anytls.c
   src/protocol/uot.c
-  src/tls/tls.c
-  src/tls/wolfssl_adapter.c
   src/sniff/sniff.c
   src/sniff/tls_sni.c
   src/sniff/http_host.c
@@ -202,6 +231,16 @@ set(ftun_deferred_module_sources
 )
 
 set(ftun_module_definitions)
+if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+  list(APPEND ftun_core_sources
+    src/frs/format.c
+    src/frs/frs.c
+    src/frs/ip.c
+    src/frs/domain.c
+    src/frs/update.c
+  )
+  list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_FRS=1)
+endif()
 if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
   list(APPEND ftun_core_sources
     src/dns/dns.c
@@ -271,29 +310,20 @@ target_compile_definitions(ftun_core PRIVATE ${ftun_module_definitions}
 target_link_libraries(ftun_core PRIVATE ftun_options Threads::Threads
   ${ftun_internal_dependencies})
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ftun-build-modules.txt" CONTENT
-  "core=BUILTIN\ndns=${FTUN_MODULE_DNS}\ntun=${FTUN_MODULE_TUN}\n")
+  "core=BUILTIN\ndns=${FTUN_MODULE_DNS}\ntun=${FTUN_MODULE_TUN}\nfrs=${FTUN_MODULE_FRS}\n")
 add_executable(ftun src/main.c src/cli/cli.c)
 target_include_directories(ftun PRIVATE src)
 target_link_libraries(ftun PRIVATE ftun_core ftun_options)
 set(ftun_targets ftun_core ftun)
-list(APPEND ftun_targets ftun_cjson)
+list(APPEND ftun_targets ftun_cjson wolfssl)
 if(TARGET ftun_lwip)
   list(APPEND ftun_targets ftun_lwip)
 endif()
 if(TARGET ftun_libev)
   list(APPEND ftun_targets ftun_libev)
 endif()
-if(FTUN_BUILD_GEO_TOOL)
-  add_executable(ftun-geo tools/geo/main.c)
-  target_link_libraries(ftun-geo PRIVATE ftun_options)
-  list(APPEND ftun_targets ftun-geo)
-  install(TARGETS ftun-geo RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
-endif()
 if(FTUN_STATIC)
   target_link_options(ftun PRIVATE -static)
-  if(TARGET ftun-geo)
-    target_link_options(ftun-geo PRIVATE -static)
-  endif()
 endif()
 if(FTUN_LTO)
   set_property(TARGET ${ftun_targets} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
@@ -301,6 +331,7 @@ endif()
 install(TARGETS ftun ftun_core RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(TARGETS ftun_cjson ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(TARGETS wolfssl ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 if(TARGET ftun_lwip)
   install(TARGETS ftun_lwip ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
   install(FILES third_party/lwip/LICENSE
@@ -311,6 +342,8 @@ if(TARGET ftun_libev)
 endif()
 install(FILES third_party/cjson/LICENSE
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-cJSON)
+install(FILES third_party/wolfssl/COPYING
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES THIRD_PARTY_NOTICES.md DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 if(TARGET ftun_libev)
@@ -335,6 +368,9 @@ if(BUILD_TESTING)
   endif()
   if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
     target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_TUN=1)
+  endif()
+  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_FRS=1)
   endif()
   if(FTUN_STATIC)
     target_link_options(ftun-build-modules-test PRIVATE -static)
@@ -431,6 +467,50 @@ if(BUILD_TESTING)
     target_link_options(ftun-protocol-socks5-test PRIVATE -static)
   endif()
   add_test(NAME protocol-socks5-contract COMMAND ftun-protocol-socks5-test)
+  add_executable(ftun-protocol-http-test tests/protocol_http.c)
+  target_include_directories(ftun-protocol-http-test PRIVATE src)
+  target_link_libraries(ftun-protocol-http-test PRIVATE ftun_core ftun_options)
+  add_test(NAME protocol-http-contract COMMAND ftun-protocol-http-test)
+  add_executable(ftun-inbound-socks5-test tests/inbound_socks5.c)
+  target_include_directories(ftun-inbound-socks5-test PRIVATE src)
+  target_link_libraries(ftun-inbound-socks5-test PRIVATE ftun_core ftun_options)
+  add_test(NAME inbound-socks5-contract COMMAND ftun-inbound-socks5-test)
+  add_executable(ftun-inbound-mixed-test tests/inbound_mixed.c)
+  target_include_directories(ftun-inbound-mixed-test PRIVATE src)
+  target_link_libraries(ftun-inbound-mixed-test PRIVATE
+    ftun_core ftun_options)
+  add_test(NAME inbound-mixed-contract COMMAND ftun-inbound-mixed-test)
+  add_executable(ftun-v04-group-test tests/group.c)
+  target_include_directories(ftun-v04-group-test PRIVATE src)
+  target_link_libraries(ftun-v04-group-test PRIVATE ftun_core ftun_options)
+  add_test(NAME group-contract COMMAND ftun-v04-group-test)
+  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    add_executable(ftun-v04-frs-test tests/frs.c tests/frs_fixture.c)
+    target_include_directories(ftun-v04-frs-test PRIVATE src tests)
+    target_link_libraries(ftun-v04-frs-test PRIVATE ftun_core ftun_options)
+    add_test(NAME frs-contract COMMAND ftun-v04-frs-test)
+    add_executable(ftun-v04-frs-update-test
+      tests/frs_update.c tests/frs_fixture.c)
+    target_include_directories(ftun-v04-frs-update-test PRIVATE src tests)
+    target_link_libraries(ftun-v04-frs-update-test PRIVATE
+      ftun_core ftun_options)
+    add_test(NAME frs-update-contract COMMAND ftun-v04-frs-update-test)
+  endif()
+  add_executable(ftun-v04-tls-test tests/tls.c)
+  target_include_directories(ftun-v04-tls-test PRIVATE src)
+  target_compile_definitions(ftun-v04-tls-test PRIVATE
+    "FTUN_TEST_CERT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/third_party/wolfssl/certs")
+  target_link_libraries(ftun-v04-tls-test PRIVATE
+    ftun_core ftun_options wolfssl::wolfssl)
+  add_test(NAME tls-wolfssl-contract COMMAND ftun-v04-tls-test)
+  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    add_executable(ftun-v04-integration-test
+      tests/integration_v04.c tests/frs_fixture.c)
+    target_include_directories(ftun-v04-integration-test PRIVATE src tests)
+    target_link_libraries(ftun-v04-integration-test PRIVATE
+      ftun_core ftun_options)
+    add_test(NAME integration-v04-contract COMMAND ftun-v04-integration-test)
+  endif()
   add_executable(ftun-route-target-test tests/route_target.c)
   target_include_directories(ftun-route-target-test PRIVATE src)
   target_link_libraries(ftun-route-target-test PRIVATE ftun_core ftun_options)
@@ -719,10 +799,6 @@ if(BUILD_TESTING)
   set_tests_properties(cli-version PROPERTIES PASS_REGULAR_EXPRESSION "skeleton; proxy features: none")
   add_test(NAME cli-refuses-run COMMAND ftun run)
   set_tests_properties(cli-refuses-run PROPERTIES WILL_FAIL TRUE)
-  if(TARGET ftun-geo)
-    add_test(NAME geo-refuses-convert COMMAND ftun-geo compile)
-    set_tests_properties(geo-refuses-convert PROPERTIES WILL_FAIL TRUE)
-  endif()
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     add_test(NAME config-schema COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/config_schema.py)
@@ -733,6 +809,9 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME cjson-vendor
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/cjson_vendor.py
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json)
+    add_test(NAME wolfssl-vendor
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/wolfssl_vendor.py
         ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json)
     if(TARGET ftun_lwip)
       add_test(NAME lwip-vendor
@@ -752,4 +831,5 @@ if(BUILD_TESTING)
   # 工程检查不能因运行环境或工具故障无限阻塞。
   get_property(ftun_tests DIRECTORY PROPERTY TESTS)
   set_tests_properties(${ftun_tests} PROPERTIES TIMEOUT 30)
+  set_tests_properties(build-modules-matrix PROPERTIES TIMEOUT 60)
 endif()

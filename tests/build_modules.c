@@ -74,16 +74,21 @@ int main(void)
   size_t left, right;
   int expect_dns = 0;
   int expect_tun = 0;
+  int expect_frs = 0;
 #if defined(FTUN_EXPECT_DNS)
   expect_dns = 1;
 #endif
 #if defined(FTUN_EXPECT_TUN)
   expect_tun = 1;
 #endif
+#if defined(FTUN_EXPECT_FRS)
+  expect_frs = 1;
+#endif
   CHECK(capabilities != NULL);
   CHECK((capabilities->builtins & FTUN_BUILD_MODULE_CORE) != 0u);
   CHECK(has_name(capabilities, "core"));
-  CHECK(capabilities->name_count == (size_t)(1 + expect_dns + expect_tun));
+  CHECK(capabilities->name_count ==
+        (size_t)(1 + expect_dns + expect_tun + expect_frs));
   for (left = 0; left < capabilities->name_count; left++) {
     CHECK(capabilities->names[left] != NULL && capabilities->names[left][0] != '\0');
     for (right = left + 1; right < capabilities->name_count; right++) {
@@ -92,6 +97,7 @@ int main(void)
   }
   CHECK(check_module(capabilities, FTUN_BUILD_MODULE_DNS, "dns", expect_dns) == 0);
   CHECK(check_module(capabilities, FTUN_BUILD_MODULE_TUN, "tun", expect_tun) == 0);
+  CHECK(check_module(capabilities, FTUN_BUILD_MODULE_FRS, "frs", expect_frs) == 0);
   CHECK(ftun_build_require_modules(FTUN_BUILD_MODULE_CORE, &diagnostic) == FTUN_OK);
   CHECK(ftun_build_require_modules(1u << 31, &diagnostic) == FTUN_E_INVALID);
   CHECK(diagnostic.error.status == FTUN_E_INVALID);
@@ -102,5 +108,10 @@ int main(void)
     "{\"dns\":{\"enable\":false},\"inbounds\":[{\"name\":\"t\","
     "\"type\":\"tun\",\"interface\":{\"name\":\"t0\"},"
     "\"ipv4\":{\"address\":\"10.0.0.1/30\"}}]}", expect_tun) == 0);
+  CHECK(check_config_capability(
+    "{\"dns\":{\"enable\":false},\"frs\":42}", 1) == 0);
+  CHECK(check_config_capability(
+    "{\"dns\":{\"enable\":false},\"rules\":[\"FRS-IP,CN,DIRECT\"]}",
+    expect_frs) == 0);
   return 0;
 }

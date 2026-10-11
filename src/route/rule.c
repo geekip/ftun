@@ -1,5 +1,11 @@
 #include "rule.h"
 
+#if defined(FTUN_HAVE_MODULE_FRS)
+#include "frs/domain.h"
+#include "frs/frs.h"
+#include "frs/ip.h"
+#endif
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -25,6 +31,18 @@ static int ftun_rule_string_equal_fold(ftun_string_t left,
   for (index = 0u; index < left.length; index++) {
     if (ftun_rule_ascii_lower((unsigned char)left.data[index]) !=
         ftun_rule_ascii_lower((unsigned char)right.data[index])) return 0;
+  }
+  return 1;
+}
+
+static int ftun_rule_type_equal(ftun_string_t type, const char *value)
+{
+  size_t length = strlen(value);
+  size_t index;
+  if (type.data == NULL || type.length != length) return 0;
+  for (index = 0u; index < length; index++) {
+    if (ftun_rule_ascii_lower((unsigned char)type.data[index]) !=
+        ftun_rule_ascii_lower((unsigned char)value[index])) return 0;
   }
   return 1;
 }
@@ -112,10 +130,13 @@ ftun_status_t ftun_rule_address_match(const ftun_rule_t *rule,
     *out = (value & rule->network_mask) == rule->network_address;
     return FTUN_OK;
   }
-  if (rule->kind == FTUN_RULE_GEOIP) {
-    if (rule->geoip == NULL) return FTUN_E_UNSUPPORTED;
-    *out = rule->geoip(rule->operand, address, rule->geo_user);
-    return FTUN_OK;
+  if (rule->kind == FTUN_RULE_FRS_IP) {
+#if defined(FTUN_HAVE_MODULE_FRS)
+    if (rule->frs_set == NULL) return FTUN_E_STATE_CORRUPT;
+    return ftun_frs_ip_contains(rule->frs_set, address->address, out);
+#else
+    return FTUN_E_UNSUPPORTED;
+#endif
   }
   return FTUN_E_INVALID;
 }
@@ -170,12 +191,12 @@ ftun_status_t ftun_rule_match(const ftun_rule_t *rule,
           metadata->source.kind != FTUN_ADDRESS_IPV4) return FTUN_OK;
       return ftun_rule_address_match(rule, &metadata->source, &out->matched);
     case FTUN_RULE_IP_CIDR:
-    case FTUN_RULE_GEOIP:
+    case FTUN_RULE_FRS_IP:
       return ftun_rule_match_ip(rule, metadata, out);
     case FTUN_RULE_DOMAIN:
     case FTUN_RULE_DOMAIN_SUFFIX:
     case FTUN_RULE_DOMAIN_KEYWORD:
-    case FTUN_RULE_GEOSITE:
+    case FTUN_RULE_FRS_DOMAIN:
       if (!ftun_rule_domain(metadata, &domain)) return FTUN_OK;
       if (rule->kind == FTUN_RULE_DOMAIN) {
         out->matched = ftun_rule_string_equal_fold(domain, rule->operand) != 0;
@@ -194,9 +215,25 @@ ftun_status_t ftun_rule_match(const ftun_rule_t *rule,
       } else if (rule->kind == FTUN_RULE_DOMAIN_KEYWORD) {
         out->matched = ftun_rule_string_contains_fold(domain, rule->operand) != 0;
       } else {
-        if (rule->geosite == NULL) return FTUN_E_UNSUPPORTED;
-        out->matched = rule->geosite(rule->operand, domain,
-                                     rule->geo_user);
+#if defined(FTUN_HAVE_MODULE_FRS)
+        char normalized[254];
+        size_t length = domain.length;
+        size_t index;
+        ftun_string_t normalized_domain;
+        if (rule->frs_set == NULL) return FTUN_E_STATE_CORRUPT;
+        if (length != 0u && domain.data[length - 1u] == '.') length--;
+        if (length == 0u || length > 253u) return FTUN_E_INVALID;
+        for (index = 0u; index < length; index++) {
+          normalized[index] = (char)ftun_rule_ascii_lower(
+            (unsigned char)domain.data[index]);
+        }
+        normalized_domain.data = normalized;
+        normalized_domain.length = length;
+        return ftun_frs_domain_contains(rule->frs_set, normalized_domain,
+                                        &out->matched);
+#else
+        return FTUN_E_UNSUPPORTED;
+#endif
       }
       return FTUN_OK;
     case FTUN_RULE_DST_PORT:
@@ -290,10 +327,10 @@ static ftun_status_t ftun_rule_resolve_outbound(
   return resolver(name, out, resolver_user);
 }
 
-ftun_status_t ftun_rule_compile(const char *text,
-                                ftun_rule_outbound_resolver_fn resolver,
-                                void *resolver_user,
-                                ftun_rule_t **out)
+ftun_status_t ftun_rule_compile_with_frs(
+  const char *text, ftun_rule_outbound_resolver_fn resolver,
+  void *resolver_user, ftun_rule_frs_bind_fn frs_bind, void *frs_user,
+  ftun_rule_t **out)
 {
   ftun_rule_t *rule;
   const char *first;
@@ -309,7 +346,7 @@ ftun_status_t ftun_rule_compile(const char *text,
   if (first == NULL) return FTUN_E_INVALID;
   type = (ftun_string_t){text, (size_t)(first - text)};
   second = strchr(first + 1u, ',');
-  if (type.length == 5u && memcmp(type.data, "MATCH", 5u) == 0) {
+  if (ftun_rule_type_equal(type, "MATCH")) {
     if (second != NULL) return FTUN_E_INVALID;
     outbound = (ftun_string_t){first + 1u, strlen(first + 1u)};
   } else {
@@ -319,30 +356,28 @@ ftun_status_t ftun_rule_compile(const char *text,
     operand = (ftun_string_t){first + 1u, (size_t)(second - first - 1u)};
     outbound = (ftun_string_t){second + 1u, strlen(second + 1u)};
   }
-  if (outbound.length == 0u || operand.length > 253u) return FTUN_E_INVALID;
+  if (outbound.length == 0u) return FTUN_E_INVALID;
   rule = (ftun_rule_t *)calloc(1u, sizeof(*rule));
   if (rule == NULL) return FTUN_E_LIMIT;
-  if (type.length == 11u && memcmp(type.data, "SRC-IP-CIDR", 11u) == 0) {
+  if (ftun_rule_type_equal(type, "SRC-IP-CIDR")) {
     rule->kind = FTUN_RULE_SRC_IP_CIDR;
-  } else if (type.length == 7u && memcmp(type.data, "IP-CIDR", 7u) == 0) {
+  } else if (ftun_rule_type_equal(type, "IP-CIDR")) {
     rule->kind = FTUN_RULE_IP_CIDR;
-  } else if (type.length == 6u && memcmp(type.data, "DOMAIN", 6u) == 0) {
+  } else if (ftun_rule_type_equal(type, "DOMAIN")) {
     rule->kind = FTUN_RULE_DOMAIN;
-  } else if (type.length == 13u &&
-             memcmp(type.data, "DOMAIN-SUFFIX", 13u) == 0) {
+  } else if (ftun_rule_type_equal(type, "DOMAIN-SUFFIX")) {
     rule->kind = FTUN_RULE_DOMAIN_SUFFIX;
-  } else if (type.length == 14u &&
-             memcmp(type.data, "DOMAIN-KEYWORD", 14u) == 0) {
+  } else if (ftun_rule_type_equal(type, "DOMAIN-KEYWORD")) {
     rule->kind = FTUN_RULE_DOMAIN_KEYWORD;
-  } else if (type.length == 5u && memcmp(type.data, "GEOIP", 5u) == 0) {
-    rule->kind = FTUN_RULE_GEOIP;
-  } else if (type.length == 7u && memcmp(type.data, "GEOSITE", 7u) == 0) {
-    rule->kind = FTUN_RULE_GEOSITE;
-  } else if (type.length == 8u && memcmp(type.data, "DST-PORT", 8u) == 0) {
+  } else if (ftun_rule_type_equal(type, "FRS-IP")) {
+    rule->kind = FTUN_RULE_FRS_IP;
+  } else if (ftun_rule_type_equal(type, "FRS-DOMAIN")) {
+    rule->kind = FTUN_RULE_FRS_DOMAIN;
+  } else if (ftun_rule_type_equal(type, "DST-PORT")) {
     rule->kind = FTUN_RULE_DST_PORT;
-  } else if (type.length == 7u && memcmp(type.data, "NETWORK", 7u) == 0) {
+  } else if (ftun_rule_type_equal(type, "NETWORK")) {
     rule->kind = FTUN_RULE_NETWORK;
-  } else if (type.length == 5u && memcmp(type.data, "MATCH", 5u) == 0) {
+  } else if (ftun_rule_type_equal(type, "MATCH")) {
     rule->kind = FTUN_RULE_MATCH;
   } else {
     status = FTUN_E_UNSUPPORTED;
@@ -351,7 +386,15 @@ ftun_status_t ftun_rule_compile(const char *text,
   status = ftun_rule_resolve_outbound(outbound, resolver, resolver_user,
                                       &rule->outbound_id);
   if (status != FTUN_OK) goto fail;
-  if (rule->kind == FTUN_RULE_SRC_IP_CIDR ||
+  if (rule->kind == FTUN_RULE_FRS_IP || rule->kind == FTUN_RULE_FRS_DOMAIN) {
+    uint16_t kind = rule->kind == FTUN_RULE_FRS_IP ? 1u : 2u;
+    if (operand.length == 0u || frs_bind == NULL) {
+      status = frs_bind == NULL ? FTUN_E_UNSUPPORTED : FTUN_E_INVALID;
+      goto fail;
+    }
+    status = frs_bind(kind, operand, &rule->frs_set, frs_user);
+    if (status != FTUN_OK) goto fail;
+  } else if (rule->kind == FTUN_RULE_SRC_IP_CIDR ||
       rule->kind == FTUN_RULE_IP_CIDR) {
     if (!ftun_rule_cidr(operand, &rule->network_address,
                         &rule->network_mask)) {
@@ -396,9 +439,21 @@ ftun_status_t ftun_rule_compile(const char *text,
   return FTUN_OK;
 
 fail:
+#if defined(FTUN_HAVE_MODULE_FRS)
+  (void)ftun_frs_set_release(&rule->frs_set);
+#endif
   free(rule->owned_operand);
   free(rule);
   return status;
+}
+
+ftun_status_t ftun_rule_compile(const char *text,
+                                ftun_rule_outbound_resolver_fn resolver,
+                                void *resolver_user,
+                                ftun_rule_t **out)
+{
+  return ftun_rule_compile_with_frs(text, resolver, resolver_user, NULL, NULL,
+                                    out);
 }
 
 ftun_status_t ftun_rule_destroy(ftun_rule_t **rule)
@@ -407,6 +462,11 @@ ftun_status_t ftun_rule_destroy(ftun_rule_t **rule)
   if (rule == NULL) return FTUN_E_INVALID;
   owned = *rule;
   if (owned == NULL) return FTUN_OK;
+#if defined(FTUN_HAVE_MODULE_FRS)
+  if (ftun_frs_set_release(&owned->frs_set) != FTUN_OK) {
+    return FTUN_E_STATE_CORRUPT;
+  }
+#endif
   free(owned->owned_operand);
   memset(owned, 0, sizeof(*owned));
   free(owned);

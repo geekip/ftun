@@ -12,6 +12,9 @@ static const char *const ftun_builtin_module_names[] = {
 #if defined(FTUN_HAVE_MODULE_TUN)
   "tun",
 #endif
+#if defined(FTUN_HAVE_MODULE_FRS)
+  "frs",
+#endif
 };
 
 static const ftun_build_capabilities_t ftun_capabilities = {
@@ -21,6 +24,9 @@ static const ftun_build_capabilities_t ftun_capabilities = {
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
     | FTUN_BUILD_MODULE_TUN
+#endif
+#if defined(FTUN_HAVE_MODULE_FRS)
+    | FTUN_BUILD_MODULE_FRS
 #endif
   ,
   ftun_builtin_module_names,
@@ -285,7 +291,16 @@ static const char *ftun_plan_rule_outbound(const char *rule)
 static int ftun_plan_rule_has_type(const char *rule, const char *type)
 {
   size_t length = strlen(type);
-  return strncmp(rule, type, length) == 0 && rule[length] == ',';
+  size_t index;
+  if (rule == NULL || strlen(rule) <= length || rule[length] != ',') return 0;
+  for (index = 0u; index < length; index++) {
+    unsigned char left = (unsigned char)rule[index];
+    unsigned char right = (unsigned char)type[index];
+    if (left >= 'A' && left <= 'Z') left = (unsigned char)(left + ('a' - 'A'));
+    if (right >= 'A' && right <= 'Z') right = (unsigned char)(right + ('a' - 'A'));
+    if (left != right) return 0;
+  }
+  return 1;
 }
 
 static ftun_status_t ftun_plan_rules(const ftun_config_t *config,
@@ -307,15 +322,12 @@ static ftun_status_t ftun_plan_rules(const ftun_config_t *config,
     status = ftun_plan_mark_outbound_name(config, plan, outbound, 1);
     if (status != FTUN_OK) return status;
     if (ftun_plan_rule_has_type(rule, "IP-CIDR") ||
-        ftun_plan_rule_has_type(rule, "GEOIP")) {
+        ftun_plan_rule_has_type(rule, "FRS-IP")) {
       *needs_default_dns = 1;
     }
-    if (ftun_plan_rule_has_type(rule, "GEOIP")) {
-      ftun_plan_add(plan, FTUN_PLAN_GEOIP,
-                    FTUN_PLAN_ITEM_COMPILED | FTUN_PLAN_ITEM_PREPARE |
-                    FTUN_PLAN_ITEM_ACTIVE | FTUN_PLAN_ITEM_RETAINED);
-    } else if (ftun_plan_rule_has_type(rule, "GEOSITE")) {
-      ftun_plan_add(plan, FTUN_PLAN_GEOSITE,
+    if (ftun_plan_rule_has_type(rule, "FRS-IP") ||
+        ftun_plan_rule_has_type(rule, "FRS-DOMAIN")) {
+      ftun_plan_add(plan, FTUN_PLAN_FRS,
                     FTUN_PLAN_ITEM_COMPILED | FTUN_PLAN_ITEM_PREPARE |
                     FTUN_PLAN_ITEM_ACTIVE | FTUN_PLAN_ITEM_RETAINED);
     }
@@ -391,51 +403,28 @@ static ftun_status_t ftun_plan_dns(const ftun_config_t *config,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_plan_geo(const ftun_config_t *config,
+static ftun_status_t ftun_plan_frs(const ftun_config_t *config,
                                    ftun_feature_plan_t *plan)
 {
-  int has_update = 0;
-  int needs_geo_resolver = 0;
-  if ((plan->prepare & FTUN_PLAN_GEOIP) != 0u) plan->prepare_geo_count++;
-  if ((plan->prepare & FTUN_PLAN_GEOSITE) != 0u) plan->prepare_geo_count++;
-  if (!config->geo.present || !config->geo.auto_update) return FTUN_OK;
-  if (config->geo.geoip.present) {
-    has_update = 1;
-    if ((plan->prepare & FTUN_PLAN_GEOIP) == 0u) {
-      plan->prepare_geo_count++;
-      ftun_plan_add(plan, FTUN_PLAN_GEOIP,
-                    FTUN_PLAN_ITEM_COMPILED | FTUN_PLAN_ITEM_PREPARE |
-                    FTUN_PLAN_ITEM_ACTIVE | FTUN_PLAN_ITEM_RETAINED);
-    }
-    if (ftun_plan_host_is_domain(config->geo.geoip.url, 1)) {
-      needs_geo_resolver = 1;
-    }
-  }
-  if (config->geo.geosite.present) {
-    has_update = 1;
-    if ((plan->prepare & FTUN_PLAN_GEOSITE) == 0u) {
-      plan->prepare_geo_count++;
-      ftun_plan_add(plan, FTUN_PLAN_GEOSITE,
-                    FTUN_PLAN_ITEM_COMPILED | FTUN_PLAN_ITEM_PREPARE |
-                    FTUN_PLAN_ITEM_ACTIVE | FTUN_PLAN_ITEM_RETAINED);
-    }
-    if (ftun_plan_host_is_domain(config->geo.geosite.url, 1)) {
-      needs_geo_resolver = 1;
-    }
-  }
-  if (has_update) {
+  int needs_frs_resolver;
+  if ((plan->prepare & FTUN_PLAN_FRS) == 0u) return FTUN_OK;
+  plan->prepare_frs_count = 1u;
+  if (!config->frs.auto_update || config->frs.url == NULL ||
+      config->frs.url[0] == '\0') return FTUN_OK;
+  needs_frs_resolver = ftun_plan_host_is_domain(config->frs.url, 1);
+  {
     ftun_status_t status;
-    ftun_plan_add(plan, FTUN_PLAN_GEO_UPDATE,
+    ftun_plan_add(plan, FTUN_PLAN_FRS_UPDATE,
                   FTUN_PLAN_ITEM_COMPILED | FTUN_PLAN_ITEM_ACTIVE |
                   FTUN_PLAN_ITEM_RETAINED);
     status = ftun_plan_mark_outbound_name(config, plan,
-                                          config->geo.update_outbound, 0);
+                                          config->frs.update_outbound, 0);
     if (status != FTUN_OK) return status;
-    if (config->dns.enable && config->geo.dns_server[0] != '\0' &&
-        needs_geo_resolver) {
-      status = ftun_plan_mark_dns_name(config, plan, config->geo.dns_server);
+    if (config->dns.enable && config->frs.dns_server[0] != '\0' &&
+        needs_frs_resolver) {
+      status = ftun_plan_mark_dns_name(config, plan, config->frs.dns_server);
       if (status != FTUN_OK) return status;
-    } else if (needs_geo_resolver) {
+    } else if (needs_frs_resolver) {
       ftun_plan_need_resolver(config, plan);
     }
   }
@@ -482,14 +471,12 @@ static void ftun_plan_compile_definitions(const ftun_config_t *config,
       ftun_plan_add(plan, FTUN_PLAN_FAKE_IP, FTUN_PLAN_ITEM_COMPILED);
     }
   }
-  if (config->geo.geoip.present) {
-    ftun_plan_add(plan, FTUN_PLAN_GEOIP, FTUN_PLAN_ITEM_COMPILED);
+  if (config->frs.active) {
+    ftun_plan_add(plan, FTUN_PLAN_FRS, FTUN_PLAN_ITEM_COMPILED);
   }
-  if (config->geo.geosite.present) {
-    ftun_plan_add(plan, FTUN_PLAN_GEOSITE, FTUN_PLAN_ITEM_COMPILED);
-  }
-  if (config->geo.auto_update) {
-    ftun_plan_add(plan, FTUN_PLAN_GEO_UPDATE, FTUN_PLAN_ITEM_COMPILED);
+  if (config->frs.active && config->frs.auto_update &&
+      config->frs.url != NULL && config->frs.url[0] != '\0') {
+    ftun_plan_add(plan, FTUN_PLAN_FRS_UPDATE, FTUN_PLAN_ITEM_COMPILED);
   }
 }
 
@@ -543,6 +530,7 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
   plan->built_modules = ftun_build_capabilities()->builtins;
   plan->required_modules = FTUN_BUILD_MODULE_CORE;
   if (config->dns.enable) plan->required_modules |= FTUN_BUILD_MODULE_DNS;
+  if (config->frs.active) plan->required_modules |= FTUN_BUILD_MODULE_FRS;
   for (index = 0u; index < config->inbound_count; index++) {
     if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
       plan->required_modules |= FTUN_BUILD_MODULE_TUN;
@@ -554,7 +542,7 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
                                                      &needs_default_dns);
   if (status == FTUN_OK) status = ftun_plan_dns(config, plan,
                                                 needs_default_dns);
-  if (status == FTUN_OK) status = ftun_plan_geo(config, plan);
+  if (status == FTUN_OK) status = ftun_plan_frs(config, plan);
   if (status == FTUN_OK && config->dns.cache &&
       (plan->prepare & FTUN_PLAN_DNS) != 0u) {
     ftun_plan_add(plan, FTUN_PLAN_DNS_CACHE,

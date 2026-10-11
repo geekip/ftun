@@ -1,12 +1,55 @@
 #ifndef FTUN_TLS_TLS_H
 #define FTUN_TLS_TLS_H
+/* TASK-TLS-001 / TEST-TLS-001：ftun_tls_client_open，目标 0.4.0。 */
 #include "internal/contracts.h"
-/* TLS 抽象。
- * 需求 REQ-DEP-001；任务 TASK-TLS-001；目标 0.4.0；验收 TEST-TLS-001。
- * 实现路径：非阻塞 WANT_READ/WRITE、证书与主机名验证、SNI/CA、取消和内部缓冲预算；HTTPS 即使无 AnyTLS 也需要客户端。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
-ftun_status_t ftun_tls_client_open(ftun_core_t *core, const ftun_tls_options_t *options, ftun_stream_t *transport, ftun_stream_t **out);
+
+typedef struct ftun_tls_client ftun_tls_client_t;
+
+typedef ftun_status_t (*ftun_tls_io_read_fn)(void *user, uint8_t *buffer,
+                                             size_t capacity,
+                                             size_t *length);
+typedef ftun_status_t (*ftun_tls_io_write_fn)(void *user,
+                                              const uint8_t *buffer,
+                                              size_t length,
+                                              size_t *written);
+
+typedef struct {
+  ftun_tls_io_read_fn read;
+  ftun_tls_io_write_fn write;
+  void *user;
+} ftun_tls_io_t;
+
+struct ftun_tls_options {
+  ftun_budget_t *budget;
+  ftun_string_t server_name;
+  ftun_bytes_t ca_pem;
+  const char *ca_file;
+  size_t maximum_plaintext;
+};
+
+typedef struct {
+  bool handshake_complete;
+  bool peer_verified;
+  bool wants_read;
+  bool wants_write;
+} ftun_tls_info_t;
+
+/* TASK-TLS-001 / TEST-TLS-001：同步推进的非阻塞 TLS 客户端。底层 IO 的
+ * AGAIN 被精确映射为 wants_read/wants_write；不允许关闭 peer/hostname 验证。
+ * budget 为借用且必须比 client 长寿；准入会为包装对象、主机名和有界
+ * 明文工作区保留逻辑预算。options 与 io 只在 create 同步借用，backend
+ * 自行复制所需主机名状态。 */
+ftun_status_t ftun_tls_client_open(const ftun_tls_options_t *options,
+                                   const ftun_tls_io_t *io,
+                                   ftun_tls_client_t **out);
+ftun_status_t ftun_tls_client_handshake(ftun_tls_client_t *client);
+ftun_status_t ftun_tls_client_read(ftun_tls_client_t *client,
+                                   uint8_t *buffer, size_t capacity,
+                                   size_t *length);
+ftun_status_t ftun_tls_client_write(ftun_tls_client_t *client,
+                                    const uint8_t *buffer, size_t length,
+                                    size_t *written);
+ftun_status_t ftun_tls_client_get_info(const ftun_tls_client_t *client,
+                                       ftun_tls_info_t *out);
+ftun_status_t ftun_tls_client_destroy(ftun_tls_client_t **client);
 #endif

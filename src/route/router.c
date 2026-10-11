@@ -47,9 +47,10 @@ ftun_status_t ftun_route_table_accounted_bytes(const char *const *rules,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_route_table_create(
+ftun_status_t ftun_route_table_create_with_frs(
   uint64_t generation, const char *const *rules, size_t rule_count,
   ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
+  ftun_rule_frs_bind_fn frs_bind, void *frs_user,
   ftun_route_table_t **out)
 {
   ftun_route_table_t *table;
@@ -70,8 +71,9 @@ ftun_status_t ftun_route_table_create(
   table->rule_count = rule_count;
   table->generation = generation;
   for (index = 0u; index < rule_count; index++) {
-    status = ftun_rule_compile(rules[index], resolver, resolver_user,
-                               &table->rules[index]);
+    status = ftun_rule_compile_with_frs(rules[index], resolver, resolver_user,
+                                        frs_bind, frs_user,
+                                        &table->rules[index]);
     if (status != FTUN_OK) {
       (void)ftun_route_table_destroy(&table);
       return status;
@@ -79,6 +81,16 @@ ftun_status_t ftun_route_table_create(
   }
   *out = table;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_route_table_create(
+  uint64_t generation, const char *const *rules, size_t rule_count,
+  ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
+  ftun_route_table_t **out)
+{
+  return ftun_route_table_create_with_frs(generation, rules, rule_count,
+                                          resolver, resolver_user, NULL, NULL,
+                                          out);
 }
 
 ftun_status_t ftun_route_table_set_generation(ftun_route_table_t *table,
@@ -208,7 +220,7 @@ ftun_status_t ftun_route_table_evaluate(const ftun_route_table_t *table,
     }
     out->kind = FTUN_ROUTE_READY;
     if (rule->kind == FTUN_RULE_IP_CIDR ||
-        rule->kind == FTUN_RULE_GEOIP) {
+        rule->kind == FTUN_RULE_FRS_IP) {
       status = ftun_route_copy_matching_candidates(rule, metadata, out);
     } else {
       status = ftun_route_copy_all_candidates(metadata, out);
@@ -259,7 +271,7 @@ ftun_status_t ftun_route_table_evaluate_known(const ftun_route_table_t *table,
       return FTUN_OK;
     }
     out->kind = FTUN_ROUTE_READY;
-    if (rule->kind == FTUN_RULE_IP_CIDR || rule->kind == FTUN_RULE_GEOIP) {
+    if (rule->kind == FTUN_RULE_IP_CIDR || rule->kind == FTUN_RULE_FRS_IP) {
       status = ftun_route_copy_matching_candidates(rule, metadata, out);
     } else {
       status = ftun_route_copy_all_candidates(metadata, out);

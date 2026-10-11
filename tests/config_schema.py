@@ -65,7 +65,7 @@ class ConfigSchemaTest(unittest.TestCase):
 
     def test_empty_objects_and_default_annotations(self):
         self.valid({})  # Embedding/fragments are distinct from CLI run's non-empty input requirement.
-        self.valid({'base': {}, 'dns': {}, 'geo': {}, 'sniff': {}, 'rules': []})
+        self.valid({'base': {}, 'dns': {}, 'frs': {}, 'sniff': {}, 'rules': []})
         original = {'inbounds': [tun()]}
         value = copy.deepcopy(original)
         self.valid(value)
@@ -141,7 +141,7 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_dns_shapes_and_disabled_references(self):
         self.valid({'dns': {'enable': False, 'default-server': 'missing',
                            'listeners': [{'listen': '127.0.0.1:53', 'server': 'missing'}]},
-                    'outbounds': [node(**{'dns-server': 'missing'})], 'geo': {'dns-server': 'missing'},
+                    'outbounds': [node(**{'dns-server': 'missing'})], 'frs': {'dns-server': 'missing'},
                     'inbounds': [tun(**{'dns-hijack': True})]})
         self.valid({'dns': {'listeners': [{'listen': '127.0.0.1:53'},
                                          {'listen': '127.0.0.1:5353', 'server': ''}]}})
@@ -202,26 +202,35 @@ class ConfigSchemaTest(unittest.TestCase):
                     'https://example.com/\n']:
             self.invalid({'outbounds': [group('url-test', url=url)]})
 
-    def test_geo_activation_and_updates(self):
-        self.valid({'geo': {'geoip': {}, 'geosite': {}}})  # Unused objects have no file dependency.
-        self.valid({'geo': {'geoip': {'path': 'geo.ftgeo'}}, 'rules': ['GEOIP,CN,DIRECT']})
-        self.valid({'geo': {'auto-update': True, 'geoip': {'path': 'geo.ftgeo', 'url': 'https://example.com/geo'}}})
-        for value in [{'rules': ['GEOIP,CN,DIRECT']},
-                      {'geo': {'geosite': {}}, 'rules': ['GEOSITE,private,DIRECT']},
-                      {'geo': {'auto-update': True, 'geoip': {'path': 'geo.ftgeo'}}},
-                      {'geo': {'auto-update': True, 'geosite': {'url': 'https://example.com/geo'}}}]:
+    def test_frs_activation_and_updates(self):
+        self.valid({'frs': 42})  # No FRS rule: DDRA ignores the entire value.
+        self.valid({'rules': ['FRS-IP,CN,DIRECT']})  # Default executable-dir path.
+        self.valid({'frs': {'path': 'rules.frs'}, 'rules': ['frs-domain,CN,DIRECT']})
+        self.valid({'frs': {'auto-update': True}, 'rules': ['FRS-IP,CN,DIRECT']})
+        self.valid({'frs': {'auto-update': True, 'url': ''},
+                    'rules': ['FRS-IP,CN,DIRECT']})
+        self.valid({'frs': {'auto-update': True,
+                            'url': 'https://example.com/rules.frs'},
+                    'rules': ['FRS-IP,CN,DIRECT']})
+        for value in [
+            {'frs': {'unknown': 1}, 'rules': ['FRS-IP,CN,DIRECT']},
+            {'frs': {'path': ''}, 'rules': ['FRS-IP,CN,DIRECT']},
+            {'frs': {'url': 'ftp://example.com/rules.frs'},
+             'rules': ['FRS-IP,CN,DIRECT']},
+        ]:
             self.invalid(value)
 
     def test_all_rule_kinds_and_boundaries(self):
         rules = ['SRC-IP-CIDR,192.168.0.1/32,REJECT', 'IP-CIDR,0.0.0.0/0,DIRECT',
                  'DOMAIN,A.COM.,proxy', 'DOMAIN-SUFFIX,xn--fiqs8s.com,proxy',
                  'DOMAIN-KEYWORD,google,proxy', 'DST-PORT,1,DIRECT', 'DST-PORT,65535,DIRECT',
+                 'FRS-IP,cn,DIRECT', 'frs-domain,CN,proxy',
                  'NETWORK,tcp,proxy', 'NETWORK,udp,DIRECT', 'MATCH,香港 01']
         self.valid({'rules': rules})
         for rule in ['IP-CIDR,10.0.0.0/33,DIRECT', 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
                      'DOMAIN-REGEX,.*example.*,proxy', 'DOMAIN,*.example.com,proxy',
                      'DOMAIN,中文.com,proxy', 'DOMAIN,,DIRECT', 'DOMAIN-KEYWORD,,DIRECT',
-                     'DOMAIN-KEYWORD,中文,DIRECT', 'GEOSITE-REGEX,private,proxy',
+                     'DOMAIN-KEYWORD,中文,DIRECT', 'FRS-DOMAIN-REGEX,private,proxy',
                      'SRC-IP-CIDR,::/0,DIRECT', 'DST-PORT,0,DIRECT', 'DST-PORT,80-90,DIRECT',
                      'DST-PORT,65536,DIRECT', 'NETWORK,icmp,DIRECT', 'MATCH,',
                      'INBOUND,tun-in,proxy', 'MATCH,DIRECT\n']:

@@ -52,23 +52,6 @@ static ftun_status_t resolve_outbound(ftun_string_t name, uint32_t *out,
   return FTUN_OK;
 }
 
-static bool geoip(ftun_string_t label, const ftun_endpoint_t *address,
-                  void *user)
-{
-  unsigned int *calls = (unsigned int *)user;
-  (*calls)++;
-  return label.length == 2u && memcmp(label.data, "cn", 2u) == 0 &&
-         address->address[0] == 10u;
-}
-
-static bool geosite(ftun_string_t label, ftun_string_t domain, void *user)
-{
-  unsigned int *calls = (unsigned int *)user;
-  (*calls)++;
-  return label.length == 4u && memcmp(label.data, "test", 4u) == 0 &&
-         domain.length == 11u && memcmp(domain.data, "example.com", 11u) == 0;
-}
-
 static int test_domain_port_and_network_boundaries(void)
 {
   ftun_rule_t *rule = NULL;
@@ -132,36 +115,9 @@ static int test_real_candidates_and_fake_identity(void)
   return 0;
 }
 
-static int test_geo_callbacks_are_pure(void)
-{
-  ftun_rule_t rule;
-  ftun_metadata_t metadata = metadata_domain("example.com");
-  ftun_match_result_t match;
-  unsigned int calls = 0u;
-  memset(&rule, 0, sizeof(rule));
-  rule.kind = FTUN_RULE_GEOSITE;
-  rule.operand = (ftun_string_t){"test", 4u};
-  rule.geosite = geosite;
-  rule.geo_user = &calls;
-  CHECK(ftun_rule_match(&rule, &metadata, &match) == FTUN_OK &&
-        match.matched && calls == 1u && !match.needs_resolve);
-  rule.kind = FTUN_RULE_GEOIP;
-  rule.operand = (ftun_string_t){"cn", 2u};
-  rule.geoip = geoip;
-  CHECK(ftun_rule_match(&rule, &metadata, &match) == FTUN_OK &&
-        !match.matched && match.needs_resolve && calls == 1u);
-  metadata.original_target = ipv4(10u, 0u, 0u, 1u, 53u);
-  CHECK(ftun_rule_match(&rule, &metadata, &match) == FTUN_OK &&
-        match.matched && calls == 2u);
-  rule.geoip = NULL;
-  CHECK(ftun_rule_match(&rule, &metadata, &match) == FTUN_E_UNSUPPORTED);
-  return 0;
-}
-
 int main(void)
 {
   CHECK(test_domain_port_and_network_boundaries() == 0);
   CHECK(test_real_candidates_and_fake_identity() == 0);
-  CHECK(test_geo_callbacks_are_pure() == 0);
   return 0;
 }

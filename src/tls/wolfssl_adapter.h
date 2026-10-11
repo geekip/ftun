@@ -1,12 +1,23 @@
 #ifndef FTUN_TLS_WOLFSSL_ADAPTER_H
 #define FTUN_TLS_WOLFSSL_ADAPTER_H
-#include "internal/contracts.h"
-/* 首个 TLS 验证候选。
- * 需求 REQ-DEP-001；任务 TASK-TLS-002；目标 0.4.0；验收 TEST-TLS-002。
- * 实现路径：后续审核精确版本、许可、裁剪和互操作后接入；当前未包含 wolfSSL 代码或报告 backend 可用。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
- * 输入同步借用；将来异步接纳前复制并保留所有依赖，owner loop 一次终结。
- * 当前为骨架：不接纳请求、不转移输入所有权、不调用回调；失败输出清空。
- */
+/* TASK-TLS-002 / TEST-TLS-002：ftun_wolfssl_prepare，目标 0.4.0。 */
+#include "tls/tls.h"
+
+/* TASK-TLS-002 / TEST-TLS-002：wolfSSL v5.8.4-stable 候选。 */
 ftun_status_t ftun_wolfssl_prepare(const ftun_tls_options_t *options, ftun_tls_context_t **out);
+ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
+                                         const ftun_tls_options_t *options,
+                                         const ftun_tls_io_t *io,
+                                         ftun_tls_client_t **out);
+ftun_status_t ftun_wolfssl_client_handshake(ftun_tls_client_t *client);
+ftun_status_t ftun_wolfssl_client_read(ftun_tls_client_t *client,
+                                       uint8_t *buffer, size_t capacity,
+                                       size_t *length);
+ftun_status_t ftun_wolfssl_client_write(ftun_tls_client_t *client,
+                                        const uint8_t *buffer, size_t length,
+                                        size_t *written);
+ftun_status_t ftun_wolfssl_client_info(const ftun_tls_client_t *client,
+                                       ftun_tls_info_t *out);
+ftun_status_t ftun_wolfssl_client_destroy(ftun_tls_client_t **client);
+ftun_status_t ftun_wolfssl_context_destroy(ftun_tls_context_t **context);
 #endif

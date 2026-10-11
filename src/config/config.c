@@ -69,7 +69,7 @@ static ftun_status_t ftun_config_read_file(const char *path, uint8_t **out,
 static char *ftun_config_copy_span(const char *value, size_t length)
 {
   char *copy;
-  if (value == NULL || length > FTUN_CONFIG_MAX_STRING_BYTES) return NULL;
+  if (value == NULL || length > FTUN_CONFIG_MAX_PATH_BYTES) return NULL;
   copy = (char *)malloc(length + 1u);
   if (copy == NULL) return NULL;
   memcpy(copy, value, length);
@@ -98,9 +98,9 @@ static char *ftun_config_join(const char *directory, const char *relative)
   directory_length = strlen(directory);
   relative_length = strlen(relative);
   separator = directory_length != 0u && directory[directory_length - 1u] == '/' ? 0u : 1u;
-  if (directory_length > FTUN_CONFIG_MAX_STRING_BYTES ||
-      relative_length > FTUN_CONFIG_MAX_STRING_BYTES ||
-      directory_length + separator > FTUN_CONFIG_MAX_STRING_BYTES - relative_length) {
+  if (directory_length > FTUN_CONFIG_MAX_PATH_BYTES ||
+      relative_length > FTUN_CONFIG_MAX_PATH_BYTES ||
+      directory_length + separator > FTUN_CONFIG_MAX_PATH_BYTES - relative_length) {
     return NULL;
   }
   joined = (char *)malloc(directory_length + separator + relative_length + 1u);
@@ -153,6 +153,26 @@ static ftun_status_t ftun_config_resolve_one(const char *directory, char **value
   return FTUN_OK;
 }
 
+static ftun_status_t ftun_config_default_frs_path(char **out)
+{
+  char executable[FTUN_CONFIG_MAX_PATH_BYTES + 1u];
+  char *directory;
+  char *path;
+  ssize_t length;
+  if (out == NULL) return FTUN_E_INVALID;
+  *out = NULL;
+  length = readlink("/proc/self/exe", executable, sizeof(executable) - 1u);
+  if (length <= 0 || (size_t)length >= sizeof(executable)) return FTUN_E_IO;
+  executable[length] = '\0';
+  directory = ftun_config_directory(executable);
+  if (directory == NULL) return FTUN_E_IO;
+  path = ftun_config_join(directory, "rules.frs");
+  free(directory);
+  if (path == NULL) return FTUN_E_LIMIT;
+  *out = path;
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
                                                char *source_path)
 {
@@ -166,13 +186,13 @@ static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
   if (status == FTUN_OK) {
     status = ftun_config_resolve_one(config->base_directory, &config->log.file);
   }
-  if (status == FTUN_OK) {
-    status = ftun_config_resolve_one(config->base_directory,
-                                     &config->geo.geoip.path);
-  }
-  if (status == FTUN_OK) {
-    status = ftun_config_resolve_one(config->base_directory,
-                                     &config->geo.geosite.path);
+  if (status == FTUN_OK && config->frs.active) {
+    if (config->frs.path == NULL) {
+      status = ftun_config_default_frs_path(&config->frs.path);
+    } else {
+      status = ftun_config_resolve_one(config->base_directory,
+                                       &config->frs.path);
+    }
   }
   return status;
 }
@@ -193,7 +213,7 @@ ftun_status_t ftun_config_load(ftun_core_t *core, const char *path,
   (void)core;
   source_path = realpath(path, NULL);
   if (source_path == NULL) return FTUN_E_IO;
-  if (strlen(source_path) > FTUN_CONFIG_MAX_STRING_BYTES) {
+  if (strlen(source_path) > FTUN_CONFIG_MAX_PATH_BYTES) {
     free(source_path);
     return FTUN_E_LIMIT;
   }
