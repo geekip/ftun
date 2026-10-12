@@ -99,6 +99,16 @@ static ftun_status_t backend_timer_start(void *user,
   return FTUN_OK;
 }
 
+static ftun_status_t backend_io_update(void *user,
+                                        ftun_event_source_t *source,
+                                        uint32_t interests)
+{
+  (void)user;
+  (void)source;
+  (void)interests;
+  return FTUN_OK;
+}
+
 static ftun_status_t backend_source_cancel(void *user,
                                            ftun_event_source_t *source)
 {
@@ -137,6 +147,7 @@ static void backend_destroy(void *user)
 
 static const ftun_event_backend_ops_t backend_ops = {
   backend_io_start,
+  backend_io_update,
   backend_timer_start,
   backend_source_cancel,
   backend_wakeup,

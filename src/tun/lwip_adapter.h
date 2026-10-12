@@ -88,6 +88,8 @@ ftun_status_t ftun_lwip_tcp_peek(ftun_lwip_tcp_t *flow,
                                  size_t segment_capacity, size_t *segment_count,
                                  size_t *available, bool *peer_finished);
 ftun_status_t ftun_lwip_tcp_consume(ftun_lwip_tcp_t *flow, size_t bytes);
+ftun_status_t ftun_lwip_tcp_ready(const ftun_lwip_tcp_t *flow,
+                                  bool *readable, bool *writable);
 ftun_status_t ftun_lwip_tcp_write_ref(ftun_lwip_tcp_t *flow,
                                       const ftun_buffer_slice_t *slice,
                                       size_t *accepted);

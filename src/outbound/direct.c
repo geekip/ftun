@@ -105,13 +105,14 @@ static int ftun_direct_request_valid(const ftun_direct_request_t *request)
   if (request == NULL || request->loop == NULL ||
       request->operations == NULL || request->budget == NULL ||
       request->target == NULL || request->completion == NULL ||
-      request->protection.mark == 0u ||
       (request->transport != FTUN_DIAL_TCP &&
        request->transport != FTUN_DIAL_UDP)) return 0;
   if (request->protection.interface_name.length >=
       FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
   if (request->protection.interface_name.length != 0u &&
       request->protection.interface_name.data == NULL) return 0;
+  if (request->protection.mark == 0u &&
+      request->protection.interface_name.length != 0u) return 0;
   return 1;
 }
 

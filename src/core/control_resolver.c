@@ -171,7 +171,7 @@ ftun_status_t ftun_control_resolver_plan(
   size_t index;
   ftun_status_t status = FTUN_OK;
   if (out != NULL) memset(out, 0, sizeof(*out));
-  if (config == NULL || out == NULL || socket_mark == 0u ||
+  if (config == NULL || out == NULL ||
       (server.length != 0u && server.data == NULL)) return FTUN_E_INVALID;
   out->socket_mark = socket_mark;
   if (!config->dns.enable) return FTUN_OK;
@@ -371,7 +371,7 @@ ftun_status_t ftun_control_resolve_bootstrap(
   uint16_t port, ftun_endpoint_t *out)
 {
   if (out != NULL) memset(out, 0, sizeof(*out));
-  if (plan == NULL || plan->socket_mark == 0u || domain.data == NULL ||
+  if (plan == NULL || domain.data == NULL ||
       domain.length == 0u || domain.length > 253u || port == 0u ||
       out == NULL) return FTUN_E_INVALID;
   return ftun_control_bootstrap(plan, domain, port, out);
@@ -403,8 +403,7 @@ ftun_status_t ftun_control_resolve(
   ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (plan == NULL || domain.data == NULL || domain.length == 0u ||
-      domain.length > 253u || port == 0u || out == NULL ||
-      plan->socket_mark == 0u) return FTUN_E_INVALID;
+      domain.length > 253u || port == 0u || out == NULL) return FTUN_E_INVALID;
   if (!plan->named) return ftun_control_bootstrap(plan, domain, port, out);
   status = ftun_control_resolve_text(plan, plan->upstream, 53u, &upstream);
   if (status != FTUN_OK) return status;

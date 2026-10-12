@@ -565,6 +565,37 @@ ftun_status_t ftun_tun_ingress_tick(ftun_tun_ingress_context_t *context,
   return ftun_lwip_tick(context->stack, now_ms);
 }
 
+ftun_status_t ftun_tun_ingress_abort_stream(
+  ftun_tun_ingress_context_t *context, ftun_stream_t *stream)
+{
+  ftun_tun_tcp_bridge_t *bridge;
+  if (context == NULL || stream == NULL || context != ftun_tun_active) {
+    return FTUN_E_INVALID;
+  }
+  for (bridge = context->tcp_streams; bridge != NULL; bridge = bridge->next) {
+    if (bridge->stream == stream) break;
+  }
+  if (bridge == NULL) return FTUN_E_STALE;
+  if (bridge->flow == NULL) return FTUN_OK;
+  return ftun_lwip_tcp_close(&bridge->flow);
+}
+
+ftun_status_t ftun_tun_ingress_stream_ready(
+  ftun_tun_ingress_context_t *context, ftun_stream_t *stream,
+  bool *readable, bool *writable)
+{
+  ftun_tun_tcp_bridge_t *bridge;
+  if (readable != NULL) *readable = false;
+  if (writable != NULL) *writable = false;
+  if (context == NULL || stream == NULL || readable == NULL ||
+      writable == NULL || context != ftun_tun_active) return FTUN_E_INVALID;
+  for (bridge = context->tcp_streams; bridge != NULL; bridge = bridge->next) {
+    if (bridge->stream == stream) break;
+  }
+  if (bridge == NULL || bridge->flow == NULL) return FTUN_E_STALE;
+  return ftun_lwip_tcp_ready(bridge->flow, readable, writable);
+}
+
 ftun_status_t ftun_tun_ingress_set_generation(
   ftun_tun_ingress_context_t *context, uint64_t generation)
 {

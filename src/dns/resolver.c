@@ -84,7 +84,6 @@ static ftun_status_t ftun_resolver_validate(
   ftun_status_t status;
   if (request == NULL || request->session == NULL ||
       request->query.budget == NULL || request->query.completion == NULL ||
-      request->query.protection.mark == 0u ||
       !ftun_resolver_domain_valid(request->query.domain) ||
       !ftun_resolver_name_valid(request->default_server)) {
     return FTUN_E_INVALID;

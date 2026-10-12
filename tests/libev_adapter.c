@@ -88,6 +88,15 @@ int main(void)
   CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 1u && state.io_calls == 1);
 
+  CHECK(ftun_event_io_update(io, FTUN_EVENT_ERROR) == FTUN_OK);
+  CHECK(write(descriptors[1], "x", 1u) == 1);
+  CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 0u && state.io_calls == 1);
+  CHECK(ftun_event_io_update(io, FTUN_EVENT_READ | FTUN_EVENT_ERROR) ==
+        FTUN_OK);
+  CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 1u && state.io_calls == 2);
+
   CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
   CHECK(ftun_event_timer_start(loop, now_ms + 5u, ready, &state, &timer) == FTUN_OK);
   CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);

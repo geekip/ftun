@@ -10,7 +10,8 @@ typedef struct ftun_udp_flow_table ftun_udp_flow_table_t;
 
 typedef ftun_status_t (*ftun_udp_flow_open_fn)(
   void *user, ftun_core_t *core, const ftun_runtime_t *runtime,
-  const ftun_metadata_t *metadata, ftun_datagram_result_fn result,
+  const ftun_metadata_t *metadata, const ftun_route_result_t *route,
+  ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out);
 typedef ftun_status_t (*ftun_udp_flow_inbound_fn)(
@@ -63,8 +64,19 @@ ftun_status_t ftun_udp_flow_input_on(ftun_udp_flow_table_t *table,
                                      ftun_datagram_t *inbound,
                                      const ftun_metadata_t *metadata,
                                      ftun_packet_t *packet);
+/* 已由共享异步 Router 决定路由的 Engine 路径。 */
+ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
+                                         ftun_datagram_t *inbound,
+                                         const ftun_metadata_t *metadata,
+                                         const ftun_route_result_t *route,
+                                         ftun_packet_t *packet);
 ftun_status_t ftun_udp_flow_tick(ftun_udp_flow_table_t *table,
                                  uint64_t now_ms);
+/* 只标记并回收拥有该 outbound 的 flow；单个已连接 UDP socket 的网络或
+ * 协议错误不得逃逸到 owner loop。 */
+ftun_status_t ftun_udp_flow_fail_outbound(ftun_udp_flow_table_t *table,
+                                          ftun_datagram_t *outbound,
+                                          ftun_status_t failure);
 ftun_status_t ftun_udp_flow_close_inbound(ftun_udp_flow_table_t *table,
                                           ftun_datagram_t *inbound);
 ftun_status_t ftun_udp_flow_get_usage(const ftun_udp_flow_table_t *table,

@@ -42,6 +42,10 @@ ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left,
 ftun_status_t ftun_relay_start_with_options(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
   const ftun_relay_options_t *options, ftun_relay_t **out);
+/* 内部生产路径。pool 为借用引用，其寿命必须长于 relay。 */
+ftun_status_t ftun_relay_start_with_pool(
+  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
+  ftun_buffer_pool_t *pool, ftun_relay_t **out);
 /* events 是本轮已就绪位；单次最多执行 options.max_work_per_round 个动作。 */
 ftun_status_t ftun_relay_process(ftun_relay_t *relay,
                                  uint32_t left_events,

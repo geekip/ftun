@@ -86,9 +86,10 @@ static int ftun_system_resolver_request_valid(
   return request != NULL && request->worker != NULL &&
          request->budget != NULL &&
          ftun_system_resolver_domain_valid(request->domain) &&
-         request->protection.mark != 0u &&
          ftun_system_resolver_device_valid(
            request->protection.interface_name) &&
+         (request->protection.mark != 0u ||
+          request->protection.interface_name.length == 0u) &&
          request->check_path != NULL && request->completion != NULL;
 }
 

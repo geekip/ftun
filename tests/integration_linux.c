@@ -716,7 +716,7 @@ static int socks_client_with_hold_main(const char *port_text,
     errno = 0;
     hold_ms = strtoul(hold_text, &tail, 10);
     if (errno != 0 || tail == hold_text || *tail != '\0' ||
-        hold_ms > 60000u) return 1;
+        hold_ms > 120000u) return 1;
   }
   descriptor = proxy_connect((uint16_t)port);
   if (descriptor < 0) return 1;
@@ -755,6 +755,7 @@ static int socks_client_main(const char *port_text, const char *target_text)
 typedef struct {
   int descriptor;
   size_t length;
+  size_t completed;
   uint8_t payload[16384];
   int succeeded;
 } socks_load_writer_t;
@@ -769,9 +770,92 @@ static void *socks_load_writer(void *argument)
       ? remaining : sizeof(writer->payload);
     if (!write_exact(writer->descriptor, writer->payload, amount)) return NULL;
     remaining -= amount;
+    writer->completed += amount;
   }
   writer->succeeded = 1;
   return NULL;
+}
+
+static int load_echo(int descriptor, size_t requested, const char *path)
+{
+  uint8_t response[16384];
+  socks_load_writer_t writer;
+  pthread_t writer_thread;
+  uint64_t started;
+  uint64_t finished;
+  uint64_t elapsed;
+  size_t remaining;
+  size_t index;
+  int reader_succeeded = 1;
+  memset(&writer, 0, sizeof(writer));
+  writer.descriptor = descriptor;
+  writer.length = requested;
+  for (index = 0u; index < sizeof(writer.payload); index++) {
+    writer.payload[index] = (uint8_t)(index * 31u + 17u);
+  }
+  if (ftun_monotonic_now(&started) != FTUN_OK ||
+      pthread_create(&writer_thread, NULL, socks_load_writer, &writer) != 0) {
+    return 1;
+  }
+  remaining = requested;
+  while (remaining != 0u) {
+    size_t amount = remaining < sizeof(writer.payload)
+      ? remaining : sizeof(writer.payload);
+    if (!read_exact(descriptor, response, amount) ||
+        memcmp(writer.payload, response, amount) != 0) {
+      reader_succeeded = 0;
+      break;
+    }
+    remaining -= amount;
+  }
+  if (!reader_succeeded) (void)shutdown(descriptor, SHUT_RDWR);
+  if (pthread_join(writer_thread, NULL) != 0 || !reader_succeeded ||
+      !writer.succeeded) {
+    fprintf(stderr, "load echo failed path=%s sent=%zu received=%zu "
+            "requested=%zu errno=%d\n", path, writer.completed,
+            requested - remaining, requested, errno);
+    return 1;
+  }
+  if (ftun_monotonic_now(&finished) != FTUN_OK || finished < started) return 1;
+  elapsed = finished - started;
+  if (elapsed == 0u) elapsed = 1u;
+  printf("production-data-plane path=%s bytes=%zu elapsed-ms=%llu "
+         "throughput-mib-s=%.2f\n",
+         path, requested, (unsigned long long)elapsed,
+         ((double)requested * 1000.0) /
+           ((double)elapsed * 1024.0 * 1024.0));
+  return 0;
+}
+
+static int load_client_main(const char *target_text, const char *bytes_text,
+                            const char *path)
+{
+  struct sockaddr_in target;
+  struct timeval timeout;
+  char *tail = NULL;
+  unsigned long long requested;
+  int descriptor;
+  if (!parse_ipv4_target(target_text, &target, NULL, 0u)) return 1;
+  errno = 0;
+  requested = strtoull(bytes_text, &tail, 10);
+  if (errno != 0 || tail == bytes_text || *tail != '\0' || requested == 0u ||
+      requested > (unsigned long long)SIZE_MAX) return 1;
+  descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return 1;
+  timeout.tv_sec = 30;
+  timeout.tv_usec = 0;
+  if (setsockopt(descriptor, SOL_SOCKET, SO_RCVTIMEO,
+                 &timeout, sizeof(timeout)) != 0 ||
+      setsockopt(descriptor, SOL_SOCKET, SO_SNDTIMEO,
+                 &timeout, sizeof(timeout)) != 0 ||
+      connect(descriptor, (const struct sockaddr *)&target,
+              (socklen_t)sizeof(target)) != 0 ||
+      load_echo(descriptor, (size_t)requested, path) != 0) {
+    (void)close(descriptor);
+    return 1;
+  }
+  (void)close(descriptor);
+  return 0;
 }
 
 static int socks_load_client_main(const char *port_text,
@@ -782,19 +866,10 @@ static int socks_load_client_main(const char *port_text,
   uint8_t selected[2];
   uint8_t request[10] = {5u, 1u, 0u, 1u};
   uint8_t reply[10];
-  uint8_t response[16384];
   struct sockaddr_in target;
-  socks_load_writer_t writer;
-  pthread_t writer_thread;
   char *tail = NULL;
   unsigned long port = strtoul(port_text, &tail, 10);
   unsigned long long requested;
-  uint64_t started;
-  uint64_t finished;
-  uint64_t elapsed;
-  size_t remaining;
-  size_t index;
-  int reader_succeeded = 1;
   int descriptor;
   if (tail == port_text || *tail != '\0' || port == 0u ||
       port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
@@ -816,45 +891,10 @@ static int socks_load_client_main(const char *port_text,
     (void)close(descriptor);
     return 1;
   }
-  memset(&writer, 0, sizeof(writer));
-  writer.descriptor = descriptor;
-  writer.length = (size_t)requested;
-  for (index = 0u; index < sizeof(writer.payload); index++) {
-    writer.payload[index] = (uint8_t)(index * 31u + 17u);
-  }
-  if (ftun_monotonic_now(&started) != FTUN_OK ||
-      pthread_create(&writer_thread, NULL, socks_load_writer, &writer) != 0) {
+  if (load_echo(descriptor, (size_t)requested, "socks5") != 0) {
     (void)close(descriptor);
     return 1;
   }
-  remaining = (size_t)requested;
-  while (remaining != 0u) {
-    size_t amount = remaining < sizeof(writer.payload)
-      ? remaining : sizeof(writer.payload);
-    if (!read_exact(descriptor, response, amount) ||
-        memcmp(writer.payload, response, amount) != 0) {
-      reader_succeeded = 0;
-      break;
-    }
-    remaining -= amount;
-  }
-  if (!reader_succeeded) (void)shutdown(descriptor, SHUT_RDWR);
-  if (pthread_join(writer_thread, NULL) != 0 || !reader_succeeded ||
-      !writer.succeeded) {
-    (void)close(descriptor);
-    return 1;
-  }
-  if (ftun_monotonic_now(&finished) != FTUN_OK || finished < started) {
-    (void)close(descriptor);
-    return 1;
-  }
-  elapsed = finished - started;
-  if (elapsed == 0u) elapsed = 1u;
-  printf("production-data-plane bytes=%llu elapsed-ms=%llu "
-         "throughput-mib-s=%.2f\n",
-         requested, (unsigned long long)elapsed,
-         ((double)requested * 1000.0) /
-           ((double)elapsed * 1024.0 * 1024.0));
   (void)close(descriptor);
   return 0;
 }
@@ -903,7 +943,8 @@ static int socks_domain_client_main(const char *port_text,
 }
 
 static int socks_udp_client_main(const char *port_text,
-                                 const char *target_text)
+                                 const char *target_text,
+                                 const char *packets_text)
 {
   static const uint8_t payload_bytes[] = "socks-udp-production";
   uint8_t offer[3] = {5u, 1u, 0u};
@@ -921,12 +962,22 @@ static int socks_udp_client_main(const char *port_text,
   size_t consumed = 0u;
   char *tail = NULL;
   unsigned long port = strtoul(port_text, &tail, 10);
+  unsigned long packets = 1u;
+  uint64_t started = 0u;
+  uint64_t finished = 0u;
+  unsigned long packet_index;
   ssize_t length;
   int control;
   int udp;
   if (tail == port_text || *tail != '\0' || port == 0u ||
       port > UINT16_MAX || !parse_ipv4_target(target_text, &target,
                                                NULL, 0u)) return 1;
+  if (packets_text != NULL) {
+    errno = 0;
+    packets = strtoul(packets_text, &tail, 10);
+    if (errno != 0 || tail == packets_text || *tail != '\0' ||
+        packets == 0u || packets > 1000000u) return 1;
+  }
   control = proxy_connect((uint16_t)port);
   if (control < 0) return 1;
   if (!write_exact(control, offer, sizeof(offer)) ||
@@ -963,17 +1014,29 @@ static int socks_udp_client_main(const char *port_text,
   if (ftun_socks5_encode_udp_datagram(&endpoint,
       (ftun_bytes_t){payload_bytes, sizeof(payload_bytes) - 1u},
       wire, sizeof(wire), &written) != FTUN_OK ||
-      send(udp, wire, written, MSG_NOSIGNAL) != (ssize_t)written) goto fail;
-  length = recv(udp, response, sizeof(response), 0);
-  if (length <= 0 || ftun_socks5_decode_udp_datagram(
-      (ftun_bytes_t){response, (size_t)length}, &datagram, &consumed) !=
-      FTUN_OK || consumed != (size_t)length ||
-      datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
-      datagram.endpoint.port != endpoint.port ||
-      memcmp(datagram.endpoint.address, endpoint.address, 4u) != 0 ||
-      datagram.payload.length != sizeof(payload_bytes) - 1u ||
-      memcmp(datagram.payload.data, payload_bytes,
-             sizeof(payload_bytes) - 1u) != 0) goto fail;
+      ftun_monotonic_now(&started) != FTUN_OK) goto fail;
+  for (packet_index = 0u; packet_index < packets; packet_index++) {
+    if (send(udp, wire, written, MSG_NOSIGNAL) != (ssize_t)written) goto fail;
+    length = recv(udp, response, sizeof(response), 0);
+    consumed = 0u;
+    if (length <= 0 || ftun_socks5_decode_udp_datagram(
+        (ftun_bytes_t){response, (size_t)length}, &datagram, &consumed) !=
+        FTUN_OK || consumed != (size_t)length ||
+        datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
+        datagram.endpoint.port != endpoint.port ||
+        memcmp(datagram.endpoint.address, endpoint.address, 4u) != 0 ||
+        datagram.payload.length != sizeof(payload_bytes) - 1u ||
+        memcmp(datagram.payload.data, payload_bytes,
+               sizeof(payload_bytes) - 1u) != 0) goto fail;
+  }
+  if (ftun_monotonic_now(&finished) != FTUN_OK || finished < started) goto fail;
+  if (packets_text != NULL) {
+    uint64_t elapsed = finished - started;
+    if (elapsed == 0u) elapsed = 1u;
+    printf("production-udp packets=%lu elapsed-ms=%llu packets-per-second=%.0f\n",
+           packets, (unsigned long long)elapsed,
+           (double)packets * 1000.0 / (double)elapsed);
+  }
   (void)close(udp);
   (void)close(control);
   return 0;
@@ -1707,7 +1770,9 @@ static void capture_dial(ftun_operation_t *operation, ftun_error_t error,
 
 static ftun_status_t open_udp_flow(
   void *user, ftun_core_t *core, const ftun_runtime_t *runtime,
-  const ftun_metadata_t *metadata, ftun_datagram_result_fn result,
+  const ftun_metadata_t *metadata,
+  const ftun_route_result_t *prepared_route,
+  ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out)
 {
@@ -1727,6 +1792,7 @@ static ftun_status_t open_udp_flow(
   ftun_status_t status;
   size_t dispatched = 0u;
   size_t index;
+  (void)prepared_route;
   (void)callback_user;
   if (out != NULL) *out = NULL;
   if (core != integration->core || runtime == NULL || metadata == NULL ||
@@ -2688,11 +2754,17 @@ int main(int argc, char **argv)
   if (argc == 5 && strcmp(argv[1], "--socks-load-client") == 0) {
     return socks_load_client_main(argv[2], argv[3], argv[4]);
   }
+  if (argc == 5 && strcmp(argv[1], "--load-client") == 0) {
+    return load_client_main(argv[2], argv[3], argv[4]);
+  }
   if (argc == 4 && strcmp(argv[1], "--socks-domain-client") == 0) {
     return socks_domain_client_main(argv[2], argv[3]);
   }
   if (argc == 4 && strcmp(argv[1], "--socks-udp-client") == 0) {
-    return socks_udp_client_main(argv[2], argv[3]);
+    return socks_udp_client_main(argv[2], argv[3], NULL);
+  }
+  if (argc == 5 && strcmp(argv[1], "--socks-udp-load-client") == 0) {
+    return socks_udp_client_main(argv[2], argv[3], argv[4]);
   }
   if (argc == 4 && strcmp(argv[1], "--mixed-connect-client") == 0) {
     return mixed_connect_client_main(argv[2], argv[3]);
@@ -2713,8 +2785,10 @@ int main(int argc, char **argv)
                   "--socks-client PORT TARGET | "
                   "--socks-hold-client PORT TARGET HOLD_MS | "
                   "--socks-load-client PORT TARGET BYTES | "
+                  "--load-client TARGET BYTES PATH | "
                   "--socks-domain-client PORT DOMAIN:PORT | "
                   "--socks-udp-client PORT TARGET | "
+                  "--socks-udp-load-client PORT TARGET PACKETS | "
                   "--mixed-connect-client PORT TARGET | "
                   "--mixed-forward-client PORT TARGET | "
                   "--echo-server TARGET READY | --run\n",

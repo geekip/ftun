@@ -17,6 +17,10 @@
 
 #define FTUN_LWIP_ALLOC_MAGIC UINT64_C(0x4654554e4c574950)
 #define FTUN_LWIP_MAX_TIMER_CATCHUP 4096u
+#define FTUN_LWIP_INPUT_POOL_CAPACITY 1024u
+#define FTUN_LWIP_SEND_POOL_CAPACITY 1024u
+#define FTUN_LWIP_PACKET_POOL_BYTES (2u * 1024u * 1024u)
+#define FTUN_LWIP_PACKET_POOL_BUFFERS 64u
 
 /* TASK-TUN-002 / TEST-TUN-002，目标 0.2.0：NO_SYS raw IPv4、显式计时、
  * Budget allocator，以及 ftun_lwip_input 的 pbuf/ACK 所有权边界。 */
@@ -34,12 +38,15 @@ typedef union {
 
 typedef struct ftun_lwip_send_ref {
   struct ftun_lwip_send_ref *next;
+  struct ftun_lwip_send_ref *free_next;
   ftun_buffer_slice_t slice;
   void *token;
 } ftun_lwip_send_ref_t;
 
-typedef struct {
+typedef struct ftun_lwip_input_pbuf {
   struct pbuf_custom custom;
+  struct ftun_lwip_input_pbuf *free_next;
+  ftun_lwip_t *stack;
   ftun_buffer_slice_t slice;
 } ftun_lwip_input_pbuf_t;
 
@@ -69,11 +76,17 @@ struct ftun_lwip_udp {
 struct ftun_lwip {
   ftun_budget_t *budget;
   ftun_reservation_t *reservation;
+  ftun_reservation_t *wrapper_reservation;
+  ftun_buffer_pool_t *packet_pool;
   struct netif netif;
   struct tcp_pcb *listener;
   struct udp_pcb *udp_listener;
   ftun_lwip_tcp_t *flows;
   ftun_lwip_udp_t *udp_flows;
+  ftun_lwip_input_pbuf_t *input_storage;
+  ftun_lwip_input_pbuf_t *input_free;
+  ftun_lwip_send_ref_t *send_storage;
+  ftun_lwip_send_ref_t *send_free;
   uint8_t *output_buffer;
   uint32_t mtu;
   uint64_t last_ms;
@@ -87,6 +100,8 @@ struct ftun_lwip {
   size_t udp_flow_count;
   size_t received_bytes;
   size_t retained_send_bytes;
+  size_t input_active;
+  size_t send_active;
   uint32_t random_state;
   ftun_lwip_output_fn output;
   ftun_lwip_accept_fn accept;
@@ -103,6 +118,59 @@ struct ftun_lwip {
 };
 
 static ftun_lwip_t *ftun_lwip_active;
+
+static ftun_lwip_input_pbuf_t *ftun_lwip_input_acquire(ftun_lwip_t *stack)
+{
+  ftun_lwip_input_pbuf_t *input;
+  if (stack == NULL || stack->input_free == NULL) return NULL;
+  input = stack->input_free;
+  stack->input_free = input->free_next;
+  memset(input, 0, sizeof(*input));
+  input->stack = stack;
+  stack->input_active++;
+  return input;
+}
+
+static void ftun_lwip_input_release(ftun_lwip_input_pbuf_t *input)
+{
+  ftun_lwip_t *stack;
+  if (input == NULL || input->stack == NULL) return;
+  stack = input->stack;
+  (void)ftun_buffer_slice_release(&input->slice);
+  if (stack->input_active == 0u) {
+    stack->corrupt = true;
+    return;
+  }
+  stack->input_active--;
+  memset(input, 0, sizeof(*input));
+  input->free_next = stack->input_free;
+  stack->input_free = input;
+}
+
+static ftun_lwip_send_ref_t *ftun_lwip_send_acquire(ftun_lwip_t *stack)
+{
+  ftun_lwip_send_ref_t *reference;
+  if (stack == NULL || stack->send_free == NULL) return NULL;
+  reference = stack->send_free;
+  stack->send_free = reference->free_next;
+  memset(reference, 0, sizeof(*reference));
+  stack->send_active++;
+  return reference;
+}
+
+static void ftun_lwip_send_release(ftun_lwip_t *stack,
+                                   ftun_lwip_send_ref_t *reference)
+{
+  if (stack == NULL || reference == NULL || stack->send_active == 0u) {
+    if (stack != NULL) stack->corrupt = true;
+    return;
+  }
+  (void)ftun_buffer_slice_release(&reference->slice);
+  stack->send_active--;
+  memset(reference, 0, sizeof(*reference));
+  reference->free_next = stack->send_free;
+  stack->send_free = reference;
+}
 
 static ftun_status_t ftun_lwip_from_err(err_t error)
 {
@@ -224,7 +292,6 @@ static void ftun_lwip_release_send_refs(ftun_lwip_tcp_t *flow,
     size_t bytes = reference->slice.length;
     void *token = reference->token;
     flow->send_head = reference->next;
-    (void)ftun_buffer_slice_release(&reference->slice);
     if (flow->retained_send_bytes < bytes ||
         flow->stack->retained_send_bytes < bytes) {
       flow->stack->corrupt = true;
@@ -234,7 +301,7 @@ static void ftun_lwip_release_send_refs(ftun_lwip_tcp_t *flow,
       flow->retained_send_bytes -= bytes;
       flow->stack->retained_send_bytes -= bytes;
     }
-    ftun_lwip_port_free(reference);
+    ftun_lwip_send_release(flow->stack, reference);
     ftun_lwip_write_done(flow, token, status);
   }
   flow->send_tail = NULL;
@@ -339,8 +406,7 @@ static err_t ftun_lwip_tcp_sent(void *argument, struct tcp_pcb *pcb, u16_t lengt
       void *token = reference->token;
       flow->send_head = reference->next;
       if (flow->send_head == NULL) flow->send_tail = NULL;
-      (void)ftun_buffer_slice_release(&reference->slice);
-      ftun_lwip_port_free(reference);
+      ftun_lwip_send_release(flow->stack, reference);
       ftun_lwip_write_done(flow, token, FTUN_OK);
     }
   }
@@ -445,8 +511,8 @@ static void ftun_lwip_udp_received(void *argument, struct udp_pcb *pcb,
     return;
   }
   length = buffer->tot_len;
-  status = ftun_buffer_acquire(stack->budget, length == 0u ? 1u : length,
-                               &owned);
+  status = ftun_buffer_pool_acquire(stack->packet_pool,
+                                    length == 0u ? 1u : length, &owned);
   if (status == FTUN_OK) status = ftun_buffer_data(owned, &data, &capacity);
   if (status == FTUN_OK && capacity < length) status = FTUN_E_STATE_CORRUPT;
   if (status == FTUN_OK && length != 0u &&
@@ -570,8 +636,7 @@ static err_t ftun_lwip_netif_init(struct netif *netif)
 static void ftun_lwip_input_pbuf_free(struct pbuf *buffer)
 {
   ftun_lwip_input_pbuf_t *owned = (ftun_lwip_input_pbuf_t *)buffer;
-  (void)ftun_buffer_slice_release(&owned->slice);
-  ftun_lwip_port_free(owned);
+  ftun_lwip_input_release(owned);
 }
 
 static ftun_status_t ftun_lwip_cleanup_create(ftun_lwip_t *stack)
@@ -589,6 +654,9 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
   ip4_addr_t loopback;
   ip4_addr_t any;
   err_t error;
+  ftun_status_t pool_status;
+  size_t index;
+  size_t wrapper_charge;
   if (out != NULL) *out = NULL;
   if (spec == NULL || out == NULL || spec->budget == NULL || spec->output == NULL ||
       (spec->accept == NULL && spec->udp_accept == NULL) ||
@@ -623,6 +691,39 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
   stack->allocated_blocks = 1u;
   ftun_lwip_active = stack;
   lwip_init();
+  wrapper_charge = FTUN_LWIP_INPUT_POOL_CAPACITY *
+      sizeof(*stack->input_storage) +
+    FTUN_LWIP_SEND_POOL_CAPACITY * sizeof(*stack->send_storage);
+  pool_status = ftun_budget_reserve(stack->budget, wrapper_charge,
+                                    &stack->wrapper_reservation);
+  if (pool_status == FTUN_OK) {
+    stack->input_storage = (ftun_lwip_input_pbuf_t *)calloc(
+      FTUN_LWIP_INPUT_POOL_CAPACITY, sizeof(*stack->input_storage));
+    stack->send_storage = (ftun_lwip_send_ref_t *)calloc(
+      FTUN_LWIP_SEND_POOL_CAPACITY, sizeof(*stack->send_storage));
+    if (stack->input_storage == NULL || stack->send_storage == NULL) {
+      pool_status = FTUN_E_LIMIT;
+    }
+  }
+  for (index = 0u; pool_status == FTUN_OK &&
+       index < FTUN_LWIP_INPUT_POOL_CAPACITY; index++) {
+    stack->input_storage[index].free_next = stack->input_free;
+    stack->input_free = &stack->input_storage[index];
+  }
+  for (index = 0u; pool_status == FTUN_OK &&
+       index < FTUN_LWIP_SEND_POOL_CAPACITY; index++) {
+    stack->send_storage[index].free_next = stack->send_free;
+    stack->send_free = &stack->send_storage[index];
+  }
+  if (pool_status == FTUN_OK) {
+    pool_status = ftun_buffer_pool_create(stack->budget,
+      FTUN_LWIP_PACKET_POOL_BYTES, FTUN_LWIP_PACKET_POOL_BUFFERS,
+      &stack->packet_pool);
+  }
+  if (pool_status != FTUN_OK) {
+    (void)ftun_lwip_cleanup_create(stack);
+    return pool_status;
+  }
   stack->output_buffer = (uint8_t *)ftun_lwip_port_malloc(stack->mtu);
   if (stack->output_buffer == NULL) {
     (void)ftun_lwip_cleanup_create(stack);
@@ -702,11 +803,11 @@ ftun_status_t ftun_lwip_input(ftun_lwip_t *stack, ftun_packet_t *packet)
   if (status != FTUN_OK) return status;
   if (bytes.length < 20u || bytes.length > stack->mtu || bytes.length > UINT16_MAX ||
       (bytes.data[0] >> 4) != 4u) return FTUN_E_PROTOCOL;
-  input = (ftun_lwip_input_pbuf_t *)ftun_lwip_port_calloc(1u, sizeof(*input));
+  input = ftun_lwip_input_acquire(stack);
   if (input == NULL) return FTUN_E_LIMIT;
   status = ftun_buffer_slice_clone(&packet->payload, &input->slice);
   if (status != FTUN_OK) {
-    ftun_lwip_port_free(input);
+    ftun_lwip_input_release(input);
     return status;
   }
   input->custom.custom_free_function = ftun_lwip_input_pbuf_free;
@@ -714,8 +815,7 @@ ftun_status_t ftun_lwip_input(ftun_lwip_t *stack, ftun_packet_t *packet)
                                &input->custom, (void *)bytes.data,
                                (u16_t)bytes.length);
   if (buffer == NULL) {
-    (void)ftun_buffer_slice_release(&input->slice);
-    ftun_lwip_port_free(input);
+    ftun_lwip_input_release(input);
     return FTUN_E_LIMIT;
   }
   stack->input_status = FTUN_OK;
@@ -824,6 +924,19 @@ ftun_status_t ftun_lwip_tcp_consume(ftun_lwip_tcp_t *flow, size_t bytes)
   return flow->stack->corrupt ? FTUN_E_STATE_CORRUPT : FTUN_OK;
 }
 
+ftun_status_t ftun_lwip_tcp_ready(const ftun_lwip_tcp_t *flow,
+                                  bool *readable, bool *writable)
+{
+  if (readable != NULL) *readable = false;
+  if (writable != NULL) *writable = false;
+  if (flow == NULL || flow->stack == NULL || readable == NULL ||
+      writable == NULL) return FTUN_E_INVALID;
+  *readable = flow->received_bytes != 0u || flow->peer_finished;
+  *writable = flow->pcb != NULL && tcp_sndbuf(flow->pcb) != 0u &&
+              flow->stack->send_free != NULL;
+  return flow->stack->corrupt ? FTUN_E_STATE_CORRUPT : FTUN_OK;
+}
+
 ftun_status_t ftun_lwip_tcp_write_ref_with_token(
   ftun_lwip_tcp_t *flow, const ftun_buffer_slice_t *slice, void *token,
   size_t *accepted)
@@ -842,19 +955,18 @@ ftun_status_t ftun_lwip_tcp_write_ref_with_token(
   if (length > bytes.length) length = bytes.length;
   if (length > UINT16_MAX) length = UINT16_MAX;
   if (length == 0u) return FTUN_E_AGAIN;
-  reference = (ftun_lwip_send_ref_t *)ftun_lwip_port_calloc(1u, sizeof(*reference));
+  reference = ftun_lwip_send_acquire(flow->stack);
   if (reference == NULL) return FTUN_E_LIMIT;
   status = ftun_buffer_slice_clone(slice, &reference->slice);
   if (status != FTUN_OK) {
-    ftun_lwip_port_free(reference);
+    ftun_lwip_send_release(flow->stack, reference);
     return status;
   }
   reference->slice.length = length;
   reference->token = token;
   error = tcp_write(flow->pcb, bytes.data, (u16_t)length, 0u);
   if (error != ERR_OK) {
-    (void)ftun_buffer_slice_release(&reference->slice);
-    ftun_lwip_port_free(reference);
+    ftun_lwip_send_release(flow->stack, reference);
     return error == ERR_MEM ? FTUN_E_AGAIN : ftun_lwip_from_err(error);
   }
   if (flow->send_tail != NULL) flow->send_tail->next = reference;
@@ -979,6 +1091,22 @@ ftun_status_t ftun_lwip_destroy(ftun_lwip_t **stack)
   }
   ftun_lwip_port_free(owned->output_buffer);
   owned->output_buffer = NULL;
+  if (owned->input_active != 0u || owned->send_active != 0u) {
+    owned->corrupt = true;
+  }
+  if (owned->packet_pool != NULL &&
+      ftun_buffer_pool_destroy(&owned->packet_pool) != FTUN_OK) {
+    owned->corrupt = true;
+  }
+  free(owned->input_storage);
+  free(owned->send_storage);
+  owned->input_storage = NULL;
+  owned->send_storage = NULL;
+  owned->input_free = NULL;
+  owned->send_free = NULL;
+  if (ftun_reservation_release(&owned->wrapper_reservation) != FTUN_OK) {
+    owned->corrupt = true;
+  }
   if (owned->allocated_blocks != 1u || owned->allocated_bytes != sizeof(*owned)) {
     owned->corrupt = true;
   }

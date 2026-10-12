@@ -246,8 +246,8 @@ static int test_rejection_and_limits(void)
   operation = (ftun_operation_t *)(uintptr_t)1;
   accepted = 99u;
   CHECK(ftun_stream_write_ref(fixture.stream, &first, &accepted,
-                              &operation) == FTUN_E_LIMIT);
-  CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 1);
+                              &operation) == FTUN_E_AGAIN);
+  CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 2);
   CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
 
   fixture.backend.start_status = FTUN_OK;
@@ -270,7 +270,7 @@ static int test_rejection_and_limits(void)
   accepted = 99u;
   CHECK(ftun_stream_write_ref(fixture.stream, &second, &accepted,
                               &operation) == FTUN_E_LIMIT);
-  CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 3);
+  CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 4);
   CHECK(ftun_buffer_slice_release(&first) == FTUN_OK);
   CHECK(ftun_buffer_slice_release(&second) == FTUN_OK);
   CHECK(complete_backend(&fixture, success) == 0);

@@ -71,6 +71,13 @@ ftun_status_t ftun_tun_ingress(ftun_core_t *core, ftun_packet_port_t *port,
                                ftun_packet_t *packet);
 ftun_status_t ftun_tun_ingress_tick(ftun_tun_ingress_context_t *context,
                                     uint64_t now_ms);
+/* owner loop 异常终止：中止 PCB，并立即完成保留的写令牌。
+ * 正常半关闭仍由 Stream/Relay 继续排空。 */
+ftun_status_t ftun_tun_ingress_abort_stream(
+  ftun_tun_ingress_context_t *context, ftun_stream_t *stream);
+ftun_status_t ftun_tun_ingress_stream_ready(
+  ftun_tun_ingress_context_t *context, ftun_stream_t *stream,
+  bool *readable, bool *writable);
 /* 事务重载提交后只影响后续新 flow；已有 Stream/Datagram 已固定旧代。 */
 ftun_status_t ftun_tun_ingress_set_generation(
   ftun_tun_ingress_context_t *context, uint64_t generation);

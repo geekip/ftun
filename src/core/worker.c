@@ -11,6 +11,8 @@ struct ftun_worker_task {
   ftun_worker_t *worker;
   ftun_worker_task_t *next;
   ftun_worker_execute_fn execute;
+  ftun_worker_input_cleanup_fn input_cleanup;
+  ftun_worker_result_cleanup_fn result_cleanup;
   ftun_worker_completion_fn callback;
   void *user;
   uint8_t *input;
@@ -18,6 +20,7 @@ struct ftun_worker_task {
   uint8_t *result;
   size_t result_capacity;
   size_t result_size;
+  size_t cleanup_result_size;
   uint64_t deadline_ms;
   ftun_operation_t *operation;
   ftun_reservation_t *reservation;
@@ -85,6 +88,14 @@ static void ftun_worker_task_dispose(ftun_worker_task_t *task)
   int release_failed = 0;
 
   task->reservation = NULL;
+  if (task->result_cleanup != NULL && task->worker_done &&
+      task->cleanup_result_size != 0u) {
+    task->result_cleanup((ftun_bytes_t){task->result,
+                                        task->cleanup_result_size});
+  }
+  if (task->input_cleanup != NULL) {
+    task->input_cleanup((ftun_bytes_t){task->input, task->input_size});
+  }
   if (ftun_reservation_release(&reservation) != FTUN_OK) release_failed = 1;
   free(task->result);
   free(task->input);
@@ -138,6 +149,7 @@ static void ftun_worker_run_task(ftun_worker_task_t *task)
   if (status == FTUN_OK && result_size > task->result_capacity) {
     status = FTUN_E_STATE_CORRUPT;
   }
+  if (status == FTUN_OK) task->cleanup_result_size = result_size;
   if (status == FTUN_OK && ftun_worker_expired(task->deadline_ms, &status)) {
     status = FTUN_E_TIMEOUT;
   }
@@ -247,10 +259,13 @@ ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t 
     return FTUN_E_INVALID;
   }
   if (job->input.length > SIZE_MAX - sizeof(*task) ||
-      job->result_capacity > SIZE_MAX - sizeof(*task) - job->input.length) {
+      job->result_capacity > SIZE_MAX - sizeof(*task) - job->input.length ||
+      job->accounted_extra > SIZE_MAX - sizeof(*task) - job->input.length -
+                               job->result_capacity) {
     return FTUN_E_LIMIT;
   }
-  charge = sizeof(*task) + job->input.length + job->result_capacity;
+  charge = sizeof(*task) + job->input.length + job->result_capacity +
+           job->accounted_extra;
 
   (void)pthread_mutex_lock(&worker->mutex);
   if (!worker->accepting) {
@@ -283,6 +298,8 @@ ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t 
   }
   task->worker = worker;
   task->execute = job->execute;
+  task->input_cleanup = job->input_cleanup;
+  task->result_cleanup = job->result_cleanup;
   task->callback = callback;
   task->user = user;
   task->input_size = job->input.length;

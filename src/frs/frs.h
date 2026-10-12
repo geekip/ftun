@@ -32,6 +32,14 @@ ftun_status_t ftun_frs_open_mode(ftun_core_t *core, const char *path,
                                  ftun_frs_open_mode_t mode,
                                  ftun_frs_view_t **out);
 ftun_status_t ftun_frs_open_bytes(ftun_bytes_t file, ftun_frs_view_t **out);
+/* Runtime 拥有的内存视图；预算预留持续到最终释放。输入仍会被复制，
+ * 调用返回后即可释放。 */
+ftun_status_t ftun_frs_open_bytes_budget(ftun_budget_t *budget,
+                                         ftun_bytes_t file,
+                                         ftun_frs_view_t **out);
+/* Worker 内已创建的拥有型 view 在交给 Runtime 前绑定长期预算。 */
+ftun_status_t ftun_frs_view_bind_budget(ftun_frs_view_t *view,
+                                        ftun_budget_t *budget);
 ftun_status_t ftun_frs_view_retain(ftun_frs_view_t *view);
 ftun_status_t ftun_frs_view_release(ftun_frs_view_t **view);
 ftun_status_t ftun_frs_view_get_info(const ftun_frs_view_t *view,

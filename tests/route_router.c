@@ -162,9 +162,67 @@ static int test_runtime_owned_table(void)
   return 0;
 }
 
+static uint32_t route_random(uint32_t *state)
+{
+  uint32_t value = *state;
+  value ^= value << 13u;
+  value ^= value >> 17u;
+  value ^= value << 5u;
+  *state = value;
+  return value;
+}
+
+static int test_first_match_differential(void)
+{
+  const char *rules[] = {
+    "IP-CIDR,10.0.0.0/8,DIRECT",
+    "IP-CIDR,10.1.0.0/16,REJECT",
+    "IP-CIDR,192.168.0.0/16,proxy",
+    "MATCH,REJECT"
+  };
+  ftun_route_table_t *table = NULL;
+  ftun_metadata_t metadata;
+  ftun_route_result_t route;
+  uint32_t random_state = UINT32_C(0x13579bdf);
+  size_t iteration;
+  CHECK(ftun_route_table_create(11u, rules, 4u, outbound, NULL, &table) ==
+        FTUN_OK);
+  memset(&metadata, 0, sizeof(metadata));
+  metadata.generation = 11u;
+  metadata.known_fields = FTUN_META_PORT | FTUN_META_NETWORK;
+  metadata.network = 1u;
+  metadata.original_target.kind = FTUN_ADDRESS_IPV4;
+  metadata.original_target.port = 443u;
+  for (iteration = 0u; iteration < 100000u; iteration++) {
+    uint32_t value = route_random(&random_state);
+    uint32_t expected;
+    memcpy(metadata.original_target.address, &value, 4u);
+    if (metadata.original_target.address[0] == 10u) {
+      expected = FTUN_OUTBOUND_ID_DIRECT;
+    } else if (metadata.original_target.address[0] == 192u &&
+               metadata.original_target.address[1] == 168u) {
+      expected = 9u;
+    } else {
+      expected = FTUN_OUTBOUND_ID_REJECT;
+    }
+    CHECK(ftun_route_table_evaluate(table, &metadata, 0u, &route) == FTUN_OK);
+    CHECK(route.outbound_id == expected);
+    if (expected == FTUN_OUTBOUND_ID_REJECT) {
+      CHECK(route.kind == FTUN_ROUTE_DENY && route.allowed_count == 0u);
+    } else {
+      CHECK(route.kind == FTUN_ROUTE_READY && route.allowed_count == 1u &&
+            memcmp(route.allowed[0].address,
+                   metadata.original_target.address, 4u) == 0);
+    }
+  }
+  CHECK(ftun_route_table_destroy(&table) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_order_suspend_resume_and_subset() == 0);
   CHECK(test_runtime_owned_table() == 0);
+  CHECK(test_first_match_differential() == 0);
   return 0;
 }

@@ -159,9 +159,13 @@ static ftun_status_t ftun_bootstrap_request_validate(
 {
   ftun_status_t status;
   if (request == NULL || request->budget == NULL ||
-      request->completion == NULL || request->protection.mark == 0u ||
+      request->completion == NULL ||
       !ftun_bootstrap_domain_valid(request->domain) ||
       !ftun_bootstrap_device_valid(request->protection.interface_name)) {
+    return FTUN_E_INVALID;
+  }
+  if (request->protection.mark == 0u &&
+      request->protection.interface_name.length != 0u) {
     return FTUN_E_INVALID;
   }
   status = ftun_bootstrap_servers_validate(request);

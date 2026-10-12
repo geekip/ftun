@@ -65,6 +65,10 @@ static int ftun_runtime_core_valid(const ftun_core_t *core)
          core->budget != NULL;
 }
 
+static ftun_status_t ftun_runtime_resolve_outbound(ftun_string_t name,
+                                                    uint32_t *out,
+                                                    void *user);
+
 static int ftun_size_add(size_t *total, size_t value)
 {
   if (total == NULL || *total > SIZE_MAX - value) return 0;
@@ -216,6 +220,21 @@ static int ftun_runtime_layout(const ftun_config_t *config,
   return 1;
 }
 
+ftun_status_t ftun_runtime_accounted_bytes(const ftun_config_t *config,
+                                            size_t *out)
+{
+  size_t item_count;
+  size_t accounted_bytes;
+  if (out != NULL) *out = 0u;
+  if (out == NULL ||
+      !ftun_runtime_layout(config, &item_count, &accounted_bytes)) {
+    return FTUN_E_INVALID;
+  }
+  (void)item_count;
+  *out = accounted_bytes;
+  return FTUN_OK;
+}
+
 static void ftun_runtime_fill_items(ftun_runtime_t *runtime,
                                     const ftun_feature_plan_t *plan)
 {
@@ -242,6 +261,35 @@ static void ftun_runtime_fill_items(ftun_runtime_t *runtime,
     runtime->prepared_items[cursor].feature = FTUN_PLAN_FRS;
     runtime->prepared_items[cursor].ordinal = index;
   }
+}
+
+static ftun_status_t ftun_runtime_fill_group_defaults(
+  ftun_runtime_t *runtime, const ftun_config_t *config)
+{
+  size_t index;
+  for (index = 0u; index < config->outbound_count; index++) {
+    const ftun_config_outbound_t *outbound = &config->outbounds[index];
+    size_t member_index;
+    if (outbound->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
+    for (member_index = 0u; member_index < outbound->members.count;
+         member_index++) {
+      const char *member = outbound->members.items[member_index];
+      if (member != NULL && outbound->default_member != NULL &&
+          strcmp(member, outbound->default_member) == 0) {
+        ftun_string_t name;
+        ftun_status_t status;
+        name.data = member;
+        name.length = strlen(member);
+        status = ftun_runtime_resolve_outbound(
+          name, &runtime->group_choices[index].selected_member_id,
+          (void *)config);
+        if (status != FTUN_OK) return status;
+        runtime->group_choices[index].selected = true;
+        break;
+      }
+    }
+  }
+  return FTUN_OK;
 }
 
 static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
@@ -580,40 +628,18 @@ static ftun_status_t ftun_runtime_prepare_internal(
   runtime->accounted_bytes = accounted_bytes;
   runtime->reference_count = 1u;
   runtime->state = FTUN_RUNTIME_CANDIDATE;
-  {
-    size_t index;
-    for (index = 0u; index < config->outbound_count; index++) {
-      const ftun_config_outbound_t *outbound = &config->outbounds[index];
-      size_t member_index;
-      if (outbound->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
-      for (member_index = 0u; member_index < outbound->members.count;
-           member_index++) {
-        const char *member = outbound->members.items[member_index];
-        if (member != NULL && outbound->default_member != NULL &&
-            strcmp(member, outbound->default_member) == 0) {
-          ftun_string_t name;
-          name.data = member;
-          name.length = strlen(member);
-          status = ftun_runtime_resolve_outbound(
-            name, &runtime->group_choices[index].selected_member_id,
-            (void *)config);
-          if (status != FTUN_OK) {
-            (void)ftun_config_destroy((ftun_config_t **)&runtime->config);
-            (void)ftun_route_table_destroy(&runtime->routes);
+  status = ftun_runtime_fill_group_defaults(runtime, config);
+  if (status != FTUN_OK) {
+    (void)ftun_config_destroy((ftun_config_t **)&runtime->config);
+    (void)ftun_route_table_destroy(&runtime->routes);
 #if defined(FTUN_HAVE_MODULE_FRS)
-            (void)ftun_frs_view_release(&runtime->frs_view);
+    (void)ftun_frs_view_release(&runtime->frs_view);
 #endif
-            free(runtime->group_choices);
-            free(runtime->prepared_items);
-            free(runtime);
-            (void)ftun_reservation_release(&reservation);
-            return status;
-          }
-          runtime->group_choices[index].selected = true;
-          break;
-        }
-      }
-    }
+    free(runtime->group_choices);
+    free(runtime->prepared_items);
+    free(runtime);
+    (void)ftun_reservation_release(&reservation);
+    return status;
   }
   ftun_runtime_fill_items(runtime, config->plan);
   core->candidate = runtime;
@@ -640,6 +666,141 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
   }
   return ftun_runtime_prepare_internal(core, config, view, out);
 }
+
+#if defined(FTUN_HAVE_MODULE_FRS)
+ftun_status_t ftun_runtime_prepare_detached_frs(
+  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out)
+{
+  ftun_runtime_t *runtime;
+  size_t item_count;
+  size_t accounted_bytes;
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (config == NULL || view == NULL || out == NULL || config->plan == NULL ||
+      (config->plan->prepare & FTUN_PLAN_FRS) == 0u ||
+      !ftun_runtime_layout(config, &item_count, &accounted_bytes)) {
+    return FTUN_E_INVALID;
+  }
+  runtime = (ftun_runtime_t *)calloc(1u, sizeof(*runtime));
+  if (runtime == NULL) return FTUN_E_LIMIT;
+  if (item_count != 0u) {
+    runtime->prepared_items = (ftun_runtime_prepared_item_t *)calloc(
+      item_count, sizeof(*runtime->prepared_items));
+    if (runtime->prepared_items == NULL) goto allocation_error;
+  }
+  if (config->outbound_count != 0u) {
+    runtime->group_choices = (ftun_runtime_group_choice_state_t *)calloc(
+      config->outbound_count, sizeof(*runtime->group_choices));
+    if (runtime->group_choices == NULL) goto allocation_error;
+  }
+  status = ftun_route_table_create_with_frs(
+    0u, (const char *const *)config->rules.items, config->rules.count,
+    ftun_runtime_resolve_outbound, (void *)config,
+    ftun_runtime_frs_bind, view, &runtime->routes);
+  if (status != FTUN_OK) goto status_error;
+  runtime->config = config;
+  runtime->frs_view = view;
+  runtime->prepared_item_count = item_count;
+  runtime->accounted_bytes = accounted_bytes;
+  runtime->reference_count = 1u;
+  runtime->state = FTUN_RUNTIME_CANDIDATE;
+  status = ftun_runtime_fill_group_defaults(runtime, config);
+  if (status != FTUN_OK) goto route_error;
+  ftun_runtime_fill_items(runtime, config->plan);
+  *out = runtime;
+  return FTUN_OK;
+
+route_error:
+  (void)ftun_route_table_destroy(&runtime->routes);
+status_error:
+  free(runtime->group_choices);
+  free(runtime->prepared_items);
+  free(runtime);
+  return status;
+
+allocation_error:
+  free(runtime->group_choices);
+  free(runtime->prepared_items);
+  free(runtime);
+  return FTUN_E_LIMIT;
+}
+
+ftun_status_t ftun_runtime_prepared_release(ftun_runtime_t **prepared)
+{
+  ftun_runtime_t *runtime;
+  ftun_status_t status = FTUN_OK;
+  ftun_status_t step;
+  if (prepared == NULL) return FTUN_E_INVALID;
+  runtime = *prepared;
+  if (runtime == NULL) return FTUN_OK;
+  if (runtime->owner != NULL || runtime->reservation != NULL ||
+      runtime->state != FTUN_RUNTIME_CANDIDATE ||
+      runtime->reference_count != 1u) return FTUN_E_STATE_CORRUPT;
+  step = ftun_route_table_destroy(&runtime->routes);
+  if (step != FTUN_OK) status = step;
+  step = ftun_frs_view_release(&runtime->frs_view);
+  if (status == FTUN_OK) status = step;
+  free(runtime->group_choices);
+  free(runtime->prepared_items);
+  memset(runtime, 0, sizeof(*runtime));
+  free(runtime);
+  *prepared = NULL;
+  return status;
+}
+
+ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
+                                           ftun_runtime_t **prepared,
+                                           ftun_runtime_t **out)
+{
+  ftun_runtime_t *runtime;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (!ftun_runtime_core_valid(core) || prepared == NULL || out == NULL) {
+    return FTUN_E_INVALID;
+  }
+  runtime = *prepared;
+  if (runtime == NULL || runtime->owner != NULL ||
+      runtime->reservation != NULL || runtime->config == NULL ||
+      runtime->frs_view == NULL || runtime->routes == NULL ||
+      runtime->state != FTUN_RUNTIME_CANDIDATE ||
+      runtime->reference_count != 1u) return FTUN_E_INVALID;
+  if (core->candidate != NULL) return FTUN_E_AGAIN;
+  if (core->generation == UINT64_MAX ||
+      (core->active != NULL && core->active->reference_count > 1u &&
+       core->retained_count >= core->retained_limit)) return FTUN_E_LIMIT;
+  status = ftun_config_retain((ftun_config_t *)runtime->config);
+  if (status != FTUN_OK) return status;
+  status = ftun_budget_reserve(core->budget, runtime->accounted_bytes,
+                               &reservation);
+  if (status == FTUN_OK) {
+    status = ftun_frs_view_bind_budget(runtime->frs_view, core->budget);
+  }
+  if (status != FTUN_OK) {
+    (void)ftun_reservation_release(&reservation);
+    (void)ftun_config_destroy((ftun_config_t **)&runtime->config);
+    return status;
+  }
+  runtime->owner = core;
+  runtime->reservation = reservation;
+  core->candidate = runtime;
+  *prepared = NULL;
+  *out = runtime;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_prepared_frs_bytes(
+  const ftun_runtime_t *prepared, ftun_bytes_t *out)
+{
+  if (out != NULL) {
+    out->data = NULL;
+    out->length = 0u;
+  }
+  if (prepared == NULL || out == NULL || prepared->frs_view == NULL ||
+      prepared->state != FTUN_RUNTIME_CANDIDATE) return FTUN_E_INVALID;
+  return ftun_frs_view_bytes(prepared->frs_view, out);
+}
+#endif
 
 ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
                                       const ftun_runtime_t *candidate)
@@ -719,6 +880,15 @@ ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core,
   if (runtime->reference_count == SIZE_MAX) return FTUN_E_LIMIT;
   runtime->reference_count++;
   *out = runtime;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_retain(ftun_runtime_t *runtime)
+{
+  if (runtime == NULL || !ftun_runtime_core_valid(runtime->owner) ||
+      runtime->state == FTUN_RUNTIME_CANDIDATE ||
+      runtime->reference_count == SIZE_MAX) return FTUN_E_INVALID;
+  runtime->reference_count++;
   return FTUN_OK;
 }
 

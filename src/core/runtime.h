@@ -80,6 +80,21 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
                                             const ftun_config_t *config,
                                             ftun_frs_view_t *view,
                                             ftun_runtime_t **out);
+#if defined(FTUN_HAVE_MODULE_FRS)
+/* FRS 更新 worker 使用的脱离态候选。prepare 在 worker 内完成规则表和
+ * label 绑定，并接管 view；attach 只在 owner loop 中执行预算、快照保留和
+ * manager 指针提交。 */
+ftun_status_t ftun_runtime_prepare_detached_frs(
+  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
+ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
+                                           ftun_runtime_t **prepared,
+                                           ftun_runtime_t **out);
+ftun_status_t ftun_runtime_prepared_frs_bytes(
+  const ftun_runtime_t *prepared, ftun_bytes_t *out);
+ftun_status_t ftun_runtime_prepared_release(ftun_runtime_t **prepared);
+#endif
+ftun_status_t ftun_runtime_accounted_bytes(const ftun_config_t *config,
+                                            size_t *out);
 /* commit 不分配；成功清空 candidate 句柄并由 manager 持有 active。 */
 ftun_status_t ftun_runtime_commit(ftun_core_t *core, ftun_runtime_t **candidate);
 /* 持久化先于指针切换的事务可先执行只读提交门禁；成功后到 commit 之间不得
@@ -89,6 +104,7 @@ ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
 ftun_status_t ftun_runtime_abort(ftun_core_t *core, ftun_runtime_t **candidate);
 /* acquire/release 表示 Session 等旧代消费者的引用。 */
 ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core, ftun_runtime_t **out);
+ftun_status_t ftun_runtime_retain(ftun_runtime_t *runtime);
 ftun_status_t ftun_runtime_release(ftun_runtime_t **runtime);
 ftun_status_t ftun_runtime_get_info(const ftun_runtime_t *runtime,
                                     ftun_runtime_info_t *out);

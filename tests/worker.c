@@ -8,6 +8,7 @@
 #include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -23,6 +24,8 @@ typedef struct {
   ftun_status_t status;
   uint8_t result[32];
   size_t result_size;
+  void *owned_result;
+  int take_result;
 } completion_state_t;
 
 static pthread_mutex_t gate_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -31,6 +34,8 @@ static int gate_entered;
 static int gate_open;
 static int gate_saw_copy;
 static int execute_calls;
+static int input_cleanup_calls;
+static int result_cleanup_calls;
 
 static void sleep_one_millisecond(void)
 {
@@ -51,6 +56,25 @@ static ftun_status_t gate_execute(ftun_bytes_t input, uint8_t *result,
   if (capacity < input.length) return FTUN_E_LIMIT;
   if (input.length != 0u) memcpy(result, input.data, input.length);
   *out_size = input.length;
+  return FTUN_OK;
+}
+
+static ftun_status_t gate_owned_execute(ftun_bytes_t input, uint8_t *result,
+                                        size_t capacity, size_t *out_size)
+{
+  void *owned;
+  (void)pthread_mutex_lock(&gate_mutex);
+  gate_entered = 1;
+  (void)pthread_cond_broadcast(&gate_condition);
+  while (!gate_open) (void)pthread_cond_wait(&gate_condition, &gate_mutex);
+  gate_saw_copy = input.length == 4u && memcmp(input.data, "copy", 4u) == 0;
+  execute_calls++;
+  (void)pthread_mutex_unlock(&gate_mutex);
+  if (capacity < sizeof(owned)) return FTUN_E_LIMIT;
+  owned = malloc(1u);
+  if (owned == NULL) return FTUN_E_LIMIT;
+  memcpy(result, &owned, sizeof(owned));
+  *out_size = sizeof(owned);
   return FTUN_OK;
 }
 
@@ -79,6 +103,37 @@ static ftun_status_t fail_execute(ftun_bytes_t input, uint8_t *result,
   return FTUN_E_IO;
 }
 
+static ftun_status_t owned_execute(ftun_bytes_t input, uint8_t *result,
+                                   size_t capacity, size_t *out_size)
+{
+  void *owned;
+  (void)input;
+  if (capacity < sizeof(owned)) return FTUN_E_LIMIT;
+  owned = malloc(1u);
+  if (owned == NULL) return FTUN_E_LIMIT;
+  memcpy(result, &owned, sizeof(owned));
+  *out_size = sizeof(owned);
+  return FTUN_OK;
+}
+
+static void input_cleanup(ftun_bytes_t input)
+{
+  if (input.length == 4u && memcmp(input.data, "hold", 4u) == 0) {
+    input_cleanup_calls++;
+  }
+}
+
+static void result_cleanup(ftun_bytes_t result)
+{
+  void *owned = NULL;
+  if (result.length != sizeof(owned)) return;
+  memcpy(&owned, result.data, sizeof(owned));
+  if (owned != NULL) {
+    result_cleanup_calls++;
+    free(owned);
+  }
+}
+
 static void completed(ftun_operation_t *operation, ftun_error_t error,
                       ftun_bytes_t result, void *user)
 {
@@ -88,6 +143,10 @@ static void completed(ftun_operation_t *operation, ftun_error_t error,
   state->result_size = result.length;
   if (result.length <= sizeof(state->result) && result.length != 0u) {
     memcpy(state->result, result.data, result.length);
+  }
+  if (state->take_result && result.length == sizeof(state->owned_result)) {
+    memcpy(&state->owned_result, result.data, sizeof(state->owned_result));
+    memset((void *)(uintptr_t)result.data, 0, sizeof(state->owned_result));
   }
   if (ftun_operation_cancel(operation) != FTUN_E_STALE) state->calls = -100;
 }
@@ -172,6 +231,8 @@ int main(void)
   completion_state_t timed_out = {0};
   completion_state_t failed = {0};
   completion_state_t stopped = {0};
+  completion_state_t discarded_owned = {0};
+  completion_state_t taken_owned = {0};
   uint8_t mutable_input[] = "copy";
   uint8_t echo_input[] = "echo";
   ftun_worker_job_t job;
@@ -189,10 +250,11 @@ int main(void)
   CHECK(operation == NULL && echoed.calls == 0);
 
   memset(&job, 0, sizeof(job));
-  job.execute = gate_execute;
+  job.execute = gate_owned_execute;
   job.input.data = mutable_input;
   job.input.length = 4u;
-  job.result_capacity = 4u;
+  job.result_capacity = sizeof(void *);
+  job.result_cleanup = result_cleanup;
   reset_gate();
   CHECK(ftun_worker_submit(worker, &job, completed, &cancelled, &operation) == FTUN_OK);
   memcpy(mutable_input, "xxxx", 4u);
@@ -210,6 +272,7 @@ int main(void)
   open_gate();
   CHECK(wait_for_empty(worker));
   CHECK(cancelled.calls == 1);
+  CHECK(result_cleanup_calls == 1);
   (void)pthread_mutex_lock(&gate_mutex);
   CHECK(gate_saw_copy);
   (void)pthread_mutex_unlock(&gate_mutex);
@@ -219,6 +282,7 @@ int main(void)
   job.input.length = 4u;
   job.result_capacity = 4u;
   job.deadline_ms = 0u;
+  job.result_cleanup = NULL;
   CHECK(ftun_worker_submit(worker, &job, completed, &echoed, &operation) == FTUN_OK);
   CHECK(echoed.calls == 0 && wait_for_calls(worker, &echoed, 1));
   CHECK(echoed.status == FTUN_OK && echoed.result_size == 4u &&
@@ -238,9 +302,33 @@ int main(void)
   CHECK(wait_for_calls(worker, &failed, 1));
   CHECK(failed.status == FTUN_E_IO && failed.result_size == 0u);
 
+  memset(&job, 0, sizeof(job));
+  job.execute = owned_execute;
+  job.input.data = (const uint8_t *)"hold";
+  job.input.length = 4u;
+  job.result_capacity = sizeof(void *);
+  job.accounted_extra = 32u;
+  job.input_cleanup = input_cleanup;
+  job.result_cleanup = result_cleanup;
+  CHECK(ftun_worker_submit(worker, &job, completed, &discarded_owned,
+                           &operation) == FTUN_OK);
+  CHECK(wait_for_calls(worker, &discarded_owned, 1));
+  CHECK(result_cleanup_calls == 2 && input_cleanup_calls == 1);
+  taken_owned.take_result = 1;
+  CHECK(ftun_worker_submit(worker, &job, completed, &taken_owned,
+                           &operation) == FTUN_OK);
+  CHECK(wait_for_calls(worker, &taken_owned, 1));
+  CHECK(taken_owned.owned_result != NULL && result_cleanup_calls == 2 &&
+        input_cleanup_calls == 2);
+  free(taken_owned.owned_result);
+  taken_owned.owned_result = NULL;
+
   reset_gate();
+  memset(&job, 0, sizeof(job));
   job.execute = gate_execute;
   job.input.data = (const uint8_t *)"copy";
+  job.input.length = 4u;
+  job.result_capacity = 4u;
   CHECK(ftun_worker_submit(worker, &job, completed, &stopped, &operation) == FTUN_OK);
   CHECK(wait_for_gate());
   CHECK(ftun_worker_stop(worker) == FTUN_OK);

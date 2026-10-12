@@ -39,9 +39,24 @@ void ftun_lwip_port_free(void *pointer);
 
 /* MTU 在 netif 上运行时收紧；编译上限保持常见 1500 字节链路的 MSS。 */
 #define TCP_MSS 1460
-#define TCP_WND (12 * TCP_MSS)
-#define TCP_SND_BUF (12 * TCP_MSS)
-#define TCP_SND_QUEUELEN 48
+/* 这些内部覆盖只用于固定拓扑对照构建，不形成运行时配置接口。 */
+#ifndef FTUN_LWIP_TCP_WINDOW_MSS
+#define FTUN_LWIP_TCP_WINDOW_MSS 44
+#endif
+#ifndef FTUN_LWIP_WINDOW_SCALE
+#define FTUN_LWIP_WINDOW_SCALE 0
+#endif
+#ifndef FTUN_LWIP_TCP_SEND_WINDOW_MSS
+#define FTUN_LWIP_TCP_SEND_WINDOW_MSS FTUN_LWIP_TCP_WINDOW_MSS
+#endif
+#ifndef FTUN_LWIP_RCV_SCALE
+#define FTUN_LWIP_RCV_SCALE 0
+#endif
+#define TCP_WND (FTUN_LWIP_TCP_WINDOW_MSS * TCP_MSS)
+#define TCP_SND_BUF (FTUN_LWIP_TCP_SEND_WINDOW_MSS * TCP_MSS)
+#define TCP_SND_QUEUELEN (FTUN_LWIP_TCP_SEND_WINDOW_MSS * 4)
+#define LWIP_WND_SCALE FTUN_LWIP_WINDOW_SCALE
+#define TCP_RCV_SCALE FTUN_LWIP_RCV_SCALE
 #define TCP_QUEUE_OOSEQ 1
 #define TCP_LISTEN_BACKLOG 1
 #define TCP_DEFAULT_LISTEN_BACKLOG 16

@@ -6,7 +6,7 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FTUN_VERSION "1.0.0"
+#define FTUN_VERSION "1.0.1"
 #define FTUN_ABI_VERSION 1u
 /* REQ-CAPI-001：只公开宿主边界，不暴露 libev/lwIP/TLS 类型。
  * 0.x 不承诺稳定 ABI；options 使用 struct_size 向后兼容。 */

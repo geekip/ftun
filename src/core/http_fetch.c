@@ -374,7 +374,7 @@ static ftun_status_t ftun_http_connect(const ftun_endpoint_t *target,
   descriptor = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
   if (descriptor < 0) return ftun_http_errno(errno);
 #if defined(SO_MARK)
-  if (setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark,
+  if (mark != 0u && setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark,
                  (socklen_t)sizeof(mark)) != 0) {
     error_code = errno;
     (void)close(descriptor);
@@ -867,7 +867,6 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
   if (spec == NULL || out == NULL || spec->budget == NULL ||
       spec->url.data == NULL || spec->url.length == 0u ||
       spec->maximum_bytes == 0u || spec->deadline_ms == 0u ||
-      spec->resolver.socket_mark == 0u ||
       (spec->use_proxy && spec->proxy.kind != FTUN_ADDRESS_IPV4 &&
        (spec->proxy.kind != FTUN_ADDRESS_DOMAIN ||
         spec->proxy_domain[0] == '\0'))) {

@@ -176,8 +176,12 @@ int main(void)
     rejected_state.queue = queue;
     rejected_state.expected = FTUN_OK;
     third = (ftun_operation_t *)(uintptr_t)1;
-    CHECK(ftun_operation_accept(queue, completed, &rejected_state, &third) == FTUN_E_LIMIT);
-    CHECK(third == NULL && rejected_state.calls == 0);
+    /* Operation 槽位随队列预留，因此稳态接纳不依赖分配器或剩余预算。 */
+    CHECK(ftun_operation_accept(queue, completed, &rejected_state, &third) == FTUN_OK);
+    CHECK(third != NULL && rejected_state.calls == 0);
+    CHECK(ftun_operation_complete(third, success) == FTUN_OK);
+    CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
+    CHECK(dispatched == 1u && rejected_state.calls == 1);
     CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
     CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
     CHECK(ftun_budget_destroy(&budget) == FTUN_OK);

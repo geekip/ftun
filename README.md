@@ -6,19 +6,22 @@ FTUN 的目标是成为轻量、可裁剪的跨平台代理内核，提供命令
 
 ## 当前状态
 
-当前源码版本为 **1.0.0**，正式支持 Linux x86_64 IPv4。`ftun run` 会装配
+当前源码版本为 **1.0.1**，正式支持 Linux x86_64 IPv4。`ftun run` 会装配
 TUN、SOCKS5、Mixed、DNS、FakeIP、FRS、规则、Select/URL-Test、DIRECT、
 REJECT 和 SOCKS5 出站数据面，并支持 TCP/UDP、TLS SNI/HTTP Host 嗅探及
 SIGHUP 事务重载。
 
 首版不包含 IPv6、AnyTLS、管理 HTTP API、Full Cone 和非 Linux 平台。
-TUN/自动路由需要 root 或相应网络能力；只使用 SOCKS5/Mixed 入站时可按监听权限运行。
+TUN/自动路由需要 root 或相应网络能力，且必需的 socket mark
+保护无法建立时会在启动阶段明确失败。只使用 SOCKS5/Mixed 入站时不设置
+`SO_MARK`，普通用户只需满足监听端口、配置和状态文件权限。
 
 ## 文档
 
 - [公开 C API](include/ftun/ftun.h)
 - [CLI、运行与宿主控制](document/control.md)
 - [v1.0 构建、交付与验证基线](document/build-release.md)
+- [v1.0.1 发行说明](document/release-v1.0.1.md)
 - [v1.0 发行说明](document/release-v1.0.md)
 - [配置 JSON Schema](schema.json)
 - [配置样例](examples/)

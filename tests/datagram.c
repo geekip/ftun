@@ -406,15 +406,16 @@ static int test_rejection_limits_and_stop(void)
   CHECK(after.normal_available > 0u);
   CHECK(ftun_budget_reserve(fixture.budget, after.normal_available,
                             &blocker) == FTUN_OK);
-  CHECK(ftun_datagram_send(fixture.channel, &target, &first) == FTUN_E_LIMIT);
-  CHECK(fixture.backend.start_calls == 1);
+  /* 发送描述符随 channel 预留；即使全局剩余预算耗尽也可复用。 */
+  CHECK(ftun_datagram_send(fixture.channel, &target, &first) == FTUN_E_AGAIN);
+  CHECK(fixture.backend.start_calls == 2);
   CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
 
   fixture.backend.start_status = FTUN_OK;
   CHECK(ftun_datagram_send(fixture.channel, &target, &first) == FTUN_OK);
   CHECK(make_packet(&fixture, 40u, 3u, 2u, &second) == 0);
   CHECK(ftun_datagram_send(fixture.channel, &target, &second) == FTUN_E_LIMIT);
-  CHECK(fixture.backend.start_calls == 2);
+  CHECK(fixture.backend.start_calls == 3);
   CHECK(ftun_packet_release(&first) == FTUN_OK);
   CHECK(ftun_packet_release(&second) == FTUN_OK);
   fixture.backend.cancel_status = FTUN_E_IO;

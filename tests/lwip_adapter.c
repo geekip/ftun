@@ -241,6 +241,8 @@ static int test_tcp_lifecycle(void)
   size_t length;
   size_t index;
   bool peer_finished;
+  bool readable;
+  bool writable;
 
   memset(&context, 0, sizeof(context));
   memset(&spec, 0, sizeof(spec));
@@ -260,12 +262,16 @@ static int test_tcp_lifecycle(void)
   CHECK(usage.tcp_timer_ticks == 4u && usage.reassembly_timer_ticks == 1u);
   CHECK(establish(stack, budget, &context, &server_sequence) == 0);
   CHECK(context.flow != NULL && context.callback_failed == 0);
+  CHECK(ftun_lwip_tcp_ready(context.flow, &readable, &writable) == FTUN_OK &&
+        !readable && writable);
 
   length = make_tcp_packet(packet, sizeof(packet), source, target, 12345u, 443u,
                            1001u, server_sequence + 1u, 0x18u,
                            hello, sizeof(hello));
   CHECK(input_bytes(stack, budget, packet, length) == FTUN_OK);
   CHECK(context.readable_events == 1u);
+  CHECK(ftun_lwip_tcp_ready(context.flow, &readable, &writable) == FTUN_OK &&
+        readable);
   CHECK(ftun_lwip_tcp_peek(context.flow, segments, 4u, &count, &available,
                            &peer_finished) == FTUN_OK);
   CHECK(count >= 1u && available == sizeof(hello) && !peer_finished);
@@ -275,6 +281,8 @@ static int test_tcp_lifecycle(void)
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK && usage.received_bytes == 3u);
   CHECK(ftun_lwip_tcp_consume(context.flow, 3u) == FTUN_OK);
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK && usage.received_bytes == 0u);
+  CHECK(ftun_lwip_tcp_ready(context.flow, &readable, &writable) == FTUN_OK &&
+        !readable);
 
   CHECK(ftun_buffer_acquire(budget, sizeof(reply), &send_buffer) == FTUN_OK);
   CHECK(ftun_buffer_data(send_buffer, &send_storage, &send_capacity) == FTUN_OK);
@@ -310,6 +318,8 @@ static int test_tcp_lifecycle(void)
                            NULL, 0u);
   CHECK(input_bytes(stack, budget, packet, length) == FTUN_OK);
   CHECK(context.fin_events == 1u);
+  CHECK(ftun_lwip_tcp_ready(context.flow, &readable, &writable) == FTUN_OK &&
+        readable);
   CHECK(ftun_lwip_tcp_peek(context.flow, NULL, 0u, &count, &available,
                            &peer_finished) == FTUN_OK);
   CHECK(available == 0u && peer_finished);

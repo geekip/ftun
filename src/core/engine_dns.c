@@ -225,7 +225,7 @@ static ftun_status_t ftun_engine_dns_connect_socket(
   descriptor = socket(AF_INET, type | SOCK_CLOEXEC, 0);
   if (descriptor < 0) return ftun_engine_dns_errno(errno);
 #if defined(SO_MARK)
-  if (setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark,
+  if (mark != 0u && setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark,
                  (socklen_t)sizeof(mark)) != 0) {
     error_code = errno;
     (void)close(descriptor);
@@ -511,7 +511,7 @@ ftun_status_t ftun_engine_dns_query_blocking(
   ftun_status_t status;
   if (out_response_size != NULL) *out_response_size = 0u;
   if (query == NULL || query->upstream.kind != FTUN_ADDRESS_IPV4 ||
-      query->upstream.port == 0u || query->socket_mark == 0u ||
+      query->upstream.port == 0u ||
       wire.data == NULL || wire.length < 12u || wire.length > UINT32_MAX ||
       response == NULL || response_capacity == 0u ||
       out_response_size == NULL ||

@@ -83,6 +83,7 @@ ftun_status_t ftun_frs_update(ftun_core_t *core,
   ftun_frs_view_t *baseline = NULL;
   ftun_frs_view_t *candidate_view = NULL;
   ftun_runtime_t *candidate_runtime = NULL;
+  ftun_budget_t *budget = NULL;
   ftun_operation_t *operation = NULL;
   ftun_frs_download_t download;
   ftun_frs_publish_state_t publish;
@@ -171,7 +172,8 @@ ftun_status_t ftun_frs_update(ftun_core_t *core,
         break;
       }
     }
-    status = ftun_frs_open_bytes(
+    status = ftun_runtime_manager_budget(core, &budget);
+    if (status == FTUN_OK) status = ftun_frs_open_bytes_budget(budget,
       (ftun_bytes_t){download.data, download.length}, &candidate_view);
     if (status == FTUN_OK) {
       status = ftun_runtime_prepare_with_frs(core, request->config,

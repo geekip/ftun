@@ -223,12 +223,40 @@ while [ "$load_index" -lt "$load_runs" ]; do
 done
 "$helper_binary" --socks-udp-client 11081 192.0.2.2:18081
 "$helper_binary" --socks-udp-client 11082 192.0.2.2:18081
+udp_load_packets=${FTUN_RELEASE_UDP_LOAD_PACKETS:-0}
+if [ "$udp_load_packets" -ne 0 ]; then
+  "$helper_binary" --socks-udp-load-client 11081 192.0.2.2:18081 \
+    "$udp_load_packets"
+fi
 "$helper_binary" --mixed-connect-client 11082 192.0.2.2:18080
 "$helper_binary" --mixed-forward-client 11082 192.0.2.2:18080
 "$helper_binary" --client tcp release-local-tcp
 "$helper_binary" --client udp release-local-udp
 ip netns exec ftun-lan "$helper_binary" --client tcp release-lan-tcp
 ip netns exec ftun-lan "$helper_binary" --client udp release-lan-udp
+tun_load_runs=${FTUN_RELEASE_TUN_LOAD_RUNS:-1}
+tun_load_bytes=${FTUN_RELEASE_TUN_LOAD_BYTES:-1048576}
+tun_load_label=${FTUN_RELEASE_TUN_LOAD_LABEL:-tun}
+netem_delay=${FTUN_RELEASE_NETEM_DELAY:-0ms}
+netem_loss=${FTUN_RELEASE_NETEM_LOSS:-0%}
+if [ "$netem_delay" != 0ms ] || [ "$netem_loss" != 0% ]; then
+  ip netns exec ftun-peer tc qdisc replace dev peer0 root handle 1: prio
+  ip netns exec ftun-peer tc qdisc replace dev peer0 parent 1:3 handle 30: \
+    netem delay "$netem_delay" loss "$netem_loss"
+  ip netns exec ftun-peer tc filter add dev peer0 protocol ip parent 1: \
+    prio 3 u32 match ip sport 18080 0xffff flowid 1:3
+fi
+tun_load_index=0
+while [ "$tun_load_index" -lt "$tun_load_runs" ]; do
+  "$helper_binary" --load-client 192.0.2.2:18080 "$tun_load_bytes" \
+    "$tun_load_label-local"
+  ip netns exec ftun-lan "$helper_binary" \
+    --load-client 192.0.2.2:18080 "$tun_load_bytes" "$tun_load_label-lan"
+  tun_load_index=$((tun_load_index + 1))
+done
+if [ "$netem_delay" != 0ms ] || [ "$netem_loss" != 0% ]; then
+  ip netns exec ftun-peer tc qdisc del dev peer0 root
+fi
 "$helper_binary" --dns-client 127.0.0.1 15353 192.0.2.2
 "$helper_binary" --dns-client 127.0.0.1 15354 198.18.0.1
 "$helper_binary" --dns-client 127.0.0.1 15355 192.0.2.2
@@ -245,29 +273,43 @@ ip netns exec ftun-lan "$helper_binary" --dns-tcp-client 192.0.2.53 53 192.0.2.2
 # Bounded connection pressure: exercise independent concurrent Session/Relay
 # ownership without serial helper startup hiding admission or cleanup defects.
 stage=concurrent-streams
+stress_flows=${FTUN_RELEASE_STRESS_FLOWS:-32}
+stress_expect_rejections=${FTUN_RELEASE_STRESS_EXPECT_REJECTIONS:-0}
+stress_hold_ms=${FTUN_RELEASE_STRESS_HOLD_MS:-500}
+stress_sample_delay=${FTUN_RELEASE_STRESS_SAMPLE_DELAY:-0.1}
 stress_pids=
 stress_index=0
-while [ "$stress_index" -lt 32 ]; do
-  "$helper_binary" --socks-hold-client 11081 192.0.2.2:18080 500 &
+while [ "$stress_index" -lt "$stress_flows" ]; do
+  "$helper_binary" --socks-hold-client 11081 192.0.2.2:18080 \
+    "$stress_hold_ms" &
   stress_pids="$stress_pids $!"
   stress_index=$((stress_index + 1))
 done
-sleep 0.1
+sleep "$stress_sample_delay"
 stress_rss=$(awk '/^Rss:/ {print $2}' "/proc/$ftun_pid/smaps_rollup")
 stress_pss=$(awk '/^Pss:/ {print $2}' "/proc/$ftun_pid/smaps_rollup")
 stress_fds=$(find "/proc/$ftun_pid/fd" -mindepth 1 -maxdepth 1 | wc -l)
 resource_limit_kib=${FTUN_RELEASE_RESOURCE_LIMIT_KIB:-65536}
-echo "production-concurrency flows=32 rss-kib=$stress_rss "\
+fd_limit=${FTUN_RELEASE_FD_LIMIT:-256}
+echo "production-concurrency flows=$stress_flows rss-kib=$stress_rss "\
 "pss-kib=$stress_pss fds=$stress_fds"
 if [ "$stress_rss" -gt "$resource_limit_kib" ] ||
    [ "$stress_pss" -gt "$resource_limit_kib" ] ||
-   [ "$stress_fds" -gt 256 ]; then
+   [ "$stress_fds" -gt "$fd_limit" ]; then
   echo "production concurrency resource threshold exceeded" >&2
   exit 1
 fi
+stress_failures=0
 for stress_pid in $stress_pids; do
-  wait "$stress_pid"
+  if ! wait "$stress_pid"; then
+    stress_failures=$((stress_failures + 1))
+  fi
 done
+if [ "$stress_failures" -ne "$stress_expect_rejections" ]; then
+  echo "unexpected connection admission result: failures=$stress_failures "\
+"expected=$stress_expect_rejections" >&2
+  exit 1
+fi
 
 # CI runs a short soak; release qualification can raise this without changing
 # the scenario (the v1.0 evidence run uses FTUN_RELEASE_SOAK_SECONDS=60).
@@ -332,7 +374,8 @@ while ! grep -q 'reload committed' "$temporary/ftun.log"; do
 done
 "$helper_binary" --dns-client 127.0.0.1 15356 198.18.0.1
 
-if grep -q 'FRS update failed' /tmp/ftun-release.log 2>/dev/null; then
+if [ "${FTUN_RELEASE_ALLOW_FRS_RETRY_WARNINGS:-0}" != 1 ] &&
+   grep -q 'FRS update failed' /tmp/ftun-release.log 2>/dev/null; then
   echo "conditional FRS update was reported as a failure" >&2
   exit 1
 fi

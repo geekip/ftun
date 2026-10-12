@@ -11,11 +11,16 @@ typedef void (*ftun_worker_completion_fn)(ftun_operation_t *operation,
                                           ftun_error_t error,
                                           ftun_bytes_t result,
                                           void *user);
+typedef void (*ftun_worker_result_cleanup_fn)(ftun_bytes_t result);
+typedef void (*ftun_worker_input_cleanup_fn)(ftun_bytes_t input);
 
 struct ftun_worker_job {
   ftun_worker_execute_fn execute;
   ftun_bytes_t input;
   size_t result_capacity;
+  size_t accounted_extra;
+  ftun_worker_input_cleanup_fn input_cleanup;
+  ftun_worker_result_cleanup_fn result_cleanup;
   uint64_t deadline_ms; /* 0 表示无截止时间。 */
 };
 
@@ -31,9 +36,13 @@ typedef struct {
 
 /* 有界文件任务。
  * 需求 REQ-CORE-001；任务 TASK-CORE-006；目标 0.2.0；验收 TEST-CORE-006。
- * 提交时复制输入并预留任务、结果和 completion 预算。execute 只获得
- * 独立字节视图，不得访问 Session 或保留指针。deadline 过期只丢弃结果，
- * 不声称中断正在执行的阻塞调用。poll/join/destroy 只由 owner loop 调用。
+ * 提交时复制输入并预留任务、结果、额外输出所有权和 completion 预算。
+ * execute 只获得独立字节视图，不得访问 Session。input 若携带由
+ * owner 预先保留的不可变快照，必须提供 input_cleanup；它在任务真正结束且
+ * 回调完成后执行。输出若携带拥有型对象，必须提供 result_cleanup；回调取走
+ * 对象后须清空结果中的所有权字段。
+ * deadline 过期只丢弃结果，不声称中断正在执行的阻塞调用。
+ * poll/join/destroy 只由 owner loop 调用。
  */
 ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
                                  ftun_worker_t **out);

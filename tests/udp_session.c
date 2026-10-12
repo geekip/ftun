@@ -19,7 +19,7 @@
   } \
 } while (0)
 
-#define FLOW_SLOTS 16u
+#define FLOW_SLOTS 64u
 #define PAYLOAD_BYTES 128u
 
 typedef struct fixture fixture_t;
@@ -189,7 +189,8 @@ static void outbound_destroy(void *user)
 
 static ftun_status_t open_outbound(
   void *user, ftun_core_t *core, const ftun_runtime_t *runtime,
-  const ftun_metadata_t *metadata, ftun_datagram_result_fn result,
+  const ftun_metadata_t *metadata, const ftun_route_result_t *route,
+  ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out)
 {
@@ -199,6 +200,7 @@ static ftun_status_t open_outbound(
   ftun_datagram_backend_t backend;
   ftun_runtime_info_t info;
   if (out != NULL) *out = NULL;
+  (void)route;
   fixture->open_calls++;
   if (core != fixture->core || runtime == NULL || metadata == NULL ||
       result == NULL || receive == NULL || outbound_id == NULL ||
@@ -494,6 +496,69 @@ static int test_failure_no_replay_and_cancel(void)
   return 0;
 }
 
+static int test_isolated_outbound_failure(void)
+{
+  static const uint8_t bytes[] = {'i'};
+  fixture_t fixture;
+  ftun_metadata_t first;
+  ftun_metadata_t second;
+  ftun_packet_t packet = {{0}, 0u};
+  ftun_udp_flow_usage_t usage;
+  CHECK(fixture_start(&fixture, 2u, 1000u) == 0);
+  fill_real_metadata(&first);
+  second = first;
+  second.source.port++;
+  CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
+  CHECK(ftun_udp_flow_input(fixture.core, &first, &packet) == FTUN_OK);
+  CHECK(ftun_udp_flow_input(fixture.core, &second, &packet) == FTUN_OK);
+  CHECK(fixture.slot_count == 2u);
+  CHECK(ftun_udp_flow_fail_outbound(fixture.table,
+        fixture.slots[0].channel, FTUN_E_IO) == FTUN_OK);
+  CHECK(fixture.slots[0].destroyed == 1 &&
+        fixture.slots[1].destroyed == 0);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
+        usage.active == 1u && usage.failed == 1u);
+  CHECK(ftun_udp_flow_input(fixture.core, &second, &packet) == FTUN_OK &&
+        fixture.open_calls == 2u && fixture.slots[1].sends == 2u);
+  CHECK(ftun_udp_flow_fail_outbound(fixture.table,
+        fixture.slots[1].channel, FTUN_OK) == FTUN_E_INVALID);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_hash_index_and_bounded_expiry(void)
+{
+  static const uint8_t bytes[] = {'h'};
+  fixture_t fixture;
+  ftun_metadata_t metadata;
+  ftun_packet_t packet = {{0}, 0u};
+  ftun_udp_flow_usage_t usage;
+  size_t index;
+  CHECK(fixture_start(&fixture, 64u, 100u) == 0);
+  fill_real_metadata(&metadata);
+  CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
+  for (index = 0u; index < 40u; index++) {
+    metadata.source.port = (uint16_t)(50000u + index);
+    metadata.original_target.address[3] = (uint8_t)(index + 1u);
+    CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK);
+  }
+  CHECK(fixture.open_calls == 40u);
+  metadata.source.port = 50017u;
+  metadata.original_target.address[3] = 18u;
+  CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK &&
+        fixture.open_calls == 40u && fixture.slots[17].sends == 2u);
+  CHECK(ftun_udp_flow_tick(fixture.table, 1100u) == FTUN_OK);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
+        usage.active == 8u && usage.expired == 32u);
+  CHECK(ftun_udp_flow_tick(fixture.table, 1101u) == FTUN_OK);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
+        usage.active == 0u && usage.expired == 40u);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 static int test_boundaries(void)
 {
   static const uint8_t bytes[] = {'b'};
@@ -553,6 +618,8 @@ int main(void)
   CHECK(test_key_runtime_and_idle() == 0);
   CHECK(test_fake_reply_and_fixed_remote() == 0);
   CHECK(test_failure_no_replay_and_cancel() == 0);
+  CHECK(test_isolated_outbound_failure() == 0);
+  CHECK(test_hash_index_and_bounded_expiry() == 0);
   CHECK(test_boundaries() == 0);
   return 0;
 }

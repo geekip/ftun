@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FTUN VERSION 1.0.0 LANGUAGES C)
+project(FTUN VERSION 1.0.1 LANGUAGES C)
 include(GNUInstallDirs)
 include(CTest)
 find_package(Threads REQUIRED)
@@ -404,7 +404,7 @@ install(FILES third_party/wolfssl/COPYING
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES LICENSE README.md document/control.md document/build-release.md
-  document/release-v1.0.md
+  document/release-v1.0.md document/release-v1.0.1.md
   THIRD_PARTY_NOTICES.md third_party/LOCK.json
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 if(TARGET ftun_libev)
@@ -560,6 +560,28 @@ if(BUILD_TESTING)
   target_include_directories(ftun-sniff-test PRIVATE src)
   target_link_libraries(ftun-sniff-test PRIVATE ftun_core ftun_options)
   add_test(NAME sniff-contract COMMAND ftun-sniff-test)
+  set(ftun_untrusted_parser_sources tests/untrusted_parsers.c)
+  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    list(APPEND ftun_untrusted_parser_sources tests/frs_fixture.c)
+  endif()
+  add_executable(ftun-untrusted-parsers-test
+    ${ftun_untrusted_parser_sources})
+  target_include_directories(ftun-untrusted-parsers-test PRIVATE src tests)
+  target_link_libraries(ftun-untrusted-parsers-test PRIVATE
+    ftun_core ftun_options)
+  if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
+      FTUN_TEST_DNS=1)
+  endif()
+  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
+      FTUN_TEST_FRS=1)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-untrusted-parsers-test PRIVATE -static)
+  endif()
+  add_test(NAME untrusted-parsers-regression
+    COMMAND ftun-untrusted-parsers-test)
   add_executable(ftun-group-cache-test tests/group_cache.c)
   target_include_directories(ftun-group-cache-test PRIVATE src)
   target_link_libraries(ftun-group-cache-test PRIVATE ftun_core ftun_options)
@@ -887,7 +909,7 @@ if(BUILD_TESTING)
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration_linux.sh
                    $<TARGET_FILE:ftun-linux-integration-test>)
       set_tests_properties(linux-isolated-integration PROPERTIES
-        SKIP_RETURN_CODE 77 TIMEOUT 30)
+        SKIP_RETURN_CODE 77 TIMEOUT 30 RESOURCE_LOCK ftun_linux_namespace)
       if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
         add_test(NAME release-linux-production
           COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_linux.sh
@@ -895,7 +917,7 @@ if(BUILD_TESTING)
                      $<TARGET_FILE:ftun-linux-integration-test>
                      $<TARGET_FILE:ftun-v04-frs-test>)
         set_tests_properties(release-linux-production PROPERTIES
-          SKIP_RETURN_CODE 77)
+          SKIP_RETURN_CODE 77 RESOURCE_LOCK ftun_linux_namespace)
         if(FTUN_SANITIZERS)
           # ASan reserves and commits shadow/quarantine pages which are not part
           # of the production memory budget. Keep the same 32-flow functional
@@ -908,7 +930,16 @@ if(BUILD_TESTING)
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/socket_inbounds.sh
                    $<TARGET_FILE:ftun>
                    $<TARGET_FILE:ftun-linux-integration-test>)
-      set_tests_properties(socket-inbounds-production PROPERTIES TIMEOUT 20)
+      set_tests_properties(socket-inbounds-production PROPERTIES
+        TIMEOUT 20 RESOURCE_LOCK ftun_host_socket)
+      if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+        add_test(NAME idle-tcp-resource-profile
+          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/idle_tcp.sh
+                     $<TARGET_FILE:ftun>
+                     $<TARGET_FILE:ftun-linux-integration-test>)
+        set_tests_properties(idle-tcp-resource-profile PROPERTIES
+          TIMEOUT 75 RESOURCE_LOCK ftun_host_socket)
+      endif()
     endif()
   endif()
   if(UNIX)
@@ -1017,5 +1048,8 @@ if(BUILD_TESTING)
   set_tests_properties(build-modules-matrix PROPERTIES TIMEOUT 180)
   if(TEST release-linux-production)
     set_tests_properties(release-linux-production PROPERTIES TIMEOUT 90)
+  endif()
+  if(TEST idle-tcp-resource-profile)
+    set_tests_properties(idle-tcp-resource-profile PROPERTIES TIMEOUT 75)
   endif()
 endif()

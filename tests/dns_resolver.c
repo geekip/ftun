@@ -557,7 +557,12 @@ static int test_boundaries(void)
   request.query.domain.length = strlen(domain);
   request.query.protection.mark = 0u;
   CHECK(ftun_resolve_real_with_backend(fixture.core, &request,
-        &fixture.backend, &operation) == FTUN_E_INVALID && operation == NULL);
+        &fixture.backend, &operation) == FTUN_OK && operation != NULL &&
+        fixture.backend_state.mark == 0u);
+  CHECK(ftun_operation_cancel(operation) == FTUN_OK);
+  CHECK(ftun_operation_dispatch(fixture.operations, 1u, &dispatched) ==
+        FTUN_OK && dispatched == 1u &&
+        completion.error.status == FTUN_E_CANCELLED);
   request.query.protection.mark = 91u;
   request.default_server.data = "bad,name";
   request.default_server.length = strlen("bad,name");
@@ -579,7 +584,7 @@ static int test_boundaries(void)
         &fixture.backend, &operation) == FTUN_E_STALE && operation == NULL);
   CHECK(close_session(&real_ip_session) == 0);
   CHECK(fixture.backend_state.system_calls == 0 &&
-        fixture.backend_state.bootstrap_calls == 0 &&
+        fixture.backend_state.bootstrap_calls == 1 &&
         fixture.backend_state.server_calls == 0);
 
   CHECK(open_session(&fixture, domain, NULL, 0u, &session) == 0);

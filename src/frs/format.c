@@ -468,7 +468,9 @@ static ftun_status_t ftun_frs_validate_domain(
     size_t depth = 0u;
     if (colors[index] != 0u) continue;
     colors[index] = 1u;
-    stack[depth++].node = node_start + index;
+    stack[depth].node = node_start + index;
+    stack[depth].edge_index = 0u;
+    depth++;
     while (depth != 0u) {
       ftun_frs_dfs_frame_t *frame = &stack[depth - 1u];
       const uint8_t *node = file.data + (size_t)nodes->offset +

@@ -5,7 +5,7 @@
 #include <string.h>
 
 #define FTUN_EVENT_DEFERRED_CAPACITY 256u
-#define FTUN_EVENT_SOURCE_CAPACITY 256u
+#define FTUN_EVENT_SOURCE_CAPACITY 1024u
 
 typedef enum {
   FTUN_EVENT_SOURCE_IO = 1,
@@ -23,6 +23,7 @@ struct ftun_event_source {
   ftun_event_source_t *next;
   ftun_event_callback_fn callback;
   void *user;
+  void *backend_data;
   ftun_event_source_kind_t kind;
   ftun_native_socket_t socket;
   uint64_t deadline_ms;
@@ -93,7 +94,8 @@ ftun_status_t ftun_event_loop_set_wakeup(ftun_event_loop_t *loop,
 
 static int ftun_event_backend_ops_valid(const ftun_event_backend_ops_t *ops)
 {
-  return ops != NULL && ops->io_start != NULL && ops->timer_start != NULL &&
+  return ops != NULL && ops->io_start != NULL && ops->io_update != NULL &&
+    ops->timer_start != NULL &&
     ops->source_cancel != NULL && ops->wakeup != NULL && ops->run_once != NULL &&
     ops->stop != NULL && ops->destroy != NULL;
 }
@@ -246,6 +248,48 @@ ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_
     }
   }
   *out = source;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_io_update(ftun_event_source_t *source,
+                                   uint32_t interests)
+{
+  const uint32_t allowed = FTUN_EVENT_READ | FTUN_EVENT_WRITE |
+                           FTUN_EVENT_ERROR;
+  ftun_event_loop_t *loop;
+  ftun_status_t status;
+  if (source == NULL || source->loop == NULL ||
+      source->kind != FTUN_EVENT_SOURCE_IO || interests == 0u ||
+      (interests & ~allowed) != 0u) return FTUN_E_INVALID;
+  if (!source->active) return FTUN_E_STALE;
+  if (source->interests == interests) return FTUN_OK;
+  loop = source->loop;
+  if (loop->backend != NULL) {
+    status = loop->backend->io_update(loop->backend_context, source,
+                                      interests);
+    if (status != FTUN_OK) return status;
+  }
+  source->interests = interests;
+  source->pending &= interests;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_source_backend_data(ftun_event_source_t *source,
+                                             void **out)
+{
+  if (out != NULL) *out = NULL;
+  if (source == NULL || source->loop == NULL || out == NULL) {
+    return FTUN_E_INVALID;
+  }
+  *out = source->backend_data;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_source_set_backend_data(ftun_event_source_t *source,
+                                                 void *data)
+{
+  if (source == NULL || source->loop == NULL) return FTUN_E_INVALID;
+  source->backend_data = data;
   return FTUN_OK;
 }
 
@@ -409,6 +453,7 @@ ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source)
     if (status != FTUN_OK) return status;
   }
   ftun_event_source_unlink(owned);
+  owned->backend_data = NULL;
   owned->callback = NULL;
   owned->user = NULL;
   free(owned);

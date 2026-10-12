@@ -31,6 +31,7 @@ typedef struct {
 
 struct ftun_libev_watcher {
   ftun_libev_adapter_t *adapter;
+  ftun_libev_watcher_t *previous;
   ftun_libev_watcher_t *next;
   ftun_event_source_t *source;
   ftun_libev_watcher_kind_t kind;
@@ -74,17 +75,19 @@ static void ftun_libev_async_callback(EV_P_ ev_async *async, int revents)
   (void)revents;
 }
 
-static ftun_libev_watcher_t *ftun_libev_find(ftun_libev_adapter_t *adapter,
-                                             ftun_event_source_t *source,
-                                             ftun_libev_watcher_t **previous)
+static void ftun_libev_timeout_callback(EV_P_ ev_timer *timer, int revents)
 {
-  ftun_libev_watcher_t *watcher;
-  *previous = NULL;
-  for (watcher = adapter->watchers; watcher != NULL; watcher = watcher->next) {
-    if (watcher->source == source) return watcher;
-    *previous = watcher;
-  }
-  return NULL;
+  (void)loop;
+  (void)timer;
+  (void)revents;
+}
+
+static int ftun_libev_events(uint32_t interests)
+{
+  int events = 0;
+  if ((interests & FTUN_EVENT_READ) != 0u) events |= EV_READ;
+  if ((interests & FTUN_EVENT_WRITE) != 0u) events |= EV_WRITE;
+  return events;
 }
 
 static ftun_status_t ftun_libev_io_start(void *context, ftun_event_source_t *source,
@@ -93,21 +96,47 @@ static ftun_status_t ftun_libev_io_start(void *context, ftun_event_source_t *sou
 {
   ftun_libev_adapter_t *adapter = (ftun_libev_adapter_t *)context;
   ftun_libev_watcher_t *watcher;
-  int events = 0;
+  int events = ftun_libev_events(interests);
   if (socket > (ftun_native_socket_t)INT_MAX) return FTUN_E_INVALID;
-  if ((interests & FTUN_EVENT_READ) != 0u) events |= EV_READ;
-  if ((interests & FTUN_EVENT_WRITE) != 0u) events |= EV_WRITE;
-  if (events == 0) return FTUN_E_INVALID;
   watcher = (ftun_libev_watcher_t *)calloc(1u, sizeof(*watcher));
   if (watcher == NULL) return FTUN_E_LIMIT;
   watcher->adapter = adapter;
   watcher->source = source;
   watcher->kind = FTUN_LIBEV_IO;
-  ev_io_init(&watcher->io, ftun_libev_io_callback, (int)socket, events);
+  ev_io_init(&watcher->io, ftun_libev_io_callback, (int)socket,
+             events == 0 ? EV_READ : events);
   watcher->io.data = watcher;
-  ev_io_start(adapter->loop, &watcher->io);
+  if (events != 0) ev_io_start(adapter->loop, &watcher->io);
   watcher->next = adapter->watchers;
+  if (watcher->next != NULL) watcher->next->previous = watcher;
   adapter->watchers = watcher;
+  if (ftun_event_source_set_backend_data(source, watcher) != FTUN_OK) {
+    ev_io_stop(adapter->loop, &watcher->io);
+    adapter->watchers = watcher->next;
+    if (adapter->watchers != NULL) adapter->watchers->previous = NULL;
+    free(watcher);
+    return FTUN_E_STATE_CORRUPT;
+  }
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_libev_io_update(void *context,
+                                          ftun_event_source_t *source,
+                                          uint32_t interests)
+{
+  ftun_libev_adapter_t *adapter = (ftun_libev_adapter_t *)context;
+  ftun_libev_watcher_t *watcher = NULL;
+  int events = ftun_libev_events(interests);
+  if (ftun_event_source_backend_data(source, (void **)&watcher) != FTUN_OK ||
+      watcher == NULL ||
+      watcher->adapter != adapter || watcher->kind != FTUN_LIBEV_IO) {
+    return FTUN_E_INVALID;
+  }
+  if (ev_is_active(&watcher->io)) ev_io_stop(adapter->loop, &watcher->io);
+  if (events != 0) {
+    ev_io_set(&watcher->io, watcher->io.fd, events);
+    ev_io_start(adapter->loop, &watcher->io);
+  }
   return FTUN_OK;
 }
 
@@ -131,7 +160,15 @@ static ftun_status_t ftun_libev_timer_start(void *context,
   watcher->timer.data = watcher;
   ev_timer_start(adapter->loop, &watcher->timer);
   watcher->next = adapter->watchers;
+  if (watcher->next != NULL) watcher->next->previous = watcher;
   adapter->watchers = watcher;
+  if (ftun_event_source_set_backend_data(source, watcher) != FTUN_OK) {
+    ev_timer_stop(adapter->loop, &watcher->timer);
+    adapter->watchers = watcher->next;
+    if (adapter->watchers != NULL) adapter->watchers->previous = NULL;
+    free(watcher);
+    return FTUN_E_STATE_CORRUPT;
+  }
   return FTUN_OK;
 }
 
@@ -139,15 +176,20 @@ static ftun_status_t ftun_libev_source_cancel(void *context,
                                               ftun_event_source_t *source)
 {
   ftun_libev_adapter_t *adapter = (ftun_libev_adapter_t *)context;
-  ftun_libev_watcher_t *previous;
-  ftun_libev_watcher_t *watcher = ftun_libev_find(adapter, source, &previous);
-  if (watcher == NULL) return FTUN_E_STATE_CORRUPT;
+  ftun_libev_watcher_t *watcher = NULL;
+  if (ftun_event_source_backend_data(source, (void **)&watcher) != FTUN_OK ||
+      watcher == NULL || watcher->adapter != adapter) {
+    return FTUN_E_STATE_CORRUPT;
+  }
   if (watcher->kind == FTUN_LIBEV_IO) ev_io_stop(adapter->loop, &watcher->io);
   else ev_timer_stop(adapter->loop, &watcher->timer);
-  if (previous != NULL) previous->next = watcher->next;
+  if (watcher->previous != NULL) watcher->previous->next = watcher->next;
   else adapter->watchers = watcher->next;
+  if (watcher->next != NULL) watcher->next->previous = watcher->previous;
+  (void)ftun_event_source_set_backend_data(source, NULL);
   watcher->source = NULL;
   watcher->adapter = NULL;
+  watcher->previous = NULL;
   watcher->next = NULL;
   free(watcher);
   return FTUN_OK;
@@ -162,9 +204,15 @@ static void ftun_libev_wakeup(void *context)
 static ftun_status_t ftun_libev_run_once(void *context, bool block)
 {
   ftun_libev_adapter_t *adapter = (ftun_libev_adapter_t *)context;
+  ev_timer timeout;
   if (adapter->stopped) return FTUN_E_CANCELLED;
   adapter->pending_error = FTUN_OK;
+  if (block) {
+    ev_timer_init(&timeout, ftun_libev_timeout_callback, 0.01, 0.0);
+    ev_timer_start(adapter->loop, &timeout);
+  }
   (void)ev_run(adapter->loop, block ? EVRUN_ONCE : EVRUN_NOWAIT);
+  if (block) ev_timer_stop(adapter->loop, &timeout);
   return adapter->pending_error;
 }
 
@@ -195,6 +243,7 @@ static void ftun_libev_destroy(void *context)
 
 static const ftun_event_backend_ops_t ftun_libev_ops = {
   ftun_libev_io_start,
+  ftun_libev_io_update,
   ftun_libev_timer_start,
   ftun_libev_source_cancel,
   ftun_libev_wakeup,

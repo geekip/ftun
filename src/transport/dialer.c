@@ -56,13 +56,15 @@ static int ftun_dial_request_valid(const ftun_dial_request_t *request)
   if (request == NULL || request->loop == NULL || request->operations == NULL ||
       request->budget == NULL || request->completion == NULL ||
       request->endpoint.kind != FTUN_ADDRESS_IPV4 ||
-      request->endpoint.port == 0u || request->protection.mark == 0u ||
+      request->endpoint.port == 0u ||
       !ftun_dial_transport_valid(request->transport) ||
       !ftun_dial_purpose_valid(request->purpose)) return 0;
   if (request->protection.interface_name.length >=
       FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
   if (request->protection.interface_name.length != 0u &&
       request->protection.interface_name.data == NULL) return 0;
+  if (request->protection.mark == 0u &&
+      request->protection.interface_name.length != 0u) return 0;
   return 1;
 }
 
@@ -354,10 +356,13 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
   if (context->result.socket == FTUN_INVALID_SOCKET) {
     return ftun_dial_reject(context, FTUN_E_STATE_CORRUPT);
   }
-  status = context->io.protect_socket(context->io.context,
-                                      context->result.socket,
-                                      &context->policy);
-  if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  if (context->policy.mark != 0u ||
+      context->policy.interface_name.length != 0u) {
+    status = context->io.protect_socket(context->io.context,
+                                        context->result.socket,
+                                        &context->policy);
+    if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  }
   status = context->io.connect_socket(context->io.context,
                                       context->result.socket,
                                       &context->result.endpoint);

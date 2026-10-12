@@ -25,6 +25,7 @@ struct ftun_relay_direction {
 
 struct ftun_relay {
   ftun_budget_t *budget;
+  ftun_buffer_pool_t *pool;
   ftun_reservation_t *reservation;
   ftun_relay_direction_t left_to_right;
   ftun_relay_direction_t right_to_left;
@@ -129,7 +130,10 @@ static ftun_status_t ftun_relay_buffer(ftun_relay_direction_t *direction,
   ftun_relay_t *relay = direction->relay;
   ftun_status_t status;
   if (direction->buffer == NULL) {
-    status = ftun_buffer_acquire(relay->budget, relay->high_water,
+    status = relay->pool == NULL
+      ? ftun_buffer_acquire(relay->budget, relay->high_water,
+                            &direction->buffer)
+      : ftun_buffer_pool_acquire(relay->pool, relay->high_water,
                                  &direction->buffer);
     if (status != FTUN_OK) return status;
   }
@@ -314,6 +318,25 @@ ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left,
     FTUN_RELAY_DEFAULT_MAX_WORK
   };
   return ftun_relay_start_with_options(core, left, right, &options, out);
+}
+
+ftun_status_t ftun_relay_start_with_pool(
+  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
+  ftun_buffer_pool_t *pool, ftun_relay_t **out)
+{
+  const ftun_relay_options_t options = {
+    FTUN_RELAY_DEFAULT_HIGH_WATER,
+    FTUN_RELAY_DEFAULT_LOW_WATER,
+    FTUN_RELAY_DEFAULT_MAX_WORK
+  };
+  ftun_status_t status;
+  if (pool == NULL) {
+    if (out != NULL) *out = NULL;
+    return FTUN_E_INVALID;
+  }
+  status = ftun_relay_start_with_options(core, left, right, &options, out);
+  if (status == FTUN_OK) (*out)->pool = pool;
+  return status;
 }
 
 ftun_status_t ftun_relay_process(ftun_relay_t *relay,

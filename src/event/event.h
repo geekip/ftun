@@ -16,6 +16,8 @@ typedef void (*ftun_event_wakeup_fn)(void *user);
 typedef struct {
   ftun_status_t (*io_start)(void *context, ftun_event_source_t *source,
                             ftun_native_socket_t socket, uint32_t interests);
+  ftun_status_t (*io_update)(void *context, ftun_event_source_t *source,
+                             uint32_t interests);
   ftun_status_t (*timer_start)(void *context, ftun_event_source_t *source,
                                uint64_t deadline_ms);
   ftun_status_t (*source_cancel)(void *context, ftun_event_source_t *source);
@@ -57,6 +59,8 @@ ftun_status_t ftun_event_loop_detach_backend(ftun_event_loop_t *loop);
 ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
                                   uint32_t interests, ftun_event_callback_fn callback,
                                   void *user, ftun_event_source_t **out);
+ftun_status_t ftun_event_io_update(ftun_event_source_t *source,
+                                   uint32_t interests);
 ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
                                      ftun_event_callback_fn callback, void *user,
                                      ftun_event_source_t **out);
@@ -71,6 +75,11 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
 ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
                                        size_t max_callbacks, size_t *out_callbacks);
 ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source);
+/* 后端私有的 O(1) watcher 关联，只允许 owner loop 访问。 */
+ftun_status_t ftun_event_source_backend_data(
+  ftun_event_source_t *source, void **out);
+ftun_status_t ftun_event_source_set_backend_data(
+  ftun_event_source_t *source, void *data);
 ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop);
 ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
                                         ftun_event_loop_usage_t *out);

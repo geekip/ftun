@@ -15,6 +15,8 @@ struct ftun_stream {
   size_t pending_bytes;
   size_t completions;
   size_t reference_count;
+  ftun_stream_write_t *storage;
+  ftun_stream_write_t *free_head;
   int accepting;
   int write_shutdown;
 };
@@ -22,7 +24,7 @@ struct ftun_stream {
 struct ftun_stream_write {
   ftun_stream_t *stream;
   ftun_operation_t *operation;
-  ftun_reservation_t *reservation;
+  ftun_stream_write_t *free_next;
   ftun_buffer_slice_t slice;
   ftun_completion_fn completion;
   void *completion_user;
@@ -63,7 +65,6 @@ static void ftun_stream_write_dispatched(ftun_operation_t *operation,
 {
   ftun_stream_write_t *write = (ftun_stream_write_t *)user;
   ftun_stream_t *stream;
-  ftun_reservation_t *reservation;
   ftun_status_t release_status;
   if (write == NULL || write->stream == NULL) return;
   stream = write->stream;
@@ -76,28 +77,25 @@ static void ftun_stream_write_dispatched(ftun_operation_t *operation,
   }
   release_status = ftun_buffer_slice_release(&write->slice);
   if (release_status != FTUN_OK) error.status = release_status;
-  reservation = write->reservation;
-  write->reservation = NULL;
   write->operation = NULL;
   write->stream = NULL;
   stream->completions++;
   write->completion(operation, error, write->completion_user);
   stream->completions--;
   memset(write, 0, sizeof(*write));
-  free(write);
-  (void)ftun_reservation_release(&reservation);
+  write->free_next = stream->free_head;
+  stream->free_head = write;
 }
 
 static void ftun_stream_write_release(ftun_stream_write_t *write)
 {
-  ftun_reservation_t *reservation;
+  ftun_stream_t *stream;
   if (write == NULL) return;
-  reservation = write->reservation;
-  write->reservation = NULL;
+  stream = write->stream;
   (void)ftun_buffer_slice_release(&write->slice);
   memset(write, 0, sizeof(*write));
-  free(write);
-  (void)ftun_reservation_release(&reservation);
+  write->free_next = stream->free_head;
+  stream->free_head = write;
 }
 
 static ftun_status_t ftun_stream_write_reject(ftun_stream_write_t *write,
@@ -120,13 +118,27 @@ ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
   ftun_stream_t *stream;
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
+  size_t charge;
+  size_t index;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_stream_options_valid(options) ||
       !ftun_stream_backend_valid(backend)) return FTUN_E_INVALID;
-  status = ftun_budget_reserve(options->budget, sizeof(*stream), &reservation);
+  if (options->max_pending_writes >
+      (SIZE_MAX - sizeof(*stream)) / sizeof(ftun_stream_write_t)) {
+    return FTUN_E_LIMIT;
+  }
+  charge = sizeof(*stream) + options->max_pending_writes *
+    sizeof(ftun_stream_write_t);
+  status = ftun_budget_reserve(options->budget, charge, &reservation);
   if (status != FTUN_OK) return status;
   stream = (ftun_stream_t *)calloc(1u, sizeof(*stream));
-  if (stream == NULL) {
+  if (stream != NULL) {
+    stream->storage = (ftun_stream_write_t *)calloc(
+      options->max_pending_writes, sizeof(*stream->storage));
+  }
+  if (stream == NULL || stream->storage == NULL) {
+    if (stream != NULL) free(stream->storage);
+    free(stream);
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
@@ -140,6 +152,10 @@ ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
   stream->max_pending_bytes = options->max_pending_bytes;
   stream->reference_count = 1u;
   stream->accepting = 1;
+  for (index = 0u; index < options->max_pending_writes; index++) {
+    stream->storage[index].free_next = stream->free_head;
+    stream->free_head = &stream->storage[index];
+  }
   *out = stream;
   return FTUN_OK;
 }
@@ -150,7 +166,6 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   size_t *accepted, ftun_operation_t **out)
 {
   ftun_stream_write_t *write;
-  ftun_reservation_t *reservation = NULL;
   ftun_bytes_t bytes;
   ftun_status_t status;
   size_t available;
@@ -171,15 +186,11 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   offered = bytes.length < available ? bytes.length : available;
   if (offered == 0u) return FTUN_E_LIMIT;
 
-  status = ftun_budget_reserve(stream->budget, sizeof(*write), &reservation);
-  if (status != FTUN_OK) return status;
-  write = (ftun_stream_write_t *)calloc(1u, sizeof(*write));
-  if (write == NULL) {
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_LIMIT;
-  }
+  write = stream->free_head;
+  if (write == NULL) return FTUN_E_STATE_CORRUPT;
+  stream->free_head = write->free_next;
+  memset(write, 0, sizeof(*write));
   write->stream = stream;
-  write->reservation = reservation;
   write->completion = completion;
   write->completion_user = completion_user;
   status = ftun_operation_accept(stream->operations,
@@ -361,6 +372,7 @@ ftun_status_t ftun_stream_destroy(ftun_stream_t **stream)
   if (status != FTUN_OK) return status;
   owned->reservation = NULL;
   owned->backend.destroy(owned->backend.context);
+  free(owned->storage);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *stream = NULL;

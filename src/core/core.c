@@ -274,13 +274,22 @@ static ftun_status_t ftun_core_runtime_prepare(
       status = FTUN_E_LIMIT;
     }
     if (status == FTUN_OK) {
+      size_t inbound_index;
+      uint32_t socket_mark = 0u;
+      for (inbound_index = 0u; inbound_index < config->inbound_count;
+           inbound_index++) {
+        if (config->inbounds[inbound_index].kind == FTUN_CONFIG_INBOUND_TUN) {
+          socket_mark = UINT32_C(0x4654);
+          break;
+        }
+      }
       fetch_spec.budget = control->budget;
       fetch_spec.url.data = config->frs.url;
       fetch_spec.url.length = strlen(config->frs.url);
       fetch_spec.maximum_bytes = usage.normal_available -
         1024u * 1024u;
       fetch_spec.deadline_ms = now_ms + UINT64_C(30000);
-      fetch_spec.socket_mark = UINT32_C(0x4654);
+      fetch_spec.socket_mark = socket_mark;
       {
         ftun_string_t resolver = {NULL, 0u};
         if (config->frs.dns_server != NULL &&
@@ -302,7 +311,7 @@ static ftun_status_t ftun_core_runtime_prepare(
       status = FTUN_E_PROTOCOL;
     }
     if (status == FTUN_OK) {
-      status = ftun_frs_open_bytes(
+      status = ftun_frs_open_bytes_budget(control->budget,
         (ftun_bytes_t){fetched.data, fetched.length}, &view);
     }
     if (status == FTUN_OK) {

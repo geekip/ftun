@@ -14,11 +14,13 @@ struct ftun_operation {
   ftun_operation_queue_t *queue;
   ftun_operation_t *previous;
   ftun_operation_t *next;
+  ftun_operation_t *ready_previous;
+  ftun_operation_t *ready_next;
+  ftun_operation_t *free_next;
   ftun_completion_fn callback;
   void *user;
   ftun_operation_cancel_hook_fn cancel_hook;
   void *cancel_user;
-  ftun_reservation_t *reservation;
   ftun_error_t result;
   ftun_operation_state_t state;
   int stop_visited;
@@ -29,12 +31,24 @@ struct ftun_operation_queue {
   ftun_reservation_t *reservation;
   ftun_operation_t *head;
   ftun_operation_t *tail;
+  ftun_operation_t *ready_head;
+  ftun_operation_t *ready_tail;
+  ftun_operation_t *storage;
+  ftun_operation_t *free_head;
   size_t capacity;
   size_t inflight;
   int accepting;
   int dispatching;
   pthread_mutex_t mutex;
 };
+
+static void ftun_operation_recycle(ftun_operation_queue_t *queue,
+                                   ftun_operation_t *operation)
+{
+  memset(operation, 0, sizeof(*operation));
+  operation->free_next = queue->free_head;
+  queue->free_head = operation;
+}
 
 /* TASK-CORE-005 / TEST-CORE-005，目标 0.2.0：owner-loop 异步终结仲裁。 */
 static ftun_error_t ftun_cancelled_error(void)
@@ -56,18 +70,57 @@ static void ftun_operation_unlink(ftun_operation_t *operation)
   operation->next = NULL;
 }
 
+static void ftun_operation_ready_link(ftun_operation_t *operation)
+{
+  ftun_operation_queue_t *queue = operation->queue;
+  operation->ready_previous = queue->ready_tail;
+  operation->ready_next = NULL;
+  if (queue->ready_tail != NULL) queue->ready_tail->ready_next = operation;
+  else queue->ready_head = operation;
+  queue->ready_tail = operation;
+}
+
+static void ftun_operation_ready_unlink(ftun_operation_t *operation)
+{
+  ftun_operation_queue_t *queue = operation->queue;
+  if (operation->ready_previous != NULL) {
+    operation->ready_previous->ready_next = operation->ready_next;
+  } else {
+    queue->ready_head = operation->ready_next;
+  }
+  if (operation->ready_next != NULL) {
+    operation->ready_next->ready_previous = operation->ready_previous;
+  } else {
+    queue->ready_tail = operation->ready_previous;
+  }
+  operation->ready_previous = NULL;
+  operation->ready_next = NULL;
+}
+
 ftun_status_t ftun_operation_queue_create(ftun_budget_t *budget, size_t capacity,
                                           ftun_operation_queue_t **out)
 {
   ftun_operation_queue_t *queue;
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
+  size_t index;
+  size_t charge;
   if (out != NULL) *out = NULL;
   if (budget == NULL || out == NULL || capacity == 0u) return FTUN_E_INVALID;
-  status = ftun_budget_reserve(budget, sizeof(*queue), &reservation);
+  if (capacity > (SIZE_MAX - sizeof(*queue)) / sizeof(ftun_operation_t)) {
+    return FTUN_E_LIMIT;
+  }
+  charge = sizeof(*queue) + capacity * sizeof(ftun_operation_t);
+  status = ftun_budget_reserve(budget, charge, &reservation);
   if (status != FTUN_OK) return status;
   queue = (ftun_operation_queue_t *)calloc(1u, sizeof(*queue));
-  if (queue == NULL) {
+  if (queue != NULL) {
+    queue->storage = (ftun_operation_t *)calloc(capacity,
+                                                sizeof(*queue->storage));
+  }
+  if (queue == NULL || queue->storage == NULL) {
+    if (queue != NULL) free(queue->storage);
+    free(queue);
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
@@ -75,7 +128,13 @@ ftun_status_t ftun_operation_queue_create(ftun_budget_t *budget, size_t capacity
   queue->reservation = reservation;
   queue->capacity = capacity;
   queue->accepting = 1;
+  for (index = 0u; index < capacity; index++) {
+    queue->storage[index].free_next = queue->free_head;
+    queue->free_head = &queue->storage[index];
+  }
   if (pthread_mutex_init(&queue->mutex, NULL) != 0) {
+    free(queue->storage);
+    queue->storage = NULL;
     free(queue);
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_IO;
@@ -89,8 +148,6 @@ ftun_status_t ftun_operation_accept(ftun_operation_queue_t *queue,
                                     ftun_operation_t **out)
 {
   ftun_operation_t *operation;
-  ftun_reservation_t *reservation = NULL;
-  ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (queue == NULL || callback == NULL || out == NULL) return FTUN_E_INVALID;
   (void)pthread_mutex_lock(&queue->mutex);
@@ -102,21 +159,16 @@ ftun_status_t ftun_operation_accept(ftun_operation_queue_t *queue,
     (void)pthread_mutex_unlock(&queue->mutex);
     return FTUN_E_LIMIT;
   }
-  status = ftun_budget_reserve(queue->budget, sizeof(*operation), &reservation);
-  if (status != FTUN_OK) {
-    (void)pthread_mutex_unlock(&queue->mutex);
-    return status;
-  }
-  operation = (ftun_operation_t *)calloc(1u, sizeof(*operation));
+  operation = queue->free_head;
   if (operation == NULL) {
-    (void)ftun_reservation_release(&reservation);
     (void)pthread_mutex_unlock(&queue->mutex);
-    return FTUN_E_LIMIT;
+    return FTUN_E_STATE_CORRUPT;
   }
+  queue->free_head = operation->free_next;
+  memset(operation, 0, sizeof(*operation));
   operation->queue = queue;
   operation->callback = callback;
   operation->user = user;
-  operation->reservation = reservation;
   operation->state = FTUN_OPERATION_ACCEPTED;
   operation->previous = queue->tail;
   if (queue->tail != NULL) queue->tail->next = operation;
@@ -138,6 +190,7 @@ ftun_status_t ftun_operation_complete(ftun_operation_t *operation, ftun_error_t 
   }
   operation->result = result;
   operation->state = FTUN_OPERATION_TERMINAL;
+  ftun_operation_ready_link(operation);
   (void)pthread_mutex_unlock(&operation->queue->mutex);
   return FTUN_OK;
 }
@@ -165,8 +218,6 @@ ftun_status_t ftun_operation_reject(ftun_operation_t **operation)
 {
   ftun_operation_t *owned;
   ftun_operation_queue_t *queue;
-  ftun_reservation_t *reservation;
-  ftun_status_t status;
   if (operation == NULL) return FTUN_E_INVALID;
   owned = *operation;
   if (owned == NULL) return FTUN_OK;
@@ -181,17 +232,9 @@ ftun_status_t ftun_operation_reject(ftun_operation_t **operation)
     (void)pthread_mutex_unlock(&queue->mutex);
     return FTUN_E_STATE_CORRUPT;
   }
-  reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) {
-    (void)pthread_mutex_unlock(&queue->mutex);
-    return status;
-  }
-  owned->reservation = NULL;
   ftun_operation_unlink(owned);
   queue->inflight--;
-  memset(owned, 0, sizeof(*owned));
-  free(owned);
+  ftun_operation_recycle(queue, owned);
   *operation = NULL;
   (void)pthread_mutex_unlock(&queue->mutex);
   return FTUN_OK;
@@ -220,8 +263,8 @@ ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
   }
   hook = operation->cancel_hook;
   hook_user = operation->cancel_user;
+  previous = operation->state;
   if (hook != NULL) {
-    previous = operation->state;
     operation->state = FTUN_OPERATION_CANCELLING;
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     status = hook(hook_user);
@@ -240,6 +283,9 @@ ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
   operation->cancel_user = NULL;
   operation->result = ftun_cancelled_error();
   operation->state = FTUN_OPERATION_TERMINAL;
+  if (previous != FTUN_OPERATION_TERMINAL) {
+    ftun_operation_ready_link(operation);
+  }
   (void)pthread_mutex_unlock(&operation->queue->mutex);
   return FTUN_OK;
 }
@@ -262,16 +308,17 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
     ftun_completion_fn callback;
     void *user;
     ftun_error_t result;
-    ftun_reservation_t *reservation;
     (void)pthread_mutex_lock(&queue->mutex);
-    operation = queue->head;
-    while (operation != NULL && operation->state != FTUN_OPERATION_TERMINAL) {
-      operation = operation->next;
-    }
+    operation = queue->ready_head;
     if (operation == NULL) {
       (void)pthread_mutex_unlock(&queue->mutex);
       break;
     }
+    if (operation->state != FTUN_OPERATION_TERMINAL) {
+      (void)pthread_mutex_unlock(&queue->mutex);
+      break;
+    }
+    ftun_operation_ready_unlink(operation);
     ftun_operation_unlink(operation);
     operation->state = FTUN_OPERATION_CALLBACK;
     callback = operation->callback;
@@ -282,18 +329,13 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
     (void)pthread_mutex_unlock(&queue->mutex);
     callback(operation, result, user);
     (void)pthread_mutex_lock(&queue->mutex);
-    reservation = operation->reservation;
-    operation->queue = NULL;
-    operation->callback = NULL;
-    operation->user = NULL;
-    operation->reservation = NULL;
-    free(operation);
-    if (queue->inflight == 0u || ftun_reservation_release(&reservation) != FTUN_OK) {
+    if (queue->inflight == 0u) {
       queue->dispatching = 0;
       (void)pthread_mutex_unlock(&queue->mutex);
       return FTUN_E_STATE_CORRUPT;
     }
     queue->inflight--;
+    ftun_operation_recycle(queue, operation);
     (void)pthread_mutex_unlock(&queue->mutex);
     dispatched++;
   }
@@ -358,7 +400,8 @@ ftun_status_t ftun_operation_queue_destroy(ftun_operation_queue_t **queue)
   if (owned == NULL) return FTUN_OK;
   (void)pthread_mutex_lock(&owned->mutex);
   if (owned->dispatching || owned->inflight != 0u || owned->head != NULL ||
-      owned->tail != NULL) {
+      owned->tail != NULL || owned->ready_head != NULL ||
+      owned->ready_tail != NULL) {
     (void)pthread_mutex_unlock(&owned->mutex);
     return FTUN_E_AGAIN;
   }
@@ -371,6 +414,7 @@ ftun_status_t ftun_operation_queue_destroy(ftun_operation_queue_t **queue)
   owned->reservation = NULL;
   (void)pthread_mutex_unlock(&owned->mutex);
   (void)pthread_mutex_destroy(&owned->mutex);
+  free(owned->storage);
   free(owned);
   *queue = NULL;
   return FTUN_OK;

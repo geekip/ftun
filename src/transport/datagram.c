@@ -3,10 +3,11 @@
 #include <string.h>
 
 struct ftun_datagram_send {
+  ftun_datagram_t *owner;
   ftun_datagram_t *channel;
   ftun_datagram_send_t *previous;
   ftun_datagram_send_t *next;
-  ftun_reservation_t *reservation;
+  ftun_datagram_send_t *free_next;
   ftun_packet_t packet;
   ftun_endpoint_t target;
   char domain[FTUN_DATAGRAM_DOMAIN_BYTES];
@@ -25,6 +26,8 @@ struct ftun_datagram {
   void *user;
   ftun_datagram_send_t *head;
   ftun_datagram_send_t *tail;
+  ftun_datagram_send_t *storage;
+  ftun_datagram_send_t *free_head;
   size_t max_pending_packets;
   size_t max_pending_bytes;
   size_t pending_packets;
@@ -105,12 +108,12 @@ static void ftun_datagram_unlink(ftun_datagram_send_t *send)
 
 static void ftun_datagram_release_send(ftun_datagram_send_t *send)
 {
-  ftun_reservation_t *reservation = send->reservation;
-  send->reservation = NULL;
+  ftun_datagram_t *owner = send->owner;
   (void)ftun_packet_release(&send->packet);
   memset(send, 0, sizeof(*send));
-  free(send);
-  (void)ftun_reservation_release(&reservation);
+  send->owner = owner;
+  send->free_next = owner->free_head;
+  owner->free_head = send;
 }
 
 static void ftun_datagram_finish(ftun_datagram_send_t *send,
@@ -185,13 +188,27 @@ ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
   ftun_datagram_t *channel;
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
+  size_t index;
+  size_t charge;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_datagram_options_valid(options) ||
       !ftun_datagram_backend_valid(backend)) return FTUN_E_INVALID;
-  status = ftun_budget_reserve(options->budget, sizeof(*channel), &reservation);
+  if (options->max_pending_packets >
+      (SIZE_MAX - sizeof(*channel)) / sizeof(ftun_datagram_send_t)) {
+    return FTUN_E_LIMIT;
+  }
+  charge = sizeof(*channel) + options->max_pending_packets *
+    sizeof(ftun_datagram_send_t);
+  status = ftun_budget_reserve(options->budget, charge, &reservation);
   if (status != FTUN_OK) return status;
   channel = (ftun_datagram_t *)calloc(1u, sizeof(*channel));
-  if (channel == NULL) {
+  if (channel != NULL) {
+    channel->storage = (ftun_datagram_send_t *)calloc(
+      options->max_pending_packets, sizeof(*channel->storage));
+  }
+  if (channel == NULL || channel->storage == NULL) {
+    if (channel != NULL) free(channel->storage);
+    free(channel);
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
@@ -204,6 +221,11 @@ ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
   channel->max_pending_packets = options->max_pending_packets;
   channel->max_pending_bytes = options->max_pending_bytes;
   channel->accepting = 1;
+  for (index = 0u; index < options->max_pending_packets; index++) {
+    channel->storage[index].owner = channel;
+    channel->storage[index].free_next = channel->free_head;
+    channel->free_head = &channel->storage[index];
+  }
   *out = channel;
   return FTUN_OK;
 }
@@ -213,7 +235,6 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
                                  ftun_packet_t *packet)
 {
   ftun_datagram_send_t *send;
-  ftun_reservation_t *reservation = NULL;
   ftun_bytes_t payload;
   ftun_status_t status;
   if (channel == NULL || packet == NULL) return FTUN_E_INVALID;
@@ -226,15 +247,12 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
       payload.length > channel->max_pending_bytes - channel->pending_bytes) {
     return FTUN_E_LIMIT;
   }
-  status = ftun_budget_reserve(channel->budget, sizeof(*send), &reservation);
-  if (status != FTUN_OK) return status;
-  send = (ftun_datagram_send_t *)calloc(1u, sizeof(*send));
-  if (send == NULL) {
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_LIMIT;
-  }
+  send = channel->free_head;
+  if (send == NULL) return FTUN_E_STATE_CORRUPT;
+  channel->free_head = send->free_next;
+  memset(send, 0, sizeof(*send));
+  send->owner = channel;
   send->channel = channel;
-  send->reservation = reservation;
   status = ftun_packet_clone(packet, &send->packet);
   if (status != FTUN_OK) {
     ftun_datagram_release_send(send);
@@ -374,6 +392,7 @@ ftun_status_t ftun_datagram_destroy(ftun_datagram_t **channel)
   if (status != FTUN_OK) return status;
   owned->reservation = NULL;
   owned->backend.destroy(owned->backend.context);
+  free(owned->storage);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *channel = NULL;

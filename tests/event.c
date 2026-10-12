@@ -91,7 +91,7 @@ int main(void)
   CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
   state.loop = loop;
   CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK);
-  CHECK(usage.deferred_capacity == 256u && usage.source_capacity == 256u &&
+  CHECK(usage.deferred_capacity == 256u && usage.source_capacity == 1024u &&
         usage.deferred_count == 0u && usage.source_count == 0u && usage.accepting);
   CHECK(ftun_event_loop_set_wakeup(loop, wakeup, &state) == FTUN_OK);
   CHECK(ftun_event_defer(loop, NULL, &state) == FTUN_E_INVALID);
@@ -136,6 +136,16 @@ int main(void)
   CHECK(ftun_event_loop_poll(loop, 50u, 1u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 1u && state.calls == 1 &&
         state.events == (FTUN_EVENT_READ | FTUN_EVENT_ERROR));
+  state.calls = 0;
+  state.events = 0u;
+  CHECK(ftun_event_io_ready(io, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_event_io_update(io, FTUN_EVENT_WRITE | FTUN_EVENT_ERROR) ==
+        FTUN_OK);
+  CHECK(ftun_event_loop_poll(loop, 50u, 1u, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 0u && state.calls == 0);
+  CHECK(ftun_event_io_ready(io, FTUN_EVENT_WRITE) == FTUN_OK);
+  CHECK(ftun_event_loop_poll(loop, 50u, 1u, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 1u && state.calls == 1 && state.events == FTUN_EVENT_WRITE);
 
   state.calls = 0;
   state.events = 0u;
