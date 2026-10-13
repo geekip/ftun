@@ -130,7 +130,7 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          notes_file="document/release-${tag#v}.md"
+          notes_file="document/release-${tag}.md"
           if gh release view "${tag}" >/dev/null 2>&1; then
             if [[ -f "${notes_file}" ]]; then
               gh release edit "${tag}" --title "FTUN ${tag#v}" \
