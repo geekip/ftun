@@ -22,6 +22,11 @@ struct ftun_buffer_pool {
   size_t idle_bytes;
   size_t idle_buffers;
   size_t active_buffers;
+  size_t cache_hits;
+  size_t cache_misses;
+  size_t pressure_trims;
+  size_t pressure_trimmed_bytes;
+  size_t pressure_trimmed_buffers;
 };
 
 /* TASK-UTIL-002 / TEST-UTIL-002，目标 0.2.0：分档、有界闲置与所有者引用。 */
@@ -140,10 +145,22 @@ ftun_status_t ftun_buffer_pool_acquire(ftun_buffer_pool_t *pool, size_t capacity
     buffer->next = NULL;
     buffer->references = 1u;
     pool->active_buffers++;
+    pool->cache_hits++;
     *out = buffer;
     return FTUN_OK;
   }
+  pool->cache_misses++;
   status = ftun_buffer_allocate(pool->budget, pool, buffer_class, out);
+  if (status == FTUN_E_LIMIT && pool->idle != NULL) {
+    size_t idle_bytes = pool->idle_bytes;
+    size_t idle_buffers = pool->idle_buffers;
+    status = ftun_buffer_pool_trim(pool, 0u);
+    if (status != FTUN_OK) return status;
+    pool->pressure_trims++;
+    pool->pressure_trimmed_bytes += idle_bytes - pool->idle_bytes;
+    pool->pressure_trimmed_buffers += idle_buffers - pool->idle_buffers;
+    status = ftun_buffer_allocate(pool->budget, pool, buffer_class, out);
+  }
   if (status != FTUN_OK) return status;
   if (pool->active_buffers == SIZE_MAX) {
     buffer = *out;
@@ -165,6 +182,11 @@ ftun_status_t ftun_buffer_pool_get_usage(const ftun_buffer_pool_t *pool,
   out->idle_bytes = pool->idle_bytes;
   out->idle_buffers = pool->idle_buffers;
   out->active_buffers = pool->active_buffers;
+  out->cache_hits = pool->cache_hits;
+  out->cache_misses = pool->cache_misses;
+  out->pressure_trims = pool->pressure_trims;
+  out->pressure_trimmed_bytes = pool->pressure_trimmed_bytes;
+  out->pressure_trimmed_buffers = pool->pressure_trimmed_buffers;
   return FTUN_OK;
 }
 

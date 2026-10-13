@@ -111,6 +111,8 @@ static int test_nonpersistent_identity(void)
 static int test_persistent_boundary_and_core(void)
 {
   char directory[] = "/tmp/ftun-fakeip-service.XXXXXX";
+  char reservation_path[256];
+  char saved_path[256];
   ftun_fakeip_store_identity_t identity;
   ftun_fakeip_store_options_t store_options;
   ftun_fakeip_service_options_t service_options;
@@ -170,6 +172,24 @@ static int test_persistent_boundary_and_core(void)
   CHECK(ftun_fakeip_snapshot_destroy(&snapshot) == FTUN_OK);
   CHECK(ftun_runtime_manager_set_fakeip(core, NULL) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(snprintf(reservation_path, sizeof(reservation_path),
+                 "%s/reservations", directory) > 0);
+  CHECK(snprintf(saved_path, sizeof(saved_path), "%s/reservations.saved",
+                 directory) > 0);
+  CHECK(rename(reservation_path, saved_path) == 0);
+  CHECK(ftun_fakeip_store_reserve(store, 108u, &operation) == FTUN_OK);
+  CHECK(poll_until(worker, &completion, 2u) &&
+        completion.status == FTUN_E_IO);
+  CHECK(rename(saved_path, reservation_path) == 0);
+  /* A durable reservation failure halts only new issuance.  The domain
+   * index is consulted before store refresh, so already published mappings
+   * remain usable while a new name fails closed. */
+  CHECK(ftun_fakeip_service_acquire(service,
+    (ftun_string_t){"one.test", 8u}, &handle) == FTUN_OK);
+  CHECK(ftun_fakeip_handle_release(&handle) == FTUN_OK);
+  CHECK(ftun_fakeip_service_acquire(service,
+    (ftun_string_t){"two.test", 8u}, &handle) == FTUN_E_STATE_CORRUPT &&
+        handle == NULL);
   CHECK(ftun_fakeip_service_destroy(&service) == FTUN_OK);
   CHECK(ftun_fakeip_store_destroy(&store) == FTUN_OK);
   CHECK(ftun_worker_stop(worker) == FTUN_OK);

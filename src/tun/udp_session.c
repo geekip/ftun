@@ -44,6 +44,7 @@ struct ftun_udp_flow_table {
   size_t created;
   size_t expired;
   size_t failed;
+  size_t reused;
   size_t rejected_sources;
   uint64_t idle_timeout_ms;
   uint64_t now_ms;
@@ -166,9 +167,8 @@ static uint64_t ftun_udp_expiry(const ftun_udp_flow_table_t *table)
   return table->now_ms + table->idle_timeout_ms;
 }
 
-static bool ftun_udp_flow_key_equal(const ftun_udp_flow_t *flow,
-                                    const ftun_metadata_t *metadata,
-                                    const ftun_route_result_t *route)
+static bool ftun_udp_flow_stable_key_equal(const ftun_udp_flow_t *flow,
+                                           const ftun_metadata_t *metadata)
 {
   if (flow->metadata.generation != metadata->generation ||
       flow->metadata.inbound_id != metadata->inbound_id ||
@@ -176,15 +176,22 @@ static bool ftun_udp_flow_key_equal(const ftun_udp_flow_t *flow,
       flow->metadata.original_is_fake != metadata->original_is_fake ||
       !ftun_udp_endpoint_equal(&flow->metadata.source, &metadata->source) ||
       !ftun_udp_endpoint_equal(&flow->metadata.original_target,
-                               &metadata->original_target) ||
-      flow->route_pinned != (route != NULL) ||
-      (route != NULL && flow->route_outbound_id != route->outbound_id)) {
+                               &metadata->original_target)) {
     return false;
   }
   if (!metadata->original_is_fake) return true;
   return flow->metadata.domain.length == metadata->domain.length &&
          memcmp(flow->metadata.domain.data, metadata->domain.data,
                 metadata->domain.length) == 0;
+}
+
+static bool ftun_udp_flow_key_equal(const ftun_udp_flow_t *flow,
+                                    const ftun_metadata_t *metadata,
+                                    const ftun_route_result_t *route)
+{
+  return ftun_udp_flow_stable_key_equal(flow, metadata) &&
+    flow->route_pinned == (route != NULL) &&
+    (route == NULL || flow->route_outbound_id == route->outbound_id);
 }
 
 static uint64_t ftun_udp_hash_bytes(uint64_t hash, const void *data,
@@ -238,6 +245,17 @@ static ftun_udp_flow_t *ftun_udp_flow_find(ftun_udp_flow_table_t *table,
   size_t bucket = ftun_udp_flow_hash(metadata);
   for (flow = table->buckets[bucket]; flow != NULL; flow = flow->hash_next) {
     if (ftun_udp_flow_key_equal(flow, metadata, route)) return flow;
+  }
+  return NULL;
+}
+
+static ftun_udp_flow_t *ftun_udp_flow_find_existing(
+  ftun_udp_flow_table_t *table, const ftun_metadata_t *metadata)
+{
+  ftun_udp_flow_t *flow;
+  size_t bucket = ftun_udp_flow_hash(metadata);
+  for (flow = table->buckets[bucket]; flow != NULL; flow = flow->hash_next) {
+    if (ftun_udp_flow_stable_key_equal(flow, metadata)) return flow;
   }
   return NULL;
 }
@@ -550,6 +568,52 @@ ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
     flow->expires_at = ftun_udp_expiry(table);
     return FTUN_OK;
   }
+  if (!flow->failed && (status == FTUN_E_AGAIN || status == FTUN_E_LIMIT)) {
+    /* The packet was not accepted, but the established association remains
+     * valid.  Localize transient queue pressure to this datagram instead of
+     * tearing down and immediately rebuilding the flow. */
+    return status;
+  }
+  if (status == FTUN_OK) status = flow->failure_status;
+  flow->failed = true;
+  flow->failure_status = status;
+  cleanup = ftun_udp_flow_dispose(flow);
+  ftun_udp_flow_increment(&table->failed);
+  return cleanup == FTUN_OK ? status : cleanup;
+}
+
+ftun_status_t ftun_udp_flow_input_existing(ftun_udp_flow_table_t *table,
+                                           ftun_datagram_t *inbound,
+                                           const ftun_metadata_t *metadata,
+                                           ftun_packet_t *packet,
+                                           bool *found)
+{
+  ftun_udp_flow_t *flow;
+  ftun_budget_t *inbound_budget = NULL;
+  ftun_status_t status;
+  ftun_status_t cleanup;
+  if (found != NULL) *found = false;
+  if (table == NULL || inbound == NULL || metadata == NULL || packet == NULL ||
+      found == NULL || table != ftun_udp_flow_active) return FTUN_E_INVALID;
+  status = ftun_udp_metadata_validate(metadata);
+  if (status != FTUN_OK) return status;
+  if (!table->accepting) return FTUN_E_CANCELLED;
+  status = ftun_datagram_budget(inbound, &inbound_budget);
+  if (status != FTUN_OK) return status;
+  if (inbound_budget != table->budget) return FTUN_E_REJECTED;
+  flow = ftun_udp_flow_find_existing(table, metadata);
+  if (flow == NULL) return FTUN_OK;
+  *found = true;
+  if (flow->inbound != inbound) return FTUN_E_REJECTED;
+  status = ftun_datagram_send(flow->outbound, &flow->remote, packet);
+  if (status == FTUN_OK && !flow->failed) {
+    flow->expires_at = ftun_udp_expiry(table);
+    ftun_udp_flow_increment(&table->reused);
+    return FTUN_OK;
+  }
+  if (!flow->failed && (status == FTUN_E_AGAIN || status == FTUN_E_LIMIT)) {
+    return status;
+  }
   if (status == FTUN_OK) status = flow->failure_status;
   flow->failed = true;
   flow->failure_status = status;
@@ -641,6 +705,7 @@ ftun_status_t ftun_udp_flow_get_usage(const ftun_udp_flow_table_t *table,
   out->created = table->created;
   out->expired = table->expired;
   out->failed = table->failed;
+  out->reused = table->reused;
   out->rejected_sources = table->rejected_sources;
   out->now_ms = table->now_ms;
   out->accepting = table->accepting;

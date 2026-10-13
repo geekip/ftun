@@ -12,13 +12,14 @@ script_directory=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 config_file=$script_directory/fixtures/socket-inbounds.json
 temporary=$(mktemp -d "${TMPDIR:-/tmp}/ftun-idle.XXXXXX")
 echo_pid=
+dns_pid=
 ftun_pid=
 client_pid=
 
 cleanup()
 {
   status=$?
-  for process in "$client_pid" "$ftun_pid" "$echo_pid"; do
+  for process in "$client_pid" "$ftun_pid" "$dns_pid" "$echo_pid"; do
     if [ -n "$process" ]; then
       kill -TERM "$process" >/dev/null 2>&1 || true
       wait "$process" >/dev/null 2>&1 || true
@@ -27,8 +28,10 @@ cleanup()
   if [ "$status" -ne 0 ]; then
     sed -n '1,200p' "$temporary/ftun.log" >&2 || true
     sed -n '1,200p' "$temporary/echo.log" >&2 || true
+    sed -n '1,200p' "$temporary/dns.log" >&2 || true
   fi
-  rm -f "$temporary/ready" "$temporary/ftun.log" "$temporary/echo.log"
+  rm -f "$temporary/ready" "$temporary/dns.ready" \
+    "$temporary/ftun.log" "$temporary/echo.log" "$temporary/dns.log"
   rmdir "$temporary" >/dev/null 2>&1 || true
   exit "$status"
 }
@@ -42,10 +45,21 @@ process_ticks()
 "$helper_binary" --echo-server 127.0.0.1:18080 "$temporary/ready" \
   >"$temporary/echo.log" 2>&1 &
 echo_pid=$!
+"$helper_binary" --dns-server 127.0.0.1 18053 "$temporary/dns.ready" \
+  >"$temporary/dns.log" 2>&1 &
+dns_pid=$!
 attempt=0
 while [ ! -f "$temporary/ready" ]; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 100 ] || ! kill -0 "$echo_pid" 2>/dev/null; then
+    exit 1
+  fi
+  sleep 0.01
+done
+attempt=0
+while [ ! -f "$temporary/dns.ready" ]; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 100 ] || ! kill -0 "$dns_pid" 2>/dev/null; then
     exit 1
   fi
   sleep 0.01

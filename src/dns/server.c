@@ -307,6 +307,8 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   ftun_dns_answer_t *cached = NULL;
   uint8_t *cursor;
   size_t bytes;
+  size_t response_capacity;
+  ftun_status_t cache_status = FTUN_E_EOF;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || server == NULL || query == NULL || out == NULL ||
@@ -319,17 +321,34 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   if (server->now(server->now_user) >= query->deadline_ms) {
     return FTUN_E_TIMEOUT;
   }
+  if (server->cache != NULL) {
+    cache_status = ftun_dns_cache_lookup(server->cache, query, &cached);
+  }
+  if (cache_status == FTUN_OK && cached == NULL) {
+    cache_status = FTUN_E_STATE_CORRUPT;
+  }
+  response_capacity = cache_status == FTUN_OK &&
+    cached->wire_length <= server->max_response_bytes
+    ? cached->wire_length
+    : (cache_status == FTUN_E_EOF ? server->max_response_bytes : 0u);
   if (sizeof(*context) > SIZE_MAX - query->wire.length ||
       sizeof(*context) + query->wire.length > SIZE_MAX -
         query->question.name.length ||
       sizeof(*context) + query->wire.length + query->question.name.length >
-        SIZE_MAX - server->max_response_bytes) return FTUN_E_LIMIT;
+        SIZE_MAX - response_capacity) {
+    (void)ftun_dns_answer_release(&cached);
+    return FTUN_E_LIMIT;
+  }
   bytes = sizeof(*context) + query->wire.length + query->question.name.length +
-          server->max_response_bytes;
+          response_capacity;
   status = ftun_budget_reserve(server->budget, bytes, &reservation);
-  if (status != FTUN_OK) return status;
+  if (status != FTUN_OK) {
+    (void)ftun_dns_answer_release(&cached);
+    return status;
+  }
   context = (ftun_dns_exchange_context_t *)calloc(1u, bytes);
   if (context == NULL) {
+    (void)ftun_dns_answer_release(&cached);
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
@@ -360,24 +379,21 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   }
   server->inflight++;
   *out = context->operation;
-  if (server->cache != NULL) {
-    status = ftun_dns_cache_lookup(server->cache, &context->query, &cached);
-    if (status == FTUN_OK) {
-      if (cached->wire_length <= server->max_response_bytes) {
-        memcpy(context->response, cached->wire, cached->wire_length);
-        context->response_length = cached->wire_length;
-        (void)ftun_dns_answer_release(&cached);
-        return ftun_dns_server_finish(context, FTUN_OK,
-                                      FTUN_DNS_SERVER_STAGE_RESPONSE);
-      }
+  if (cache_status == FTUN_OK) {
+    if (cached->wire_length <= server->max_response_bytes) {
+      memcpy(context->response, cached->wire, cached->wire_length);
+      context->response_length = cached->wire_length;
       (void)ftun_dns_answer_release(&cached);
-      return ftun_dns_server_finish(context, FTUN_E_LIMIT,
+      return ftun_dns_server_finish(context, FTUN_OK,
                                     FTUN_DNS_SERVER_STAGE_RESPONSE);
     }
-    if (status != FTUN_E_EOF) {
-      return ftun_dns_server_finish(context, status,
-                                    FTUN_DNS_SERVER_STAGE_TRANSPORT);
-    }
+    (void)ftun_dns_answer_release(&cached);
+    return ftun_dns_server_finish(context, FTUN_E_LIMIT,
+                                  FTUN_DNS_SERVER_STAGE_RESPONSE);
+  }
+  if (cache_status != FTUN_E_EOF) {
+    return ftun_dns_server_finish(context, cache_status,
+                                  FTUN_DNS_SERVER_STAGE_TRANSPORT);
   }
   return ftun_dns_server_submit(context, server->transport);
 

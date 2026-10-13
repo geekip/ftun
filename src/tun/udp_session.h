@@ -42,6 +42,7 @@ typedef struct {
   size_t created;
   size_t expired;
   size_t failed;
+  size_t reused;
   size_t rejected_sources;
   uint64_t now_ms;
   bool accepting;
@@ -70,6 +71,13 @@ ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
                                          const ftun_metadata_t *metadata,
                                          const ftun_route_result_t *route,
                                          ftun_packet_t *packet);
+/* 仅查找并复用已经固定路由的完整键；miss 返回 OK 且 found=false，调用方
+ * 再执行首包路由。命中时不得依据当前组选择或规则重新选择出口。 */
+ftun_status_t ftun_udp_flow_input_existing(ftun_udp_flow_table_t *table,
+                                           ftun_datagram_t *inbound,
+                                           const ftun_metadata_t *metadata,
+                                           ftun_packet_t *packet,
+                                           bool *found);
 ftun_status_t ftun_udp_flow_tick(ftun_udp_flow_table_t *table,
                                  uint64_t now_ms);
 /* 只标记并回收拥有该 outbound 的 flow；单个已连接 UDP socket 的网络或

@@ -84,6 +84,8 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
 /* FRS 更新 worker 使用的脱离态候选。prepare 在 worker 内完成规则表和
  * label 绑定，并接管 view；attach 只在 owner loop 中执行预算、快照保留和
  * manager 指针提交。 */
+ftun_status_t ftun_runtime_prepare_detached(
+  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
 ftun_status_t ftun_runtime_prepare_detached_frs(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
 ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,

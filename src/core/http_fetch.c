@@ -66,7 +66,10 @@ static int ftun_http_wait(int descriptor, short events, uint64_t deadline_ms)
   do {
     result = poll(&item, 1u, timeout);
   } while (result < 0 && errno == EINTR);
-  return result == 1 && (item.revents & events) != 0;
+  /* HUP/ERR are readiness notifications too: recv/send/getsockopt must run
+   * once to drain buffered bytes or report the concrete socket error. */
+  return result == 1 &&
+    (item.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
 
 static int ftun_http_send_all(int descriptor, const uint8_t *data,

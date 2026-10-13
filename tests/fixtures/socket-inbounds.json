@@ -6,7 +6,21 @@
     "level": "silent"
   },
   "dns": {
-    "enable": false
+    "enable": true,
+    "cache": true,
+    "bootstrap": ["127.0.0.1:18053"],
+    "default-server": "real",
+    "listeners": [
+      {"listen": "127.0.0.1:21553", "server": "real"}
+    ],
+    "servers": [
+      {
+        "name": "real",
+        "type": "udp",
+        "address": ["dns.socket.test:18053"],
+        "outbound": "DIRECT"
+      }
+    ]
   },
   "inbounds": [
     {

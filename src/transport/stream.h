@@ -30,6 +30,10 @@ typedef struct {
   size_t max_pending_bytes;
   ftun_completion_fn completion;
   void *completion_user;
+  /* Any write completion has been dispatched and may have made the owner
+   * runnable again.  Optional and invoked on the owner loop. */
+  void (*progress)(void *user);
+  void *progress_user;
 } ftun_stream_options_t;
 
 typedef struct {

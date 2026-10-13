@@ -249,7 +249,8 @@ static const ftun_event_backend_ops_t ftun_libev_ops = {
   ftun_libev_wakeup,
   ftun_libev_run_once,
   ftun_libev_stop,
-  ftun_libev_destroy
+  ftun_libev_destroy,
+  true
 };
 
 /* TASK-EVENT-002 / TEST-EVENT-002，目标 0.2.0：完整 libev 4.33 epoll 适配。 */

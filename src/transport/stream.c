@@ -9,6 +9,8 @@ struct ftun_stream {
   ftun_stream_backend_t backend;
   ftun_completion_fn completion;
   void *completion_user;
+  void (*progress)(void *user);
+  void *progress_user;
   size_t max_pending_writes;
   size_t max_pending_bytes;
   size_t pending_writes;
@@ -82,6 +84,7 @@ static void ftun_stream_write_dispatched(ftun_operation_t *operation,
   stream->completions++;
   write->completion(operation, error, write->completion_user);
   stream->completions--;
+  if (stream->progress != NULL) stream->progress(stream->progress_user);
   memset(write, 0, sizeof(*write));
   write->free_next = stream->free_head;
   stream->free_head = write;
@@ -148,6 +151,8 @@ ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
   stream->backend = *backend;
   stream->completion = options->completion;
   stream->completion_user = options->completion_user;
+  stream->progress = options->progress;
+  stream->progress_user = options->progress_user;
   stream->max_pending_writes = options->max_pending_writes;
   stream->max_pending_bytes = options->max_pending_bytes;
   stream->reference_count = 1u;

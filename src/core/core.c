@@ -3,14 +3,17 @@
 #include "ftun/ftun.h"
 
 #include "config/config.h"
+#include "config/compile.h"
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/engine.h"
+#include "core/engine_dns.h"
 #include "core/http_fetch.h"
 #include "core/operation.h"
 #include "core/runtime.h"
 #include "core/state.h"
+#include "core/worker.h"
 #include "state/group_cache.h"
 #if defined(FTUN_HAVE_MODULE_FRS)
 #include "frs/frs.h"
@@ -21,17 +24,20 @@
 
 #include <stddef.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #define FTUN_CORE_DEFAULT_MEMORY (64u * 1024u * 1024u)
 #define FTUN_CORE_DEFAULT_OPERATIONS 1024u
 #define FTUN_CORE_MAX_OPERATIONS 4096u
 #define FTUN_CORE_DEFAULT_RETAINED 4u
 #define FTUN_CORE_CONTROL_STRING 4096u
+#define FTUN_CORE_RELOAD_WORK_MAGIC UINT32_C(0x4654524c)
 
 typedef enum {
   FTUN_CONTROL_POST = 1,
@@ -47,11 +53,30 @@ typedef struct ftun_control_task {
   char *first;
   char *second;
   ftun_control_kind_t kind;
+  ftun_operation_t *prepare_operation;
   pthread_mutex_t mutex;
   int cancelled;
   int ring_consumed;
   int callback_complete;
+  int async_started;
+  int async_complete;
 } ftun_control_task_t;
+
+typedef struct {
+  uint32_t magic;
+  uint32_t socket_mark;
+  uint64_t base_generation;
+  uint64_t maximum_bytes;
+  uint32_t path_length;
+} ftun_core_reload_work_t;
+
+typedef struct {
+  uint64_t base_generation;
+  uintptr_t config;
+  uintptr_t runtime;
+  uintptr_t dns_plan;
+  uintptr_t logger;
+} ftun_core_reload_result_t;
 
 typedef struct {
   pthread_mutex_t mutex;
@@ -61,6 +86,7 @@ typedef struct {
   ftun_operation_queue_t *operations;
   ftun_logger_t *logger;
   ftun_engine_t *engine;
+  ftun_worker_t *reload_worker;
   ftun_control_task_t **tasks;
   char *config_path;
   size_t task_capacity;
@@ -73,6 +99,9 @@ typedef struct {
   int stop_requested;
   int reload_pending;
 } ftun_core_control_t;
+
+static int ftun_control_task_cancelled(ftun_control_task_t *task);
+static void ftun_control_task_destroy(ftun_control_task_t *task);
 
 const char *ftun_version(void)
 {
@@ -343,6 +372,207 @@ static ftun_status_t ftun_core_runtime_prepare(
   return ftun_runtime_prepare(core, config, out);
 }
 
+#if defined(FTUN_HAVE_MODULE_FRS)
+static ftun_status_t ftun_core_reload_read_file(const char *path,
+                                                uint64_t maximum_bytes,
+                                                uint8_t **out,
+                                                size_t *out_length)
+{
+  struct stat info;
+  uint8_t *data;
+  size_t length;
+  size_t offset = 0u;
+  int descriptor;
+  if (out != NULL) *out = NULL;
+  if (out_length != NULL) *out_length = 0u;
+  if (path == NULL || out == NULL || out_length == NULL) return FTUN_E_INVALID;
+  descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (descriptor < 0) return errno == ENOENT ? FTUN_E_EOF : FTUN_E_IO;
+  if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
+      info.st_size < 0 || (uintmax_t)info.st_size > (uintmax_t)SIZE_MAX ||
+      (uintmax_t)info.st_size > maximum_bytes / 2u) {
+    (void)close(descriptor);
+    return FTUN_E_LIMIT;
+  }
+  length = (size_t)info.st_size;
+  data = (uint8_t *)malloc(length == 0u ? 1u : length);
+  if (data == NULL) {
+    (void)close(descriptor);
+    return FTUN_E_LIMIT;
+  }
+  while (offset < length) {
+    ssize_t received = read(descriptor, data + offset, length - offset);
+    if (received > 0) offset += (size_t)received;
+    else if (received < 0 && errno == EINTR) continue;
+    else {
+      free(data);
+      (void)close(descriptor);
+      return FTUN_E_IO;
+    }
+  }
+  if (close(descriptor) != 0) {
+    free(data);
+    return FTUN_E_IO;
+  }
+  *out = data;
+  *out_length = length;
+  return FTUN_OK;
+}
+#endif
+
+static void ftun_core_reload_result_release(ftun_core_reload_result_t *result)
+{
+  ftun_config_t *config;
+  ftun_runtime_t *runtime;
+  ftun_engine_dns_plan_t *dns_plan;
+  ftun_logger_t *logger;
+  if (result == NULL) return;
+  config = (ftun_config_t *)result->config;
+  runtime = (ftun_runtime_t *)result->runtime;
+  dns_plan = (ftun_engine_dns_plan_t *)result->dns_plan;
+  logger = (ftun_logger_t *)result->logger;
+#if defined(FTUN_HAVE_MODULE_FRS)
+  (void)ftun_runtime_prepared_release(&runtime);
+#else
+  (void)runtime;
+#endif
+  (void)ftun_engine_dns_plan_destroy(&dns_plan);
+  (void)ftun_logger_destroy(&logger);
+  (void)ftun_config_destroy(&config);
+  memset(result, 0, sizeof(*result));
+}
+
+static void ftun_core_reload_result_cleanup(ftun_bytes_t bytes)
+{
+  ftun_core_reload_result_t result;
+  if (bytes.data == NULL || bytes.length != sizeof(result)) return;
+  memcpy(&result, bytes.data, sizeof(result));
+  ftun_core_reload_result_release(&result);
+}
+
+static ftun_status_t ftun_core_reload_execute(
+  ftun_bytes_t input, uint8_t *output, size_t output_capacity,
+  size_t *out_output_size)
+{
+  const ftun_core_reload_work_t *work;
+  const char *path;
+  ftun_core_reload_result_t result;
+  ftun_config_t *config = NULL;
+  ftun_runtime_t *runtime = NULL;
+  ftun_engine_dns_plan_t *dns_plan = NULL;
+  ftun_logger_t *logger = NULL;
+  ftun_status_t status;
+  if (out_output_size != NULL) *out_output_size = 0u;
+  if (input.data == NULL || input.length < sizeof(*work) || output == NULL ||
+      output_capacity < sizeof(result) || out_output_size == NULL) {
+    return FTUN_E_INVALID;
+  }
+  work = (const ftun_core_reload_work_t *)input.data;
+  if (work->magic != FTUN_CORE_RELOAD_WORK_MAGIC || work->path_length == 0u ||
+      input.length != sizeof(*work) + (size_t)work->path_length + 1u ||
+      input.data[input.length - 1u] != 0u) return FTUN_E_INVALID;
+  path = (const char *)(input.data + sizeof(*work));
+  memset(&result, 0, sizeof(result));
+  status = ftun_config_load(NULL, path, &config);
+  if (status != FTUN_OK) goto done;
+#if defined(FTUN_HAVE_MODULE_FRS)
+  {
+    ftun_frs_view_t *view = NULL;
+    uint8_t *file = NULL;
+    size_t file_length = 0u;
+    ftun_http_fetch_result_t fetched;
+    ftun_budget_t *fetch_budget = NULL;
+    bool publish = false;
+    memset(&fetched, 0, sizeof(fetched));
+    if ((config->plan->prepare & FTUN_PLAN_FRS) != 0u) {
+      status = ftun_core_reload_read_file(config->frs.path,
+        work->maximum_bytes, &file, &file_length);
+      if (status == FTUN_E_EOF && config->frs.auto_update &&
+          config->frs.url != NULL && config->frs.url[0] != '\0') {
+        ftun_http_fetch_spec_t fetch_spec;
+        uint64_t now_ms;
+        memset(&fetch_spec, 0, sizeof(fetch_spec));
+        status = ftun_budget_create(NULL, (size_t)work->maximum_bytes, 0u,
+                                    &fetch_budget);
+        if (status == FTUN_OK) status = ftun_monotonic_now(&now_ms);
+        if (status == FTUN_OK && now_ms > UINT64_MAX - UINT64_C(30000)) {
+          status = FTUN_E_LIMIT;
+        }
+        if (status == FTUN_OK) {
+          ftun_string_t resolver = {NULL, 0u};
+          fetch_spec.budget = fetch_budget;
+          fetch_spec.url.data = config->frs.url;
+          fetch_spec.url.length = strlen(config->frs.url);
+          fetch_spec.maximum_bytes = (size_t)work->maximum_bytes / 2u;
+          fetch_spec.deadline_ms = now_ms + UINT64_C(30000);
+          fetch_spec.socket_mark = work->socket_mark;
+          if (config->frs.dns_server != NULL &&
+              config->frs.dns_server[0] != '\0') {
+            resolver.data = config->frs.dns_server;
+            resolver.length = strlen(config->frs.dns_server);
+          }
+          status = ftun_http_fetch_resolver(config, NULL, resolver,
+                                            &fetch_spec);
+          if (status == FTUN_OK) status = ftun_http_fetch_route(config, NULL,
+            config->frs.update_outbound, &fetch_spec);
+          if (status == FTUN_OK) status = ftun_http_fetch(&fetch_spec, &fetched);
+          if (status == FTUN_OK && fetched.status != 200u) {
+            status = FTUN_E_PROTOCOL;
+          }
+          if (status == FTUN_OK) publish = true;
+        }
+      }
+      if (status == FTUN_OK) {
+        ftun_bytes_t bytes = publish
+          ? (ftun_bytes_t){fetched.data, fetched.length}
+          : (ftun_bytes_t){file, file_length};
+        status = ftun_frs_open_bytes(bytes, &view);
+      }
+      if (status == FTUN_OK) {
+        status = ftun_runtime_prepare_detached(config, view, &runtime);
+        if (status == FTUN_OK) view = NULL;
+      }
+      if (status == FTUN_OK && publish) {
+        ftun_core_file_publish_t file_publish;
+        memset(&file_publish, 0, sizeof(file_publish));
+        status = ftun_file_write_atomic_with_hook(config->frs.path,
+          (ftun_bytes_t){fetched.data, fetched.length}, 0644u,
+          ftun_core_file_stage, &file_publish);
+        if (status != FTUN_OK &&
+            file_publish.reached >= FTUN_FILE_STAGE_RENAMED) status = FTUN_OK;
+      }
+    } else {
+      status = ftun_runtime_prepare_detached(config, NULL, &runtime);
+    }
+    free(file);
+    (void)ftun_frs_view_release(&view);
+    ftun_http_fetch_release(&fetched);
+    (void)ftun_budget_destroy(&fetch_budget);
+    if (status != FTUN_OK) goto done;
+  }
+#endif
+  status = ftun_engine_dns_plan_prepare(config, work->socket_mark, &dns_plan);
+  if (status == FTUN_OK) status = ftun_core_logger_create(config, &logger);
+
+done:
+  if (status == FTUN_OK) {
+    result.base_generation = work->base_generation;
+    result.config = (uintptr_t)config;
+    result.runtime = (uintptr_t)runtime;
+    result.dns_plan = (uintptr_t)dns_plan;
+    result.logger = (uintptr_t)logger;
+    memcpy(output, &result, sizeof(result));
+    *out_output_size = sizeof(result);
+    return FTUN_OK;
+  }
+  result.config = (uintptr_t)config;
+  result.runtime = (uintptr_t)runtime;
+  result.dns_plan = (uintptr_t)dns_plan;
+  result.logger = (uintptr_t)logger;
+  ftun_core_reload_result_release(&result);
+  return status;
+}
+
 static ftun_status_t ftun_core_transaction(ftun_core_t *core,
                                            ftun_core_control_t *control,
                                            const char *path, int reload,
@@ -454,6 +684,246 @@ done:
   return status;
 }
 
+static ftun_status_t ftun_core_reload_commit_prepared(
+  ftun_core_t *core, ftun_core_control_t *control,
+  ftun_core_reload_result_t *prepared, uint32_t *out_stage)
+{
+  const ftun_config_t *active = NULL;
+  ftun_config_t *config = (ftun_config_t *)prepared->config;
+  ftun_runtime_t *detached = (ftun_runtime_t *)prepared->runtime;
+  ftun_engine_dns_plan_t *dns_plan =
+    (ftun_engine_dns_plan_t *)prepared->dns_plan;
+  ftun_logger_t *next_logger = (ftun_logger_t *)prepared->logger;
+  ftun_runtime_t *candidate = NULL;
+  ftun_logger_t *old_logger = NULL;
+  char *next_path = NULL;
+  ftun_state_restore_info_t restore_info;
+  uint64_t now_ms;
+  uint64_t next_generation = 0u;
+  bool replace_logger = true;
+  ftun_status_t status;
+  memset(&restore_info, 0, sizeof(restore_info));
+  prepared->config = 0u;
+  prepared->runtime = 0u;
+  prepared->dns_plan = 0u;
+  prepared->logger = 0u;
+  if (out_stage != NULL) *out_stage = FTUN_STAGE_CONFIG_PREPARE;
+  status = ftun_runtime_active_config(core, &active);
+  if (status == FTUN_OK) status = ftun_core_reload_compatible(active, config);
+  if (status == FTUN_OK) {
+    ftun_runtime_manager_info_t info;
+    status = ftun_runtime_manager_get_info(core, &info);
+    if (status == FTUN_OK && info.generation != prepared->base_generation) {
+      status = FTUN_E_STALE;
+    }
+  }
+  if (status == FTUN_OK) {
+    replace_logger = !ftun_core_string_equal(active->log.level,
+                                              config->log.level) ||
+      !ftun_core_string_equal(active->log.file, config->log.file);
+    next_path = ftun_core_copy_string(config->source_path);
+    if (next_path == NULL) status = FTUN_E_LIMIT;
+  }
+#if defined(FTUN_HAVE_MODULE_FRS)
+  if (status == FTUN_OK) {
+    status = ftun_runtime_attach_prepared(core, &detached, &candidate);
+  }
+#else
+  (void)detached;
+  if (status == FTUN_OK) status = ftun_runtime_prepare(core, config, &candidate);
+#endif
+  if (status == FTUN_OK && out_stage != NULL) {
+    *out_stage = FTUN_STAGE_STATE_RESTORE;
+  }
+  if (status == FTUN_OK) status = ftun_monotonic_now(&now_ms);
+  if (status == FTUN_OK) {
+    status = ftun_state_restore_candidate_at(core, config, now_ms,
+      15u * 60u * 1000u, &restore_info);
+  }
+  if (status == FTUN_OK && out_stage != NULL) *out_stage = FTUN_STAGE_COMMIT;
+  if (status == FTUN_OK) {
+    ftun_runtime_manager_info_t info;
+    status = ftun_runtime_manager_get_info(core, &info);
+    if (status == FTUN_OK && info.generation != UINT64_MAX) {
+      next_generation = info.generation + 1u;
+    } else if (status == FTUN_OK) status = FTUN_E_LIMIT;
+  }
+  if (status == FTUN_OK) {
+    status = ftun_engine_reload_prepare_planned(control->engine, config,
+      next_generation, dns_plan);
+  }
+  if (status == FTUN_OK) status = ftun_runtime_commit(core, &candidate);
+  if (status == FTUN_OK) {
+    status = ftun_engine_reload_commit(control->engine, next_generation);
+  }
+  if (status == FTUN_OK) {
+    (void)pthread_mutex_lock(&control->mutex);
+    control->generation = next_generation;
+    (void)pthread_mutex_unlock(&control->mutex);
+    if (replace_logger) {
+      old_logger = control->logger;
+      control->logger = next_logger;
+      next_logger = NULL;
+      (void)ftun_runtime_manager_set_logger(core, control->logger);
+    }
+    free(control->config_path);
+    control->config_path = next_path;
+    next_path = NULL;
+    (void)ftun_logger_destroy(&old_logger);
+    if (restore_info.cache_discarded) {
+      ftun_core_log_status(core, FTUN_E_STALE, FTUN_STAGE_STATE_RESTORE,
+                           "discarded incompatible group cache");
+    }
+  }
+  if (candidate != NULL) (void)ftun_runtime_abort(core, &candidate);
+  if (status != FTUN_OK && control->engine != NULL) {
+    (void)ftun_engine_reload_abort(control->engine);
+  }
+#if defined(FTUN_HAVE_MODULE_FRS)
+  (void)ftun_runtime_prepared_release(&detached);
+#endif
+  (void)ftun_engine_dns_plan_destroy(&dns_plan);
+  (void)ftun_logger_destroy(&next_logger);
+  (void)ftun_config_destroy(&config);
+  free(next_path);
+  return status;
+}
+
+static void ftun_core_reload_worker_completed(
+  ftun_operation_t *operation, ftun_error_t error, ftun_bytes_t bytes,
+  void *user)
+{
+  ftun_control_task_t *task = (ftun_control_task_t *)user;
+  ftun_core_control_t *control = NULL;
+  ftun_core_reload_result_t prepared;
+  ftun_error_t result;
+  uint32_t stage = FTUN_STAGE_CONFIG_READ;
+  int destroy;
+  memset(&prepared, 0, sizeof(prepared));
+  memset(&result, 0, sizeof(result));
+  (void)pthread_mutex_lock(&task->mutex);
+  task->prepare_operation = NULL;
+  (void)pthread_mutex_unlock(&task->mutex);
+  result.status = error.status;
+  result.stage = stage;
+  if (result.status == FTUN_OK && bytes.data != NULL &&
+      bytes.length == sizeof(prepared)) {
+    memcpy(&prepared, bytes.data, sizeof(prepared));
+  } else if (result.status == FTUN_OK) {
+    result.status = FTUN_E_STATE_CORRUPT;
+  }
+  if (ftun_core_control(task->core, &control) != FTUN_OK) {
+    result.status = FTUN_E_STATE_CORRUPT;
+  }
+  if (result.status == FTUN_OK && !ftun_control_task_cancelled(task)) {
+    result.status = ftun_core_reload_commit_prepared(task->core, control,
+                                                     &prepared, &stage);
+    result.stage = stage;
+  }
+  ftun_core_reload_result_release(&prepared);
+  if (bytes.data != NULL && bytes.length == sizeof(prepared)) {
+    memset((void *)bytes.data, 0, bytes.length);
+  }
+  if (control != NULL) {
+    if (result.status != FTUN_OK && result.status != FTUN_E_CANCELLED) {
+      ftun_core_log_status(task->core, result.status, result.stage,
+                           "control operation failed");
+    }
+    (void)pthread_mutex_lock(&control->mutex);
+    control->reload_pending = 0;
+    (void)pthread_mutex_unlock(&control->mutex);
+  }
+  if (!ftun_control_task_cancelled(task)) {
+    (void)ftun_operation_complete(task->operation, result);
+  }
+  (void)operation;
+  (void)pthread_mutex_lock(&task->mutex);
+  task->async_complete = 1;
+  destroy = task->ring_consumed && task->callback_complete;
+  (void)pthread_mutex_unlock(&task->mutex);
+  if (destroy) ftun_control_task_destroy(task);
+}
+
+static ftun_status_t ftun_core_reload_schedule(ftun_core_control_t *control,
+                                               ftun_control_task_t *task)
+{
+  ftun_core_reload_work_t *work;
+  ftun_worker_job_t job;
+  ftun_budget_usage_t usage;
+  uint8_t *input;
+  ftun_operation_t *prepare_operation = NULL;
+  size_t path_length = strlen(task->first);
+  size_t input_length;
+  ftun_status_t status;
+  if (path_length > UINT32_MAX || path_length > SIZE_MAX - sizeof(*work) - 1u) {
+    return FTUN_E_LIMIT;
+  }
+  status = ftun_budget_get_usage(control->budget, &usage);
+  if (status != FTUN_OK || usage.normal_available < 512u * 1024u) {
+    return status == FTUN_OK ? FTUN_E_LIMIT : status;
+  }
+  input_length = sizeof(*work) + path_length + 1u;
+  input = (uint8_t *)calloc(1u, input_length);
+  if (input == NULL) return FTUN_E_LIMIT;
+  work = (ftun_core_reload_work_t *)input;
+  work->magic = FTUN_CORE_RELOAD_WORK_MAGIC;
+  work->maximum_bytes = usage.normal_available / 2u;
+  work->path_length = (uint32_t)path_length;
+  memcpy(input + sizeof(*work), task->first, path_length + 1u);
+  {
+    const ftun_config_t *active = NULL;
+    size_t index;
+    ftun_runtime_manager_info_t info;
+    if (ftun_runtime_manager_get_info(task->core, &info) != FTUN_OK) {
+      free(input);
+      return FTUN_E_STATE_CORRUPT;
+    }
+    work->base_generation = info.generation;
+    if (ftun_runtime_active_config(task->core, &active) == FTUN_OK) {
+      for (index = 0u; index < active->inbound_count; index++) {
+        if (active->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
+          work->socket_mark = UINT32_C(0x4654);
+          break;
+        }
+      }
+    }
+  }
+  memset(&job, 0, sizeof(job));
+  job.execute = ftun_core_reload_execute;
+  job.input.data = input;
+  job.input.length = input_length;
+  job.result_capacity = sizeof(ftun_core_reload_result_t);
+  job.accounted_extra = (size_t)work->maximum_bytes;
+  job.result_cleanup = ftun_core_reload_result_cleanup;
+  (void)pthread_mutex_lock(&task->mutex);
+  task->async_started = 1;
+  (void)pthread_mutex_unlock(&task->mutex);
+  status = ftun_worker_submit(control->reload_worker, &job,
+    ftun_core_reload_worker_completed, task, &prepare_operation);
+  free(input);
+  if (status != FTUN_OK) {
+    (void)pthread_mutex_lock(&task->mutex);
+    task->async_started = 0;
+    (void)pthread_mutex_unlock(&task->mutex);
+  } else {
+    int cancelled;
+    (void)pthread_mutex_lock(&task->mutex);
+    task->prepare_operation = prepare_operation;
+    cancelled = task->cancelled;
+    (void)pthread_mutex_unlock(&task->mutex);
+    if (cancelled) (void)ftun_operation_cancel(prepare_operation);
+  }
+  return status;
+}
+
+static void ftun_core_reload_wakeup(void *user)
+{
+  ftun_core_control_t *control = (ftun_core_control_t *)user;
+  if (control != NULL && control->engine != NULL) {
+    (void)ftun_engine_wakeup(control->engine);
+  }
+}
+
 ftun_status_t ftun_core_create(const ftun_core_options_t *options,
                                ftun_core_t **out)
 {
@@ -522,6 +992,11 @@ ftun_status_t ftun_core_create(const ftun_core_options_t *options,
 
 fail:
   if (control != NULL) {
+    if (control->reload_worker != NULL) {
+      (void)ftun_worker_stop(control->reload_worker);
+      (void)ftun_worker_join(control->reload_worker);
+      (void)ftun_worker_destroy(&control->reload_worker);
+    }
     (void)ftun_operation_queue_destroy(&control->operations);
     if (condition_initialized) {
       (void)pthread_cond_destroy(&control->condition);
@@ -538,10 +1013,16 @@ fail:
 static ftun_status_t ftun_control_task_cancel(void *user)
 {
   ftun_control_task_t *task = (ftun_control_task_t *)user;
+  ftun_operation_t *prepare_operation;
   if (task == NULL) return FTUN_E_INVALID;
   (void)pthread_mutex_lock(&task->mutex);
   task->cancelled = 1;
+  prepare_operation = task->prepare_operation;
   (void)pthread_mutex_unlock(&task->mutex);
+  if (prepare_operation != NULL) {
+    ftun_status_t status = ftun_operation_cancel(prepare_operation);
+    if (status != FTUN_OK && status != FTUN_E_STALE) return status;
+  }
   return FTUN_OK;
 }
 
@@ -560,7 +1041,8 @@ static void ftun_control_task_consumed(ftun_control_task_t *task)
   if (task == NULL) return;
   (void)pthread_mutex_lock(&task->mutex);
   task->ring_consumed = 1;
-  destroy = task->callback_complete;
+  destroy = task->callback_complete &&
+    (!task->async_started || task->async_complete);
   (void)pthread_mutex_unlock(&task->mutex);
   if (destroy) ftun_control_task_destroy(task);
 }
@@ -573,7 +1055,8 @@ static void ftun_control_task_complete(ftun_operation_t *operation,
   task->completion(operation, result, task->completion_user);
   (void)pthread_mutex_lock(&task->mutex);
   task->callback_complete = 1;
-  destroy = task->ring_consumed;
+  destroy = task->ring_consumed &&
+    (!task->async_started || task->async_complete);
   (void)pthread_mutex_unlock(&task->mutex);
   if (destroy) ftun_control_task_destroy(task);
 }
@@ -718,7 +1201,8 @@ static void ftun_core_process_task(ftun_core_t *core,
                              "group cache save failed");
       }
     }
-    status = ftun_core_transaction(core, control, task->first, 1, &stage);
+    status = ftun_core_reload_schedule(control, task);
+    if (status == FTUN_OK) return;
   } else if (task->kind == FTUN_CONTROL_SELECT) {
     status = ftun_runtime_select_names(core,
       (ftun_string_t){task->first, strlen(task->first)},
@@ -766,8 +1250,33 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   control->owner = pthread_self();
   control->owner_valid = 1;
   (void)pthread_mutex_unlock(&control->mutex);
+  /* Create owner-side workers only after the caller has entered run().  The
+   * CLI blocks its control signals immediately before this call, so workers
+   * inherit the same mask and SIGHUP remains dedicated to sigwait(). */
+  status = ftun_worker_create(control->budget, 1u,
+                              &control->reload_worker);
+  if (status == FTUN_OK) {
+    status = ftun_worker_set_wakeup(control->reload_worker,
+                                    ftun_core_reload_wakeup, control);
+  }
+  if (status != FTUN_OK) {
+    if (control->reload_worker != NULL) {
+      (void)ftun_worker_stop(control->reload_worker);
+      (void)ftun_worker_join(control->reload_worker);
+      (void)ftun_worker_destroy(&control->reload_worker);
+    }
+    (void)pthread_mutex_lock(&control->mutex);
+    control->state = FTUN_CORE_CREATED;
+    control->owner_valid = 0;
+    control->stop_requested = 0;
+    (void)pthread_mutex_unlock(&control->mutex);
+    return status;
+  }
   status = ftun_core_transaction(core, control, path, 0, &stage);
   if (status != FTUN_OK) {
+    (void)ftun_worker_stop(control->reload_worker);
+    (void)ftun_worker_join(control->reload_worker);
+    (void)ftun_worker_destroy(&control->reload_worker);
     (void)pthread_mutex_lock(&control->mutex);
     control->state = FTUN_CORE_CREATED;
     control->owner_valid = 0;
@@ -792,7 +1301,16 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
       ftun_core_process_task(core, control, task);
       ftun_control_task_consumed(task);
     }
-    status = ftun_engine_run_once(control->engine);
+    {
+      size_t reload_callbacks = 0u;
+      status = ftun_worker_poll(control->reload_worker, 1u,
+                                &reload_callbacks);
+    }
+    if (status != FTUN_OK) {
+      ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
+                           "reload worker failed");
+    }
+    if (status == FTUN_OK) status = ftun_engine_run_once(control->engine);
     if (status != FTUN_OK) {
       ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
                            "production data plane failed");
@@ -828,6 +1346,14 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     ftun_control_task_consumed(task);
   }
   (void)pthread_mutex_unlock(&control->mutex);
+  (void)ftun_worker_stop(control->reload_worker);
+  (void)ftun_worker_join(control->reload_worker);
+  {
+    size_t callbacks = 0u;
+    ftun_status_t worker_status = ftun_worker_poll(control->reload_worker,
+                                                    SIZE_MAX, &callbacks);
+    if (worker_status != FTUN_OK && status == FTUN_OK) status = worker_status;
+  }
   (void)ftun_engine_stop(control->engine);
   (void)ftun_operation_queue_stop(control->operations);
   for (;;) {
@@ -933,6 +1459,16 @@ ftun_status_t ftun_core_destroy(ftun_core_t **core)
   }
   (void)pthread_mutex_unlock(&control->mutex);
   budget = control->budget;
+  if (control->reload_worker != NULL) {
+    size_t callbacks = 0u;
+    (void)ftun_worker_stop(control->reload_worker);
+    status = ftun_worker_join(control->reload_worker);
+    if (status == FTUN_OK) {
+      status = ftun_worker_poll(control->reload_worker, SIZE_MAX, &callbacks);
+    }
+    if (status == FTUN_OK) status = ftun_worker_destroy(&control->reload_worker);
+    if (status != FTUN_OK) return status;
+  }
   (void)ftun_runtime_manager_set_logger(owned, NULL);
   (void)ftun_runtime_manager_set_control(owned, NULL);
   manager = owned;

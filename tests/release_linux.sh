@@ -207,7 +207,19 @@ while ! grep -q 'http-health' "$temporary/peer.log"; do
   fi
   sleep 0.01
 done
-"$helper_binary" --socks-domain-client 11081 health.release.test:18080
+# Seeing the probe request does not mean its worker completion has already
+# published the URL-Test choice.  Wait for the selected route rather than
+# racing the owner-side completion callback.
+attempt=0
+while ! "$helper_binary" --socks-domain-client 11081 \
+  health.release.test:18080 >/dev/null 2>&1; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 200 ] || ! kill -0 "$ftun_pid" 2>/dev/null; then
+    echo "URL-Test production route did not become ready" >&2
+    exit 1
+  fi
+  sleep 0.01
+done
 "$helper_binary" --socks-domain-client 11081 remote.release.test:18080
 if ! grep -q 'socks-domain-target' "$temporary/peer.log"; then
   echo "SOCKS target domain was not delegated to the remote proxy" >&2
@@ -223,6 +235,25 @@ while [ "$load_index" -lt "$load_runs" ]; do
 done
 "$helper_binary" --socks-udp-client 11081 192.0.2.2:18081
 "$helper_binary" --socks-udp-client 11082 192.0.2.2:18081
+if [ "${FTUN_TEST_UDP_CONTROL_CLOSE:-0}" = 1 ]; then
+  stage=socks5-udp-control-recovery
+  "$helper_binary" --socks-udp-recovery-client 11081 192.0.2.2:18081
+  if ! grep -q 'udp-control-closed' "$temporary/peer.log"; then
+    echo "SOCKS5 UDP control-close fault was not injected" >&2
+    exit 1
+  fi
+  stage=socks5-udp-reconnect-backoff
+  "$helper_binary" --socks-udp-backoff-client 11081 192.0.2.2:18081
+  backoff_attempts=$(awk '/udp-control-backoff-attempt/ {count++} END {print count+0}' \
+    "$temporary/peer.log")
+  if [ "$backoff_attempts" -lt 3 ] || [ "$backoff_attempts" -gt 5 ]; then
+    echo "SOCKS5 UDP reconnect backoff was not bounded: attempts=$backoff_attempts" >&2
+    exit 1
+  fi
+  # Let the final bounded retry window expire before unrelated UDP acceptance
+  # checks exercise the same proxy leaf.
+  sleep 1
+fi
 udp_load_packets=${FTUN_RELEASE_UDP_LOAD_PACKETS:-0}
 if [ "$udp_load_packets" -ne 0 ]; then
   "$helper_binary" --socks-udp-load-client 11081 192.0.2.2:18081 \
@@ -234,6 +265,11 @@ fi
 "$helper_binary" --client udp release-local-udp
 ip netns exec ftun-lan "$helper_binary" --client tcp release-lan-tcp
 ip netns exec ftun-lan "$helper_binary" --client udp release-lan-udp
+if [ -n "${FTUN_TEST_SEND_EAGAIN_PORT:-}" ] &&
+   ! grep -q 'ftun-test-send-eagain' "$temporary/ftun.log"; then
+  echo "UDP EAGAIN fault was not injected" >&2
+  exit 1
+fi
 tun_load_runs=${FTUN_RELEASE_TUN_LOAD_RUNS:-1}
 tun_load_bytes=${FTUN_RELEASE_TUN_LOAD_BYTES:-1048576}
 tun_load_label=${FTUN_RELEASE_TUN_LOAD_LABEL:-tun}
@@ -263,6 +299,11 @@ fi
 "$helper_binary" --dns-tcp-client 127.0.0.1 15353 192.0.2.2
 "$helper_binary" --dns-tcp-client 127.0.0.1 15354 198.18.0.1
 "$helper_binary" --dns-tcp-pipeline 127.0.0.1 15353 192.0.2.2
+if [ "${FTUN_TEST_FAKEIP_BOUNDARY_COUNT:-0}" -ne 0 ]; then
+  stage=fakeip-runtime-reservation
+  "$helper_binary" --dns-fakeip-sequence 127.0.0.1 15354 \
+    "$FTUN_TEST_FAKEIP_BOUNDARY_COUNT"
+fi
 # Both transports to port 53 traverse the TUN policy DNS hijack.
 "$helper_binary" --dns-client 192.0.2.53 53 192.0.2.2
 "$helper_binary" --dns-tcp-client 192.0.2.53 53 192.0.2.2

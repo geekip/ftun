@@ -34,9 +34,12 @@
 #define FTUN_ENGINE_DNS_MAX_LISTENERS 16u
 #define FTUN_ENGINE_DNS_MAX_TCP_CONNECTIONS 64u
 #define FTUN_ENGINE_DNS_MAX_PENDING 256u
-#define FTUN_ENGINE_DNS_MARK UINT32_C(0x4654)
 #define FTUN_ENGINE_DNS_TIMEOUT_MS UINT64_C(5000)
+#define FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MIN_MS UINT64_C(50)
+#define FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MAX_MS UINT64_C(1000)
 #define FTUN_ENGINE_DNS_WORK_MAGIC UINT32_C(0x46544451)
+#define FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES \
+  (FTUN_DNS_MAX_MESSAGE_BYTES + 263u)
 
 typedef struct {
   uint32_t magic;
@@ -57,22 +60,79 @@ enum {
   FTUN_ENGINE_DNS_SOCKS5 = 2
 };
 
+struct ftun_engine_dns_plan {
+  ftun_endpoint_t servers[FTUN_ENGINE_DNS_MAX_SERVERS];
+  ftun_endpoint_t *proxies;
+  uint8_t *proxy_valid;
+  size_t server_count;
+  size_t outbound_count;
+};
+
+typedef enum {
+  FTUN_ENGINE_DNS_REQUEST_CONNECT = 1,
+  FTUN_ENGINE_DNS_REQUEST_GREETING_SEND,
+  FTUN_ENGINE_DNS_REQUEST_GREETING_RECV,
+  FTUN_ENGINE_DNS_REQUEST_AUTH_SEND,
+  FTUN_ENGINE_DNS_REQUEST_AUTH_RECV,
+  FTUN_ENGINE_DNS_REQUEST_COMMAND_SEND,
+  FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_HEAD,
+  FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_BODY,
+  FTUN_ENGINE_DNS_REQUEST_DNS_SEND,
+  FTUN_ENGINE_DNS_REQUEST_DNS_RECV_UDP,
+  FTUN_ENGINE_DNS_REQUEST_DNS_RECV_PREFIX,
+  FTUN_ENGINE_DNS_REQUEST_DNS_RECV_BODY
+} ftun_engine_dns_request_state_t;
+
+typedef struct ftun_engine_dns_transport_waiter
+  ftun_engine_dns_transport_waiter_t;
+
 typedef struct ftun_engine_dns_transport_request {
+  struct ftun_engine_dns_transport_request *previous;
+  struct ftun_engine_dns_transport_request *next;
   struct ftun_engine_dns *dns;
-  ftun_operation_t *operation;
+  ftun_reservation_t *reservation;
+  ftun_engine_dns_transport_waiter_t *waiter_head;
+  ftun_engine_dns_transport_waiter_t *waiter_tail;
+  ftun_endpoint_t upstream;
+  ftun_endpoint_t proxy;
+  uint64_t deadline_ms;
+  uint8_t *query;
+  uint8_t *buffer;
+  size_t query_length;
+  size_t buffer_length;
+  size_t buffer_offset;
+  size_t receive_needed;
+  size_t response_length;
+  size_t username_length;
+  size_t password_length;
+  int descriptor;
+  int control_descriptor;
+  uint8_t username[UINT8_MAX];
+  uint8_t password[UINT8_MAX];
+  ftun_dns_transport_t transport;
+  ftun_engine_dns_request_state_t state;
+  uint8_t mode;
+  bool connecting;
+} ftun_engine_dns_transport_request_t;
+
+struct ftun_engine_dns_transport_waiter {
+  ftun_engine_dns_transport_waiter_t *previous;
+  ftun_engine_dns_transport_waiter_t *next;
+  ftun_engine_dns_transport_request_t *request;
   ftun_reservation_t *reservation;
   ftun_dns_transport_completion_fn completion;
   void *completion_user;
-  ftun_endpoint_t upstream;
-  ftun_dns_transport_t transport;
-  bool cancelled;
-} ftun_engine_dns_transport_request_t;
+  uint64_t deadline_ms;
+  uint16_t query_id;
+};
 
 typedef struct {
   int descriptor;
   int tcp_descriptor;
   ftun_dns_listener_t *protocol;
   size_t fixed_server;
+  uint64_t accept_after_ms;
+  uint64_t accept_backoff_ms;
   bool policy;
 } ftun_engine_dns_listener_slot_t;
 
@@ -123,6 +183,8 @@ struct ftun_engine_dns {
   ftun_operation_queue_t *operations;
   ftun_worker_t *worker;
   ftun_config_t *config;
+  ftun_endpoint_t *proxy_endpoints;
+  uint8_t *proxy_endpoint_valid;
   ftun_fakeip_service_t *fakeip;
   ftun_dns_server_t *servers[FTUN_ENGINE_DNS_MAX_SERVERS];
   ftun_engine_dns_listener_slot_t listeners[FTUN_ENGINE_DNS_MAX_LISTENERS];
@@ -131,10 +193,14 @@ struct ftun_engine_dns {
   ftun_dns_dispatcher_t *dispatcher;
   ftun_dns_cache_t *cache;
   ftun_dns_listener_t *hijack;
+  ftun_engine_dns_transport_request_t *request_head;
+  ftun_engine_dns_transport_request_t *request_tail;
+  size_t request_count;
   size_t server_count;
   size_t listener_count;
   size_t default_server;
   uint64_t next_peer_id;
+  uint32_t socket_mark;
   bool accepting;
   bool active;
 };
@@ -177,7 +243,8 @@ static int ftun_engine_dns_wait(int descriptor, short events,
   do {
     result = poll(&item, 1u, timeout);
   } while (result < 0 && errno == EINTR);
-  return result == 1 && (item.revents & events) != 0;
+  return result == 1 &&
+    (item.revents & (events | POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
 
 static int ftun_engine_dns_send_all(int descriptor, const uint8_t *data,
@@ -561,26 +628,266 @@ ftun_status_t ftun_engine_dns_query_blocking(
   return status;
 }
 
-static void ftun_engine_dns_worker_completed(ftun_operation_t *operation,
-                                              ftun_error_t error,
-                                              ftun_bytes_t result, void *user)
+static void ftun_engine_dns_request_unlink(
+  ftun_engine_dns_transport_request_t *request)
 {
-  ftun_engine_dns_transport_request_t *request =
-    (ftun_engine_dns_transport_request_t *)user;
-  ftun_reservation_t *reservation = request->reservation;
-  request->operation = NULL;
-  if (!request->cancelled) {
-    request->completion(request->completion_user, error.status,
-      request->transport, &request->upstream, result);
+  ftun_engine_dns_t *dns = request->dns;
+  if (request->previous != NULL) request->previous->next = request->next;
+  else dns->request_head = request->next;
+  if (request->next != NULL) request->next->previous = request->previous;
+  else dns->request_tail = request->previous;
+  request->previous = NULL;
+  request->next = NULL;
+  if (dns->request_count != 0u) dns->request_count--;
+}
+
+static void ftun_engine_dns_request_close(
+  ftun_engine_dns_transport_request_t *request)
+{
+  if (request->descriptor >= 0 &&
+      request->descriptor != request->control_descriptor) {
+    (void)close(request->descriptor);
   }
-  (void)operation;
+  if (request->control_descriptor >= 0) {
+    (void)close(request->control_descriptor);
+  }
+  request->descriptor = -1;
+  request->control_descriptor = -1;
+}
+
+static void ftun_engine_dns_request_release(
+  ftun_engine_dns_transport_request_t *request)
+{
+  ftun_reservation_t *reservation;
+  if (request == NULL) return;
+  reservation = request->reservation;
+  ftun_engine_dns_request_close(request);
   memset(request, 0, sizeof(*request));
   free(request);
   (void)ftun_reservation_release(&reservation);
 }
 
+static void ftun_engine_dns_waiter_unlink(
+  ftun_engine_dns_transport_waiter_t *waiter)
+{
+  ftun_engine_dns_transport_request_t *request = waiter->request;
+  if (waiter->previous != NULL) waiter->previous->next = waiter->next;
+  else request->waiter_head = waiter->next;
+  if (waiter->next != NULL) waiter->next->previous = waiter->previous;
+  else request->waiter_tail = waiter->previous;
+  waiter->previous = NULL;
+  waiter->next = NULL;
+  waiter->request = NULL;
+}
+
+static void ftun_engine_dns_waiter_release(
+  ftun_engine_dns_transport_waiter_t *waiter)
+{
+  ftun_reservation_t *reservation = waiter->reservation;
+  memset(waiter, 0, sizeof(*waiter));
+  free(waiter);
+  (void)ftun_reservation_release(&reservation);
+}
+
+static void ftun_engine_dns_waiter_finish(
+  ftun_engine_dns_transport_waiter_t *waiter, ftun_status_t status,
+  ftun_bytes_t response)
+{
+  ftun_engine_dns_transport_request_t *request = waiter->request;
+  ftun_dns_transport_completion_fn completion = waiter->completion;
+  void *completion_user = waiter->completion_user;
+  ftun_endpoint_t upstream = request->upstream;
+  ftun_dns_transport_t transport = request->transport;
+  ftun_engine_dns_waiter_unlink(waiter);
+  completion(completion_user, status, transport, &upstream, response);
+  ftun_engine_dns_waiter_release(waiter);
+}
+
+static void ftun_engine_dns_request_finish(
+  ftun_engine_dns_transport_request_t *request, ftun_status_t status)
+{
+  ftun_engine_dns_request_unlink(request);
+  while (request->waiter_head != NULL) {
+    ftun_engine_dns_transport_waiter_t *waiter = request->waiter_head;
+    ftun_bytes_t response = {NULL, 0u};
+    if (status == FTUN_OK) {
+      request->buffer[0] = (uint8_t)(waiter->query_id >> 8u);
+      request->buffer[1] = (uint8_t)waiter->query_id;
+      response.data = request->buffer;
+      response.length = request->response_length;
+    }
+    ftun_engine_dns_waiter_finish(waiter, status, response);
+  }
+  ftun_engine_dns_request_release(request);
+}
+
+static ftun_status_t ftun_engine_dns_request_open(
+  ftun_engine_dns_transport_request_t *request, int type,
+  const ftun_endpoint_t *target, bool control)
+{
+  struct sockaddr_in address;
+  int descriptor;
+  int flags;
+  if (request == NULL || target == NULL ||
+      target->kind != FTUN_ADDRESS_IPV4 || target->port == 0u) {
+    return FTUN_E_INVALID;
+  }
+  descriptor = socket(AF_INET, type | SOCK_CLOEXEC, 0);
+  if (descriptor < 0) return ftun_engine_dns_errno(errno);
+#if defined(SO_MARK)
+  if (request->dns->socket_mark != 0u &&
+      setsockopt(descriptor, SOL_SOCKET, SO_MARK, &request->dns->socket_mark,
+                 (socklen_t)sizeof(request->dns->socket_mark)) != 0) {
+    ftun_status_t status = ftun_engine_dns_errno(errno);
+    (void)close(descriptor);
+    return status;
+  }
+#endif
+  flags = fcntl(descriptor, F_GETFL, 0);
+  if (flags < 0 || fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) != 0) {
+    (void)close(descriptor);
+    return FTUN_E_IO;
+  }
+  memset(&address, 0, sizeof(address));
+  address.sin_family = AF_INET;
+  address.sin_port = htons(target->port);
+  memcpy(&address.sin_addr.s_addr, target->address, 4u);
+  request->connecting = false;
+  if (connect(descriptor, (const struct sockaddr *)&address,
+              (socklen_t)sizeof(address)) != 0) {
+    if (errno != EINPROGRESS && errno != EALREADY && errno != EINTR) {
+      ftun_status_t status = ftun_engine_dns_errno(errno);
+      (void)close(descriptor);
+      return status;
+    }
+    request->connecting = true;
+  }
+  if (control) request->control_descriptor = descriptor;
+  request->descriptor = descriptor;
+  request->state = FTUN_ENGINE_DNS_REQUEST_CONNECT;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_connected(
+  ftun_engine_dns_transport_request_t *request, bool *connected)
+{
+  struct pollfd item;
+  int error_code = 0;
+  socklen_t error_length = (socklen_t)sizeof(error_code);
+  *connected = !request->connecting;
+  if (!request->connecting) return FTUN_OK;
+  memset(&item, 0, sizeof(item));
+  item.fd = request->descriptor;
+  item.events = POLLOUT;
+  if (poll(&item, 1u, 0) < 0) {
+    return errno == EINTR ? FTUN_E_AGAIN : ftun_engine_dns_errno(errno);
+  }
+  if ((item.revents & (POLLOUT | POLLERR | POLLHUP | POLLNVAL)) == 0) {
+    return FTUN_E_AGAIN;
+  }
+  if (getsockopt(request->descriptor, SOL_SOCKET, SO_ERROR, &error_code,
+                 &error_length) != 0) return ftun_engine_dns_errno(errno);
+  if (error_code != 0) return ftun_engine_dns_errno(error_code);
+  request->connecting = false;
+  *connected = true;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_send(
+  ftun_engine_dns_transport_request_t *request)
+{
+  while (request->buffer_offset < request->buffer_length) {
+    ssize_t sent = send(request->descriptor,
+      request->buffer + request->buffer_offset,
+      request->buffer_length - request->buffer_offset, MSG_NOSIGNAL);
+    if (sent > 0) {
+      request->buffer_offset += (size_t)sent;
+      if (request->transport == FTUN_DNS_TRANSPORT_UDP &&
+          request->buffer_offset != request->buffer_length) {
+        return FTUN_E_PROTOCOL;
+      }
+      continue;
+    }
+    if (sent < 0 && errno == EINTR) continue;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK ||
+                     errno == EINPROGRESS || errno == EALREADY ||
+                     errno == ENOTCONN)) return FTUN_E_AGAIN;
+    return sent == 0 ? FTUN_E_EOF : ftun_engine_dns_errno(errno);
+  }
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_receive(
+  ftun_engine_dns_transport_request_t *request, size_t needed)
+{
+  while (request->buffer_length < needed) {
+    ssize_t received = recv(request->descriptor,
+      request->buffer + request->buffer_length,
+      needed - request->buffer_length, 0);
+    if (received > 0) {
+      request->buffer_length += (size_t)received;
+      continue;
+    }
+    if (received < 0 && errno == EINTR) continue;
+    if (received < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return FTUN_E_AGAIN;
+    }
+    return received == 0 ? FTUN_E_EOF : ftun_engine_dns_errno(errno);
+  }
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_command(
+  ftun_engine_dns_transport_request_t *request)
+{
+  ftun_endpoint_t target = request->upstream;
+  size_t written = 0u;
+  if (request->transport == FTUN_DNS_TRANSPORT_UDP) {
+    memset(target.address, 0, 4u);
+    target.port = 0u;
+  }
+  request->buffer_offset = 0u;
+  request->buffer_length = 0u;
+  if (ftun_socks5_encode_request(
+      request->transport == FTUN_DNS_TRANSPORT_UDP
+        ? FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE : FTUN_SOCKS5_COMMAND_CONNECT,
+      &target, request->buffer, FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES,
+      &written) != FTUN_OK) return FTUN_E_PROTOCOL;
+  request->buffer_length = written;
+  request->state = FTUN_ENGINE_DNS_REQUEST_COMMAND_SEND;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_dns_send(
+  ftun_engine_dns_transport_request_t *request)
+{
+  size_t written;
+  request->buffer_offset = 0u;
+  request->buffer_length = 0u;
+  if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
+    if (request->query_length > UINT16_MAX) return FTUN_E_LIMIT;
+    request->buffer[0] = (uint8_t)(request->query_length >> 8u);
+    request->buffer[1] = (uint8_t)request->query_length;
+    memcpy(request->buffer + 2u, request->query, request->query_length);
+    request->buffer_length = request->query_length + 2u;
+  } else if (request->mode == FTUN_ENGINE_DNS_SOCKS5) {
+    written = 0u;
+    if (ftun_socks5_encode_udp_datagram(&request->upstream,
+        (ftun_bytes_t){request->query, request->query_length},
+        request->buffer, FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES,
+        &written) != FTUN_OK) return FTUN_E_PROTOCOL;
+    request->buffer_length = written;
+  } else {
+    memcpy(request->buffer, request->query, request->query_length);
+    request->buffer_length = request->query_length;
+  }
+  request->state = FTUN_ENGINE_DNS_REQUEST_DNS_SEND;
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_engine_dns_resolve_upstream(
-  const ftun_config_t *config, const char *text, ftun_endpoint_t *out);
+  const ftun_config_t *config, const char *text, uint32_t socket_mark,
+  ftun_endpoint_t *out);
 
 static ftun_status_t ftun_engine_dns_outbound(
   ftun_engine_dns_t *dns, uint32_t requested, uint8_t *mode,
@@ -612,9 +919,12 @@ static ftun_status_t ftun_engine_dns_outbound(
       const ftun_config_outbound_t *item =
         &dns->config->outbounds[current - FTUN_OUTBOUND_ID_NAMED_BASE];
       if (item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
-        status = ftun_engine_dns_resolve_upstream(dns->config, item->server,
-                                                  proxy);
-        if (status == FTUN_OK) {
+        size_t index = current - FTUN_OUTBOUND_ID_NAMED_BASE;
+        if (dns->proxy_endpoint_valid == NULL ||
+            dns->proxy_endpoint_valid[index] == 0u) {
+          status = FTUN_E_RESOLVE;
+        } else {
+          *proxy = dns->proxy_endpoints[index];
           *mode = FTUN_ENGINE_DNS_SOCKS5;
           *username = item->username;
           *password = item->password;
@@ -641,6 +951,280 @@ static ftun_status_t ftun_engine_dns_outbound(
   return status;
 }
 
+static ftun_status_t ftun_engine_dns_request_drive_connected(
+  ftun_engine_dns_transport_request_t *request)
+{
+  bool connected = false;
+  ftun_status_t status = ftun_engine_dns_request_connected(request,
+                                                            &connected);
+  if (status != FTUN_OK || !connected) return status;
+  if (request->mode == FTUN_ENGINE_DNS_DIRECT ||
+      request->descriptor != request->control_descriptor) {
+    return ftun_engine_dns_request_dns_send(request);
+  }
+  request->buffer[0] = FTUN_SOCKS5_VERSION;
+  request->buffer[1] = 1u;
+  request->buffer[2] = request->username_length == 0u
+    ? FTUN_SOCKS5_METHOD_NO_AUTH : FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
+  request->buffer_offset = 0u;
+  request->buffer_length = 3u;
+  request->state = FTUN_ENGINE_DNS_REQUEST_GREETING_SEND;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_dns_request_drive(
+  ftun_engine_dns_transport_request_t *request)
+{
+  size_t steps;
+  for (steps = 0u; steps < 16u; steps++) {
+    ftun_status_t status;
+    if (ftun_engine_dns_now(NULL) >= request->deadline_ms) {
+      return FTUN_E_TIMEOUT;
+    }
+    switch (request->state) {
+      case FTUN_ENGINE_DNS_REQUEST_CONNECT:
+        status = ftun_engine_dns_request_drive_connected(request);
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_GREETING_SEND:
+        status = ftun_engine_dns_request_send(request);
+        if (status == FTUN_OK) {
+          request->buffer_length = 0u;
+          request->receive_needed = 2u;
+          request->state = FTUN_ENGINE_DNS_REQUEST_GREETING_RECV;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_GREETING_RECV:
+        status = ftun_engine_dns_request_receive(request,
+                                                 request->receive_needed);
+        if (status == FTUN_OK) {
+          uint8_t expected = request->username_length == 0u
+            ? FTUN_SOCKS5_METHOD_NO_AUTH : FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
+          if (request->buffer[0] != FTUN_SOCKS5_VERSION ||
+              request->buffer[1] != expected) return FTUN_E_REJECTED;
+          if (request->username_length == 0u) {
+            status = ftun_engine_dns_request_command(request);
+          } else {
+            size_t written = 0u;
+            status = ftun_socks5_encode_credentials(
+              (ftun_bytes_t){request->username, request->username_length},
+              (ftun_bytes_t){request->password, request->password_length},
+              request->buffer, FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES,
+              &written);
+            if (status == FTUN_OK) {
+              request->buffer_offset = 0u;
+              request->buffer_length = written;
+              request->state = FTUN_ENGINE_DNS_REQUEST_AUTH_SEND;
+            }
+          }
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_AUTH_SEND:
+        status = ftun_engine_dns_request_send(request);
+        if (status == FTUN_OK) {
+          request->buffer_length = 0u;
+          request->receive_needed = 2u;
+          request->state = FTUN_ENGINE_DNS_REQUEST_AUTH_RECV;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_AUTH_RECV:
+        status = ftun_engine_dns_request_receive(request,
+                                                 request->receive_needed);
+        if (status == FTUN_OK) {
+          if (request->buffer[0] != FTUN_SOCKS5_AUTH_VERSION ||
+              request->buffer[1] != 0u) return FTUN_E_REJECTED;
+          status = ftun_engine_dns_request_command(request);
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_COMMAND_SEND:
+        status = ftun_engine_dns_request_send(request);
+        if (status == FTUN_OK) {
+          request->buffer_length = 0u;
+          request->receive_needed = 4u;
+          request->state = FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_HEAD;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_HEAD:
+        status = ftun_engine_dns_request_receive(request,
+                                                 request->receive_needed);
+        if (status == FTUN_OK) {
+          if (request->buffer[0] != FTUN_SOCKS5_VERSION ||
+              request->buffer[1] != FTUN_SOCKS5_REPLY_SUCCEEDED ||
+              request->buffer[2] != 0u) return FTUN_E_REJECTED;
+          if (request->buffer[3] == 1u) request->receive_needed = 10u;
+          else if (request->buffer[3] == 4u) request->receive_needed = 22u;
+          else if (request->buffer[3] == 3u) request->receive_needed = 5u;
+          else return FTUN_E_PROTOCOL;
+          request->state = FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_BODY;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_COMMAND_RECV_BODY:
+        status = ftun_engine_dns_request_receive(request,
+                                                 request->receive_needed);
+        if (status == FTUN_OK && request->buffer[3] == 3u &&
+            request->receive_needed == 5u) {
+          request->receive_needed = 7u + request->buffer[4];
+          if (request->receive_needed >
+              FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES) return FTUN_E_LIMIT;
+          break;
+        }
+        if (status == FTUN_OK) {
+          ftun_socks5_reply_t reply;
+          size_t consumed = 0u;
+          status = ftun_socks5_decode_reply(
+            (ftun_bytes_t){request->buffer, request->receive_needed},
+            &reply, &consumed);
+          if (status != FTUN_OK || consumed != request->receive_needed ||
+              reply.reply != FTUN_SOCKS5_REPLY_SUCCEEDED) {
+            return status == FTUN_OK ? FTUN_E_REJECTED : status;
+          }
+          if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
+            status = ftun_engine_dns_request_dns_send(request);
+          } else {
+            ftun_endpoint_t relay = reply.endpoint;
+            if (relay.kind != FTUN_ADDRESS_IPV4 || relay.port == 0u) {
+              return FTUN_E_UNSUPPORTED;
+            }
+            if (relay.address[0] == 0u && relay.address[1] == 0u &&
+                relay.address[2] == 0u && relay.address[3] == 0u) {
+              memcpy(relay.address, request->proxy.address, 4u);
+            }
+            request->descriptor = -1;
+            status = ftun_engine_dns_request_open(request, SOCK_DGRAM,
+                                                   &relay, false);
+          }
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_DNS_SEND:
+        status = ftun_engine_dns_request_send(request);
+        if (status == FTUN_OK) {
+          request->buffer_length = 0u;
+          request->buffer_offset = 0u;
+          request->state = request->transport == FTUN_DNS_TRANSPORT_UDP
+            ? FTUN_ENGINE_DNS_REQUEST_DNS_RECV_UDP
+            : FTUN_ENGINE_DNS_REQUEST_DNS_RECV_PREFIX;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_DNS_RECV_UDP:
+        do {
+          ssize_t received = recv(request->descriptor, request->buffer,
+            FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES, 0);
+          if (received > 0) {
+            if (request->mode == FTUN_ENGINE_DNS_SOCKS5) {
+              ftun_socks5_udp_datagram_t datagram;
+              size_t consumed = 0u;
+              status = ftun_socks5_decode_udp_datagram(
+                (ftun_bytes_t){request->buffer, (size_t)received},
+                &datagram, &consumed);
+              if (status == FTUN_OK &&
+                  (consumed != (size_t)received ||
+                   datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
+                   datagram.endpoint.port != request->upstream.port ||
+                   memcmp(datagram.endpoint.address,
+                          request->upstream.address, 4u) != 0)) {
+                status = FTUN_E_REJECTED;
+              }
+              if (status != FTUN_OK) return status;
+              memmove(request->buffer, datagram.payload.data,
+                      datagram.payload.length);
+              request->response_length = datagram.payload.length;
+            } else {
+              request->response_length = (size_t)received;
+            }
+            return FTUN_OK;
+          }
+          if (received == 0) return FTUN_E_EOF;
+          if (errno == EINTR) continue;
+          return errno == EAGAIN || errno == EWOULDBLOCK
+            ? FTUN_E_AGAIN : ftun_engine_dns_errno(errno);
+        } while (true);
+      case FTUN_ENGINE_DNS_REQUEST_DNS_RECV_PREFIX:
+        status = ftun_engine_dns_request_receive(request, 2u);
+        if (status == FTUN_OK) {
+          request->receive_needed = ((size_t)request->buffer[0] << 8u) |
+                                    request->buffer[1];
+          if (request->receive_needed == 0u ||
+              request->receive_needed > FTUN_DNS_MAX_MESSAGE_BYTES) {
+            return FTUN_E_LIMIT;
+          }
+          request->buffer_length = 0u;
+          request->state = FTUN_ENGINE_DNS_REQUEST_DNS_RECV_BODY;
+        }
+        break;
+      case FTUN_ENGINE_DNS_REQUEST_DNS_RECV_BODY:
+        status = ftun_engine_dns_request_receive(request,
+                                                 request->receive_needed);
+        if (status == FTUN_OK) {
+          request->response_length = request->receive_needed;
+          return FTUN_OK;
+        }
+        break;
+      default:
+        return FTUN_E_STATE_CORRUPT;
+    }
+    if (status == FTUN_E_AGAIN) return status;
+    if (status != FTUN_OK) return status;
+  }
+  return FTUN_E_AGAIN;
+}
+
+static int ftun_engine_dns_request_matches(
+  const ftun_engine_dns_transport_request_t *request,
+  const ftun_endpoint_t *upstream, ftun_dns_transport_t transport,
+  uint8_t mode, const ftun_endpoint_t *proxy, const char *username,
+  const char *password, ftun_bytes_t query)
+{
+  size_t username_length = username == NULL ? 0u : strlen(username);
+  size_t password_length = password == NULL ? 0u : strlen(password);
+  return request->transport == transport && request->mode == mode &&
+    request->upstream.kind == upstream->kind &&
+    request->upstream.port == upstream->port &&
+    memcmp(request->upstream.address, upstream->address, 4u) == 0 &&
+    request->proxy.kind == proxy->kind && request->proxy.port == proxy->port &&
+    memcmp(request->proxy.address, proxy->address, 4u) == 0 &&
+    request->username_length == username_length &&
+    request->password_length == password_length &&
+    (username_length == 0u ||
+     memcmp(request->username, username, username_length) == 0) &&
+    (password_length == 0u ||
+     memcmp(request->password, password, password_length) == 0) &&
+    request->query_length == query.length && query.length >= 2u &&
+    memcmp(request->query + 2u, query.data + 2u, query.length - 2u) == 0;
+}
+
+static ftun_status_t ftun_engine_dns_waiter_create(
+  ftun_engine_dns_t *dns, ftun_engine_dns_transport_request_t *request,
+  ftun_bytes_t query, uint64_t deadline_ms,
+  ftun_dns_transport_completion_fn completion, void *completion_user,
+  ftun_engine_dns_transport_waiter_t **out)
+{
+  ftun_engine_dns_transport_waiter_t *waiter;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  status = ftun_budget_reserve(dns->budget, sizeof(*waiter), &reservation);
+  if (status != FTUN_OK) return status;
+  waiter = (ftun_engine_dns_transport_waiter_t *)calloc(1u,
+                                                        sizeof(*waiter));
+  if (waiter == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  waiter->request = request;
+  waiter->reservation = reservation;
+  waiter->completion = completion;
+  waiter->completion_user = completion_user;
+  waiter->deadline_ms = deadline_ms;
+  waiter->query_id = (uint16_t)(((uint16_t)query.data[0] << 8u) |
+                                query.data[1]);
+  waiter->previous = request->waiter_tail;
+  if (request->waiter_tail != NULL) request->waiter_tail->next = waiter;
+  else request->waiter_head = waiter;
+  request->waiter_tail = waiter;
+  if (deadline_ms > request->deadline_ms) request->deadline_ms = deadline_ms;
+  *out = waiter;
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_engine_dns_transport_submit(
   void *user, uint32_t outbound_id, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t transport, ftun_bytes_t query, uint64_t deadline_ms,
@@ -649,12 +1233,10 @@ static ftun_status_t ftun_engine_dns_transport_submit(
 {
   ftun_engine_dns_t *dns = (ftun_engine_dns_t *)user;
   ftun_engine_dns_transport_request_t *request;
-  ftun_engine_dns_work_header_t *header;
+  ftun_engine_dns_transport_waiter_t *waiter = NULL;
   ftun_endpoint_t proxy;
-  ftun_worker_job_t job;
   ftun_reservation_t *reservation = NULL;
-  uint8_t *input;
-  size_t input_length;
+  size_t bytes;
   size_t username_length;
   size_t password_length;
   const char *username;
@@ -664,74 +1246,80 @@ static ftun_status_t ftun_engine_dns_transport_submit(
   if (out_request != NULL) *out_request = NULL;
   if (dns == NULL || upstream == NULL || upstream->kind != FTUN_ADDRESS_IPV4 ||
       query.data == NULL || query.length < 12u || query.length > UINT32_MAX ||
-      completion == NULL || out_request == NULL) return FTUN_E_INVALID;
+      completion == NULL || out_request == NULL || deadline_ms == 0u) {
+    return FTUN_E_INVALID;
+  }
+  if (ftun_engine_dns_now(NULL) >= deadline_ms) return FTUN_E_TIMEOUT;
   status = ftun_engine_dns_outbound(dns, outbound_id, &mode, &proxy,
                                     &username, &password);
   if (status != FTUN_OK) return status;
   username_length = username == NULL ? 0u : strlen(username);
   password_length = password == NULL ? 0u : strlen(password);
   if (username_length > UINT8_MAX || password_length > UINT8_MAX ||
-      query.length > SIZE_MAX - sizeof(*header) - username_length -
-                     password_length) return FTUN_E_LIMIT;
-  input_length = sizeof(*header) + username_length + password_length +
-                 query.length;
-  status = ftun_budget_reserve(dns->budget, sizeof(*request), &reservation);
+      (username_length == 0u) != (password_length == 0u) ||
+      query.length > SIZE_MAX - sizeof(*request) ||
+      sizeof(*request) + query.length > SIZE_MAX -
+        FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES) return FTUN_E_LIMIT;
+  for (request = dns->request_head; request != NULL; request = request->next) {
+    if (!ftun_engine_dns_request_matches(request, upstream, transport, mode,
+                                         &proxy, username, password, query)) {
+      continue;
+    }
+    status = ftun_engine_dns_waiter_create(dns, request, query, deadline_ms,
+      completion, completion_user, &waiter);
+    if (status == FTUN_OK) *out_request = waiter;
+    return status;
+  }
+  if (dns->request_count >= FTUN_ENGINE_DNS_MAX_PENDING) return FTUN_E_LIMIT;
+  bytes = sizeof(*request) + query.length +
+          FTUN_ENGINE_DNS_TRANSPORT_BUFFER_BYTES;
+  status = ftun_budget_reserve(dns->budget, bytes, &reservation);
   if (status != FTUN_OK) return status;
-  request = (ftun_engine_dns_transport_request_t *)calloc(1u,
-                                                           sizeof(*request));
-  input = (uint8_t *)malloc(input_length);
-  if (request == NULL || input == NULL) {
-    free(input);
-    free(request);
+  request = (ftun_engine_dns_transport_request_t *)calloc(1u, bytes);
+  if (request == NULL) {
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
-  header = (ftun_engine_dns_work_header_t *)input;
-  memset(header, 0, sizeof(*header));
-  header->magic = FTUN_ENGINE_DNS_WORK_MAGIC;
-  header->mark = FTUN_ENGINE_DNS_MARK;
-  header->port = upstream->port;
-  header->transport = (uint8_t)transport;
-  header->mode = mode;
-  header->username_length = (uint8_t)username_length;
-  header->password_length = (uint8_t)password_length;
-  memcpy(header->address, upstream->address, 4u);
-  if (mode == FTUN_ENGINE_DNS_SOCKS5) {
-    header->proxy_port = proxy.port;
-    memcpy(header->proxy_address, proxy.address, 4u);
-  }
-  header->wire_length = (uint32_t)query.length;
-  if (username_length != 0u) {
-    memcpy(input + sizeof(*header), username, username_length);
-  }
-  if (password_length != 0u) {
-    memcpy(input + sizeof(*header) + username_length, password,
-           password_length);
-  }
-  memcpy(input + sizeof(*header) + username_length + password_length,
-         query.data, query.length);
   request->dns = dns;
   request->reservation = reservation;
-  request->completion = completion;
-  request->completion_user = completion_user;
   request->upstream = *upstream;
+  request->proxy = proxy;
+  request->deadline_ms = deadline_ms;
+  request->query = (uint8_t *)(request + 1);
+  request->buffer = request->query + query.length;
+  request->query_length = query.length;
+  request->username_length = username_length;
+  request->password_length = password_length;
+  request->descriptor = -1;
+  request->control_descriptor = -1;
   request->transport = transport;
-  memset(&job, 0, sizeof(job));
-  job.execute = ftun_engine_dns_execute;
-  job.input.data = input;
-  job.input.length = input_length;
-  job.result_capacity = FTUN_DNS_MAX_MESSAGE_BYTES;
-  job.deadline_ms = deadline_ms;
-  status = ftun_worker_submit(dns->worker, &job,
-                              ftun_engine_dns_worker_completed, request,
-                              &request->operation);
-  free(input);
+  request->mode = mode;
+  memcpy(request->query, query.data, query.length);
+  if (username_length != 0u) {
+    memcpy(request->username, username, username_length);
+    memcpy(request->password, password, password_length);
+  }
+  status = ftun_engine_dns_request_open(request,
+    mode == FTUN_ENGINE_DNS_SOCKS5 || transport == FTUN_DNS_TRANSPORT_TCP
+      ? SOCK_STREAM : SOCK_DGRAM,
+    mode == FTUN_ENGINE_DNS_SOCKS5 ? &request->proxy : &request->upstream,
+    mode == FTUN_ENGINE_DNS_SOCKS5);
   if (status != FTUN_OK) {
-    free(request);
-    (void)ftun_reservation_release(&reservation);
+    ftun_engine_dns_request_release(request);
     return status;
   }
-  *out_request = request;
+  status = ftun_engine_dns_waiter_create(dns, request, query, deadline_ms,
+    completion, completion_user, &waiter);
+  if (status != FTUN_OK) {
+    ftun_engine_dns_request_release(request);
+    return status;
+  }
+  request->previous = dns->request_tail;
+  if (dns->request_tail != NULL) dns->request_tail->next = request;
+  else dns->request_head = request;
+  dns->request_tail = request;
+  dns->request_count++;
+  *out_request = waiter;
   return FTUN_OK;
 }
 
@@ -739,18 +1327,19 @@ static ftun_status_t ftun_engine_dns_transport_cancel(void *user,
                                                        void **request_ptr)
 {
   ftun_engine_dns_t *dns = (ftun_engine_dns_t *)user;
+  ftun_engine_dns_transport_waiter_t *waiter;
   ftun_engine_dns_transport_request_t *request;
-  ftun_status_t status;
   if (dns == NULL || request_ptr == NULL || *request_ptr == NULL) {
     return FTUN_E_INVALID;
   }
-  request = (ftun_engine_dns_transport_request_t *)*request_ptr;
-  if (request->dns != dns || request->operation == NULL) return FTUN_E_STALE;
-  request->cancelled = true;
-  status = ftun_operation_cancel(request->operation);
-  if (status != FTUN_OK && status != FTUN_E_STALE) {
-    request->cancelled = false;
-    return status;
+  waiter = (ftun_engine_dns_transport_waiter_t *)*request_ptr;
+  request = waiter->request;
+  if (request == NULL || request->dns != dns) return FTUN_E_STALE;
+  ftun_engine_dns_waiter_unlink(waiter);
+  ftun_engine_dns_waiter_release(waiter);
+  if (request->waiter_head == NULL) {
+    ftun_engine_dns_request_unlink(request);
+    ftun_engine_dns_request_release(request);
   }
   *request_ptr = NULL;
   return FTUN_OK;
@@ -858,7 +1447,8 @@ static ftun_status_t ftun_engine_dns_encode_bootstrap_query(
 }
 
 static ftun_status_t ftun_engine_dns_resolve_upstream(
-  const ftun_config_t *config, const char *text, ftun_endpoint_t *out)
+  const ftun_config_t *config, const char *text, uint32_t socket_mark,
+  ftun_endpoint_t *out)
 {
   uint8_t query[FTUN_DNS_HEADER_BYTES + FTUN_DNS_MAX_NAME_BYTES + 4u];
   uint8_t response[FTUN_BOOTSTRAP_MAX_RESPONSE_BYTES];
@@ -902,10 +1492,9 @@ static ftun_status_t ftun_engine_dns_resolve_upstream(
   descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
   if (descriptor < 0) return ftun_engine_dns_errno(errno);
 #if defined(SO_MARK)
-  {
-    uint32_t mark = FTUN_ENGINE_DNS_MARK;
-    if (setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark,
-                   (socklen_t)sizeof(mark)) != 0) {
+  if (socket_mark != 0u) {
+    if (setsockopt(descriptor, SOL_SOCKET, SO_MARK, &socket_mark,
+                   (socklen_t)sizeof(socket_mark)) != 0) {
       status = ftun_engine_dns_errno(errno);
       goto done;
     }
@@ -974,6 +1563,78 @@ done:
   (void)ftun_dns_message_release(&message);
   if (descriptor >= 0) (void)close(descriptor);
   return status;
+}
+
+ftun_status_t ftun_engine_dns_plan_prepare(const ftun_config_t *config,
+                                           uint32_t socket_mark,
+                                           ftun_engine_dns_plan_t **out)
+{
+  ftun_engine_dns_plan_t *plan;
+  size_t index;
+  ftun_status_t status = FTUN_OK;
+  if (out != NULL) *out = NULL;
+  if (config == NULL || out == NULL) return FTUN_E_INVALID;
+  plan = (ftun_engine_dns_plan_t *)calloc(1u, sizeof(*plan));
+  if (plan == NULL) return FTUN_E_LIMIT;
+  if (!config->dns.enable) {
+    *out = plan;
+    return FTUN_OK;
+  }
+  plan->server_count = config->dns.server_count == 0u && config->dns.enable
+    ? 1u : config->dns.server_count;
+  plan->outbound_count = config->outbound_count;
+  if (plan->server_count > FTUN_ENGINE_DNS_MAX_SERVERS) status = FTUN_E_LIMIT;
+  if (status == FTUN_OK && plan->outbound_count != 0u) {
+    plan->proxies = (ftun_endpoint_t *)calloc(plan->outbound_count,
+                                               sizeof(*plan->proxies));
+    plan->proxy_valid = (uint8_t *)calloc(plan->outbound_count,
+                                           sizeof(*plan->proxy_valid));
+    if (plan->proxies == NULL || plan->proxy_valid == NULL) {
+      status = FTUN_E_LIMIT;
+    }
+  }
+  for (index = 0u; status == FTUN_OK && index < config->dns.server_count;
+       index++) {
+    if (config->dns.servers[index].addresses.count == 0u) {
+      status = FTUN_E_INVALID;
+    } else {
+      status = ftun_engine_dns_resolve_upstream(config,
+        config->dns.servers[index].addresses.items[0], socket_mark,
+        &plan->servers[index]);
+    }
+  }
+  if (status == FTUN_OK && config->dns.enable &&
+      config->dns.server_count == 0u) {
+    status = ftun_engine_dns_bootstrap_endpoint(config, &plan->servers[0]);
+  }
+  for (index = 0u; status == FTUN_OK && index < config->outbound_count;
+       index++) {
+    const ftun_config_outbound_t *item = &config->outbounds[index];
+    if (item->kind != FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
+    status = ftun_engine_dns_resolve_upstream(config, item->server,
+      socket_mark, &plan->proxies[index]);
+    if (status == FTUN_OK) plan->proxy_valid[index] = 1u;
+  }
+  if (status != FTUN_OK) {
+    (void)ftun_engine_dns_plan_destroy(&plan);
+    return status;
+  }
+  *out = plan;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_engine_dns_plan_destroy(ftun_engine_dns_plan_t **plan_ptr)
+{
+  ftun_engine_dns_plan_t *plan;
+  if (plan_ptr == NULL) return FTUN_E_INVALID;
+  plan = *plan_ptr;
+  if (plan == NULL) return FTUN_OK;
+  free(plan->proxies);
+  free(plan->proxy_valid);
+  memset(plan, 0, sizeof(*plan));
+  free(plan);
+  *plan_ptr = NULL;
+  return FTUN_OK;
 }
 
 static ftun_status_t ftun_engine_dns_outbound_id(
@@ -1199,7 +1860,8 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
   ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_worker_t *worker,
   const ftun_config_t *config, ftun_fakeip_service_t *fakeip,
-  bool bind_sockets, ftun_engine_dns_t **out)
+  uint32_t socket_mark, bool bind_sockets,
+  const ftun_engine_dns_plan_t *plan, ftun_engine_dns_t **out)
 {
   ftun_engine_dns_t *dns;
   ftun_dns_dispatcher_options_t dispatcher;
@@ -1212,6 +1874,9 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
   if (core == NULL || budget == NULL || operations == NULL || worker == NULL ||
       config == NULL || out == NULL) return FTUN_E_INVALID;
   if (!config->dns.enable) return FTUN_OK;
+  if (plan != NULL && (plan->server_count !=
+      (config->dns.server_count == 0u ? 1u : config->dns.server_count) ||
+      plan->outbound_count != config->outbound_count)) return FTUN_E_STALE;
   if (config->dns.server_count > FTUN_ENGINE_DNS_MAX_SERVERS ||
       config->dns.listener_count > FTUN_ENGINE_DNS_MAX_LISTENERS) {
     return FTUN_E_LIMIT;
@@ -1222,6 +1887,7 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
   dns->budget = budget;
   dns->operations = operations;
   dns->worker = worker;
+  dns->socket_mark = socket_mark;
   status = ftun_config_retain((ftun_config_t *)config);
   if (status != FTUN_OK) {
     free(dns);
@@ -1229,6 +1895,31 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
   }
   dns->config = (ftun_config_t *)config;
   dns->fakeip = fakeip;
+  if (config->outbound_count != 0u) {
+    dns->proxy_endpoints = (ftun_endpoint_t *)calloc(config->outbound_count,
+      sizeof(*dns->proxy_endpoints));
+    dns->proxy_endpoint_valid = (uint8_t *)calloc(config->outbound_count,
+      sizeof(*dns->proxy_endpoint_valid));
+    if (dns->proxy_endpoints == NULL || dns->proxy_endpoint_valid == NULL) {
+      status = FTUN_E_LIMIT;
+    }
+  }
+  for (index = 0u; status == FTUN_OK && index < config->outbound_count;
+       index++) {
+    const ftun_config_outbound_t *item = &config->outbounds[index];
+    if (item->kind != FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
+    if (plan != NULL) {
+      if (plan->proxy_valid[index] == 0u) status = FTUN_E_RESOLVE;
+      else {
+        dns->proxy_endpoints[index] = plan->proxies[index];
+        dns->proxy_endpoint_valid[index] = 1u;
+      }
+    } else {
+      status = ftun_engine_dns_resolve_upstream(config, item->server,
+        socket_mark, &dns->proxy_endpoints[index]);
+      if (status == FTUN_OK) dns->proxy_endpoint_valid[index] = 1u;
+    }
+  }
   for (index = 0u; index < FTUN_ENGINE_DNS_MAX_LISTENERS; index++) {
     dns->listeners[index].descriptor = -1;
     dns->listeners[index].tcp_descriptor = -1;
@@ -1261,8 +1952,9 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
     memset(&server, 0, sizeof(server));
     server.budget = budget;
     server.operations = operations;
-    status = ftun_engine_dns_resolve_upstream(config,
-      item->addresses.items[0], &server.upstream);
+    if (plan != NULL) server.upstream = plan->servers[index];
+    else status = ftun_engine_dns_resolve_upstream(config,
+      item->addresses.items[0], socket_mark, &server.upstream);
     if (status != FTUN_OK) break;
     status = ftun_engine_dns_outbound_id(config, item->outbound,
                                          &outbound_id);
@@ -1286,7 +1978,8 @@ static ftun_status_t ftun_engine_dns_prepare_internal(
     memset(&server, 0, sizeof(server));
     server.budget = budget;
     server.operations = operations;
-    status = ftun_engine_dns_bootstrap_endpoint(config, &server.upstream);
+    if (plan != NULL) server.upstream = plan->servers[0];
+    else status = ftun_engine_dns_bootstrap_endpoint(config, &server.upstream);
     server.outbound_id = outbound_id;
     server.fingerprint = UINT64_C(0x42535450);
     server.transport = FTUN_DNS_TRANSPORT_UDP;
@@ -1366,10 +2059,12 @@ ftun_status_t ftun_engine_dns_prepare(
   ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_worker_t *worker,
   const ftun_config_t *config, ftun_fakeip_service_t *fakeip,
+  uint32_t socket_mark,
   ftun_engine_dns_t **out)
 {
   return ftun_engine_dns_prepare_internal(core, budget, operations, worker,
-                                           config, fakeip, true, out);
+                                           config, fakeip, socket_mark, true,
+                                           NULL, out);
 }
 
 static ftun_status_t ftun_engine_dns_idle(const ftun_engine_dns_t *dns)
@@ -1421,11 +2116,13 @@ static int ftun_engine_dns_listener_reusable(
   return 0;
 }
 
-ftun_status_t ftun_engine_dns_prepare_reload(
+ftun_status_t ftun_engine_dns_prepare_reload_planned(
   const ftun_engine_dns_t *active, ftun_core_t *core,
   ftun_budget_t *budget, ftun_operation_queue_t *operations,
   ftun_worker_t *worker, const ftun_config_t *config,
-  ftun_fakeip_service_t *fakeip, ftun_engine_dns_t **out)
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  const ftun_engine_dns_plan_t *plan,
+  ftun_engine_dns_t **out)
 {
   ftun_engine_dns_t *prepared = NULL;
   size_t index;
@@ -1438,10 +2135,12 @@ ftun_status_t ftun_engine_dns_prepare_reload(
   if (!config->dns.enable) return FTUN_OK;
   if (active == NULL) {
     return ftun_engine_dns_prepare_internal(core, budget, operations, worker,
-                                             config, fakeip, true, out);
+                                             config, fakeip, socket_mark, true,
+                                             plan, out);
   }
   status = ftun_engine_dns_prepare_internal(core, budget, operations, worker,
-                                             config, fakeip, false, &prepared);
+                                             config, fakeip, socket_mark,
+                                             false, plan, &prepared);
   for (index = 0u; status == FTUN_OK &&
        index < prepared->listener_count; index++) {
     const char *listen = config->dns.listeners[index].listen;
@@ -1460,6 +2159,17 @@ ftun_status_t ftun_engine_dns_prepare_reload(
   }
   *out = prepared;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_engine_dns_prepare_reload(
+  const ftun_engine_dns_t *active, ftun_core_t *core,
+  ftun_budget_t *budget, ftun_operation_queue_t *operations,
+  ftun_worker_t *worker, const ftun_config_t *config,
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  ftun_engine_dns_t **out)
+{
+  return ftun_engine_dns_prepare_reload_planned(active, core, budget,
+    operations, worker, config, fakeip, socket_mark, NULL, out);
 }
 
 ftun_status_t ftun_engine_dns_commit_reload(ftun_engine_dns_t **active_ptr,
@@ -1540,6 +2250,10 @@ static void ftun_engine_dns_tcp_close(ftun_engine_dns_tcp_t *connection)
 static ftun_status_t ftun_engine_dns_tcp_accept(
   ftun_engine_dns_t *dns, ftun_engine_dns_listener_slot_t *listener)
 {
+  uint64_t now_ms;
+  ftun_status_t status = ftun_monotonic_now(&now_ms);
+  if (status != FTUN_OK) return status;
+  if (now_ms < listener->accept_after_ms) return FTUN_OK;
   for (;;) {
     ftun_engine_dns_tcp_t *connection = NULL;
     int descriptor;
@@ -1550,7 +2264,31 @@ static ftun_status_t ftun_engine_dns_tcp_accept(
     if (descriptor < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
       return FTUN_OK;
     }
-    if (descriptor < 0) return ftun_engine_dns_errno(errno);
+    if (descriptor < 0) {
+      if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN ||
+          errno == EHOSTDOWN || errno == ENONET || errno == EHOSTUNREACH ||
+          errno == ENETUNREACH || errno == EOPNOTSUPP) {
+        return FTUN_OK;
+      }
+      if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+          errno == ENOMEM) {
+        uint64_t delay = listener->accept_backoff_ms == 0u
+          ? FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MIN_MS
+          : listener->accept_backoff_ms;
+        if (delay > FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MAX_MS) {
+          delay = FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MAX_MS;
+        }
+        listener->accept_after_ms = now_ms > UINT64_MAX - delay
+          ? UINT64_MAX : now_ms + delay;
+        listener->accept_backoff_ms =
+          delay >= FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MAX_MS / 2u
+          ? FTUN_ENGINE_DNS_ACCEPT_BACKOFF_MAX_MS : delay * 2u;
+        return FTUN_OK;
+      }
+      return ftun_engine_dns_errno(errno);
+    }
+    listener->accept_after_ms = 0u;
+    listener->accept_backoff_ms = 0u;
     for (index = 0u; index < FTUN_ENGINE_DNS_MAX_TCP_CONNECTIONS; index++) {
       if (!dns->tcp[index].active) {
         connection = &dns->tcp[index];
@@ -1708,8 +2446,34 @@ static ftun_status_t ftun_engine_dns_tcp_drive(
 
 ftun_status_t ftun_engine_dns_run_once(ftun_engine_dns_t *dns)
 {
+  ftun_engine_dns_transport_request_t *request;
   size_t index;
-  if (dns == NULL || !dns->accepting) return FTUN_OK;
+  if (dns == NULL) return FTUN_OK;
+  request = dns->request_head;
+  while (request != NULL) {
+    ftun_engine_dns_transport_request_t *next = request->next;
+    ftun_engine_dns_transport_waiter_t *waiter = request->waiter_head;
+    uint64_t now_ms = ftun_engine_dns_now(NULL);
+    while (waiter != NULL) {
+      ftun_engine_dns_transport_waiter_t *waiter_next = waiter->next;
+      if (now_ms >= waiter->deadline_ms) {
+        ftun_engine_dns_waiter_finish(waiter, FTUN_E_TIMEOUT,
+                                      (ftun_bytes_t){NULL, 0u});
+      }
+      waiter = waiter_next;
+    }
+    if (request->waiter_head == NULL) {
+      ftun_engine_dns_request_unlink(request);
+      ftun_engine_dns_request_release(request);
+    } else {
+      ftun_status_t status = ftun_engine_dns_request_drive(request);
+      if (status != FTUN_E_AGAIN) {
+        ftun_engine_dns_request_finish(request, status);
+      }
+    }
+    request = next;
+  }
+  if (!dns->accepting) return FTUN_OK;
   for (index = 0u; index < dns->listener_count; index++) {
     ftun_engine_dns_listener_slot_t *slot = &dns->listeners[index];
     for (;;) {
@@ -1847,6 +2611,8 @@ ftun_status_t ftun_engine_dns_destroy(ftun_engine_dns_t **dns_ptr)
   }
   if (ftun_dns_cache_destroy(&dns->cache) != FTUN_OK) return FTUN_E_AGAIN;
   if (ftun_config_destroy(&dns->config) != FTUN_OK) return FTUN_E_AGAIN;
+  free(dns->proxy_endpoints);
+  free(dns->proxy_endpoint_valid);
   memset(dns, 0, sizeof(*dns));
   free(dns);
   *dns_ptr = NULL;
@@ -1856,6 +2622,7 @@ ftun_status_t ftun_engine_dns_destroy(ftun_engine_dns_t **dns_ptr)
 #else
 
 struct ftun_engine_dns { int unused; };
+struct ftun_engine_dns_plan { int unused; };
 
 ftun_status_t ftun_engine_dns_query_blocking(
   const ftun_engine_dns_blocking_query_t *query, ftun_bytes_t wire,
@@ -1870,10 +2637,11 @@ ftun_status_t ftun_engine_dns_prepare(
   ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_worker_t *worker,
   const ftun_config_t *config, ftun_fakeip_service_t *fakeip,
+  uint32_t socket_mark,
   ftun_engine_dns_t **out)
 {
   (void)core; (void)budget; (void)operations; (void)worker;
-  (void)fakeip;
+  (void)fakeip; (void)socket_mark;
   if (out != NULL) *out = NULL;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   return config->dns.enable ? FTUN_E_UNSUPPORTED : FTUN_OK;
@@ -1882,11 +2650,34 @@ ftun_status_t ftun_engine_dns_prepare_reload(
   const ftun_engine_dns_t *active, ftun_core_t *core,
   ftun_budget_t *budget, ftun_operation_queue_t *operations,
   ftun_worker_t *worker, const ftun_config_t *config,
-  ftun_fakeip_service_t *fakeip, ftun_engine_dns_t **out)
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  ftun_engine_dns_t **out)
 {
   (void)active;
   return ftun_engine_dns_prepare(core, budget, operations, worker, config,
-                                 fakeip, out);
+                                 fakeip, socket_mark, out);
+}
+ftun_status_t ftun_engine_dns_plan_prepare(const ftun_config_t *config,
+                                           uint32_t socket_mark,
+                                           ftun_engine_dns_plan_t **out)
+{
+  (void)socket_mark;
+  if (out != NULL) *out = NULL;
+  if (config == NULL || out == NULL) return FTUN_E_INVALID;
+  return config->dns.enable ? FTUN_E_UNSUPPORTED : FTUN_OK;
+}
+ftun_status_t ftun_engine_dns_plan_destroy(ftun_engine_dns_plan_t **plan)
+{ if (plan == NULL) return FTUN_E_INVALID; *plan = NULL; return FTUN_OK; }
+ftun_status_t ftun_engine_dns_prepare_reload_planned(
+  const ftun_engine_dns_t *active, ftun_core_t *core,
+  ftun_budget_t *budget, ftun_operation_queue_t *operations,
+  ftun_worker_t *worker, const ftun_config_t *config,
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  const ftun_engine_dns_plan_t *plan, ftun_engine_dns_t **out)
+{
+  (void)plan;
+  return ftun_engine_dns_prepare_reload(active, core, budget, operations,
+    worker, config, fakeip, socket_mark, out);
 }
 ftun_status_t ftun_engine_dns_commit_reload(ftun_engine_dns_t **active,
                                              ftun_engine_dns_t **prepared)

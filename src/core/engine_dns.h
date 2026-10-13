@@ -10,6 +10,7 @@
 #include <stdbool.h>
 
 typedef struct ftun_engine_dns ftun_engine_dns_t;
+typedef struct ftun_engine_dns_plan ftun_engine_dns_plan_t;
 
 typedef struct {
   ftun_endpoint_t upstream;
@@ -31,12 +32,24 @@ ftun_status_t ftun_engine_dns_prepare(
   ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_worker_t *worker,
   const ftun_config_t *config, ftun_fakeip_service_t *fakeip,
+  uint32_t socket_mark,
   ftun_engine_dns_t **out);
 ftun_status_t ftun_engine_dns_prepare_reload(
   const ftun_engine_dns_t *active, ftun_core_t *core,
   ftun_budget_t *budget, ftun_operation_queue_t *operations,
   ftun_worker_t *worker, const ftun_config_t *config,
-  ftun_fakeip_service_t *fakeip, ftun_engine_dns_t **out);
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  ftun_engine_dns_t **out);
+ftun_status_t ftun_engine_dns_plan_prepare(const ftun_config_t *config,
+                                           uint32_t socket_mark,
+                                           ftun_engine_dns_plan_t **out);
+ftun_status_t ftun_engine_dns_plan_destroy(ftun_engine_dns_plan_t **plan);
+ftun_status_t ftun_engine_dns_prepare_reload_planned(
+  const ftun_engine_dns_t *active, ftun_core_t *core,
+  ftun_budget_t *budget, ftun_operation_queue_t *operations,
+  ftun_worker_t *worker, const ftun_config_t *config,
+  ftun_fakeip_service_t *fakeip, uint32_t socket_mark,
+  const ftun_engine_dns_plan_t *plan, ftun_engine_dns_t **out);
 ftun_status_t ftun_engine_dns_commit_reload(ftun_engine_dns_t **active,
                                              ftun_engine_dns_t **prepared);
 ftun_status_t ftun_engine_dns_activate(ftun_engine_dns_t *dns);

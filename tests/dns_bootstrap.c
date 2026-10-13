@@ -191,7 +191,8 @@ static const ftun_event_backend_ops_t backend_ops = {
   backend_wakeup,
   backend_run_once,
   backend_stop,
-  backend_destroy
+  backend_destroy,
+  false
 };
 
 static ftun_status_t socket_open(void *user, ftun_dial_transport_t transport,

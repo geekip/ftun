@@ -29,6 +29,8 @@ int main(void)
   size_t pool_baseline;
   uintptr_t second_identity;
   ftun_reservation_t *blocker = NULL;
+  ftun_budget_t *pressure_budget = NULL;
+  ftun_buffer_pool_t *pressure_pool = NULL;
 
   CHECK(ftun_budget_create(NULL, 8192u, 512u, &budget) == FTUN_OK);
   CHECK(ftun_buffer_acquire(budget, 1u, &buffer) == FTUN_OK);
@@ -150,5 +152,19 @@ int main(void)
   CHECK(ftun_buffer_release(NULL) == FTUN_E_INVALID);
   CHECK(ftun_buffer_slice_release(NULL) == FTUN_E_INVALID);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+
+  CHECK(ftun_budget_create(NULL, 90u * 1024u, 0u, &pressure_budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create(pressure_budget, 90u * 1024u, 4u,
+                                &pressure_pool) == FTUN_OK);
+  CHECK(ftun_buffer_pool_acquire(pressure_pool, 64u * 1024u, &buffer) == FTUN_OK);
+  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
+  CHECK(ftun_buffer_pool_acquire(pressure_pool, 32u * 1024u, &buffer) == FTUN_OK);
+  CHECK(ftun_buffer_pool_get_usage(pressure_pool, &pool_usage) == FTUN_OK);
+  CHECK(pool_usage.cache_misses == 2u && pool_usage.pressure_trims == 1u &&
+        pool_usage.pressure_trimmed_buffers == 1u &&
+        pool_usage.pressure_trimmed_bytes == 64u * 1024u);
+  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
+  CHECK(ftun_buffer_pool_destroy(&pressure_pool) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&pressure_budget) == FTUN_OK);
   return 0;
 }

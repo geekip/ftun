@@ -13,6 +13,7 @@ typedef void (*ftun_worker_completion_fn)(ftun_operation_t *operation,
                                           void *user);
 typedef void (*ftun_worker_result_cleanup_fn)(ftun_bytes_t result);
 typedef void (*ftun_worker_input_cleanup_fn)(ftun_bytes_t input);
+typedef void (*ftun_worker_wakeup_fn)(void *user);
 
 struct ftun_worker_job {
   ftun_worker_execute_fn execute;
@@ -46,6 +47,11 @@ typedef struct {
  */
 ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
                                  ftun_worker_t **out);
+/* wakeup may run on any worker thread and must not block or call owner-only
+ * APIs.  Configure it before accepting production work. */
+ftun_status_t ftun_worker_set_wakeup(ftun_worker_t *worker,
+                                     ftun_worker_wakeup_fn wakeup,
+                                     void *user);
 ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t *job,
                                  ftun_worker_completion_fn callback, void *user,
                                  ftun_operation_t **out);

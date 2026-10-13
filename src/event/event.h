@@ -25,6 +25,8 @@ typedef struct {
   ftun_status_t (*run_once)(void *context, bool block);
   void (*stop)(void *context);
   void (*destroy)(void *context);
+  /* true when the backend itself calls ftun_event_timer_ready(). */
+  bool native_timers;
 } ftun_event_backend_ops_t;
 
 typedef struct {
@@ -32,6 +34,7 @@ typedef struct {
   size_t deferred_count;
   size_t source_capacity;
   size_t source_count;
+  size_t ready_count;
   size_t wakeups;
   bool accepting;
   bool dispatching;
@@ -70,6 +73,8 @@ ftun_status_t ftun_event_timer_ready(ftun_event_source_t *source);
 /* 接纳成功后 user 必须保持有效至 callback 返回；同步拒绝零回调。 */
 ftun_status_t ftun_event_defer(ftun_event_loop_t *loop,
                                ftun_event_deferred_fn callback, void *user);
+/* Thread-safe wakeup without enqueueing a callback. */
+ftun_status_t ftun_event_loop_wakeup(ftun_event_loop_t *loop);
 ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
                                    size_t max_callbacks, size_t *out_callbacks);
 ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,

@@ -9,6 +9,11 @@ typedef struct {
   size_t idle_bytes;
   size_t idle_buffers;
   size_t active_buffers;
+  size_t cache_hits;
+  size_t cache_misses;
+  size_t pressure_trims;
+  size_t pressure_trimmed_bytes;
+  size_t pressure_trimmed_buffers;
 } ftun_buffer_pool_usage_t;
 
 /* 引用缓冲与池。

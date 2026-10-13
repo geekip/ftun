@@ -21,6 +21,8 @@ struct ftun_event_source {
   ftun_event_loop_t *loop;
   ftun_event_source_t *previous;
   ftun_event_source_t *next;
+  ftun_event_source_t *ready_previous;
+  ftun_event_source_t *ready_next;
   ftun_event_callback_fn callback;
   void *user;
   void *backend_data;
@@ -30,11 +32,14 @@ struct ftun_event_source {
   uint32_t interests;
   uint32_t pending;
   int active;
+  int in_ready;
 };
 
 struct ftun_event_loop {
   ftun_core_t *core;
   ftun_event_source_t *sources;
+  ftun_event_source_t *ready_head;
+  ftun_event_source_t *ready_tail;
   ftun_event_deferred_t deferred[FTUN_EVENT_DEFERRED_CAPACITY];
   pthread_mutex_t mutex;
   ftun_event_wakeup_fn wakeup;
@@ -45,6 +50,7 @@ struct ftun_event_loop {
   size_t deferred_tail;
   size_t deferred_count;
   size_t source_count;
+  size_t ready_count;
   size_t wakeups;
   int accepting;
   int dispatching;
@@ -200,6 +206,41 @@ static void ftun_event_source_unlink(ftun_event_source_t *source)
   source->next = NULL;
 }
 
+static void ftun_event_ready_unlink(ftun_event_source_t *source)
+{
+  ftun_event_loop_t *loop;
+  if (source == NULL || !source->in_ready || source->loop == NULL) return;
+  loop = source->loop;
+  if (source->ready_previous != NULL) {
+    source->ready_previous->ready_next = source->ready_next;
+  } else {
+    loop->ready_head = source->ready_next;
+  }
+  if (source->ready_next != NULL) {
+    source->ready_next->ready_previous = source->ready_previous;
+  } else {
+    loop->ready_tail = source->ready_previous;
+  }
+  source->ready_previous = NULL;
+  source->ready_next = NULL;
+  source->in_ready = 0;
+  if (loop->ready_count != 0u) loop->ready_count--;
+}
+
+static void ftun_event_ready_enqueue(ftun_event_source_t *source)
+{
+  ftun_event_loop_t *loop;
+  if (source == NULL || source->loop == NULL || !source->active ||
+      source->pending == 0u || source->in_ready) return;
+  loop = source->loop;
+  source->ready_previous = loop->ready_tail;
+  if (loop->ready_tail != NULL) loop->ready_tail->ready_next = source;
+  else loop->ready_head = source;
+  loop->ready_tail = source;
+  source->in_ready = 1;
+  loop->ready_count++;
+}
+
 ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
                                   uint32_t interests, ftun_event_callback_fn callback,
                                   void *user, ftun_event_source_t **out)
@@ -271,6 +312,8 @@ ftun_status_t ftun_event_io_update(ftun_event_source_t *source,
   }
   source->interests = interests;
   source->pending &= interests;
+  if (source->pending == 0u) ftun_event_ready_unlink(source);
+  else ftun_event_ready_enqueue(source);
   return FTUN_OK;
 }
 
@@ -300,6 +343,7 @@ ftun_status_t ftun_event_io_ready(ftun_event_source_t *source, uint32_t events)
       events == 0u || (events & ~allowed) != 0u) return FTUN_E_INVALID;
   if (!source->active) return FTUN_E_STALE;
   source->pending |= events & source->interests;
+  ftun_event_ready_enqueue(source);
   return FTUN_OK;
 }
 
@@ -309,6 +353,7 @@ ftun_status_t ftun_event_timer_ready(ftun_event_source_t *source)
       source->kind != FTUN_EVENT_SOURCE_TIMER) return FTUN_E_INVALID;
   if (!source->active) return FTUN_E_STALE;
   source->pending = FTUN_EVENT_TIMER;
+  ftun_event_ready_enqueue(source);
   return FTUN_OK;
 }
 
@@ -342,6 +387,25 @@ ftun_status_t ftun_event_defer(ftun_event_loop_t *loop,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_event_loop_wakeup(ftun_event_loop_t *loop)
+{
+  if (loop == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->stopped) {
+    (void)pthread_mutex_unlock(&loop->mutex);
+    return FTUN_E_CANCELLED;
+  }
+  if (loop->backend != NULL) {
+    loop->wakeups++;
+    loop->backend->wakeup(loop->backend_context);
+  } else if (loop->wakeup != NULL) {
+    loop->wakeups++;
+    loop->wakeup(loop->wakeup_user);
+  }
+  (void)pthread_mutex_unlock(&loop->mutex);
+  return FTUN_OK;
+}
+
 static int ftun_event_pop_deferred(ftun_event_loop_t *loop,
                                    ftun_event_deferred_t *out)
 {
@@ -359,27 +423,29 @@ static int ftun_event_pop_deferred(ftun_event_loop_t *loop,
   return found;
 }
 
-static ftun_event_source_t *ftun_event_ready_source(ftun_event_loop_t *loop,
-                                                     uint64_t now_ms,
-                                                     uint32_t *events)
+static void ftun_event_queue_expired_timers(ftun_event_loop_t *loop,
+                                             uint64_t now_ms)
 {
   ftun_event_source_t *source;
   for (source = loop->sources; source != NULL; source = source->next) {
-    if (!source->active) continue;
-    if (source->kind == FTUN_EVENT_SOURCE_IO && source->pending != 0u) {
-      *events = source->pending;
-      source->pending = 0u;
-      return source;
-    }
-    if (source->kind == FTUN_EVENT_SOURCE_TIMER &&
-        (source->pending == FTUN_EVENT_TIMER || now_ms >= source->deadline_ms)) {
-      source->active = 0;
-      source->pending = 0u;
-      *events = FTUN_EVENT_TIMER;
-      return source;
+    if (source->active && source->kind == FTUN_EVENT_SOURCE_TIMER &&
+        now_ms >= source->deadline_ms) {
+      source->pending = FTUN_EVENT_TIMER;
+      ftun_event_ready_enqueue(source);
     }
   }
-  return NULL;
+}
+
+static ftun_event_source_t *ftun_event_ready_source(ftun_event_loop_t *loop,
+                                                     uint32_t *events)
+{
+  ftun_event_source_t *source = loop->ready_head;
+  if (source == NULL) return NULL;
+  *events = source->pending;
+  source->pending = 0u;
+  ftun_event_ready_unlink(source);
+  if (source->kind == FTUN_EVENT_SOURCE_TIMER) source->active = 0;
+  return source;
 }
 
 ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
@@ -392,6 +458,12 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
   }
   if (loop->dispatching) return FTUN_E_AGAIN;
   loop->dispatching = 1;
+  /* A direct poll without a backend still owns timer expiry and therefore
+   * performs one bounded scan.  Production backends enqueue timer readiness
+   * themselves, so the hot dispatch path only performs O(1) ready pops. */
+  if (loop->backend == NULL || !loop->backend->native_timers) {
+    ftun_event_queue_expired_timers(loop, now_ms);
+  }
   while (callbacks < max_callbacks) {
     ftun_event_deferred_t deferred;
     ftun_event_source_t *source;
@@ -401,7 +473,7 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
       callbacks++;
       continue;
     }
-    source = ftun_event_ready_source(loop, now_ms, &events);
+    source = ftun_event_ready_source(loop, &events);
     if (source == NULL) break;
     source->callback(source, events, source->user);
     callbacks++;
@@ -452,6 +524,7 @@ ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source)
     status = loop->backend->source_cancel(loop->backend_context, owned);
     if (status != FTUN_OK) return status;
   }
+  ftun_event_ready_unlink(owned);
   ftun_event_source_unlink(owned);
   owned->backend_data = NULL;
   owned->callback = NULL;
@@ -479,7 +552,13 @@ ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop)
   for (source = loop->sources; source != NULL; source = source->next) {
     source->active = 0;
     source->pending = 0u;
+    source->ready_previous = NULL;
+    source->ready_next = NULL;
+    source->in_ready = 0;
   }
+  loop->ready_head = NULL;
+  loop->ready_tail = NULL;
+  loop->ready_count = 0u;
   return FTUN_OK;
 }
 
@@ -493,6 +572,7 @@ ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
   out->deferred_count = loop->deferred_count;
   out->source_capacity = FTUN_EVENT_SOURCE_CAPACITY;
   out->source_count = loop->source_count;
+  out->ready_count = loop->ready_count;
   out->wakeups = loop->wakeups;
   out->accepting = loop->accepting != 0;
   out->dispatching = loop->dispatching != 0;
@@ -516,6 +596,8 @@ ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop)
   }
   (void)pthread_mutex_unlock(&owned->mutex);
   if (owned->sources != NULL) return FTUN_E_STATE_CORRUPT;
+  if (owned->ready_head != NULL || owned->ready_tail != NULL ||
+      owned->ready_count != 0u) return FTUN_E_STATE_CORRUPT;
   if (pthread_mutex_destroy(&owned->mutex) != 0) return FTUN_E_STATE_CORRUPT;
   owned->core = NULL;
   free(owned);

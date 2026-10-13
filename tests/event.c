@@ -133,9 +133,13 @@ int main(void)
   CHECK(ftun_event_loop_poll(loop, 50u, 1u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 0u && state.calls == 0);
   CHECK(ftun_event_io_ready(io, FTUN_EVENT_READ | FTUN_EVENT_ERROR) == FTUN_OK);
+  CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK &&
+        usage.ready_count == 1u);
   CHECK(ftun_event_loop_poll(loop, 50u, 1u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 1u && state.calls == 1 &&
         state.events == (FTUN_EVENT_READ | FTUN_EVENT_ERROR));
+  CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK &&
+        usage.ready_count == 0u);
   state.calls = 0;
   state.events = 0u;
   CHECK(ftun_event_io_ready(io, FTUN_EVENT_READ) == FTUN_OK);

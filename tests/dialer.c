@@ -143,7 +143,8 @@ static const ftun_event_backend_ops_t backend_ops = {
   backend_wakeup,
   backend_run_once,
   backend_stop,
-  backend_destroy
+  backend_destroy,
+  false
 };
 
 static void socket_step(socket_state_t *state, int step)

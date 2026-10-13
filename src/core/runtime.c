@@ -668,7 +668,7 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
 }
 
 #if defined(FTUN_HAVE_MODULE_FRS)
-ftun_status_t ftun_runtime_prepare_detached_frs(
+ftun_status_t ftun_runtime_prepare_detached(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out)
 {
   ftun_runtime_t *runtime;
@@ -676,8 +676,8 @@ ftun_status_t ftun_runtime_prepare_detached_frs(
   size_t accounted_bytes;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
-  if (config == NULL || view == NULL || out == NULL || config->plan == NULL ||
-      (config->plan->prepare & FTUN_PLAN_FRS) == 0u ||
+  if (config == NULL || out == NULL || config->plan == NULL ||
+      (((config->plan->prepare & FTUN_PLAN_FRS) != 0u) != (view != NULL)) ||
       !ftun_runtime_layout(config, &item_count, &accounted_bytes)) {
     return FTUN_E_INVALID;
   }
@@ -696,7 +696,7 @@ ftun_status_t ftun_runtime_prepare_detached_frs(
   status = ftun_route_table_create_with_frs(
     0u, (const char *const *)config->rules.items, config->rules.count,
     ftun_runtime_resolve_outbound, (void *)config,
-    ftun_runtime_frs_bind, view, &runtime->routes);
+    view == NULL ? NULL : ftun_runtime_frs_bind, view, &runtime->routes);
   if (status != FTUN_OK) goto status_error;
   runtime->config = config;
   runtime->frs_view = view;
@@ -723,6 +723,16 @@ allocation_error:
   free(runtime->prepared_items);
   free(runtime);
   return FTUN_E_LIMIT;
+}
+
+ftun_status_t ftun_runtime_prepare_detached_frs(
+  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out)
+{
+  if (view == NULL) {
+    if (out != NULL) *out = NULL;
+    return FTUN_E_INVALID;
+  }
+  return ftun_runtime_prepare_detached(config, view, out);
 }
 
 ftun_status_t ftun_runtime_prepared_release(ftun_runtime_t **prepared)
@@ -762,7 +772,9 @@ ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
   runtime = *prepared;
   if (runtime == NULL || runtime->owner != NULL ||
       runtime->reservation != NULL || runtime->config == NULL ||
-      runtime->frs_view == NULL || runtime->routes == NULL ||
+      runtime->routes == NULL ||
+      ((((runtime->config->plan->prepare & FTUN_PLAN_FRS) != 0u) !=
+        (runtime->frs_view != NULL))) ||
       runtime->state != FTUN_RUNTIME_CANDIDATE ||
       runtime->reference_count != 1u) return FTUN_E_INVALID;
   if (core->candidate != NULL) return FTUN_E_AGAIN;
@@ -773,7 +785,7 @@ ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
   if (status != FTUN_OK) return status;
   status = ftun_budget_reserve(core->budget, runtime->accounted_bytes,
                                &reservation);
-  if (status == FTUN_OK) {
+  if (status == FTUN_OK && runtime->frs_view != NULL) {
     status = ftun_frs_view_bind_budget(runtime->frs_view, core->budget);
   }
   if (status != FTUN_OK) {

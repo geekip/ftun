@@ -69,6 +69,14 @@
 #define FTUN_ENGINE_RELAY_POOL_BUFFERS 32u
 #define FTUN_ENGINE_SOCKET_MARK UINT32_C(0x4654)
 #define FTUN_ENGINE_CONNECT_TIMEOUT_MS UINT64_C(10000)
+#define FTUN_ENGINE_HANDSHAKE_TIMEOUT_MS UINT64_C(10000)
+#define FTUN_ENGINE_REPLY_TIMEOUT_MS UINT64_C(5000)
+#define FTUN_ENGINE_ACCEPT_BACKOFF_MIN_MS UINT64_C(50)
+#define FTUN_ENGINE_ACCEPT_BACKOFF_MAX_MS UINT64_C(1000)
+#define FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MIN_MS UINT64_C(100)
+#define FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS UINT64_C(5000)
+#define FTUN_ENGINE_FAKEIP_RESERVE_BATCH UINT32_C(4096)
+#define FTUN_ENGINE_FAKEIP_RESERVE_LOW_WATER UINT32_C(512)
 #define FTUN_ENGINE_HTTP_ETAG_BYTES (64u * 1024u)
 #define FTUN_ENGINE_HTTP_WORK_MAGIC UINT32_C(0x46544846)
 #define FTUN_ENGINE_FRS_PUBLISH_MAGIC UINT32_C(0x46525042)
@@ -118,6 +126,13 @@ typedef struct ftun_engine_flow ftun_engine_flow_t;
 typedef struct ftun_engine_health_slot ftun_engine_health_slot_t;
 typedef struct ftun_engine_udp_pending ftun_engine_udp_pending_t;
 
+typedef struct {
+  uint32_t outbound_id;
+  uint32_t failures;
+  uint64_t retry_after_ms;
+  bool active;
+} ftun_engine_udp_backoff_t;
+
 #if defined(FTUN_HAVE_MODULE_TUN)
 typedef struct {
   ftun_buffer_t *buffer;
@@ -150,10 +165,12 @@ struct ftun_engine_health_slot {
 
 static void ftun_engine_health_consume(ftun_engine_t *engine,
                                        uint32_t group_id);
-#if defined(FTUN_HAVE_MODULE_FRS)
+static void ftun_engine_flow_close(ftun_engine_flow_t *flow,
+                                   ftun_status_t reason);
 static void ftun_engine_background_log(ftun_engine_t *engine,
                                        ftun_status_t status,
                                        const char *message);
+#if defined(FTUN_HAVE_MODULE_FRS)
 typedef struct {
   ftun_file_stage_t reached;
 } ftun_engine_file_publish_t;
@@ -169,12 +186,15 @@ static ftun_status_t ftun_engine_file_stage(ftun_file_stage_t stage,
 }
 #endif
 
-typedef struct {
+typedef struct ftun_engine_udp_slot {
   struct ftun_engine *engine;
+  struct ftun_engine_udp_slot *ready_previous;
+  struct ftun_engine_udp_slot *ready_next;
   ftun_datagram_t *channel;
   ftun_socks5_connection_t *proxy_connection;
   ftun_operation_t *open_operation;
   ftun_event_source_t *source;
+  ftun_event_source_t *control_source;
   ftun_datagram_send_t *pending[32];
   ftun_endpoint_t remote;
   ftun_endpoint_t proxy_server;
@@ -192,11 +212,14 @@ typedef struct {
   int descriptor;
   size_t pending_count;
   ftun_status_t open_status;
+  uint32_t outbound_id;
   bool socks5;
   bool ready;
   bool destroying;
+  bool ready_queued;
   bool active;
   uint32_t events;
+  uint32_t control_events;
 } ftun_engine_udp_slot_t;
 
 struct ftun_engine_udp_pending {
@@ -235,14 +258,17 @@ struct ftun_engine_listener {
   int udp_descriptor;
   ftun_event_source_t *source;
   ftun_event_source_t *udp_source;
+  ftun_event_source_t *accept_timer;
   uint32_t events;
   uint32_t udp_events;
   char *name;
   ftun_config_inbound_kind_t kind;
   uint32_t inbound_id;
+  uint64_t accept_backoff_ms;
 };
 
 struct ftun_engine_flow {
+  ftun_engine_flow_t *ready_next;
   ftun_engine_flow_t *association_client_next;
   ftun_engine_flow_t *association_channel_next;
   struct ftun_engine *engine;
@@ -256,6 +282,7 @@ struct ftun_engine_flow {
   ftun_operation_t *open_operation;
   ftun_event_source_t *client_source;
   ftun_event_source_t *remote_source;
+  ftun_event_source_t *deadline_source;
   ftun_socks5_connection_t *proxy_connection;
   ftun_socks5_server_t *socks5;
   ftun_mixed_connection_t *mixed;
@@ -273,6 +300,7 @@ struct ftun_engine_flow {
   char sniff_domain[FTUN_SNIFF_DOMAIN_BYTES];
   size_t proxy_resolved_count;
   uint64_t sniff_deadline_ms;
+  uint64_t handshake_deadline_ms;
   uint32_t proxy_leaf_id;
   uint16_t proxy_port;
   uint32_t left_events;
@@ -289,6 +317,9 @@ struct ftun_engine_flow {
   bool association_client_indexed;
   bool association_channel_indexed;
   bool close_after_reply;
+  bool ready_queued;
+  bool driving;
+  bool reschedule;
   bool active;
 };
 
@@ -302,6 +333,9 @@ struct ftun_engine {
    * 避免维护任务占用唯一的系统解析执行槽。 */
   ftun_worker_t *worker;
   ftun_worker_t *maintenance_worker;
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  ftun_worker_t *fakeip_worker;
+#endif
   ftun_buffer_pool_t *relay_pool;
   ftun_engine_dns_t *dns;
   ftun_engine_dns_t *pending_dns;
@@ -319,10 +353,15 @@ struct ftun_engine {
   ftun_engine_listener_t listeners[FTUN_ENGINE_MAX_LISTENERS];
   uint32_t pending_listener_ids[FTUN_ENGINE_MAX_LISTENERS];
   ftun_engine_flow_t flows[FTUN_ENGINE_MAX_TCP_FLOWS];
+  ftun_engine_flow_t *ready_flow_head;
+  ftun_engine_flow_t *ready_flow_tail;
   ftun_engine_flow_t *association_clients[FTUN_ENGINE_ASSOCIATION_BUCKETS];
   ftun_engine_flow_t *association_channels[FTUN_ENGINE_ASSOCIATION_BUCKETS];
   ftun_udp_flow_table_t *udp_flows;
   ftun_engine_udp_slot_t udp[FTUN_ENGINE_MAX_UDP_FLOWS];
+  ftun_engine_udp_backoff_t udp_backoff[FTUN_ENGINE_MAX_UDP_FLOWS];
+  ftun_engine_udp_slot_t *ready_udp_head;
+  ftun_engine_udp_slot_t *ready_udp_tail;
   ftun_engine_udp_pending_t udp_pending[FTUN_ENGINE_MAX_UDP_FLOWS];
   size_t listener_count;
   uint64_t generation;
@@ -345,8 +384,10 @@ struct ftun_engine {
   ftun_fakeip_store_t *fakeip_store;
   ftun_fakeip_service_t *fakeip;
   char *fakeip_directory;
+  ftun_operation_t *fakeip_reserve_operation;
   ftun_status_t fakeip_store_status;
   size_t fakeip_store_completions;
+  bool fakeip_reserve_warning;
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
   ftun_engine_listener_t tun_listener;
@@ -390,6 +431,11 @@ static void ftun_engine_listener_ready(ftun_event_source_t *source,
   }
 }
 
+static void ftun_engine_worker_wakeup(void *user)
+{
+  (void)ftun_event_loop_wakeup((ftun_event_loop_t *)user);
+}
+
 static void ftun_engine_listener_udp_ready(ftun_event_source_t *source,
                                            uint32_t events, void *user)
 {
@@ -399,12 +445,49 @@ static void ftun_engine_listener_udp_ready(ftun_event_source_t *source,
   }
 }
 
+static void ftun_engine_flow_schedule(ftun_engine_flow_t *flow)
+{
+  ftun_engine_t *engine;
+  if (flow == NULL || !flow->active) return;
+  if (flow->driving) {
+    flow->reschedule = true;
+    return;
+  }
+  if (flow->ready_queued) return;
+  engine = flow->engine;
+  if (engine == NULL) return;
+  flow->ready_next = NULL;
+  if (engine->ready_flow_tail != NULL) {
+    engine->ready_flow_tail->ready_next = flow;
+  } else {
+    engine->ready_flow_head = flow;
+  }
+  engine->ready_flow_tail = flow;
+  flow->ready_queued = true;
+}
+
+static void ftun_engine_listener_accept_resume(ftun_event_source_t *source,
+                                                uint32_t events, void *user)
+{
+  ftun_engine_listener_t *listener = (ftun_engine_listener_t *)user;
+  ftun_status_t status;
+  if (listener == NULL || listener->accept_timer != source ||
+      (events & FTUN_EVENT_TIMER) == 0u) return;
+  status = ftun_event_source_cancel(&listener->accept_timer);
+  if (status == FTUN_OK && listener->source != NULL) {
+    status = ftun_event_io_update(listener->source,
+      FTUN_EVENT_READ | FTUN_EVENT_ERROR);
+  }
+  if (status != FTUN_OK) listener->events |= FTUN_EVENT_ERROR;
+}
+
 static void ftun_engine_flow_client_ready(ftun_event_source_t *source,
                                           uint32_t events, void *user)
 {
   ftun_engine_flow_t *flow = (ftun_engine_flow_t *)user;
   if (flow != NULL && flow->active && flow->client_source == source) {
     flow->client_events |= events;
+    ftun_engine_flow_schedule(flow);
   }
 }
 
@@ -414,7 +497,45 @@ static void ftun_engine_flow_remote_ready(ftun_event_source_t *source,
   ftun_engine_flow_t *flow = (ftun_engine_flow_t *)user;
   if (flow != NULL && flow->active && flow->remote_source == source) {
     flow->remote_events |= events;
+    ftun_engine_flow_schedule(flow);
   }
+}
+
+static void ftun_engine_udp_unschedule(ftun_engine_udp_slot_t *slot)
+{
+  ftun_engine_t *engine;
+  if (slot == NULL || !slot->ready_queued || slot->engine == NULL) return;
+  engine = slot->engine;
+  if (slot->ready_previous != NULL) {
+    slot->ready_previous->ready_next = slot->ready_next;
+  } else {
+    engine->ready_udp_head = slot->ready_next;
+  }
+  if (slot->ready_next != NULL) {
+    slot->ready_next->ready_previous = slot->ready_previous;
+  } else {
+    engine->ready_udp_tail = slot->ready_previous;
+  }
+  slot->ready_previous = NULL;
+  slot->ready_next = NULL;
+  slot->ready_queued = false;
+}
+
+static void ftun_engine_udp_schedule(ftun_engine_udp_slot_t *slot)
+{
+  ftun_engine_t *engine;
+  if (slot == NULL || !slot->active || slot->ready_queued ||
+      slot->engine == NULL) return;
+  engine = slot->engine;
+  slot->ready_previous = engine->ready_udp_tail;
+  slot->ready_next = NULL;
+  if (engine->ready_udp_tail != NULL) {
+    engine->ready_udp_tail->ready_next = slot;
+  } else {
+    engine->ready_udp_head = slot;
+  }
+  engine->ready_udp_tail = slot;
+  slot->ready_queued = true;
 }
 
 static void ftun_engine_udp_ready(ftun_event_source_t *source,
@@ -423,7 +544,29 @@ static void ftun_engine_udp_ready(ftun_event_source_t *source,
   ftun_engine_udp_slot_t *slot = (ftun_engine_udp_slot_t *)user;
   if (slot != NULL && slot->active && slot->source == source) {
     slot->events |= events;
+    ftun_engine_udp_schedule(slot);
   }
+}
+
+static void ftun_engine_udp_control_ready(ftun_event_source_t *source,
+                                          uint32_t events, void *user)
+{
+  ftun_engine_udp_slot_t *slot = (ftun_engine_udp_slot_t *)user;
+  if (slot != NULL && slot->active && slot->control_source == source) {
+    slot->control_events |= events;
+    ftun_engine_udp_schedule(slot);
+  }
+}
+
+static ftun_status_t ftun_engine_udp_update_source(
+  ftun_engine_udp_slot_t *slot)
+{
+  uint32_t interests = FTUN_EVENT_READ | FTUN_EVENT_ERROR;
+  if (slot == NULL || slot->source == NULL) return FTUN_E_INVALID;
+  if (slot->ready && slot->pending_count != 0u) {
+    interests |= FTUN_EVENT_WRITE;
+  }
+  return ftun_event_io_update(slot->source, interests);
 }
 
 #if defined(FTUN_HAVE_MODULE_TUN)
@@ -900,13 +1043,23 @@ static void ftun_engine_fakeip_store_completed(
 {
   ftun_engine_t *engine = (ftun_engine_t *)user;
   (void)operation;
-  (void)kind;
   (void)sequence;
   (void)reserved_end;
   if (engine == NULL) return;
+  if (kind == FTUN_FAKEIP_STORE_RESERVATION &&
+      engine->fakeip_reserve_operation == operation) {
+    engine->fakeip_reserve_operation = NULL;
+  }
   engine->fakeip_store_status = error.status;
   if (engine->fakeip_store_completions != SIZE_MAX) {
     engine->fakeip_store_completions++;
+  }
+  if (kind == FTUN_FAKEIP_STORE_RESERVATION && error.status != FTUN_OK) {
+    engine->fakeip_reserve_warning = true;
+    ftun_engine_background_log(engine, error.status,
+      "persistent FakeIP reservation failed; existing mappings remain readable");
+  } else if (kind == FTUN_FAKEIP_STORE_RESERVATION) {
+    engine->fakeip_reserve_warning = false;
   }
 }
 
@@ -966,7 +1119,7 @@ static ftun_status_t ftun_engine_fakeip_prepare(ftun_engine_t *engine,
     memset(&store_options, 0, sizeof(store_options));
     store_options.directory = engine->fakeip_directory;
     store_options.budget = engine->budget;
-    store_options.worker = engine->maintenance_worker;
+    store_options.worker = engine->fakeip_worker;
     store_options.completion = ftun_engine_fakeip_store_completed;
     store_options.user = engine;
     status = ftun_fakeip_store_open(&store_options, &engine->fakeip_store);
@@ -998,15 +1151,69 @@ static ftun_status_t ftun_engine_fakeip_prepare(ftun_engine_t *engine,
   }
   reserve_end = store_info.reserved_end;
   if (reserve_end < first) return FTUN_E_STATE_CORRUPT;
-  if ((uint64_t)reserve_end + 4096u < (uint64_t)end) reserve_end += 4096u;
+  if ((uint64_t)reserve_end + FTUN_ENGINE_FAKEIP_RESERVE_BATCH <
+      (uint64_t)end) {
+    reserve_end += FTUN_ENGINE_FAKEIP_RESERVE_BATCH;
+  }
   else reserve_end = end;
   expected = engine->fakeip_store_completions + 1u;
   engine->fakeip_store_status = FTUN_E_AGAIN;
   status = ftun_fakeip_store_reserve(engine->fakeip_store, reserve_end,
                                      &operation);
+  if (status == FTUN_OK) engine->fakeip_reserve_operation = operation;
   if (status == FTUN_OK) status = ftun_engine_wait_worker(
-    engine, engine->maintenance_worker, expected);
+    engine, engine->fakeip_worker, expected);
   return status;
+}
+
+static ftun_status_t ftun_engine_fakeip_reserve_runtime(
+  ftun_engine_t *engine)
+{
+  ftun_fakeip_service_info_t service;
+  ftun_fakeip_store_info_t store;
+  ftun_operation_t *operation = NULL;
+  uint32_t reserve_end;
+  ftun_status_t status;
+  if (engine == NULL || engine->fakeip_store == NULL ||
+      engine->fakeip == NULL || engine->fakeip_reserve_operation != NULL) {
+    return FTUN_OK;
+  }
+  status = ftun_fakeip_store_get_info(engine->fakeip_store, &store);
+  if (status != FTUN_OK) return status;
+  if (store.pending || store.halted) return FTUN_OK;
+  status = ftun_fakeip_service_get_info(engine->fakeip, &service);
+  if (status != FTUN_OK) return status;
+  if (service.next_address > store.reserved_end ||
+      store.reserved_end > service.end_address_exclusive) {
+    return FTUN_E_STATE_CORRUPT;
+  }
+  if (store.reserved_end >= service.end_address_exclusive ||
+      store.reserved_end - service.next_address >
+        FTUN_ENGINE_FAKEIP_RESERVE_LOW_WATER) {
+    return FTUN_OK;
+  }
+  reserve_end = store.reserved_end;
+  if ((uint64_t)reserve_end + FTUN_ENGINE_FAKEIP_RESERVE_BATCH <
+      (uint64_t)service.end_address_exclusive) {
+    reserve_end += FTUN_ENGINE_FAKEIP_RESERVE_BATCH;
+  } else {
+    reserve_end = service.end_address_exclusive;
+  }
+  engine->fakeip_store_status = FTUN_E_AGAIN;
+  status = ftun_fakeip_store_reserve(engine->fakeip_store, reserve_end,
+                                     &operation);
+  if (status == FTUN_OK) {
+    engine->fakeip_reserve_operation = operation;
+    engine->fakeip_reserve_warning = false;
+    return FTUN_OK;
+  }
+  if (status != FTUN_E_AGAIN && !engine->fakeip_reserve_warning) {
+    engine->fakeip_reserve_warning = true;
+    ftun_engine_background_log(engine, status,
+      "persistent FakeIP reservation could not be scheduled; "
+      "existing mappings remain readable");
+  }
+  return FTUN_OK;
 }
 #endif
 
@@ -1112,6 +1319,7 @@ static ftun_status_t ftun_engine_stream_write_start(
   if (length == 0) return FTUN_E_IO;
   socket_stream->pending = write;
   *accepted = (size_t)length;
+  ftun_engine_flow_schedule(socket_stream->flow);
   return FTUN_OK;
 }
 
@@ -1172,7 +1380,13 @@ static void ftun_engine_stream_completed(ftun_operation_t *operation,
   ftun_engine_flow_t *flow = (ftun_engine_flow_t *)user;
   (void)operation;
   if (flow != NULL && error.status != FTUN_OK &&
-      error.status != FTUN_E_CANCELLED) flow->state = FTUN_ENGINE_FLOW_CLOSING;
+      error.status != FTUN_E_CANCELLED) ftun_engine_flow_close(flow,
+                                                               error.status);
+}
+
+static void ftun_engine_stream_progress(void *user)
+{
+  ftun_engine_flow_schedule((ftun_engine_flow_t *)user);
 }
 
 static ftun_status_t ftun_engine_stream_create(
@@ -1191,6 +1405,8 @@ static ftun_status_t ftun_engine_stream_create(
   options.max_pending_bytes = 256u * 1024u;
   options.completion = ftun_engine_stream_completed;
   options.completion_user = flow;
+  options.progress = ftun_engine_stream_progress;
+  options.progress_user = flow;
   memset(&backend, 0, sizeof(backend));
   backend.read = ftun_engine_stream_read;
   backend.write_start = ftun_engine_stream_write_start;
@@ -1259,19 +1475,63 @@ static ftun_status_t ftun_engine_build_inbound_spec(
   return FTUN_OK;
 }
 
+static void ftun_engine_flow_deadline_ready(ftun_event_source_t *source,
+                                             uint32_t events, void *user)
+{
+  ftun_engine_flow_t *flow = (ftun_engine_flow_t *)user;
+  if (flow == NULL || !flow->active || flow->deadline_source != source ||
+      (events & FTUN_EVENT_TIMER) == 0u) return;
+  ftun_engine_flow_close(flow, FTUN_E_TIMEOUT);
+}
+
+static ftun_status_t ftun_engine_flow_deadline_arm(
+  ftun_engine_flow_t *flow, uint64_t deadline_ms)
+{
+  ftun_status_t status;
+  if (flow == NULL || !flow->active || deadline_ms == 0u) {
+    return FTUN_E_INVALID;
+  }
+  status = ftun_event_source_cancel(&flow->deadline_source);
+  if (status != FTUN_OK) return status;
+  return ftun_event_timer_start(flow->engine->loop, deadline_ms,
+    ftun_engine_flow_deadline_ready, flow, &flow->deadline_source);
+}
+
 static ftun_status_t ftun_engine_queue_reply(ftun_engine_flow_t *flow,
                                               ftun_bytes_t wire,
                                               bool close_after)
 {
+  bool first_reply;
+  uint64_t now;
+  uint64_t deadline;
+  ftun_status_t status;
   if (flow == NULL || (wire.length != 0u && wire.data == NULL) ||
       wire.length > sizeof(flow->reply) - flow->reply_length) {
     return FTUN_E_LIMIT;
   }
+  first_reply = flow->reply_length == 0u && wire.length != 0u;
   if (wire.length != 0u) {
     memcpy(flow->reply + flow->reply_length, wire.data, wire.length);
     flow->reply_length += wire.length;
   }
   flow->close_after_reply = flow->close_after_reply || close_after;
+  if (first_reply) {
+    status = ftun_monotonic_now(&now);
+    if (status != FTUN_OK || now > UINT64_MAX - FTUN_ENGINE_REPLY_TIMEOUT_MS) {
+      return status == FTUN_OK ? FTUN_E_LIMIT : status;
+    }
+    deadline = now + FTUN_ENGINE_REPLY_TIMEOUT_MS;
+    if (flow->state == FTUN_ENGINE_FLOW_HANDSHAKE &&
+        flow->handshake_deadline_ms < deadline) {
+      deadline = flow->handshake_deadline_ms;
+    }
+    status = ftun_engine_flow_deadline_arm(flow, deadline);
+    if (status != FTUN_OK) return status;
+  }
+  /* Replies can be produced by DNS/dial worker completions while the flow has
+   * no subscribed WRITE interest.  Queue the owner-side drive so interests
+   * are refreshed without relying on the removed full flow-table scan. */
+  if (wire.length != 0u) ftun_engine_flow_schedule(flow);
   return FTUN_OK;
 }
 
@@ -1295,6 +1555,11 @@ static ftun_status_t ftun_engine_flush_reply(ftun_engine_flow_t *flow)
     flow->state = FTUN_ENGINE_FLOW_CLOSING;
     return FTUN_E_EOF;
   }
+  if (flow->state == FTUN_ENGINE_FLOW_HANDSHAKE) {
+    return ftun_engine_flow_deadline_arm(flow,
+                                         flow->handshake_deadline_ms);
+  }
+  (void)ftun_event_source_cancel(&flow->deadline_source);
   return FTUN_OK;
 }
 
@@ -1571,6 +1836,15 @@ static void ftun_engine_flow_close(ftun_engine_flow_t *flow,
 {
   ftun_error_t error;
   if (flow == NULL || !flow->active) return;
+  /* A protocol-level failure reply owns the close sequence.  Keep the flow
+   * alive until that bounded reply is drained; hard transport failures and
+   * timeouts still tear it down immediately. */
+  if (flow->close_after_reply && flow->reply_length != 0u &&
+      reason != FTUN_E_IO && reason != FTUN_E_EOF &&
+      reason != FTUN_E_TIMEOUT && reason != FTUN_E_CANCELLED) {
+    ftun_engine_flow_schedule(flow);
+    return;
+  }
   flow->state = FTUN_ENGINE_FLOW_CLOSING;
 #if defined(FTUN_HAVE_MODULE_TUN)
   if (flow->tun && flow->client != NULL && flow->engine->tun_ingress != NULL) {
@@ -1586,6 +1860,7 @@ static void ftun_engine_flow_close(ftun_engine_flow_t *flow,
   } else if (flow->open_operation != NULL) {
     (void)ftun_operation_cancel(flow->open_operation);
   }
+  ftun_engine_flow_schedule(flow);
 }
 
 static ftun_status_t ftun_engine_protocol_finish(
@@ -1673,6 +1948,7 @@ static ftun_status_t ftun_engine_relay_ready(ftun_engine_flow_t *flow,
       status = ftun_event_io_update(flow->client_source, client_interests);
     }
   }
+  if (status == FTUN_OK) ftun_engine_flow_schedule(flow);
   return status;
 }
 
@@ -2363,6 +2639,7 @@ static void ftun_engine_tun_stream_event(
                status != FTUN_E_EOF) {
       ftun_engine_flow_close(flow, status);
     }
+    ftun_engine_flow_schedule(flow);
     return;
   }
 }
@@ -2451,13 +2728,11 @@ static ftun_status_t ftun_engine_tun_output_clear(ftun_engine_t *engine)
 }
 #endif
 
-static ftun_status_t ftun_engine_udp_send_start(
-  void *user, ftun_datagram_send_t *datagram_send,
+static ftun_status_t ftun_engine_udp_send_wire(
+  ftun_engine_udp_slot_t *slot,
   const ftun_endpoint_t *target, const ftun_packet_t *packet)
 {
-  ftun_engine_udp_slot_t *slot = (ftun_engine_udp_slot_t *)user;
   ftun_bytes_t payload;
-  ftun_error_t result;
   uint8_t wire[UINT16_MAX + 263u];
   const uint8_t *data;
   size_t data_length;
@@ -2465,19 +2740,9 @@ static ftun_status_t ftun_engine_udp_send_start(
   ssize_t length;
   ftun_status_t status;
   if (slot == NULL || !slot->active || slot->destroying ||
-      datagram_send == NULL ||
       !ftun_engine_endpoint_equal(target, &slot->remote) ||
       ftun_packet_view(packet, &payload) != FTUN_OK) return FTUN_E_INVALID;
-  if (!slot->ready) {
-    if (slot->open_operation == NULL) {
-      return slot->open_status == FTUN_OK ? FTUN_E_STATE_CORRUPT
-                                          : slot->open_status;
-    }
-    if (slot->pending_count >= sizeof(slot->pending) /
-                               sizeof(slot->pending[0])) return FTUN_E_LIMIT;
-    slot->pending[slot->pending_count++] = datagram_send;
-    return FTUN_OK;
-  }
+  if (!slot->ready) return FTUN_E_AGAIN;
   if (slot->descriptor < 0) return FTUN_E_STATE_CORRUPT;
   data = payload.data;
   data_length = payload.length;
@@ -2493,6 +2758,51 @@ static ftun_status_t ftun_engine_udp_send_start(
   } while (length < 0 && errno == EINTR);
   if (length < 0) return ftun_engine_errno_status(errno);
   if ((size_t)length != data_length) return FTUN_E_IO;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_engine_udp_queue_send(
+  ftun_engine_udp_slot_t *slot, ftun_datagram_send_t *send)
+{
+  ftun_status_t status = FTUN_OK;
+  if (slot->pending_count >= sizeof(slot->pending) /
+                             sizeof(slot->pending[0])) return FTUN_E_LIMIT;
+  slot->pending[slot->pending_count++] = send;
+  if (slot->ready && slot->source != NULL) {
+    status = ftun_engine_udp_update_source(slot);
+    if (status != FTUN_OK) {
+      slot->pending[--slot->pending_count] = NULL;
+    }
+  }
+  return status;
+}
+
+static ftun_status_t ftun_engine_udp_send_start(
+  void *user, ftun_datagram_send_t *datagram_send,
+  const ftun_endpoint_t *target, const ftun_packet_t *packet)
+{
+  ftun_engine_udp_slot_t *slot = (ftun_engine_udp_slot_t *)user;
+  ftun_error_t result;
+  ftun_status_t status;
+  if (slot == NULL || !slot->active || slot->destroying ||
+      datagram_send == NULL) return FTUN_E_INVALID;
+  if (!slot->ready) {
+    if (slot->open_operation == NULL) {
+      return slot->open_status == FTUN_OK ? FTUN_E_STATE_CORRUPT
+                                          : slot->open_status;
+    }
+    return ftun_engine_udp_queue_send(slot, datagram_send);
+  }
+  /* Preserve FIFO order once a packet is blocked.  Returning OK transfers
+   * backend ownership to this queue until a writable event retries it. */
+  if (slot->pending_count != 0u) {
+    return ftun_engine_udp_queue_send(slot, datagram_send);
+  }
+  status = ftun_engine_udp_send_wire(slot, target, packet);
+  if (status == FTUN_E_AGAIN) {
+    return ftun_engine_udp_queue_send(slot, datagram_send);
+  }
+  if (status != FTUN_OK) return status;
   memset(&result, 0, sizeof(result));
   result.status = FTUN_OK;
   return ftun_datagram_send_complete(datagram_send, result);
@@ -2513,7 +2823,8 @@ static ftun_status_t ftun_engine_udp_send_cancel(
       }
       slot->pending_count--;
       slot->pending[slot->pending_count] = NULL;
-      return FTUN_OK;
+      return slot->ready && slot->source != NULL
+        ? ftun_engine_udp_update_source(slot) : FTUN_OK;
     }
   }
   return slot->ready ? FTUN_OK : FTUN_E_STALE;
@@ -2521,8 +2832,68 @@ static ftun_status_t ftun_engine_udp_send_cancel(
 
 static void ftun_engine_udp_slot_reset(ftun_engine_udp_slot_t *slot)
 {
+  ftun_engine_udp_unschedule(slot);
   memset(slot, 0, sizeof(*slot));
   slot->descriptor = -1;
+}
+
+static ftun_engine_udp_backoff_t *ftun_engine_udp_backoff_entry(
+  ftun_engine_t *engine, uint32_t outbound_id, bool create)
+{
+  ftun_engine_udp_backoff_t *free_entry = NULL;
+  size_t index;
+  for (index = 0u; index < FTUN_ENGINE_MAX_UDP_FLOWS; index++) {
+    ftun_engine_udp_backoff_t *entry = &engine->udp_backoff[index];
+    if (entry->active && entry->outbound_id == outbound_id) return entry;
+    if (!entry->active && free_entry == NULL) free_entry = entry;
+  }
+  if (!create || free_entry == NULL) return NULL;
+  memset(free_entry, 0, sizeof(*free_entry));
+  free_entry->active = true;
+  free_entry->outbound_id = outbound_id;
+  return free_entry;
+}
+
+static bool ftun_engine_udp_backoff_allowed(ftun_engine_t *engine,
+                                            uint32_t outbound_id)
+{
+  ftun_engine_udp_backoff_t *entry =
+    ftun_engine_udp_backoff_entry(engine, outbound_id, false);
+  uint64_t now_ms;
+  if (entry == NULL || entry->failures == 0u) return true;
+  if (ftun_monotonic_now(&now_ms) != FTUN_OK) return false;
+  return now_ms >= entry->retry_after_ms;
+}
+
+static void ftun_engine_udp_backoff_failed(ftun_engine_t *engine,
+                                           uint32_t outbound_id)
+{
+  ftun_engine_udp_backoff_t *entry =
+    ftun_engine_udp_backoff_entry(engine, outbound_id, true);
+  uint64_t delay = FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MIN_MS;
+  uint64_t now_ms;
+  uint32_t shift;
+  if (entry == NULL || ftun_monotonic_now(&now_ms) != FTUN_OK) return;
+  if (entry->failures != UINT32_MAX) entry->failures++;
+  shift = entry->failures > 1u ? entry->failures - 1u : 0u;
+  while (shift-- != 0u &&
+         delay < FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS) {
+    delay = delay > FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS / 2u
+      ? FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS : delay * 2u;
+  }
+  if (delay > FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS) {
+    delay = FTUN_ENGINE_UDP_RECONNECT_BACKOFF_MAX_MS;
+  }
+  entry->retry_after_ms = now_ms > UINT64_MAX - delay
+    ? UINT64_MAX : now_ms + delay;
+}
+
+static void ftun_engine_udp_backoff_succeeded(ftun_engine_t *engine,
+                                              uint32_t outbound_id)
+{
+  ftun_engine_udp_backoff_t *entry =
+    ftun_engine_udp_backoff_entry(engine, outbound_id, false);
+  if (entry != NULL) memset(entry, 0, sizeof(*entry));
 }
 
 static ftun_status_t ftun_engine_udp_watch(ftun_engine_udp_slot_t *slot)
@@ -2546,6 +2917,7 @@ static void ftun_engine_udp_destroy(void *user)
     return;
   }
   (void)ftun_event_source_cancel(&slot->source);
+  (void)ftun_event_source_cancel(&slot->control_source);
   if (slot->socks5) {
     (void)ftun_socks5_connection_close(&slot->proxy_connection);
   } else if (slot->descriptor >= 0) {
@@ -2562,22 +2934,30 @@ static void ftun_engine_udp_finish_pending(ftun_engine_udp_slot_t *slot,
     const ftun_endpoint_t *target = NULL;
     const ftun_packet_t *packet = NULL;
     ftun_error_t error;
-    size_t remaining = --slot->pending_count;
-    if (remaining != 0u) {
-      memmove(&slot->pending[0], &slot->pending[1],
-              remaining * sizeof(slot->pending[0]));
-    }
-    slot->pending[remaining] = NULL;
     if (status == FTUN_OK) {
       status = ftun_datagram_send_view(send, &target, &packet);
       if (status == FTUN_OK) {
-        status = ftun_engine_udp_send_start(slot, send, target, packet);
+        status = ftun_engine_udp_send_wire(slot, target, packet);
       }
-      if (status == FTUN_OK) continue;
+      if (status == FTUN_E_AGAIN) {
+        (void)ftun_engine_udp_update_source(slot);
+        return;
+      }
+    }
+    {
+      size_t remaining = --slot->pending_count;
+      if (remaining != 0u) {
+        memmove(&slot->pending[0], &slot->pending[1],
+                remaining * sizeof(slot->pending[0]));
+      }
+      slot->pending[remaining] = NULL;
     }
     memset(&error, 0, sizeof(error));
     error.status = status;
     (void)ftun_datagram_send_complete(send, error);
+  }
+  if (slot->ready && slot->source != NULL) {
+    (void)ftun_engine_udp_update_source(slot);
   }
 }
 
@@ -2703,6 +3083,7 @@ static void ftun_engine_udp_proxy_resolved(
     status = ftun_engine_udp_socks_start(slot);
   }
   if (status != FTUN_OK) {
+    ftun_engine_udp_backoff_failed(slot->engine, slot->outbound_id);
     slot->open_status = status;
     ftun_engine_udp_finish_pending(slot, status);
   }
@@ -2738,8 +3119,22 @@ static void ftun_engine_udp_socks_completed(
     slot->proxy_connection = connection;
     slot->descriptor = (int)info.data_socket;
     status = ftun_engine_udp_watch(slot);
-    if (status == FTUN_OK) slot->ready = true;
+    if (status == FTUN_OK && (info.control_socket == FTUN_INVALID_SOCKET ||
+        info.control_socket > (ftun_native_socket_t)INT_MAX ||
+        info.control_socket == info.data_socket)) {
+      status = FTUN_E_STATE_CORRUPT;
+    }
+    if (status == FTUN_OK) {
+      status = ftun_event_io_start(slot->engine->loop, info.control_socket,
+        FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_engine_udp_control_ready,
+        slot, &slot->control_source);
+    }
+    if (status == FTUN_OK) {
+      slot->ready = true;
+    }
   } else {
+    (void)ftun_event_source_cancel(&slot->source);
+    (void)ftun_event_source_cancel(&slot->control_source);
     if (slot->proxy_connection == connection) {
       (void)ftun_socks5_connection_close(&slot->proxy_connection);
     } else {
@@ -2747,6 +3142,9 @@ static void ftun_engine_udp_socks_completed(
     }
   }
   slot->open_status = status;
+  if (status != FTUN_OK) {
+    ftun_engine_udp_backoff_failed(slot->engine, slot->outbound_id);
+  }
   ftun_engine_udp_finish_pending(slot, status);
 }
 
@@ -2903,6 +3301,10 @@ static ftun_status_t ftun_engine_udp_open(
              leaf.kind != FTUN_OUTBOUND_LEAF_SOCKS5) {
     status = FTUN_E_UNSUPPORTED;
   }
+  if (status == FTUN_OK && leaf.kind == FTUN_OUTBOUND_LEAF_SOCKS5 &&
+      !ftun_engine_udp_backoff_allowed(engine, leaf.id)) {
+    status = FTUN_E_AGAIN;
+  }
   if (status == FTUN_OK) {
     route.outbound_id = leaf.id;
     status = ftun_target_from_metadata(metadata, &target);
@@ -2924,6 +3326,7 @@ static ftun_status_t ftun_engine_udp_open(
     slot->remote.port = target.original.port;
   }
   slot->socks5 = leaf.kind == FTUN_OUTBOUND_LEAF_SOCKS5;
+  slot->outbound_id = leaf.id;
   slot->open_status = FTUN_E_AGAIN;
   slot->active = true;
   memset(&options, 0, sizeof(options));
@@ -3262,13 +3665,36 @@ static ftun_status_t ftun_engine_udp_route_datagram(
   const ftun_metadata_t *metadata, const ftun_packet_t *packet)
 {
   ftun_engine_udp_pending_t *pending = NULL;
+  ftun_metadata_t restored;
   ftun_runtime_info_t info;
   const ftun_config_t *config = NULL;
+  char restored_domain[254];
+  bool found = false;
   ftun_status_t status;
   size_t index;
   if (engine == NULL || inbound == NULL || metadata == NULL || packet == NULL) {
     return FTUN_E_INVALID;
   }
+  restored = *metadata;
+  if ((metadata->known_fields & FTUN_META_DOMAIN) != 0u) {
+    if (metadata->domain.data == NULL || metadata->domain.length == 0u ||
+        metadata->domain.length >= sizeof(restored_domain)) {
+      return FTUN_E_INVALID;
+    }
+    memcpy(restored_domain, metadata->domain.data, metadata->domain.length);
+    restored_domain[metadata->domain.length] = '\0';
+    restored.domain.data = restored_domain;
+    if (metadata->original_target.kind == FTUN_ADDRESS_DOMAIN) {
+      restored.original_target.domain.data = restored_domain;
+    }
+  }
+  status = ftun_engine_restore_fakeip_to(engine, &restored,
+    restored_domain, sizeof(restored_domain));
+  if (status != FTUN_OK) return status;
+  status = ftun_udp_flow_input_existing(engine->udp_flows, inbound, &restored,
+    (ftun_packet_t *)packet, &found);
+  if (status != FTUN_OK || found) return status;
+
   for (index = 0u; index < FTUN_ENGINE_MAX_UDP_FLOWS; index++) {
     if (!engine->udp_pending[index].active) {
       pending = &engine->udp_pending[index];
@@ -3279,16 +3705,16 @@ static ftun_status_t ftun_engine_udp_route_datagram(
   memset(pending, 0, sizeof(*pending));
   pending->engine = engine;
   pending->inbound = inbound;
-  pending->metadata = *metadata;
-  if ((metadata->known_fields & FTUN_META_DOMAIN) != 0u) {
-    if (metadata->domain.data == NULL || metadata->domain.length == 0u ||
-        metadata->domain.length >= sizeof(pending->domain)) {
+  pending->metadata = restored;
+  if ((restored.known_fields & FTUN_META_DOMAIN) != 0u) {
+    if (restored.domain.data == NULL || restored.domain.length == 0u ||
+        restored.domain.length >= sizeof(pending->domain)) {
       return FTUN_E_INVALID;
     }
-    memcpy(pending->domain, metadata->domain.data, metadata->domain.length);
-    pending->domain[metadata->domain.length] = '\0';
+    memcpy(pending->domain, restored.domain.data, restored.domain.length);
+    pending->domain[restored.domain.length] = '\0';
     pending->metadata.domain.data = pending->domain;
-    if (metadata->original_target.kind == FTUN_ADDRESS_DOMAIN) {
+    if (restored.original_target.kind == FTUN_ADDRESS_DOMAIN) {
       pending->metadata.original_target.domain.data = pending->domain;
     }
   }
@@ -3302,11 +3728,7 @@ static ftun_status_t ftun_engine_udp_route_datagram(
     pending->metadata.resolved = pending->resolved;
   }
   pending->active = true;
-  status = ftun_engine_restore_fakeip_to(engine, &pending->metadata,
-    pending->domain, sizeof(pending->domain));
-  if (status == FTUN_OK) {
-    status = ftun_runtime_active_acquire(engine->core, &pending->runtime);
-  }
+  status = ftun_runtime_active_acquire(engine->core, &pending->runtime);
   if (status == FTUN_OK) status = ftun_runtime_get_info(pending->runtime,
                                                         &info);
   if (status == FTUN_OK && info.generation != pending->metadata.generation) {
@@ -3456,6 +3878,13 @@ static ftun_status_t ftun_engine_udp_receive(ftun_engine_udp_slot_t *slot)
   (void)ftun_buffer_release(&buffer);
   if (status == FTUN_OK) {
     status = ftun_datagram_deliver(slot->channel, &slot->remote, &packet);
+  }
+  if (status == FTUN_OK && slot->socks5) {
+    /* A completed SOCKS handshake alone is not recovery: a flapping proxy can
+     * accept UDP ASSOCIATE and immediately drop its control connection.  Only
+     * a valid relayed response proves the association useful and resets the
+     * consecutive-failure backoff. */
+    ftun_engine_udp_backoff_succeeded(slot->engine, slot->outbound_id);
   }
   if (ftun_packet_release(&packet) != FTUN_OK && status == FTUN_OK) {
     status = FTUN_E_STATE_CORRUPT;
@@ -3967,6 +4396,7 @@ static ftun_status_t ftun_engine_flow_create(ftun_engine_t *engine,
   ftun_inbound_spec_t spec;
   ftun_inbound_user_t *users = NULL;
   ftun_status_t status;
+  uint64_t now;
   size_t index;
   for (index = 0u; index < FTUN_ENGINE_MAX_TCP_FLOWS; index++) {
     if (!engine->flows[index].active) {
@@ -3985,6 +4415,13 @@ static ftun_status_t ftun_engine_flow_create(ftun_engine_t *engine,
   flow->remote_socket.descriptor = -1;
   flow->active = true;
   flow->state = FTUN_ENGINE_FLOW_HANDSHAKE;
+  status = ftun_monotonic_now(&now);
+  if (status != FTUN_OK ||
+      now > UINT64_MAX - FTUN_ENGINE_HANDSHAKE_TIMEOUT_MS) {
+    status = status == FTUN_OK ? FTUN_E_LIMIT : status;
+    goto fail;
+  }
+  flow->handshake_deadline_ms = now + FTUN_ENGINE_HANDSHAKE_TIMEOUT_MS;
   if (peer != NULL && peer->sin_family == AF_INET) {
     flow->tcp_peer.kind = FTUN_ADDRESS_IPV4;
     flow->tcp_peer.port = ntohs(peer->sin_port);
@@ -4015,6 +4452,10 @@ static ftun_status_t ftun_engine_flow_create(ftun_engine_t *engine,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR,
       ftun_engine_flow_client_ready, flow, &flow->client_source);
   }
+  if (status == FTUN_OK) {
+    status = ftun_engine_flow_deadline_arm(flow,
+                                           flow->handshake_deadline_ms);
+  }
   if (status != FTUN_OK) goto fail;
   return FTUN_OK;
 
@@ -4023,6 +4464,7 @@ fail:
   (void)ftun_runtime_release(&runtime);
   (void)ftun_event_source_cancel(&flow->client_source);
   (void)ftun_event_source_cancel(&flow->remote_source);
+  (void)ftun_event_source_cancel(&flow->deadline_source);
   if (flow->client != NULL) {
     (void)ftun_stream_stop(flow->client);
     (void)ftun_stream_destroy(&flow->client);
@@ -4038,6 +4480,41 @@ fail:
   return status;
 }
 
+static ftun_status_t ftun_engine_accept_pause(
+  ftun_engine_t *engine, ftun_engine_listener_t *listener)
+{
+  uint64_t now;
+  uint64_t delay;
+  uint64_t deadline;
+  ftun_status_t status;
+  if (engine == NULL || listener == NULL || listener->source == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (listener->accept_timer != NULL) return FTUN_OK;
+  delay = listener->accept_backoff_ms == 0u
+    ? FTUN_ENGINE_ACCEPT_BACKOFF_MIN_MS : listener->accept_backoff_ms;
+  if (delay > FTUN_ENGINE_ACCEPT_BACKOFF_MAX_MS) {
+    delay = FTUN_ENGINE_ACCEPT_BACKOFF_MAX_MS;
+  }
+  status = ftun_monotonic_now(&now);
+  if (status != FTUN_OK || now > UINT64_MAX - delay) {
+    return status == FTUN_OK ? FTUN_E_LIMIT : status;
+  }
+  deadline = now + delay;
+  status = ftun_event_io_update(listener->source, FTUN_EVENT_ERROR);
+  if (status != FTUN_OK) return status;
+  status = ftun_event_timer_start(engine->loop, deadline,
+    ftun_engine_listener_accept_resume, listener, &listener->accept_timer);
+  if (status != FTUN_OK) {
+    (void)ftun_event_io_update(listener->source,
+      FTUN_EVENT_READ | FTUN_EVENT_ERROR);
+    return status;
+  }
+  listener->accept_backoff_ms = delay >= FTUN_ENGINE_ACCEPT_BACKOFF_MAX_MS / 2u
+    ? FTUN_ENGINE_ACCEPT_BACKOFF_MAX_MS : delay * 2u;
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_engine_accept(ftun_engine_t *engine,
                                          ftun_engine_listener_t *listener)
 {
@@ -4051,9 +4528,19 @@ static ftun_status_t ftun_engine_accept(ftun_engine_t *engine,
     ftun_status_t status;
     if (descriptor < 0) {
       if (errno == EINTR) continue;
-      return errno == EAGAIN || errno == EWOULDBLOCK
-        ? FTUN_OK : ftun_engine_errno_status(errno);
+      if (errno == EAGAIN || errno == EWOULDBLOCK) return FTUN_OK;
+      if (errno == ECONNABORTED || errno == EPROTO || errno == ENETDOWN ||
+          errno == EHOSTDOWN || errno == ENONET || errno == EHOSTUNREACH ||
+          errno == ENETUNREACH || errno == EOPNOTSUPP) {
+        return FTUN_OK;
+      }
+      if (errno == EMFILE || errno == ENFILE || errno == ENOBUFS ||
+          errno == ENOMEM) {
+        return ftun_engine_accept_pause(engine, listener);
+      }
+      return ftun_engine_errno_status(errno);
     }
+    listener->accept_backoff_ms = 0u;
     {
       ftun_runtime_t *runtime = NULL;
       const ftun_config_t *config = NULL;
@@ -4087,7 +4574,10 @@ static ftun_status_t ftun_engine_flow_finalize(ftun_engine_flow_t *flow)
   ftun_error_t result;
   ftun_status_t status = FTUN_OK;
   if (flow->open_operation != NULL) return FTUN_E_AGAIN;
-  status = ftun_event_source_cancel(&flow->client_source);
+  status = ftun_event_source_cancel(&flow->deadline_source);
+  if (status == FTUN_OK) {
+    status = ftun_event_source_cancel(&flow->client_source);
+  }
   if (status == FTUN_OK) {
     status = ftun_event_source_cancel(&flow->remote_source);
   }
@@ -4191,6 +4681,11 @@ static ftun_status_t ftun_engine_flow_drive(ftun_engine_flow_t *flow,
       ftun_engine_flow_close(flow, status);
     }
   }
+  if (flow->state != FTUN_ENGINE_FLOW_HANDSHAKE &&
+      flow->reply_length == 0u && flow->deadline_source != NULL) {
+    status = ftun_event_source_cancel(&flow->deadline_source);
+    if (status != FTUN_OK) ftun_engine_flow_close(flow, status);
+  }
   if (flow->state == FTUN_ENGINE_FLOW_UDP_ASSOCIATE) {
     if ((client_events & FTUN_EVENT_READ) != 0u) {
       uint8_t discard[256];
@@ -4266,6 +4761,54 @@ static ftun_status_t ftun_engine_flow_drive(ftun_engine_flow_t *flow,
     return status == FTUN_E_AGAIN ? FTUN_OK : status;
   }
   return status;
+}
+
+static ftun_status_t ftun_engine_flow_drain(ftun_engine_t *engine,
+                                             size_t quota,
+                                             size_t *out_work)
+{
+  ftun_engine_flow_t *last;
+  size_t work = 0u;
+  if (out_work != NULL) *out_work = 0u;
+  if (engine == NULL || quota == 0u || out_work == NULL) {
+    return FTUN_E_INVALID;
+  }
+  /* Preserve the old owner-loop lifecycle boundary: a flow which becomes
+   * runnable while this batch is being driven is deferred to the next
+   * batch.  Without this boundary a synchronously rescheduled TUN flow can
+   * be driven repeatedly and finalized before the packet/ACK cycle which
+   * caused the reschedule has returned through the event loop. */
+  last = engine->ready_flow_tail;
+  while (engine->ready_flow_head != NULL && work < quota) {
+    ftun_engine_flow_t *flow = engine->ready_flow_head;
+    bool batch_complete = flow == last;
+    uint32_t client_events;
+    uint32_t remote_events;
+    ftun_status_t status;
+    engine->ready_flow_head = flow->ready_next;
+    if (engine->ready_flow_head == NULL) engine->ready_flow_tail = NULL;
+    flow->ready_next = NULL;
+    flow->ready_queued = false;
+    if (!flow->active) continue;
+    client_events = flow->client_events;
+    remote_events = flow->remote_events;
+    flow->client_events = 0u;
+    flow->remote_events = 0u;
+    flow->driving = true;
+    flow->reschedule = false;
+    status = ftun_engine_flow_drive(flow, client_events, remote_events);
+    work++;
+    if (flow->active) {
+      bool reschedule = flow->reschedule;
+      flow->driving = false;
+      flow->reschedule = false;
+      if (reschedule) ftun_engine_flow_schedule(flow);
+    }
+    if (status != FTUN_OK) return status;
+    if (batch_complete) break;
+  }
+  *out_work = work;
+  return FTUN_OK;
 }
 
 #if defined(FTUN_HAVE_MODULE_TUN)
@@ -4845,7 +5388,6 @@ static ftun_status_t ftun_engine_health_run(ftun_engine_t *engine)
   return status;
 }
 
-#if defined(FTUN_HAVE_MODULE_FRS)
 static void ftun_engine_background_log(ftun_engine_t *engine,
                                        ftun_status_t status,
                                        const char *message)
@@ -4860,6 +5402,7 @@ static void ftun_engine_background_log(ftun_engine_t *engine,
   (void)ftun_log_emit(engine->core, &diagnostic);
 }
 
+#if defined(FTUN_HAVE_MODULE_FRS)
 static ftun_status_t ftun_engine_replace_etag(ftun_engine_t *engine,
                                                const uint8_t *value,
                                                size_t length)
@@ -5366,12 +5909,33 @@ ftun_status_t ftun_engine_prepare(ftun_core_t *core, ftun_budget_t *budget,
   if (status == FTUN_OK) {
     status = ftun_worker_create(budget, 16u, &engine->maintenance_worker);
   }
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (status == FTUN_OK &&
+      (config->plan->prepare & FTUN_PLAN_FAKE_IP) != 0u &&
+      config->dns.fake_ip.persist) {
+    status = ftun_worker_create(budget, 2u, &engine->fakeip_worker);
+  }
+#endif
   if (status == FTUN_OK) {
     status = ftun_buffer_pool_create(budget, FTUN_ENGINE_RELAY_POOL_BYTES,
       FTUN_ENGINE_RELAY_POOL_BUFFERS, &engine->relay_pool);
   }
   if (status == FTUN_OK) status = ftun_event_loop_create(core, &engine->loop);
   if (status == FTUN_OK) status = ftun_libev_attach(engine->loop);
+  if (status == FTUN_OK) {
+    status = ftun_worker_set_wakeup(engine->worker,
+      ftun_engine_worker_wakeup, engine->loop);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_worker_set_wakeup(engine->maintenance_worker,
+      ftun_engine_worker_wakeup, engine->loop);
+  }
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (status == FTUN_OK && engine->fakeip_worker != NULL) {
+    status = ftun_worker_set_wakeup(engine->fakeip_worker,
+      ftun_engine_worker_wakeup, engine->loop);
+  }
+#endif
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
   if (status == FTUN_OK) status = ftun_engine_fakeip_prepare(engine, config);
 #endif
@@ -5383,6 +5947,7 @@ ftun_status_t ftun_engine_prepare(ftun_core_t *core, ftun_budget_t *budget,
 #else
                                      NULL,
 #endif
+                                     engine->socket_mark,
                                      &engine->dns);
   }
   if (status == FTUN_OK && udp_required) {
@@ -5463,9 +6028,9 @@ ftun_status_t ftun_engine_activate(ftun_engine_t *engine)
   return status;
 }
 
-ftun_status_t ftun_engine_reload_prepare(ftun_engine_t *engine,
-                                         const ftun_config_t *config,
-                                         uint64_t generation)
+ftun_status_t ftun_engine_reload_prepare_planned(
+  ftun_engine_t *engine, const ftun_config_t *config, uint64_t generation,
+  const ftun_engine_dns_plan_t *dns_plan)
 {
   ftun_runtime_t *active_runtime = NULL;
   const ftun_config_t *active_config = NULL;
@@ -5516,13 +6081,14 @@ ftun_status_t ftun_engine_reload_prepare(ftun_engine_t *engine,
     return FTUN_E_INVALID;
   }
 #endif
-  status = ftun_engine_dns_prepare_reload(engine->dns, engine->core,
+  status = ftun_engine_dns_prepare_reload_planned(engine->dns, engine->core,
     engine->budget, engine->operations, engine->worker, config,
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
     engine->fakeip,
 #else
     NULL,
 #endif
+    engine->socket_mark, dns_plan,
     &engine->pending_dns);
   if (status == FTUN_OK) engine->reload_prepared = true;
   else {
@@ -5536,6 +6102,13 @@ ftun_status_t ftun_engine_reload_prepare(ftun_engine_t *engine,
     engine->pending_health_reuse = false;
   }
   return status;
+}
+
+ftun_status_t ftun_engine_reload_prepare(ftun_engine_t *engine,
+                                         const ftun_config_t *config,
+                                         uint64_t generation)
+{
+  return ftun_engine_reload_prepare_planned(engine, config, generation, NULL);
 }
 
 ftun_status_t ftun_engine_reload_commit(ftun_engine_t *engine,
@@ -5636,22 +6209,98 @@ ftun_status_t ftun_engine_reload_abort(ftun_engine_t *engine)
   return status;
 }
 
+static ftun_status_t ftun_engine_udp_drain(ftun_engine_t *engine,
+                                            size_t quota)
+{
+  size_t work = 0u;
+  if (engine == NULL || quota == 0u) return FTUN_E_INVALID;
+  while (engine->ready_udp_head != NULL && work < quota) {
+    ftun_engine_udp_slot_t *slot = engine->ready_udp_head;
+    uint32_t events;
+    uint32_t control_events;
+    ftun_status_t status = FTUN_OK;
+    ftun_engine_udp_unschedule(slot);
+    if (!slot->active) continue;
+    events = slot->events;
+    control_events = slot->control_events;
+    slot->events = 0u;
+    slot->control_events = 0u;
+    if (control_events != 0u) {
+      uint8_t byte;
+      ssize_t received;
+      int socket_error = 0;
+      socklen_t socket_error_length = (socklen_t)sizeof(socket_error);
+      /* The connection object owns the descriptor; retrieve it rather than
+       * duplicating socket ownership in the slot. */
+      {
+        ftun_socks5_connection_info_t info;
+        status = ftun_socks5_connection_get_info(slot->proxy_connection,
+                                                  &info);
+        if (status == FTUN_OK) {
+          if ((control_events & FTUN_EVENT_ERROR) != 0u &&
+              getsockopt((int)info.control_socket, SOL_SOCKET, SO_ERROR,
+                         &socket_error, &socket_error_length) != 0) {
+            socket_error = errno;
+          }
+          do {
+            received = recv((int)info.control_socket, &byte, sizeof(byte),
+                            MSG_PEEK | MSG_DONTWAIT);
+          } while (received < 0 && errno == EINTR);
+          if (received == 0) status = FTUN_E_EOF;
+          else if (received > 0) status = FTUN_E_PROTOCOL;
+          else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            status = socket_error == 0 ? FTUN_OK
+              : ftun_engine_errno_status(socket_error);
+          } else status = ftun_engine_errno_status(errno);
+        }
+      }
+      if (status != FTUN_OK) {
+        ftun_engine_udp_backoff_failed(engine, slot->outbound_id);
+        ftun_status_t cleanup = ftun_udp_flow_fail_outbound(
+          engine->udp_flows, slot->channel, status);
+        if (cleanup != FTUN_OK && cleanup != FTUN_E_STALE) return cleanup;
+        work++;
+        continue;
+      }
+    }
+    if ((events & FTUN_EVENT_WRITE) != 0u) {
+      ftun_engine_udp_finish_pending(slot, FTUN_OK);
+    }
+    if (slot->active &&
+        (events & (FTUN_EVENT_READ | FTUN_EVENT_ERROR)) != 0u) {
+      status = ftun_engine_udp_receive(slot);
+      if (status == FTUN_E_PROTOCOL || status == FTUN_E_REJECTED ||
+          status == FTUN_E_LIMIT || status == FTUN_E_AGAIN) {
+        status = FTUN_OK;
+      } else if (status != FTUN_OK) {
+        if (slot->socks5) {
+          ftun_engine_udp_backoff_failed(engine, slot->outbound_id);
+        }
+        ftun_status_t cleanup = ftun_udp_flow_fail_outbound(
+          engine->udp_flows, slot->channel, status);
+        if (cleanup != FTUN_OK && cleanup != FTUN_E_STALE) return cleanup;
+        status = FTUN_OK;
+      }
+    }
+    if (status != FTUN_OK) return status;
+    work++;
+  }
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_engine_run_once(ftun_engine_t *engine)
 {
   size_t index;
   size_t callbacks = 0u;
+  size_t flow_work = 0u;
+  bool immediate_work = false;
   ftun_status_t status;
   if (engine == NULL || engine->stopped) return FTUN_E_INVALID;
   status = ftun_engine_dns_run_once(engine->dns);
   if (status != FTUN_OK) return status;
-  for (index = 0u; index < FTUN_ENGINE_MAX_TCP_FLOWS; index++) {
-    ftun_engine_flow_t *flow = &engine->flows[index];
-    if (!flow->active) continue;
-    status = ftun_engine_flow_update_sources(flow);
-    if (status != FTUN_OK) {
-      ftun_engine_flow_close(flow, status);
-    }
-  }
+  status = ftun_engine_flow_drain(engine, 1024u, &flow_work);
+  if (status != FTUN_OK) return status;
+  immediate_work = flow_work != 0u || engine->ready_flow_head != NULL;
 #if defined(FTUN_HAVE_MODULE_TUN)
   if (engine->tun_source != NULL) {
     uint32_t interests = FTUN_EVENT_READ | FTUN_EVENT_ERROR;
@@ -5660,7 +6309,8 @@ ftun_status_t ftun_engine_run_once(ftun_engine_t *engine)
     if (status != FTUN_OK) return status;
   }
 #endif
-  status = ftun_event_loop_run_once(engine->loop, true, 1024u, &callbacks);
+  status = ftun_event_loop_run_once(engine->loop, !immediate_work, 1024u,
+                                    &callbacks);
   if (status != FTUN_OK) return status;
   for (index = 0u; index < engine->listener_count; index++) {
     ftun_engine_listener_t *listener = &engine->listeners[index];
@@ -5696,39 +6346,13 @@ ftun_status_t ftun_engine_run_once(ftun_engine_t *engine)
     }
   }
 #endif
-  /* TUN 输入会同步产生 lwIP stream readiness；在本轮立即消费这些事件，
-   * 避免最后一个 ACK 后没有新 FD 事件可唤醒 owner loop。 */
-  for (index = 0u; index < FTUN_ENGINE_MAX_TCP_FLOWS; index++) {
-    ftun_engine_flow_t *flow = &engine->flows[index];
-    uint32_t client_events;
-    uint32_t remote_events;
-    if (!flow->active) continue;
-    client_events = flow->client_events;
-    remote_events = flow->remote_events;
-    flow->client_events = 0u;
-    flow->remote_events = 0u;
-    status = ftun_engine_flow_drive(flow, client_events, remote_events);
-    if (status != FTUN_OK) return status;
-  }
-  for (index = 0u; index < FTUN_ENGINE_MAX_UDP_FLOWS; index++) {
-    ftun_engine_udp_slot_t *slot = &engine->udp[index];
-    uint32_t events;
-    if (!slot->active) continue;
-    events = slot->events;
-    slot->events = 0u;
-    if ((events & (FTUN_EVENT_READ | FTUN_EVENT_ERROR)) != 0u) {
-        status = ftun_engine_udp_receive(slot);
-        if (status == FTUN_E_PROTOCOL || status == FTUN_E_REJECTED ||
-            status == FTUN_E_LIMIT || status == FTUN_E_AGAIN) {
-          continue;
-        }
-        if (status != FTUN_OK) {
-          ftun_status_t cleanup = ftun_udp_flow_fail_outbound(
-            engine->udp_flows, slot->channel, status);
-          if (cleanup != FTUN_OK && cleanup != FTUN_E_STALE) return cleanup;
-        }
-    }
-  }
+  /* FD 与 TUN callbacks only enqueue runnable flows.  Draining the queue
+   * avoids a full-table pass and also completes synchronous socket writes
+   * before the owner can block again. */
+  status = ftun_engine_flow_drain(engine, 1024u, &flow_work);
+  if (status != FTUN_OK) return status;
+  status = ftun_engine_udp_drain(engine, 1024u);
+  if (status != FTUN_OK) return status;
   if (engine->udp_flows != NULL ||
 #if defined(FTUN_HAVE_MODULE_TUN)
       engine->has_tun ||
@@ -5780,7 +6404,23 @@ ftun_status_t ftun_engine_run_once(ftun_engine_t *engine)
   if (status == FTUN_OK && engine->maintenance_worker != NULL) {
     status = ftun_worker_poll(engine->maintenance_worker, 16u, &callbacks);
   }
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (status == FTUN_OK && engine->fakeip_worker != NULL) {
+    status = ftun_worker_poll(engine->fakeip_worker, 2u, &callbacks);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_engine_fakeip_reserve_runtime(engine);
+  }
+#endif
   return status;
+}
+
+ftun_status_t ftun_engine_wakeup(ftun_engine_t *engine)
+{
+  if (engine == NULL || engine->loop == NULL || engine->stopped) {
+    return FTUN_E_INVALID;
+  }
+  return ftun_event_loop_wakeup(engine->loop);
 }
 
 ftun_status_t ftun_engine_stop(ftun_engine_t *engine)
@@ -5807,9 +6447,17 @@ ftun_status_t ftun_engine_stop(ftun_engine_t *engine)
   if (engine->fakeip_store != NULL && engine->fakeip != NULL) {
     ftun_fakeip_snapshot_t *snapshot = NULL;
     ftun_operation_t *operation = NULL;
-    size_t expected = engine->fakeip_store_completions + 1u;
-    ftun_status_t status = ftun_fakeip_service_snapshot(engine->fakeip,
-                                                        &snapshot);
+    size_t expected;
+    ftun_status_t status = FTUN_OK;
+    if (engine->fakeip_reserve_operation != NULL) {
+      expected = engine->fakeip_store_completions + 1u;
+      status = ftun_engine_wait_worker(engine, engine->fakeip_worker,
+                                       expected);
+    }
+    expected = engine->fakeip_store_completions + 1u;
+    if (status == FTUN_OK) {
+      status = ftun_fakeip_service_snapshot(engine->fakeip, &snapshot);
+    }
     if (status == FTUN_OK) {
       engine->fakeip_store_status = FTUN_E_AGAIN;
       status = ftun_fakeip_snapshot_save(engine->fakeip_store, snapshot,
@@ -5817,7 +6465,7 @@ ftun_status_t ftun_engine_stop(ftun_engine_t *engine)
     }
     (void)ftun_fakeip_snapshot_destroy(&snapshot);
     if (status == FTUN_OK) status = ftun_engine_wait_worker(
-      engine, engine->maintenance_worker, expected);
+      engine, engine->fakeip_worker, expected);
     if (status != FTUN_OK) result = status;
   }
   (void)ftun_runtime_manager_set_fakeip(engine->core, NULL);
@@ -5825,6 +6473,7 @@ ftun_status_t ftun_engine_stop(ftun_engine_t *engine)
   for (index = 0u; index < engine->listener_count; index++) {
     (void)ftun_event_source_cancel(&engine->listeners[index].source);
     (void)ftun_event_source_cancel(&engine->listeners[index].udp_source);
+    (void)ftun_event_source_cancel(&engine->listeners[index].accept_timer);
     if (engine->listeners[index].descriptor >= 0) {
       (void)close(engine->listeners[index].descriptor);
       engine->listeners[index].descriptor = -1;
@@ -5838,11 +6487,17 @@ ftun_status_t ftun_engine_stop(ftun_engine_t *engine)
     if (engine->flows[index].active) {
       (void)ftun_event_source_cancel(&engine->flows[index].client_source);
       (void)ftun_event_source_cancel(&engine->flows[index].remote_source);
+      (void)ftun_event_source_cancel(&engine->flows[index].deadline_source);
       ftun_engine_flow_close(&engine->flows[index], FTUN_E_CANCELLED);
+      engine->flows[index].ready_queued = false;
+      engine->flows[index].ready_next = NULL;
     }
   }
+  engine->ready_flow_head = NULL;
+  engine->ready_flow_tail = NULL;
   for (index = 0u; index < FTUN_ENGINE_MAX_UDP_FLOWS; index++) {
     (void)ftun_event_source_cancel(&engine->udp[index].source);
+    (void)ftun_event_source_cancel(&engine->udp[index].control_source);
   }
 #if defined(FTUN_HAVE_MODULE_TUN)
   (void)ftun_event_source_cancel(&engine->tun_source);
@@ -5889,6 +6544,19 @@ ftun_status_t ftun_engine_destroy(ftun_engine_t **engine)
       return FTUN_E_AGAIN;
     }
   }
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (owned->fakeip_worker != NULL) {
+    size_t callbacks = 0u;
+    (void)ftun_worker_stop(owned->fakeip_worker);
+    if (ftun_worker_join(owned->fakeip_worker) != FTUN_OK) {
+      return FTUN_E_AGAIN;
+    }
+    if (ftun_worker_poll(owned->fakeip_worker, SIZE_MAX,
+                         &callbacks) != FTUN_OK) {
+      return FTUN_E_AGAIN;
+    }
+  }
+#endif
   for (index = 0u; index < FTUN_ENGINE_MAX_TCP_FLOWS; index++) {
     ftun_engine_flow_t *flow = &owned->flows[index];
     if (!flow->active) continue;
@@ -5952,6 +6620,12 @@ ftun_status_t ftun_engine_destroy(ftun_engine_t **engine)
       return FTUN_E_AGAIN;
     }
   }
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (owned->fakeip_worker != NULL &&
+      ftun_worker_destroy(&owned->fakeip_worker) != FTUN_OK) {
+    return FTUN_E_AGAIN;
+  }
+#endif
   if (owned->relay_pool != NULL &&
       ftun_buffer_pool_destroy(&owned->relay_pool) != FTUN_OK) {
     return FTUN_E_AGAIN;

@@ -153,7 +153,8 @@ static const ftun_event_backend_ops_t backend_ops = {
   backend_wakeup,
   backend_run_once,
   backend_stop,
-  backend_destroy
+  backend_destroy,
+  false
 };
 
 static size_t socket_index(ftun_native_socket_t socket)

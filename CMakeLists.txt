@@ -925,12 +925,50 @@ if(BUILD_TESTING)
           set_tests_properties(release-linux-production PROPERTIES
             ENVIRONMENT "FTUN_RELEASE_RESOURCE_LIMIT_KIB=262144")
         endif()
+        add_executable(ftun-send-eagain-test
+          src/main.c src/cli/cli.c tests/send_eagain_wrap.c)
+        target_include_directories(ftun-send-eagain-test PRIVATE src)
+        target_compile_definitions(ftun-send-eagain-test PRIVATE
+          ${ftun_module_definitions}
+          FTUN_SOURCE_REVISION="${ftun_source_revision}")
+        target_link_libraries(ftun-send-eagain-test PRIVATE
+          ftun_core ftun_options)
+        target_link_options(ftun-send-eagain-test PRIVATE -Wl,--wrap=send)
+        if(FTUN_STATIC)
+          target_link_options(ftun-send-eagain-test PRIVATE -static)
+        endif()
+        add_test(NAME release-linux-udp-eagain
+          COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/release_linux.sh
+                     $<TARGET_FILE:ftun-send-eagain-test>
+                     $<TARGET_FILE:ftun-linux-integration-test>
+                     $<TARGET_FILE:ftun-v04-frs-test>)
+        set_tests_properties(release-linux-udp-eagain PROPERTIES
+          SKIP_RETURN_CODE 77 RESOURCE_LOCK ftun_linux_namespace
+          ENVIRONMENT "FTUN_TEST_SEND_EAGAIN_PORT=18081;FTUN_TEST_FAKEIP_BOUNDARY_COUNT=4200;FTUN_TEST_UDP_CONTROL_CLOSE=1;FTUN_RELEASE_RESOURCE_LIMIT_KIB=196608")
       endif()
       add_test(NAME socket-inbounds-production
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/socket_inbounds.sh
                    $<TARGET_FILE:ftun>
                    $<TARGET_FILE:ftun-linux-integration-test>)
       set_tests_properties(socket-inbounds-production PROPERTIES
+        TIMEOUT 20 RESOURCE_LOCK ftun_host_socket)
+      add_test(NAME dns-concurrency-production
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/dns_concurrency.sh
+                   $<TARGET_FILE:ftun>
+                   $<TARGET_FILE:ftun-linux-integration-test>)
+      set_tests_properties(dns-concurrency-production PROPERTIES
+        TIMEOUT 15 RESOURCE_LOCK ftun_host_socket)
+      add_test(NAME dns-tcp-concurrency-production
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/dns_tcp_concurrency.sh
+                   $<TARGET_FILE:ftun>
+                   $<TARGET_FILE:ftun-linux-integration-test>)
+      set_tests_properties(dns-tcp-concurrency-production PROPERTIES
+        TIMEOUT 15 RESOURCE_LOCK ftun_host_socket)
+      add_test(NAME reload-async-production
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/reload_async.sh
+                   $<TARGET_FILE:ftun>
+                   $<TARGET_FILE:ftun-linux-integration-test>)
+      set_tests_properties(reload-async-production PROPERTIES
         TIMEOUT 20 RESOURCE_LOCK ftun_host_socket)
       if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
         add_test(NAME idle-tcp-resource-profile
@@ -987,7 +1025,8 @@ if(BUILD_TESTING)
         $<TARGET_FILE:ftun> ${ftun_cli_dns_enabled}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-run.json.in
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-fakeip.json.in)
-    set_tests_properties(cli-v05-contract PROPERTIES TIMEOUT 10)
+    set_tests_properties(cli-v05-contract PROPERTIES
+      TIMEOUT 10 RESOURCE_LOCK ftun_host_socket)
   endif()
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
@@ -1030,6 +1069,8 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_profile.py
             $<TARGET_FILE:ftun> ${CMAKE_CURRENT_SOURCE_DIR}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-run.json.in)
+        set_tests_properties(release-resource-profile PROPERTIES
+          RESOURCE_LOCK ftun_host_socket)
       endif()
     endif()
     # Optional development dependency: skip explicitly if jsonschema is absent.
@@ -1048,6 +1089,9 @@ if(BUILD_TESTING)
   set_tests_properties(build-modules-matrix PROPERTIES TIMEOUT 180)
   if(TEST release-linux-production)
     set_tests_properties(release-linux-production PROPERTIES TIMEOUT 90)
+  endif()
+  if(TEST release-linux-udp-eagain)
+    set_tests_properties(release-linux-udp-eagain PROPERTIES TIMEOUT 120)
   endif()
   if(TEST idle-tcp-resource-profile)
     set_tests_properties(idle-tcp-resource-profile PROPERTIES TIMEOUT 75)

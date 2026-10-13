@@ -176,6 +176,20 @@ static void ftun_tun_tcp_destroy(void *user)
   }
 }
 
+static void ftun_tun_tcp_stream_progress(void *user)
+{
+  ftun_tun_tcp_bridge_t *bridge = (ftun_tun_tcp_bridge_t *)user;
+  ftun_tun_ingress_context_t *context;
+  if (bridge == NULL || bridge->context == NULL || bridge->stream == NULL) {
+    return;
+  }
+  context = bridge->context;
+  if (context->stream_event != NULL) {
+    context->stream_event(context->user, bridge->stream,
+                          FTUN_TUN_STREAM_WRITABLE, FTUN_OK);
+  }
+}
+
 static ftun_status_t ftun_tun_tcp_accept(
   void *user, ftun_lwip_tcp_t *flow, const ftun_endpoint_t *source,
   const ftun_endpoint_t *target)
@@ -208,6 +222,8 @@ static ftun_status_t ftun_tun_tcp_accept(
   options.max_pending_bytes = context->max_pending_stream_bytes;
   options.completion = context->stream_write_completion;
   options.completion_user = context->user;
+  options.progress = ftun_tun_tcp_stream_progress;
+  options.progress_user = bridge;
   memset(&backend, 0, sizeof(backend));
   backend.read = ftun_tun_tcp_read;
   backend.write_start = ftun_tun_tcp_write_start;

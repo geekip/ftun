@@ -45,6 +45,8 @@ struct ftun_worker {
   size_t pending;
   size_t running;
   size_t completed;
+  ftun_worker_wakeup_fn wakeup;
+  void *wakeup_user;
   int accepting;
   int stopping;
   int joined;
@@ -188,7 +190,12 @@ static void *ftun_worker_thread(void *user)
     (void)pthread_mutex_lock(&worker->mutex);
     if (!cancel_without_run) worker->running--;
     ftun_worker_complete_list(worker, task);
-    (void)pthread_mutex_unlock(&worker->mutex);
+    {
+      ftun_worker_wakeup_fn wakeup = worker->wakeup;
+      void *wakeup_user = worker->wakeup_user;
+      (void)pthread_mutex_unlock(&worker->mutex);
+      if (wakeup != NULL) wakeup(wakeup_user);
+    }
   }
   return NULL;
 }
@@ -242,6 +249,24 @@ status_error:
 io_error:
   status = FTUN_E_IO;
   goto status_error;
+}
+
+ftun_status_t ftun_worker_set_wakeup(ftun_worker_t *worker,
+                                     ftun_worker_wakeup_fn wakeup,
+                                     void *user)
+{
+  if (worker == NULL || (wakeup == NULL && user != NULL)) {
+    return FTUN_E_INVALID;
+  }
+  (void)pthread_mutex_lock(&worker->mutex);
+  if (!worker->accepting || worker->tasks != 0u) {
+    (void)pthread_mutex_unlock(&worker->mutex);
+    return FTUN_E_AGAIN;
+  }
+  worker->wakeup = wakeup;
+  worker->wakeup_user = user;
+  (void)pthread_mutex_unlock(&worker->mutex);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t *job,
