@@ -35,5 +35,6 @@ IPv6、AnyTLS、管理 HTTP API、Full Cone、ARM/OpenWrt 和非 Linux 平台仍
 声明内。TUN/自动路由需要 root 或等价网络能力；只启用 SOCKS5/Mixed 入站时
 不需要 `CAP_NET_ADMIN` 或 `CAP_NET_RAW`。
 
-构建、矩阵、性能和资源数据见[构建、交付与验证基线](build-release.md)。本文件不代表
-已创建或推送 `v1.0.1` tag；提交、推送和打 tag 仍需仓库所有者明确授权。
+构建、矩阵、性能和资源数据见[构建、交付与验证基线](build-release.md)。`v1.0.1`
+tag 已通过 GitHub Actions 自动构建并发布；当前提供 `linux-x86_64-musl` 压缩包及
+SHA-256 校验文件。后续更新同名 tag 会重新验证，并覆盖对应 Release 资产。
