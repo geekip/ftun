@@ -44,11 +44,11 @@ ctest --preset linux-x86_64-musl --output-on-failure
 不会移除 SOCKS5 TCP/UDP；`dns.enable=false` 的必要本地解析保留 SystemResolver。
 运行时关闭功能只裁剪本次 DDRA 资源，不等于编译期裁剪。
 
-## 2026-10-12 v1.0.1 候选证据
+## 2026-10-13 v1.0.1 冻结证据
 
 环境与 v1.0 基线一致：Linux `6.12.107+deb13-amd64` x86_64、GCC 14.2.0、
-CMake 3.31.6。下列矩阵在 `953e5f7` 基线之上的候选工作树完成；提交后的正式
-候选必须从干净源码重新配置和构建，并以产物自身报告的 revision 固定来源。
+CMake 3.31.6。下列矩阵在 `953e5f7` 基线之上的候选工作树完成，并在固定干净
+提交 `a4fdeb7d745c` 上重新配置和复验；24 小时长稳产物自身报告该 revision。
 
 | 验证档 | 结果 |
 |---|---:|
@@ -98,8 +98,13 @@ lwIP 真实 TUN 对照比较原 12 MSS、约 64 KiB（44 MSS）和窗口扩大�
 SOCKS5 UDP 10,000 包为 19,841 包/秒。该 UDP 证据不支持在本版引入
 `recvmmsg`/`sendmmsg` 两套状态路径。
 
-v1.0.1 发布候选还必须在最终内容不变的构建上完成连续至少 24 小时
-长稳；短 CI 和 60 秒空闲检查不代替该门槛。
+固定提交 `a4fdeb7` 的 musl 候选随后在不可变 Docker 镜像中连续运行
+86,401 秒。长稳期间持续执行 SOCKS5 TCP、Mixed UDP 和 DNS 数据面请求；结束后
+继续通过无效重载回滚、FRS 条件更新、DNS 重载、优雅停止、持久化重启、损坏本地
+FRS 拒绝、启动下载失败拒绝和 DNS 关闭时的 SystemResolver 路径。容器状态为
+`exited`、退出码为 0、`OOMKilled=false`、重启次数为 0，镜像与四个输入产物摘要
+均和启动记录一致。由此满足连续至少 24 小时长稳门槛；短 CI 和 60 秒空闲检查仍只
+作为独立回归证据。
 
 ## 2026-10-12 v1.0 冻结候选证据
 
@@ -161,3 +166,18 @@ cmake --build build/release --target uninstall
 `FTUN 1.0.1`，并报告构建时的固定源码 revision 与完整内置能力清单；卸载后无文件
 残留。正式发行构建必须来自干净工作树，版本输出不得带 `-dirty`；具体 revision 以
 产物自身输出为准，避免文档提交反过来改变其记录的提交标识。
+
+## GitHub Release 自动构建
+
+推送或更新符合 `v*` 的 Git tag 时，`.github/workflows/release.yml` 会检出该 tag
+及递归 submodule，校验 tag 与 `project(FTUN VERSION ...)` 一致，并使用
+`linux-x86_64-musl` preset 构建和执行完整 CTest。工作流再次检查版本输出、x86-64
+静态 ELF、`PT_INTERP` 和 `DT_NEEDED`，验证通过后才创建或更新同名 GitHub Release。
+
+当前只发布 `linux-x86_64-musl`，资产为
+`ftun-<tag>-linux-x86_64-musl.tar.gz` 及对应 `.sha256`。压缩包包含 `ftun` 可执行文件
+和 CMake 安装清单中的许可、依赖说明及公开文档；不会包含用户配置、状态、日志或
+本地 Harness 资料。同名 tag 被更新时会重新构建、同步存在的对应版本发行说明，并以
+`--clobber` 替换同名资产。Release 二进制始终报告 tag 所指提交的 revision；该标识
+可能晚于长期稳定性候选的 revision，发行记录必须明确二者之间是否只有文档和发布
+自动化变化，不能把未执行的长稳重复测试写成已经执行。
