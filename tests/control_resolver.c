@@ -1,4 +1,4 @@
-#include "core/control_resolver.h"
+#include "proxy/control_resolver.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>

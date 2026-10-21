@@ -24,6 +24,7 @@ typedef struct {
   ftun_status_t failure;
   ftun_reservation_t *reservation;
   void *owned_block;
+  size_t heap_index;
   int occupied;
 } ftun_dns_cache_entry_t;
 
@@ -31,11 +32,22 @@ struct ftun_dns_cache {
   ftun_budget_t *budget;
   ftun_index_t *index;
   ftun_dns_cache_entry_t *entries;
+  size_t *expiry_heap;
+  size_t *free_slots;
   ftun_reservation_t *reservation;
   ftun_dns_cache_now_fn now;
   void *now_user;
   size_t capacity;
   size_t entry_count;
+  size_t expiry_count;
+  size_t free_count;
+  size_t positive_count;
+  size_t negative_count;
+  size_t failure_count;
+  uint64_t hits;
+  uint64_t misses;
+  uint64_t evictions;
+  uint64_t expirations;
 };
 
 static uint16_t ftun_cache_u16(const uint8_t *data)
@@ -229,35 +241,116 @@ done:
   return status;
 }
 
+static int ftun_cache_expiry_before(const ftun_dns_cache_t *cache,
+                                    size_t left, size_t right)
+{
+  uint64_t left_expiry = cache->entries[left].expires_ms;
+  uint64_t right_expiry = cache->entries[right].expires_ms;
+  return left_expiry < right_expiry ||
+    (left_expiry == right_expiry && left < right);
+}
+
+static void ftun_cache_heap_swap(ftun_dns_cache_t *cache, size_t left,
+                                 size_t right)
+{
+  size_t slot = cache->expiry_heap[left];
+  cache->expiry_heap[left] = cache->expiry_heap[right];
+  cache->expiry_heap[right] = slot;
+  cache->entries[cache->expiry_heap[left]].heap_index = left;
+  cache->entries[cache->expiry_heap[right]].heap_index = right;
+}
+
+static void ftun_cache_heap_push(ftun_dns_cache_t *cache, size_t slot)
+{
+  size_t position = cache->expiry_count++;
+  cache->expiry_heap[position] = slot;
+  cache->entries[slot].heap_index = position;
+  while (position != 0u) {
+    size_t parent = (position - 1u) / 2u;
+    if (!ftun_cache_expiry_before(cache, slot,
+                                  cache->expiry_heap[parent])) break;
+    ftun_cache_heap_swap(cache, position, parent);
+    position = parent;
+  }
+}
+
+static void ftun_cache_heap_remove(ftun_dns_cache_t *cache, size_t slot)
+{
+  size_t position = cache->entries[slot].heap_index;
+  size_t replacement;
+  if (position >= cache->expiry_count ||
+      cache->expiry_heap[position] != slot) return;
+  cache->expiry_count--;
+  replacement = cache->expiry_heap[cache->expiry_count];
+  cache->entries[slot].heap_index = SIZE_MAX;
+  if (position == cache->expiry_count) return;
+  cache->expiry_heap[position] = replacement;
+  cache->entries[replacement].heap_index = position;
+  if (position != 0u && ftun_cache_expiry_before(cache, replacement,
+      cache->expiry_heap[(position - 1u) / 2u])) {
+    while (position != 0u) {
+      size_t parent = (position - 1u) / 2u;
+      if (!ftun_cache_expiry_before(cache, replacement,
+                                    cache->expiry_heap[parent])) break;
+      ftun_cache_heap_swap(cache, position, parent);
+      position = parent;
+    }
+  } else {
+    for (;;) {
+      size_t left = position * 2u + 1u;
+      size_t right = left + 1u;
+      size_t smallest = position;
+      if (left < cache->expiry_count &&
+          ftun_cache_expiry_before(cache, cache->expiry_heap[left],
+                                   cache->expiry_heap[smallest])) {
+        smallest = left;
+      }
+      if (right < cache->expiry_count &&
+          ftun_cache_expiry_before(cache, cache->expiry_heap[right],
+                                   cache->expiry_heap[smallest])) {
+        smallest = right;
+      }
+      if (smallest == position) break;
+      ftun_cache_heap_swap(cache, position, smallest);
+      position = smallest;
+    }
+  }
+}
+
 static void ftun_cache_entry_clear(ftun_dns_cache_t *cache, size_t slot)
 {
   ftun_dns_cache_entry_t *entry = &cache->entries[slot];
   ftun_reservation_t *reservation;
   if (!entry->occupied) return;
+  ftun_cache_heap_remove(cache, slot);
   (void)ftun_index_remove(cache->index,
     (ftun_bytes_t){entry->key, entry->key_length}, NULL);
+  if (entry->kind == FTUN_DNS_CACHE_POSITIVE &&
+      cache->positive_count != 0u) cache->positive_count--;
+  else if (entry->kind == FTUN_DNS_CACHE_NEGATIVE &&
+           cache->negative_count != 0u) cache->negative_count--;
+  else if (entry->kind == FTUN_DNS_CACHE_FAILURE &&
+           cache->failure_count != 0u) cache->failure_count--;
   reservation = entry->reservation;
   free(entry->owned_block);
   memset(entry, 0, sizeof(*entry));
+  entry->heap_index = SIZE_MAX;
   if (cache->entry_count != 0u) cache->entry_count--;
+  cache->free_slots[cache->free_count++] = slot;
   (void)ftun_reservation_release(&reservation);
 }
 
 static size_t ftun_cache_slot(ftun_dns_cache_t *cache, uint64_t now)
 {
-  size_t index;
-  size_t earliest = 0u;
-  for (index = 0u; index < cache->capacity; index++) {
-    if (!cache->entries[index].occupied) return index;
-    if (cache->entries[index].expires_ms <= now) {
-      ftun_cache_entry_clear(cache, index);
-      return index;
-    }
-    if (cache->entries[index].expires_ms <
-        cache->entries[earliest].expires_ms) earliest = index;
+  size_t slot;
+  if (cache->free_count != 0u) {
+    return cache->free_slots[--cache->free_count];
   }
-  ftun_cache_entry_clear(cache, earliest);
-  return earliest;
+  slot = cache->expiry_heap[0];
+  if (cache->entries[slot].expires_ms <= now) cache->expirations++;
+  else cache->evictions++;
+  ftun_cache_entry_clear(cache, slot);
+  return cache->free_slots[--cache->free_count];
 }
 
 static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
@@ -328,10 +421,16 @@ static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
   if (status != FTUN_OK) {
     free(block);
     memset(entry, 0, sizeof(*entry));
+    entry->heap_index = SIZE_MAX;
+    cache->free_slots[cache->free_count++] = slot;
     (void)ftun_reservation_release(&reservation);
     return status;
   }
+  ftun_cache_heap_push(cache, slot);
   cache->entry_count++;
+  if (kind == FTUN_DNS_CACHE_POSITIVE) cache->positive_count++;
+  else if (kind == FTUN_DNS_CACHE_NEGATIVE) cache->negative_count++;
+  else if (kind == FTUN_DNS_CACHE_FAILURE) cache->failure_count++;
   return FTUN_OK;
 }
 
@@ -347,20 +446,35 @@ ftun_status_t ftun_dns_cache_create(const ftun_dns_cache_options_t *options,
       options->max_entries == 0u || options->max_entries > UINT32_MAX ||
       out == NULL || options->max_entries > SIZE_MAX /
         sizeof(ftun_dns_cache_entry_t)) return FTUN_E_INVALID;
-  bytes = sizeof(*cache) +
-          options->max_entries * sizeof(ftun_dns_cache_entry_t);
+  if (options->max_entries >
+      (SIZE_MAX - sizeof(*cache)) /
+        (sizeof(ftun_dns_cache_entry_t) + 2u * sizeof(size_t))) {
+    return FTUN_E_LIMIT;
+  }
+  bytes = sizeof(*cache) + options->max_entries *
+    (sizeof(ftun_dns_cache_entry_t) + 2u * sizeof(size_t));
   status = ftun_budget_reserve(options->budget, bytes, &reservation);
   if (status != FTUN_OK) return status;
   cache = (ftun_dns_cache_t *)calloc(1u, sizeof(*cache));
   if (cache == NULL) goto limit;
   cache->entries = (ftun_dns_cache_entry_t *)calloc(
     options->max_entries, sizeof(*cache->entries));
-  if (cache->entries == NULL) goto limit;
+  cache->expiry_heap = (size_t *)calloc(options->max_entries,
+                                        sizeof(*cache->expiry_heap));
+  cache->free_slots = (size_t *)calloc(options->max_entries,
+                                       sizeof(*cache->free_slots));
+  if (cache->entries == NULL || cache->expiry_heap == NULL ||
+      cache->free_slots == NULL) goto limit;
   cache->budget = options->budget;
   cache->capacity = options->max_entries;
   cache->reservation = reservation;
   cache->now = options->now == NULL ? ftun_cache_default_now : options->now;
   cache->now_user = options->now_user;
+  cache->free_count = options->max_entries;
+  for (bytes = 0u; bytes < options->max_entries; bytes++) {
+    cache->entries[bytes].heap_index = SIZE_MAX;
+    cache->free_slots[bytes] = options->max_entries - bytes - 1u;
+  }
   status = ftun_index_create(options->budget,
     options->max_entries < 8u ? options->max_entries : 8u,
     options->max_entries, NULL, NULL, &cache->index);
@@ -373,6 +487,8 @@ limit:
 fail:
   if (cache != NULL) {
     (void)ftun_index_destroy(&cache->index);
+    free(cache->free_slots);
+    free(cache->expiry_heap);
     free(cache->entries);
     free(cache);
   }
@@ -452,16 +568,22 @@ ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache,
   if (status != FTUN_OK) return status;
   status = ftun_hash_lookup(cache->index,
     (ftun_bytes_t){key, key_length}, &slot);
-  if (status != FTUN_OK) return status;
+  if (status != FTUN_OK) {
+    if (status == FTUN_E_EOF) cache->misses++;
+    return status;
+  }
   if ((size_t)slot >= cache->capacity || !cache->entries[slot].occupied) {
     return FTUN_E_STATE_CORRUPT;
   }
   entry = &cache->entries[slot];
   now = cache->now(cache->now_user);
   if (now >= entry->expires_ms) {
+    cache->expirations++;
+    cache->misses++;
     ftun_cache_entry_clear(cache, slot);
     return FTUN_E_EOF;
   }
+  cache->hits++;
   if (entry->kind == FTUN_DNS_CACHE_FAILURE) return entry->failure;
   if (sizeof(*answer) > SIZE_MAX - entry->wire_length) return FTUN_E_LIMIT;
   bytes = sizeof(*answer) + entry->wire_length;
@@ -511,17 +633,17 @@ ftun_status_t ftun_dns_answer_release(ftun_dns_answer_t **answer)
 ftun_status_t ftun_dns_cache_get_usage(const ftun_dns_cache_t *cache,
                                        ftun_dns_cache_usage_t *out)
 {
-  size_t index;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (cache == NULL || out == NULL) return FTUN_E_INVALID;
   out->capacity = cache->capacity;
   out->entries = cache->entry_count;
-  for (index = 0u; index < cache->capacity; index++) {
-    if (!cache->entries[index].occupied) continue;
-    if (cache->entries[index].kind == FTUN_DNS_CACHE_POSITIVE) out->positive++;
-    else if (cache->entries[index].kind == FTUN_DNS_CACHE_NEGATIVE) out->negative++;
-    else if (cache->entries[index].kind == FTUN_DNS_CACHE_FAILURE) out->failures++;
-  }
+  out->positive = cache->positive_count;
+  out->negative = cache->negative_count;
+  out->failures = cache->failure_count;
+  out->hits = cache->hits;
+  out->misses = cache->misses;
+  out->evictions = cache->evictions;
+  out->expirations = cache->expirations;
   return FTUN_OK;
 }
 
@@ -540,6 +662,8 @@ ftun_status_t ftun_dns_cache_destroy(ftun_dns_cache_t **cache)
     return FTUN_E_STATE_CORRUPT;
   }
   reservation = owned->reservation;
+  free(owned->free_slots);
+  free(owned->expiry_heap);
   free(owned->entries);
   free(owned);
   *cache = NULL;

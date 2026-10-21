@@ -1,6 +1,6 @@
 #include "core/budget.h"
 #include "core/operation.h"
-#include "inbound/tun.h"
+#include "proxy/tun/ingress.h"
 #include "util/buffer.h"
 
 #include <stdio.h>
@@ -150,13 +150,13 @@ static size_t make_udp_packet(uint8_t *packet, size_t capacity,
   return total;
 }
 
-static ftun_status_t capture_output(void *user, ftun_packet_port_t *port,
-                                    ftun_bytes_t packet)
+static ftun_status_t capture_output(void *user, ftun_bytes_t packet)
 {
   fixture_t *fixture = (fixture_t *)user;
   size_t index = fixture->output_count;
-  if (port != fixture->port || index >= OUTPUT_CAPACITY ||
-      packet.length > PACKET_CAPACITY) return FTUN_E_LIMIT;
+  if (index >= OUTPUT_CAPACITY || packet.length > PACKET_CAPACITY) {
+    return FTUN_E_LIMIT;
+  }
   memcpy(fixture->outputs[index], packet.data, packet.length);
   fixture->output_lengths[index] = packet.length;
   fixture->output_count++;
@@ -221,8 +221,6 @@ static void fill_spec(fixture_t *fixture, ftun_tun_ingress_spec_t *spec,
                       bool tcp, bool udp)
 {
   memset(spec, 0, sizeof(*spec));
-  spec->core = fixture->core;
-  spec->port = fixture->port;
   spec->budget = fixture->budget;
   spec->operations = fixture->operations;
   spec->generation = 7u;
@@ -289,7 +287,7 @@ static ftun_status_t input_packet(fixture_t *fixture, const uint8_t *bytes,
   }
   (void)ftun_buffer_slice_release(&slice);
   (void)ftun_buffer_release(&buffer);
-  status = ftun_tun_ingress(fixture->core, fixture->port, &packet);
+  status = ftun_tun_ingress(fixture->ingress, &packet);
   if (ftun_packet_release(&packet) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
   return status;
 }
@@ -538,11 +536,9 @@ static int test_boundaries_and_rejection(void)
   memset(&fixture, 0, sizeof(fixture));
   fixture.core = (ftun_core_t *)(uintptr_t)0x101u;
   fixture.port = (ftun_packet_port_t *)(uintptr_t)0x202u;
-  CHECK(ftun_tun_ingress(fixture.core, fixture.port,
-        (ftun_packet_t *)(uintptr_t)0x303u) == FTUN_E_STALE);
+  CHECK(ftun_tun_ingress(NULL,
+        (ftun_packet_t *)(uintptr_t)0x303u) == FTUN_E_INVALID);
   CHECK(fixture_start(&fixture, true, false) == 0);
-  fill_spec(&fixture, &spec, true, false);
-  CHECK(ftun_tun_ingress_bind(&spec, &other) == FTUN_E_AGAIN && other == NULL);
   length = make_udp_packet(packet, sizeof(packet), source, target,
                            1000u, 53u, NULL, 0u);
   CHECK(input_packet(&fixture, packet, length, 13u) == FTUN_E_UNSUPPORTED);

@@ -5,10 +5,10 @@
 #include "config/parser.h"
 #include "config/validate.h"
 #include "core/budget.h"
-#include "core/runtime.h"
-#include "core/state.h"
-#include "route/rule.h"
-#include "state/group_cache.h"
+#include "proxy/runtime_state.h"
+#include "proxy/state/restore.h"
+#include "proxy/route/rule.h"
+#include "proxy/state/group_cache.h"
 #include "util/time.h"
 
 #include <stdio.h>

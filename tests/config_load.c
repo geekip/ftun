@@ -101,7 +101,8 @@ int main(void)
   CHECK(make_path(expected, sizeof(expected), config_directory, "./data/rules.frs"));
   CHECK(strcmp(config->frs.path, expected) == 0);
   CHECK(config->plan != NULL && config->plan->required_modules ==
-        (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_FRS));
+        (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_PROXY |
+         FTUN_BUILD_MODULE_FRS));
   CHECK(config->plan->outbound_count == 1u &&
         config->plan->reachable_outbound_count == 0u);
   free(canonical);

@@ -1,7 +1,7 @@
 #ifndef FTUN_DNS_LISTENER_H
 #define FTUN_DNS_LISTENER_H
 
-#include "dns/dns.h"
+#include "dns/dispatcher.h"
 
 typedef void (*ftun_dns_listener_reply_fn)(
   ftun_dns_transport_t transport, uint64_t peer_id, ftun_error_t error,
@@ -9,6 +9,10 @@ typedef void (*ftun_dns_listener_reply_fn)(
 
 struct ftun_dns_listener_spec {
   ftun_budget_t *budget;
+  /* 显式借用；dispatcher 必须比 listener 及其在途请求长寿。 */
+  ftun_dns_dispatcher_t *dispatcher;
+  ftun_dns_dispatch_fn dispatch;
+  void *dispatch_user;
   ftun_dns_entry_t entry;
   size_t fixed_server;
   uint32_t inbound_id;

@@ -53,7 +53,7 @@ def main():
                    if "/third_party/lwip/src/core/" in entry["file"]]
   if len(lwip_commands) != 18:
     return fail("the reviewed raw-core source set must compile exactly once")
-  required = ("/src/tun/lwip_port", "/third_party/lwip/src/include")
+  required = ("/src/proxy/tun/lwip_port", "/third_party/lwip/src/include")
   if any(any(item not in command for item in required) for command in lwip_commands):
     return fail("lwIP compile commands do not use the FTUN port configuration")
   forbidden = ("/src/api/", "/src/apps/", "/src/netif/", "/src/ports/")

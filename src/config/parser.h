@@ -13,7 +13,7 @@
  * 实现路径：拒绝重复键、未知字段、深度/长度/整数溢出；解析树只在控制阶段存在；关闭 DNS 时不建立无效 DNS 选择依赖。
  * 根 $schema 是编辑器元数据：检查为字符串后忽略，不下载、不参与 Runtime 身份。
  * 字段结构与根 schema.json 保持一致；引用、环、文件等仍交 validate 校验。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
+ * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；成功返回拥有型模型，owner loop 可显式 retain 给不可变 Runtime。
  * 不调用回调；失败输出清空，所有部分分配均在返回前回滚。
  */

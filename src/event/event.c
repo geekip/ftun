@@ -49,9 +49,18 @@ struct ftun_event_loop {
   size_t deferred_head;
   size_t deferred_tail;
   size_t deferred_count;
+  size_t source_capacity;
   size_t source_count;
   size_t ready_count;
   size_t wakeups;
+  uint64_t polls;
+  uint64_t callbacks;
+  uint64_t quota_exhaustions;
+  uint64_t last_dispatch_ms;
+  uint64_t max_dispatch_ms;
+  uint64_t max_timer_lateness_ms;
+  size_t max_callbacks_per_poll;
+  int prefer_deferred;
   int accepting;
   int dispatching;
   int stopped;
@@ -60,9 +69,16 @@ struct ftun_event_loop {
 /* TASK-EVENT-001 / TEST-EVENT-001，目标 0.2.0：后端无关的有界事件前端。 */
 ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out)
 {
+  return ftun_event_loop_create_with_capacity(
+    core, FTUN_EVENT_SOURCE_CAPACITY, out);
+}
+
+ftun_status_t ftun_event_loop_create_with_capacity(
+  ftun_core_t *core, size_t source_capacity, ftun_event_loop_t **out)
+{
   ftun_event_loop_t *loop;
   if (out != NULL) *out = NULL;
-  if (out == NULL) return FTUN_E_INVALID;
+  if (out == NULL || source_capacity == 0u) return FTUN_E_INVALID;
   loop = (ftun_event_loop_t *)calloc(1u, sizeof(*loop));
   if (loop == NULL) return FTUN_E_LIMIT;
   if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
@@ -70,7 +86,9 @@ ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out)
     return FTUN_E_IO;
   }
   loop->core = core;
+  loop->source_capacity = source_capacity;
   loop->accepting = 1;
+  loop->prefer_deferred = 1;
   *out = loop;
   return FTUN_OK;
 }
@@ -178,7 +196,7 @@ static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
   if (out != NULL) *out = NULL;
   if (loop == NULL || callback == NULL || out == NULL) return FTUN_E_INVALID;
   if (!loop->accepting) return FTUN_E_CANCELLED;
-  if (loop->source_count >= FTUN_EVENT_SOURCE_CAPACITY) return FTUN_E_LIMIT;
+  if (loop->source_count >= loop->source_capacity) return FTUN_E_LIMIT;
   source = (ftun_event_source_t *)calloc(1u, sizeof(*source));
   if (source == NULL) return FTUN_E_LIMIT;
   source->loop = loop;
@@ -451,6 +469,8 @@ static ftun_event_source_t *ftun_event_ready_source(ftun_event_loop_t *loop,
 ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
                                    size_t max_callbacks, size_t *out_callbacks)
 {
+  uint64_t started_ms = 0u;
+  uint64_t finished_ms = 0u;
   size_t callbacks = 0u;
   if (out_callbacks != NULL) *out_callbacks = 0u;
   if (loop == NULL || max_callbacks == 0u || out_callbacks == NULL) {
@@ -458,6 +478,7 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
   }
   if (loop->dispatching) return FTUN_E_AGAIN;
   loop->dispatching = 1;
+  (void)ftun_monotonic_now(&started_ms);
   /* A direct poll without a backend still owns timer expiry and therefore
    * performs one bounded scan.  Production backends enqueue timer readiness
    * themselves, so the hot dispatch path only performs O(1) ready pops. */
@@ -468,17 +489,48 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
     ftun_event_deferred_t deferred;
     ftun_event_source_t *source;
     uint32_t events = 0u;
-    if (ftun_event_pop_deferred(loop, &deferred)) {
-      deferred.callback(deferred.user);
-      callbacks++;
-      continue;
+    int have_deferred = 0;
+    if (loop->prefer_deferred) {
+      have_deferred = ftun_event_pop_deferred(loop, &deferred);
+      if (!have_deferred) source = ftun_event_ready_source(loop, &events);
+      else source = NULL;
+    } else {
+      source = ftun_event_ready_source(loop, &events);
+      if (source == NULL) have_deferred = ftun_event_pop_deferred(loop,
+                                                                  &deferred);
     }
-    source = ftun_event_ready_source(loop, &events);
-    if (source == NULL) break;
-    source->callback(source, events, source->user);
+    if (!have_deferred && source == NULL) break;
+    loop->prefer_deferred = !loop->prefer_deferred;
+    if (have_deferred) {
+      deferred.callback(deferred.user);
+    } else {
+      if (source->kind == FTUN_EVENT_SOURCE_TIMER &&
+          now_ms > source->deadline_ms &&
+          now_ms - source->deadline_ms > loop->max_timer_lateness_ms) {
+        loop->max_timer_lateness_ms = now_ms - source->deadline_ms;
+      }
+      source->callback(source, events, source->user);
+    }
     callbacks++;
   }
   loop->dispatching = 0;
+  loop->polls++;
+  if (UINT64_MAX - loop->callbacks < callbacks) loop->callbacks = UINT64_MAX;
+  else loop->callbacks += callbacks;
+  if (callbacks > loop->max_callbacks_per_poll) {
+    loop->max_callbacks_per_poll = callbacks;
+  }
+  if (callbacks == max_callbacks &&
+      (loop->ready_count != 0u || loop->deferred_count != 0u)) {
+    if (loop->quota_exhaustions != UINT64_MAX) loop->quota_exhaustions++;
+  }
+  if (ftun_monotonic_now(&finished_ms) == FTUN_OK &&
+      finished_ms >= started_ms) {
+    loop->last_dispatch_ms = finished_ms - started_ms;
+    if (loop->last_dispatch_ms > loop->max_dispatch_ms) {
+      loop->max_dispatch_ms = loop->last_dispatch_ms;
+    }
+  }
   (void)pthread_mutex_lock(&loop->mutex);
   if (loop->deferred_count != 0u && loop->backend != NULL) {
     loop->wakeups++;
@@ -503,6 +555,12 @@ ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
   }
   if (loop->backend == NULL) return FTUN_E_UNSUPPORTED;
   if (loop->stopped) return FTUN_E_CANCELLED;
+  /* A retained ready/deferred item already is a wakeup source.  Never enter
+   * the backend in blocking mode after a quota-limited dispatch left work. */
+  (void)pthread_mutex_lock(&loop->mutex);
+  if (loop->deferred_count != 0u) block = false;
+  (void)pthread_mutex_unlock(&loop->mutex);
+  if (loop->ready_count != 0u) block = false;
   status = loop->backend->run_once(loop->backend_context, block);
   if (status != FTUN_OK) return status;
   status = ftun_monotonic_now(&now_ms);
@@ -570,10 +628,17 @@ ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
   (void)pthread_mutex_lock(&loop->mutex);
   out->deferred_capacity = FTUN_EVENT_DEFERRED_CAPACITY;
   out->deferred_count = loop->deferred_count;
-  out->source_capacity = FTUN_EVENT_SOURCE_CAPACITY;
+  out->source_capacity = loop->source_capacity;
   out->source_count = loop->source_count;
   out->ready_count = loop->ready_count;
   out->wakeups = loop->wakeups;
+  out->polls = loop->polls;
+  out->callbacks = loop->callbacks;
+  out->quota_exhaustions = loop->quota_exhaustions;
+  out->last_dispatch_ms = loop->last_dispatch_ms;
+  out->max_dispatch_ms = loop->max_dispatch_ms;
+  out->max_timer_lateness_ms = loop->max_timer_lateness_ms;
+  out->max_callbacks_per_poll = loop->max_callbacks_per_poll;
   out->accepting = loop->accepting != 0;
   out->dispatching = loop->dispatching != 0;
   out->stopped = loop->stopped != 0;

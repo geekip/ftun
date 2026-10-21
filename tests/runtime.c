@@ -2,7 +2,7 @@
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/budget.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -71,7 +71,9 @@ int main(void)
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
   CHECK(manager_info.generation == 0u && !manager_info.has_active &&
-        !manager_info.has_candidate && manager_info.retained_limit == 1u);
+        !manager_info.has_candidate && manager_info.retained_limit == 1u &&
+        manager_info.retained_bytes == 0u &&
+        manager_info.retained_bytes_limit == SIZE_MAX);
   CHECK(ftun_runtime_active_acquire(core, &duplicate) == FTUN_E_AGAIN &&
         duplicate == NULL);
 
@@ -119,8 +121,22 @@ int main(void)
         runtime_info.reference_count == 2u);
   CHECK(ftun_runtime_release(&old) == FTUN_OK && old == NULL);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
-        manager_info.retained_count == 0u);
+        manager_info.retained_count == 0u &&
+        manager_info.retained_bytes == 0u);
   CHECK(check_budget(budget, second_bytes) == 0);
+
+  /* stage 只固定候选代次，abort 后 active 与 manager generation 不变。 */
+  third = make_config(third_text);
+  CHECK(third != NULL);
+  CHECK(ftun_runtime_prepare(core, third, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_stage_commit(core, candidate, 3u) == FTUN_OK);
+  CHECK(ftun_runtime_get_info(candidate, &runtime_info) == FTUN_OK &&
+        runtime_info.state == FTUN_RUNTIME_CANDIDATE &&
+        runtime_info.generation == 3u);
+  CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
+        manager_info.generation == 2u && manager_info.has_candidate);
+  CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && candidate == NULL);
+  CHECK(ftun_config_destroy(&third) == FTUN_OK);
 
   CHECK(ftun_runtime_active_acquire(core, &active) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_E_AGAIN && core != NULL);
@@ -136,6 +152,7 @@ int main(void)
   second = make_config(second_text);
   CHECK(first != NULL && second != NULL);
   CHECK(ftun_runtime_prepare(core, first, &candidate) == FTUN_OK);
+  active = candidate;
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   CHECK(ftun_config_destroy(&first) == FTUN_OK);
   CHECK(ftun_runtime_active_acquire(core, &old) == FTUN_OK);
@@ -146,10 +163,36 @@ int main(void)
         manager_info.retained_count == 0u);
   CHECK(ftun_runtime_release(&old) == FTUN_OK);
   CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_stage_commit(core, candidate, 2u) == FTUN_OK);
+  old = (ftun_runtime_t *)(uintptr_t)1;
+  CHECK(ftun_runtime_active_acquire(core, &old) == FTUN_E_LIMIT && old == NULL);
+  CHECK(ftun_runtime_retain(active) == FTUN_E_LIMIT);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK && candidate == NULL);
   CHECK(ftun_config_destroy(&second) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
   CHECK(check_budget(budget, 0u) == 0);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+
+  /* retained 的字节额度独立于数量额度；拒绝不得改变 active。 */
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_runtime_manager_create_limits(budget, 4u, 1u, &core) == FTUN_OK);
+  first = make_config(first_text);
+  second = make_config(second_text);
+  CHECK(first != NULL && second != NULL);
+  CHECK(ftun_runtime_prepare(core, first, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+  CHECK(ftun_config_destroy(&first) == FTUN_OK);
+  CHECK(ftun_runtime_active_acquire(core, &old) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_E_LIMIT &&
+        candidate == NULL);
+  CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
+        manager_info.generation == 1u && manager_info.retained_count == 0u &&
+        manager_info.retained_bytes_limit == 1u);
+  CHECK(ftun_runtime_release(&old) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+  CHECK(ftun_config_destroy(&second) == FTUN_OK);
+  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   /* retained 已满时，提交不得改动 active、candidate 或 generation。 */

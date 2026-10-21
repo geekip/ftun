@@ -2,12 +2,12 @@
 
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "frs/domain.h"
-#include "frs/frs.h"
-#include "group/health.h"
-#include "group/url_test.h"
-#include "inbound/mixed.h"
+#include "proxy/runtime_state.h"
+#include "proxy/frs/domain.h"
+#include "proxy/frs/frs.h"
+#include "proxy/group/health.h"
+#include "proxy/group/url_test.h"
+#include "proxy/inbound/mixed.h"
 
 #include <stdio.h>
 #include <stdlib.h>

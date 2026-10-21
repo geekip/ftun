@@ -1,4 +1,4 @@
-#include "sniff/http_host.h"
+#include "proxy/sniff/http_host.h"
 
 #include <stdio.h>
 #include <string.h>

@@ -1,7 +1,7 @@
 #define _GNU_SOURCE 1
 #include "platform/linux/tun.h"
 #include "platform/linux/uapi.h"
-#include "tun/tun.h"
+#include "tun/device.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>

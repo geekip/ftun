@@ -3,6 +3,10 @@
 
 #include "internal/contracts.h"
 
+#define FTUN_CONFIG_CAPACITY_DEFAULT UINT32_C(256)
+#define FTUN_CONFIG_CAPACITY_MINIMUM UINT32_C(1)
+#define FTUN_CONFIG_CAPACITY_MAXIMUM UINT32_C(10000)
+
 typedef struct {
   char **items;
   size_t count;
@@ -84,6 +88,11 @@ struct ftun_config {
     bool allow_lan;
     char *cache_file;
     bool state_cache;
+    struct {
+      uint32_t tcp_flows;
+      uint32_t udp_flows;
+      uint32_t udp_associations;
+    } capacity;
   } base;
   struct {
     char *level;
@@ -119,6 +128,15 @@ struct ftun_config {
     bool tls_sni;
     bool http_host;
   } sniff;
+  struct {
+    bool present;
+    bool legacy_fields;
+    char *interface_name;
+    uint32_t mtu;
+    char *ipv4_address;
+    bool auto_route;
+    bool strict_route;
+  } tun;
   ftun_config_inbound_t *inbounds;
   size_t inbound_count;
   ftun_config_outbound_t *outbounds;

@@ -75,13 +75,6 @@ static void ftun_libev_async_callback(EV_P_ ev_async *async, int revents)
   (void)revents;
 }
 
-static void ftun_libev_timeout_callback(EV_P_ ev_timer *timer, int revents)
-{
-  (void)loop;
-  (void)timer;
-  (void)revents;
-}
-
 static int ftun_libev_events(uint32_t interests)
 {
   int events = 0;
@@ -204,15 +197,9 @@ static void ftun_libev_wakeup(void *context)
 static ftun_status_t ftun_libev_run_once(void *context, bool block)
 {
   ftun_libev_adapter_t *adapter = (ftun_libev_adapter_t *)context;
-  ev_timer timeout;
   if (adapter->stopped) return FTUN_E_CANCELLED;
   adapter->pending_error = FTUN_OK;
-  if (block) {
-    ev_timer_init(&timeout, ftun_libev_timeout_callback, 0.01, 0.0);
-    ev_timer_start(adapter->loop, &timeout);
-  }
   (void)ev_run(adapter->loop, block ? EVRUN_ONCE : EVRUN_NOWAIT);
-  if (block) ev_timer_stop(adapter->loop, &timeout);
   return adapter->pending_error;
 }
 

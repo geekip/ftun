@@ -60,6 +60,7 @@ int main(void)
   ftun_event_loop_t *loop = NULL;
   ftun_event_source_t *io = NULL;
   ftun_event_source_t *timer = NULL;
+  ftun_event_source_t *guard_timer = NULL;
   ftun_libev_info_t info;
   ftun_event_loop_usage_t usage;
   adapter_state_t state;
@@ -90,8 +91,24 @@ int main(void)
 
   CHECK(ftun_event_io_update(io, FTUN_EVENT_ERROR) == FTUN_OK);
   CHECK(write(descriptors[1], "x", 1u) == 1);
-  CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
+  /* Drain any readiness which was already queued by epoll before READ was
+   * disabled; inactive watcher callbacks must not affect the timing check. */
+  CHECK(ftun_event_loop_run_once(loop, false, 8u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 0u && state.io_calls == 1);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  {
+    uint64_t started_ms = now_ms;
+    uint64_t finished_ms = 0u;
+    /* With READ disabled, only this explicit absolute deadline may wake the
+     * blocking backend.  This rejects the former hidden 10 ms poll timer. */
+    CHECK(ftun_event_timer_start(loop, now_ms + 40u, ready, &state,
+                                 &guard_timer) == FTUN_OK);
+    CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
+    CHECK(ftun_monotonic_now(&finished_ms) == FTUN_OK &&
+          finished_ms >= started_ms + 25u);
+  }
+  CHECK(callbacks == 1u && state.io_calls == 1 && state.timer_calls == 1);
+  CHECK(ftun_event_source_cancel(&guard_timer) == FTUN_OK);
   CHECK(ftun_event_io_update(io, FTUN_EVENT_READ | FTUN_EVENT_ERROR) ==
         FTUN_OK);
   CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
@@ -100,7 +117,7 @@ int main(void)
   CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
   CHECK(ftun_event_timer_start(loop, now_ms + 5u, ready, &state, &timer) == FTUN_OK);
   CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);
-  CHECK(callbacks == 1u && state.timer_calls == 1);
+  CHECK(callbacks == 1u && state.timer_calls == 2);
 
   CHECK(pthread_create(&producer, NULL, produce, &state) == 0);
   CHECK(ftun_event_loop_run_once(loop, true, 8u, &callbacks) == FTUN_OK);

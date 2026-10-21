@@ -1,0 +1,460 @@
+{
+  "schema": "ftun-layer-policy-v1",
+  "phase": "final",
+  "final_targets": {
+    "ftun_core": [],
+    "ftun_tun": [
+      "ftun_core"
+    ],
+    "ftun_dns": [
+      "ftun_core"
+    ],
+    "ftun_proxy": [
+      "ftun_core",
+      "ftun_tun"
+    ],
+    "ftun_mesh": [
+      "ftun_core",
+      "ftun_tun"
+    ],
+    "ftun_app": [
+      "ftun_core",
+      "ftun_tun",
+      "ftun_dns",
+      "ftun_proxy",
+      "ftun_mesh"
+    ]
+  },
+  "future_targets": [
+    "ftun_mesh"
+  ],
+  "final_path_targets": {
+    "src/app": "ftun_app",
+    "src/config": "ftun_core",
+    "src/core": "ftun_core",
+    "src/event": "ftun_core",
+    "src/internal": "ftun_core",
+    "src/network": "ftun_core",
+    "src/platform": "ftun_core",
+    "src/protocol": "ftun_core",
+    "src/tls": "ftun_core",
+    "src/transport": "ftun_core",
+    "src/util": "ftun_core",
+    "src/tun": "ftun_tun",
+    "src/dns": "ftun_dns",
+    "src/proxy": "ftun_proxy",
+    "src/mesh": "ftun_mesh"
+  },
+  "final_forbidden_roots": [
+    "src/api",
+    "src/cli",
+    "src/composition",
+    "src/frs",
+    "src/group",
+    "src/inbound",
+    "src/outbound",
+    "src/route",
+    "src/sniff",
+    "src/state"
+  ],
+  "current_manifest": {
+    "core": "ftun_core",
+    "shared": "ftun_shared_services",
+    "proxy": "OPTIONAL",
+    "app": "ftun_app",
+    "mesh": "OFF"
+  },
+  "current_product_targets": [
+    "ftun",
+    "ftun_core",
+    "ftun_shared_services",
+    "ftun_proxy",
+    "ftun_app",
+    "ftun_module_dns",
+    "ftun_module_fakeip",
+    "ftun_module_frs",
+    "ftun_tun"
+  ],
+  "current_source_target_rules": [
+    {
+      "pattern": "src/app/main.c",
+      "targets": [
+        "ftun"
+      ]
+    },
+    {
+      "pattern": "src/app/runtime.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/service_runtime.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/cli/*.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/composition/*.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/core/*.c",
+      "targets": [
+        "ftun_core"
+      ]
+    },
+    {
+      "pattern": "src/dns/control_transport.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/proxy/dns/resolver_adapter.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/dns/fakeip.c",
+      "targets": [
+        "ftun_module_fakeip"
+      ]
+    },
+    {
+      "pattern": "src/dns/*.c",
+      "targets": [
+        "ftun_module_dns"
+      ]
+    },
+    {
+      "pattern": "src/proxy/tun/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/inbound/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/outbound/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/frs/*.c",
+      "targets": [
+        "ftun_module_frs"
+      ]
+    },
+    {
+      "pattern": "src/proxy/state/fakeip_store.c",
+      "targets": [
+        "ftun_module_fakeip"
+      ]
+    },
+    {
+      "pattern": "src/proxy/state/fakeip_snapshot.c",
+      "targets": [
+        "ftun_module_fakeip"
+      ]
+    },
+    {
+      "pattern": "src/proxy/group/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/sniff/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/tun/*.c",
+      "targets": [
+        "ftun_tun"
+      ]
+    },
+    {
+      "pattern": "src/platform/linux/tun.c",
+      "targets": [
+        "ftun_tun"
+      ]
+    },
+    {
+      "pattern": "src/platform/linux/route.c",
+      "targets": [
+        "ftun_tun"
+      ]
+    },
+    {
+      "pattern": "src/platform/linux/route_async.c",
+      "targets": [
+        "ftun_tun"
+      ]
+    },
+    {
+      "pattern": "src/proxy/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/proxy/*/*.c",
+      "targets": [
+        "ftun_proxy"
+      ]
+    },
+    {
+      "pattern": "src/config/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/event/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/network/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/platform/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/platform/linux/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/protocol/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/tls/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/transport/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    },
+    {
+      "pattern": "src/util/*.c",
+      "targets": [
+        "ftun_shared_services"
+      ]
+    }
+  ],
+  "protected_layers": {
+    "core": {
+      "roots": [
+        "src/core"
+      ],
+      "forbidden_include_roots": [
+        "dns",
+        "frs",
+        "group",
+        "inbound",
+        "mesh",
+        "outbound",
+        "proxy",
+        "sniff",
+        "state"
+      ]
+    },
+    "dns": {
+      "roots": [
+        "src/dns"
+      ],
+      "forbidden_include_roots": [
+        "frs",
+        "group",
+        "inbound",
+        "mesh",
+        "outbound",
+        "proxy",
+        "sniff",
+        "state"
+      ]
+    },
+    "tun": {
+      "roots": [
+        "src/tun"
+      ],
+      "forbidden_include_roots": [
+        "dns",
+        "frs",
+        "group",
+        "inbound",
+        "mesh",
+        "outbound",
+        "proxy",
+        "sniff",
+        "state"
+      ]
+    },
+    "network": {
+      "roots": [
+        "src/network"
+      ],
+      "forbidden_include_roots": [
+        "dns",
+        "frs",
+        "group",
+        "inbound",
+        "mesh",
+        "outbound",
+        "proxy",
+        "sniff",
+        "state"
+      ]
+    },
+    "transport": {
+      "roots": [
+        "src/transport"
+      ],
+      "forbidden_include_roots": [
+        "dns",
+        "frs",
+        "group",
+        "inbound",
+        "mesh",
+        "outbound",
+        "proxy",
+        "sniff",
+        "state"
+      ]
+    }
+  },
+  "migration_include_waivers": [],
+  "final_forbidden_paths": [
+    "src/api/api.c",
+    "src/api/api.h",
+    "src/cli/cli.c",
+    "src/cli/cli.h",
+    "src/composition/default.c",
+    "src/core/control_resolver.c",
+    "src/core/control_resolver.h",
+    "src/core/engine.c",
+    "src/core/engine.h",
+    "src/core/engine_dns.c",
+    "src/core/engine_dns.h",
+    "src/core/http_fetch.c",
+    "src/core/http_fetch.h",
+    "src/core/runtime.c",
+    "src/core/runtime.h",
+    "src/core/session.c",
+    "src/core/session.h",
+    "src/core/state.c",
+    "src/core/state.h",
+    "src/dns/dns.c",
+    "src/dns/dns.h",
+    "src/dns/fakeip.c",
+    "src/dns/fakeip.h",
+    "src/dns/resolver.c",
+    "src/dns/resolver.h",
+    "src/frs/domain.c",
+    "src/frs/domain.h",
+    "src/frs/format.c",
+    "src/frs/format.h",
+    "src/frs/frs.c",
+    "src/frs/frs.h",
+    "src/frs/ip.c",
+    "src/frs/ip.h",
+    "src/frs/update.c",
+    "src/frs/update.h",
+    "src/group/health.c",
+    "src/group/health.h",
+    "src/group/select.c",
+    "src/group/select.h",
+    "src/group/url_test.c",
+    "src/group/url_test.h",
+    "src/inbound/anytls.c",
+    "src/inbound/anytls.h",
+    "src/inbound/inbound.c",
+    "src/inbound/inbound.h",
+    "src/inbound/mixed.c",
+    "src/inbound/mixed.h",
+    "src/inbound/socks5.c",
+    "src/inbound/socks5.h",
+    "src/inbound/tun.c",
+    "src/inbound/tun.h",
+    "src/main.c",
+    "src/outbound/anytls.c",
+    "src/outbound/anytls.h",
+    "src/outbound/direct.c",
+    "src/outbound/direct.h",
+    "src/outbound/outbound.c",
+    "src/outbound/outbound.h",
+    "src/outbound/reject.c",
+    "src/outbound/reject.h",
+    "src/outbound/socks5.c",
+    "src/outbound/socks5.h",
+    "src/proxy/dns.c",
+    "src/proxy/dns.h",
+    "src/proxy/state.c",
+    "src/proxy/state.h",
+    "src/route/group.c",
+    "src/route/group.h",
+    "src/route/router.c",
+    "src/route/router.h",
+    "src/route/rule.c",
+    "src/route/rule.h",
+    "src/route/target.c",
+    "src/route/target.h",
+    "src/sniff/http_host.c",
+    "src/sniff/http_host.h",
+    "src/sniff/sniff.c",
+    "src/sniff/sniff.h",
+    "src/sniff/tls_sni.c",
+    "src/sniff/tls_sni.h",
+    "src/state/fakeip_store.c",
+    "src/state/fakeip_store.h",
+    "src/state/fakeip_store_internal.h",
+    "src/state/group_cache.c",
+    "src/state/group_cache.h",
+    "src/state/snapshot.c",
+    "src/state/snapshot.h",
+    "src/tun/lwip_adapter.c",
+    "src/tun/lwip_adapter.h",
+    "src/tun/lwip_port",
+    "src/tun/lwip_port/arch/cc.h",
+    "src/tun/lwip_port/arch/perf.h",
+    "src/tun/lwip_port/lwipopts.h",
+    "src/tun/tun.c",
+    "src/tun/tun.h",
+    "src/tun/udp_session.c",
+    "src/tun/udp_session.h",
+    "src/util/error.h"
+  ]
+}

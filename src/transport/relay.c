@@ -12,6 +12,7 @@ struct ftun_relay_direction {
   ftun_stream_t *destination;
   ftun_buffer_t *buffer;
   ftun_operation_t *operation;
+  ftun_buffer_wait_token_t buffer_wait;
   size_t offset;
   size_t length;
   size_t accepted;
@@ -21,6 +22,8 @@ struct ftun_relay_direction {
   int write_blocked;
   int shutdown_done;
   int shutdown_blocked;
+  int buffer_waiting;
+  int buffer_ready;
 };
 
 struct ftun_relay {
@@ -36,9 +39,14 @@ struct ftun_relay {
   size_t total_written;
   unsigned int cursor;
   ftun_status_t terminal_status;
+  ftun_relay_progress_fn progress;
+  void *progress_user;
   int stopped;
   int processing;
 };
+
+static ftun_status_t ftun_relay_fail(ftun_relay_t *relay,
+                                     ftun_status_t status);
 
 static int ftun_relay_options_valid(const ftun_relay_options_t *options)
 {
@@ -67,11 +75,21 @@ static ftun_status_t ftun_relay_cancel_direction(
   ftun_relay_direction_t *direction)
 {
   ftun_status_t status = FTUN_OK;
-  if (direction->operation != NULL) {
-    status = ftun_operation_cancel(direction->operation);
+  if (direction->buffer_waiting) {
+    status = ftun_buffer_pool_wait_cancel(&direction->buffer_wait);
     if (status == FTUN_E_STALE) status = FTUN_OK;
+    if (status == FTUN_OK) {
+      direction->buffer_waiting = 0;
+      memset(&direction->buffer_wait, 0, sizeof(direction->buffer_wait));
+    }
+  }
+  if (direction->operation != NULL) {
+    ftun_status_t current = ftun_operation_cancel(direction->operation);
+    if (current == FTUN_E_STALE) current = FTUN_OK;
+    if (status == FTUN_OK) status = current;
   }
   ftun_relay_release_buffer(direction);
+  direction->buffer_ready = 0;
   direction->write_blocked = 0;
   direction->shutdown_blocked = 0;
   return status;
@@ -90,6 +108,27 @@ static ftun_status_t ftun_relay_fail(ftun_relay_t *relay,
     (void)ftun_relay_cancel_direction(&relay->right_to_left);
   }
   return cleanup == FTUN_OK ? status : cleanup;
+}
+
+static void ftun_relay_buffer_ready(void *user)
+{
+  ftun_relay_direction_t *direction = (ftun_relay_direction_t *)user;
+  ftun_relay_t *relay;
+  ftun_status_t status;
+  if (direction == NULL || direction->relay == NULL) return;
+  relay = direction->relay;
+  direction->buffer_waiting = 0;
+  memset(&direction->buffer_wait, 0, sizeof(direction->buffer_wait));
+  if (!relay->stopped && direction->buffer == NULL) {
+    status = ftun_buffer_pool_acquire(relay->pool, relay->high_water,
+                                      &direction->buffer);
+    if (status == FTUN_OK) {
+      direction->buffer_ready = 1;
+    } else {
+      (void)ftun_relay_fail(relay, status);
+    }
+  }
+  if (relay->progress != NULL) relay->progress(relay->progress_user);
 }
 
 static void ftun_relay_write_completed(ftun_operation_t *operation,
@@ -135,6 +174,19 @@ static ftun_status_t ftun_relay_buffer(ftun_relay_direction_t *direction,
                             &direction->buffer)
       : ftun_buffer_pool_acquire(relay->pool, relay->high_water,
                                  &direction->buffer);
+    if (status == FTUN_E_LIMIT && relay->pool != NULL) {
+      if (direction->buffer_waiting) return FTUN_E_AGAIN;
+      status = ftun_buffer_pool_wait(relay->pool, relay->high_water,
+        ftun_relay_buffer_ready, direction, &direction->buffer_wait);
+      if (status == FTUN_OK) {
+        direction->buffer_waiting = 1;
+        return FTUN_E_AGAIN;
+      }
+      if (status == FTUN_E_AGAIN) {
+        status = ftun_buffer_pool_acquire(relay->pool, relay->high_water,
+                                          &direction->buffer);
+      }
+    }
     if (status != FTUN_OK) return status;
   }
   status = ftun_buffer_data(direction->buffer, data, capacity);
@@ -163,6 +215,7 @@ static ftun_status_t ftun_relay_read_direction(
   if (direction->source_eof || direction->read_paused ||
       direction->length >= relay->high_water) return FTUN_OK;
   status = ftun_relay_buffer(direction, &data, &capacity);
+  if (status == FTUN_E_AGAIN && direction->buffer_waiting) return FTUN_OK;
   if (status != FTUN_OK) return status;
   if (direction->offset > relay->high_water ||
       direction->length > relay->high_water - direction->offset) {
@@ -176,6 +229,7 @@ static ftun_status_t ftun_relay_read_direction(
   status = ftun_stream_read(direction->source,
                             data + direction->offset + direction->length,
                             available, &received);
+  direction->buffer_ready = 0;
   *did_work = 1;
   if (status == FTUN_OK) {
     direction->length += received;
@@ -249,7 +303,8 @@ static int ftun_relay_direction_readable(const ftun_relay_direction_t *direction
 {
   const ftun_relay_t *relay = direction->relay;
   return !relay->stopped && !direction->source_eof &&
-         !direction->read_paused && direction->length < relay->high_water;
+         !direction->read_paused && !direction->buffer_waiting &&
+         direction->length < relay->high_water;
 }
 
 static int ftun_relay_direction_writable(const ftun_relay_direction_t *direction)
@@ -278,6 +333,7 @@ ftun_status_t ftun_relay_start_with_options(
   ftun_budget_t *left_budget = NULL;
   ftun_budget_t *right_budget = NULL;
   ftun_reservation_t *reservation = NULL;
+  bool same_budget_root = false;
   ftun_status_t status;
   (void)core;
   if (out != NULL) *out = NULL;
@@ -285,8 +341,12 @@ ftun_status_t ftun_relay_start_with_options(
       !ftun_relay_options_valid(options)) return FTUN_E_INVALID;
   status = ftun_stream_budget(left, &left_budget);
   if (status == FTUN_OK) status = ftun_stream_budget(right, &right_budget);
+  if (status == FTUN_OK) {
+    status = ftun_budget_same_root(left_budget, right_budget,
+                                   &same_budget_root);
+  }
   if (status != FTUN_OK) return status;
-  if (left_budget != right_budget) return FTUN_E_REJECTED;
+  if (!same_budget_root) return FTUN_E_REJECTED;
   status = ftun_budget_reserve(left_budget, sizeof(*relay), &reservation);
   if (status != FTUN_OK) return status;
   relay = (ftun_relay_t *)calloc(1u, sizeof(*relay));
@@ -329,13 +389,26 @@ ftun_status_t ftun_relay_start_with_pool(
     FTUN_RELAY_DEFAULT_LOW_WATER,
     FTUN_RELAY_DEFAULT_MAX_WORK
   };
+  return ftun_relay_start_with_pool_options(core, left, right, pool, &options,
+                                             NULL, NULL, out);
+}
+
+ftun_status_t ftun_relay_start_with_pool_options(
+  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
+  ftun_buffer_pool_t *pool, const ftun_relay_options_t *options,
+  ftun_relay_progress_fn progress, void *progress_user, ftun_relay_t **out)
+{
   ftun_status_t status;
-  if (pool == NULL) {
+  if (pool == NULL || (progress == NULL && progress_user != NULL)) {
     if (out != NULL) *out = NULL;
     return FTUN_E_INVALID;
   }
-  status = ftun_relay_start_with_options(core, left, right, &options, out);
-  if (status == FTUN_OK) (*out)->pool = pool;
+  status = ftun_relay_start_with_options(core, left, right, options, out);
+  if (status == FTUN_OK) {
+    (*out)->pool = pool;
+    (*out)->progress = progress;
+    (*out)->progress_user = progress_user;
+  }
   return status;
 }
 
@@ -366,7 +439,8 @@ ftun_status_t ftun_relay_process(ftun_relay_t *relay,
     unsigned int slot = relay->cursor;
     relay->cursor = (relay->cursor + 1u) % 4u;
     scans++;
-    if (slot == 0u && (left_events & FTUN_EVENT_READ) != 0u &&
+    if (slot == 0u && ((left_events & FTUN_EVENT_READ) != 0u ||
+                       relay->left_to_right.buffer_ready) &&
         ftun_relay_direction_readable(&relay->left_to_right)) {
       size_t before_length = relay->left_to_right.length;
       int before_eof = relay->left_to_right.source_eof;
@@ -376,7 +450,8 @@ ftun_status_t ftun_relay_process(ftun_relay_t *relay,
           relay->left_to_right.source_eof == before_eof) {
         left_events &= ~FTUN_EVENT_READ;
       }
-    } else if (slot == 1u && (right_events & FTUN_EVENT_READ) != 0u &&
+    } else if (slot == 1u && ((right_events & FTUN_EVENT_READ) != 0u ||
+                              relay->right_to_left.buffer_ready) &&
                ftun_relay_direction_readable(&relay->right_to_left)) {
       size_t before_length = relay->right_to_left.length;
       int before_eof = relay->right_to_left.source_eof;
@@ -455,6 +530,8 @@ ftun_status_t ftun_relay_get_usage(const ftun_relay_t *relay,
   out->right_write_shutdown = relay->left_to_right.shutdown_done != 0;
   out->stopped = relay->stopped != 0;
   out->complete = ftun_relay_complete(relay) != 0;
+  out->left_buffer_waiting = relay->left_to_right.buffer_waiting != 0;
+  out->right_buffer_waiting = relay->right_to_left.buffer_waiting != 0;
   return FTUN_OK;
 }
 
@@ -470,7 +547,9 @@ ftun_status_t ftun_relay_destroy(ftun_relay_t **relay)
       owned->left_to_right.operation != NULL ||
       owned->right_to_left.operation != NULL ||
       owned->left_to_right.buffer != NULL ||
-      owned->right_to_left.buffer != NULL) return FTUN_E_AGAIN;
+      owned->right_to_left.buffer != NULL ||
+      owned->left_to_right.buffer_waiting ||
+      owned->right_to_left.buffer_waiting) return FTUN_E_AGAIN;
   reservation = owned->reservation;
   status = ftun_reservation_release(&reservation);
   if (status != FTUN_OK) return status;

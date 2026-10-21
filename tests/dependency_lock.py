@@ -90,6 +90,13 @@ def main():
     return fail("build must not fetch dependencies")
   if "install(FILES LICENSE README.md" not in cmake:
     return fail("installed release materials omit the FTUN project license")
+  if (root / "document").exists() or "document/" in cmake:
+    return fail("development documents must not be installed as user documentation")
+  release_workflow = (
+    root / ".github/workflows/release.yml"
+  ).read_text(encoding="utf-8")
+  if "document/" in release_workflow:
+    return fail("release workflow depends on the retired document directory")
   return 0
 
 

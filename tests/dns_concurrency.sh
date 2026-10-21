@@ -88,4 +88,5 @@ kill -TERM "$server_pid"
 wait "$server_pid"
 server_pid=
 
-grep -q '^slow=1 fast=1 shared=1 timeout=0 status=0$' "$temporary/result"
+grep -q '^slow=1 fast=1 shared=1 timeout=0 isolate=0 status=0$' \
+  "$temporary/result"

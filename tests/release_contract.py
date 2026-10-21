@@ -43,8 +43,10 @@ def main():
     if "=" in line:
       key, value = line.split("=", 1)
       values[key] = value
-  if set(values) != {"core", "dns", "fakeip", "tun", "frs"} or (
-      values.get("core") != "BUILTIN"):
+  if set(values) != {"core", "proxy", "dns", "fakeip", "tun", "frs",
+                     "mesh"} or values.get("core") != "BUILTIN" or (
+      values.get("proxy") not in {"OFF", "BUILTIN"}) or (
+      values.get("mesh") != "OFF"):
     return fail("feature manifest is incomplete")
   if any(value not in {"OFF", "BUILTIN"} for value in values.values()):
     return fail("feature manifest contains an unsupported mode")

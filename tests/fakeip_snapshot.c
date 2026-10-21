@@ -4,8 +4,8 @@
 
 #include "core/budget.h"
 #include "core/worker.h"
-#include "state/fakeip_store.h"
-#include "state/snapshot.h"
+#include "proxy/state/fakeip_store.h"
+#include "proxy/state/fakeip_snapshot.h"
 
 #include <fcntl.h>
 #include <sched.h>

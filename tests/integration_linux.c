@@ -6,21 +6,23 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "core/session.h"
+#include "proxy/runtime_state.h"
+#include "proxy/session.h"
 #include "core/worker.h"
 #include "event/event.h"
 #include "event/libev_adapter.h"
-#include "inbound/tun.h"
-#include "outbound/outbound.h"
+#include "proxy/tun/ingress.h"
+#include "proxy/outbound/outbound.h"
 #include "platform/linux/route.h"
 #include "platform/linux/tun.h"
+#include "platform/linux/uapi.h"
 #include "platform/system_resolver.h"
-#include "route/target.h"
+#include "proxy/route/target.h"
 #include "transport/datagram.h"
 #include "transport/relay.h"
 #include "transport/stream.h"
-#include "tun/udp_session.h"
+#include "tun/service.h"
+#include "proxy/udp/session.h"
 #include "util/buffer.h"
 #include "util/time.h"
 
@@ -28,6 +30,9 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <net/ethernet.h>
+#include <net/if.h>
+#include <netpacket/packet.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -57,6 +62,10 @@
 #define DIRECT_UDP_PORT 18081u
 #define HTTP_PORT 18082u
 #define SOCKS_PORT 11080u
+#define MESH_SOCKS_PORT 11081u
+#define MESH_WIRE_PORT 19090u
+#define MESH_ADDRESS "198.18.1.2"
+#define MESH_TUN_NAME "ftun-meshp"
 #define PROTECTION_MARK 77u
 #define TUN_MTU 1400u
 #define INBOUND_ID 41u
@@ -154,6 +163,27 @@ static int write_exact(int descriptor, const uint8_t *buffer, size_t length)
     else return 0;
   }
   return 1;
+}
+
+static int peer_read_exact(int descriptor, uint8_t *buffer, size_t length)
+{
+  size_t offset = 0u;
+  while (offset < length && !peer_stopping) {
+    struct pollfd item = {descriptor, POLLIN, 0};
+    ssize_t result;
+    int ready = poll(&item, 1u, 100);
+    if (ready == 0) continue;
+    if (ready < 0 && errno == EINTR) continue;
+    if (ready < 0 || (item.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+      return 0;
+    }
+    if ((item.revents & POLLIN) == 0) continue;
+    result = recv(descriptor, buffer + offset, length - offset, 0);
+    if (result > 0) offset += (size_t)result;
+    else if (result < 0 && errno == EINTR) continue;
+    else return 0;
+  }
+  return offset == length;
 }
 
 static void peer_thread_started(void)
@@ -284,13 +314,13 @@ static int peer_socks_read_endpoint(int descriptor, uint8_t type,
   size_t length;
   if (type == 1u) length = 4u;
   else if (type == 3u) {
-    if (!read_exact(descriptor, buffer, 1u)) return 0;
+    if (!peer_read_exact(descriptor, buffer, 1u)) return 0;
     length = buffer[0];
     if (length == 0u) return 0;
   } else {
     return 0;
   }
-  if (!read_exact(descriptor, buffer, length + 2u)) return 0;
+  if (!peer_read_exact(descriptor, buffer, length + 2u)) return 0;
   *port = (uint16_t)(((uint16_t)buffer[length] << 8) | buffer[length + 1u]);
   return 1;
 }
@@ -412,10 +442,10 @@ static void *peer_socks_thread(void *argument)
   uint8_t reply[10] = {5u, 0u, 0u, 1u, 0u, 0u, 0u, 0u, 0u, 0u};
   uint16_t target_port = 0u;
   free(argument);
-  if (!read_exact(descriptor, header, 2u) || header[0] != 5u ||
-      header[1] == 0u || !read_exact(descriptor, methods, header[1]) ||
+  if (!peer_read_exact(descriptor, header, 2u) || header[0] != 5u ||
+      header[1] == 0u || !peer_read_exact(descriptor, methods, header[1]) ||
       !write_exact(descriptor, (const uint8_t *)"\x05\x00", 2u) ||
-      !read_exact(descriptor, header, 4u) || header[0] != 5u ||
+      !peer_read_exact(descriptor, header, 4u) || header[0] != 5u ||
       header[2] != 0u || !peer_socks_read_endpoint(
         descriptor, header[3], &target_port)) goto done;
   if (header[3] == 3u) fputs("socks-domain-target\n", stderr);
@@ -427,7 +457,13 @@ static void *peer_socks_thread(void *argument)
   if (header[1] == 1u) {
     if (!write_exact(descriptor, reply, sizeof(reply))) goto done;
     while (!peer_stopping) {
-      ssize_t length = recv(descriptor, methods, sizeof(methods), 0);
+      struct pollfd item = {descriptor, POLLIN, 0};
+      ssize_t length;
+      int ready = poll(&item, 1u, 100);
+      if (ready == 0) continue;
+      if (ready < 0 && errno == EINTR) continue;
+      if (ready < 0 || (item.revents & (POLLERR | POLLHUP)) != 0) break;
+      length = recv(descriptor, methods, sizeof(methods), 0);
       if (length > 0) {
         if (!write_exact(descriptor, methods, (size_t)length)) break;
       } else if (length < 0 && errno == EINTR) {
@@ -514,22 +550,96 @@ static void peer_signal(int signal_number)
   peer_stopping = 1;
 }
 
+static int peer_route_drive(ftun_event_loop_t *loop,
+                            ftun_linux_route_async_t *routes,
+                            ftun_linux_route_async_state_t terminal,
+                            uint64_t deadline_ms)
+{
+  for (;;) {
+    ftun_linux_route_async_info_t info;
+    size_t work = 0u;
+    size_t callbacks = 0u;
+    uint64_t now_ms = 0u;
+    if (ftun_monotonic_now(&now_ms) != FTUN_OK || now_ms >= deadline_ms ||
+        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) return 0;
+    if (info.state == terminal) return 1;
+    if (info.state == FTUN_LINUX_ROUTE_ASYNC_FAILED ||
+        info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED ||
+        ftun_linux_route_async_run(routes, now_ms, 8u, &work) != FTUN_OK ||
+        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) return 0;
+    if (info.state == terminal) return 1;
+    if (ftun_event_loop_run_once(loop, work == 0u && !info.runnable, 8u,
+                                 &callbacks) != FTUN_OK) return 0;
+  }
+}
+
 static int peer_main(const char *ready_path, const char *frs_path)
 {
-  struct pollfd descriptors[5];
+  struct pollfd descriptors[8];
   struct sigaction action;
+  struct sockaddr_in main_wire_address;
+  ftun_event_loop_t *route_loop = NULL;
+  ftun_packet_port_t *mesh_port = NULL;
+  ftun_packet_port_info_t mesh_info;
+  ftun_linux_route_plan_t mesh_plan;
+  ftun_linux_route_async_t *mesh_routes = NULL;
+  ftun_tun_spec_t mesh_tun;
   uint8_t buffer[2048];
   int direct_tcp = socket_bound(SOCK_STREAM, PEER_ADDRESS, DIRECT_TCP_PORT);
   int direct_udp = socket_bound(SOCK_DGRAM, PEER_ADDRESS, DIRECT_UDP_PORT);
   int socks = socket_bound(SOCK_STREAM, PEER_ADDRESS, SOCKS_PORT);
+  int mesh_socks = -1;
+  int mesh_wire = socket_bound(SOCK_DGRAM, PEER_ADDRESS, MESH_WIRE_PORT);
   int http = socket_bound(SOCK_STREAM, PEER_ADDRESS, HTTP_PORT);
   int dns = socket_bound(SOCK_DGRAM, DNS_ADDRESS, 53u);
   int ready;
+  uint64_t now_ms = 0u;
   peer_frs_path = frs_path;
-  if (direct_tcp < 0 || direct_udp < 0 || socks < 0 || http < 0 || dns < 0 ||
+  memset(&mesh_tun, 0, sizeof(mesh_tun));
+  mesh_tun.name.data = MESH_TUN_NAME;
+  mesh_tun.name.length = strlen(MESH_TUN_NAME);
+  mesh_tun.mtu = TUN_MTU;
+  memset(&mesh_plan, 0, sizeof(mesh_plan));
+  mesh_plan.resource_count = 2u;
+  mesh_plan.resources[0].kind = FTUN_LINUX_ROUTE_ADDRESS;
+  mesh_plan.resources[0].family = AF_INET;
+  memcpy(mesh_plan.resources[0].interface_name, MESH_TUN_NAME,
+         sizeof(MESH_TUN_NAME));
+  CHECK(inet_pton(AF_INET, MESH_ADDRESS,
+                  mesh_plan.resources[0].address) == 1);
+  mesh_plan.resources[0].prefix_length = 16u;
+  mesh_plan.resources[0].protocol = FTUN_LINUX_ROUTE_PROTOCOL;
+  mesh_plan.resources[1].kind = FTUN_LINUX_ROUTE_OVERLAY;
+  mesh_plan.resources[1].family = AF_INET;
+  memcpy(mesh_plan.resources[1].interface_name, MESH_TUN_NAME,
+         sizeof(MESH_TUN_NAME));
+  memcpy(mesh_plan.resources[1].address,
+         (uint8_t[]){10u, 77u, 0u, 0u}, 4u);
+  mesh_plan.resources[1].prefix_length = 30u;
+  mesh_plan.resources[1].table = FTUN_RT_TABLE_MAIN;
+  mesh_plan.resources[1].metric = 100u;
+  mesh_plan.resources[1].protocol = FTUN_LINUX_ROUTE_PROTOCOL;
+  if (direct_tcp < 0 || direct_udp < 0 || socks < 0 || mesh_wire < 0 ||
+      http < 0 || dns < 0 || ftun_event_loop_create(NULL, &route_loop) !=
+        FTUN_OK || ftun_libev_attach(route_loop) != FTUN_OK ||
+      ftun_linux_tun_open(&mesh_tun, &mesh_port) != FTUN_OK ||
+      ftun_packet_port_get_info(mesh_port, &mesh_info) != FTUN_OK ||
+      ftun_monotonic_now(&now_ms) != FTUN_OK ||
+      ftun_linux_route_async_start_plan(&mesh_plan, route_loop, now_ms, 250u,
+        now_ms + 5000u, &mesh_routes) != FTUN_OK ||
+      !peer_route_drive(route_loop, mesh_routes,
+                        FTUN_LINUX_ROUTE_ASYNC_READY, now_ms + 5000u)) return 1;
+  mesh_socks = socket_bound(SOCK_STREAM, MESH_ADDRESS, MESH_SOCKS_PORT);
+  if (mesh_socks < 0 ||
       listen(direct_tcp, 128) != 0 || listen(socks, 128) != 0 ||
+      listen(mesh_socks, 128) != 0 ||
       listen(http, 128) != 0 || !set_nonblocking(direct_tcp) ||
-      !set_nonblocking(socks) || !set_nonblocking(http)) return 1;
+      !set_nonblocking(socks) || !set_nonblocking(mesh_socks) ||
+      !set_nonblocking(mesh_wire) || !set_nonblocking(http)) return 1;
+  memset(&main_wire_address, 0, sizeof(main_wire_address));
+  main_wire_address.sin_family = AF_INET;
+  main_wire_address.sin_port = htons(MESH_WIRE_PORT);
+  CHECK(inet_pton(AF_INET, MAIN_ADDRESS, &main_wire_address.sin_addr) == 1);
   memset(&action, 0, sizeof(action));
   action.sa_handler = peer_signal;
   (void)sigemptyset(&action.sa_mask);
@@ -537,19 +647,18 @@ static int peer_main(const char *ready_path, const char *frs_path)
   ready = open(ready_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   CHECK(ready >= 0 && write(ready, "ready\n", 6u) == 6);
   (void)close(ready);
-  memset(descriptors, 0, sizeof(descriptors));
-  descriptors[0].fd = direct_tcp;
-  descriptors[0].events = POLLIN;
-  descriptors[1].fd = direct_udp;
-  descriptors[1].events = POLLIN;
-  descriptors[2].fd = socks;
-  descriptors[2].events = POLLIN;
-  descriptors[3].fd = dns;
-  descriptors[3].events = POLLIN;
-  descriptors[4].fd = http;
-  descriptors[4].events = POLLIN;
   while (!peer_stopping) {
-    int count = poll(descriptors, 5u, 100);
+    int count;
+    memset(descriptors, 0, sizeof(descriptors));
+    descriptors[0] = (struct pollfd){direct_tcp, POLLIN, 0};
+    descriptors[1] = (struct pollfd){direct_udp, POLLIN, 0};
+    descriptors[2] = (struct pollfd){socks, POLLIN, 0};
+    descriptors[3] = (struct pollfd){dns, POLLIN, 0};
+    descriptors[4] = (struct pollfd){http, POLLIN, 0};
+    descriptors[5] = (struct pollfd){mesh_socks, POLLIN, 0};
+    descriptors[6] = (struct pollfd){(int)mesh_info.native_socket, POLLIN, 0};
+    descriptors[7] = (struct pollfd){mesh_wire, POLLIN, 0};
+    count = poll(descriptors, 8u, 100);
     if (count < 0 && errno == EINTR) continue;
     if (count < 0) break;
     if ((descriptors[0].revents & POLLIN) != 0 &&
@@ -569,12 +678,49 @@ static int peer_main(const char *ready_path, const char *frs_path)
     }
     if ((descriptors[4].revents & POLLIN) != 0 &&
         !peer_accept_thread(http, peer_http_thread)) break;
+    if ((descriptors[5].revents & POLLIN) != 0 &&
+        !peer_accept_thread(mesh_socks, peer_socks_thread)) break;
+    if ((descriptors[6].revents & POLLIN) != 0) {
+      size_t length = 0u;
+      ftun_status_t status;
+      do {
+        status = ftun_packet_port_read(mesh_port, buffer, TUN_MTU, &length);
+        if (status == FTUN_OK && sendto(mesh_wire, buffer, length, 0,
+              (const struct sockaddr *)&main_wire_address,
+              (socklen_t)sizeof(main_wire_address)) != (ssize_t)length) {
+          status = FTUN_E_IO;
+        }
+      } while (status == FTUN_OK);
+      if (status != FTUN_E_AGAIN) break;
+    }
+    if ((descriptors[7].revents & POLLIN) != 0) {
+      ssize_t length;
+      do {
+        length = recv(mesh_wire, buffer, TUN_MTU, 0);
+        if (length > 0 && ftun_packet_port_write(
+              mesh_port, buffer, (size_t)length) != FTUN_OK) break;
+      } while (length > 0);
+      if (length < 0 && errno != EAGAIN && errno != EWOULDBLOCK) break;
+    }
   }
+  (void)close(mesh_socks);
+  (void)close(mesh_wire);
   (void)close(http);
   (void)close(dns);
   (void)close(socks);
   (void)close(direct_udp);
   (void)close(direct_tcp);
+  if (ftun_monotonic_now(&now_ms) == FTUN_OK && mesh_routes != NULL &&
+      ftun_linux_route_async_release(mesh_routes, now_ms,
+                                     now_ms + 5000u) == FTUN_OK) {
+    (void)peer_route_drive(route_loop, mesh_routes,
+                           FTUN_LINUX_ROUTE_ASYNC_RELEASED, now_ms + 5000u);
+  }
+  (void)ftun_linux_route_async_destroy(&mesh_routes);
+  (void)ftun_packet_port_close(&mesh_port);
+  (void)ftun_event_loop_stop(route_loop);
+  (void)ftun_libev_detach(route_loop);
+  (void)ftun_event_loop_destroy(&route_loop);
   for (;;) {
     struct timespec delay = {0, 1000000L};
     size_t active;
@@ -1481,6 +1627,7 @@ static int dns_concurrency_server_main(const char *address,
 {
   dns_delayed_reply_t slow;
   dns_delayed_reply_t shared;
+  dns_delayed_reply_t isolated[2];
   struct sigaction action;
   struct pollfd item;
   char *tail = NULL;
@@ -1489,11 +1636,13 @@ static int dns_concurrency_server_main(const char *address,
   unsigned int fast_count = 0u;
   unsigned int shared_count = 0u;
   unsigned int timeout_count = 0u;
+  unsigned int isolated_count = 0u;
   int descriptor;
   int ready;
   int result = 0;
   memset(&slow, 0, sizeof(slow));
   memset(&shared, 0, sizeof(shared));
+  memset(isolated, 0, sizeof(isolated));
   peer_stopping = 0;
   errno = 0;
   port = strtoul(port_text, &tail, 10);
@@ -1543,6 +1692,13 @@ static int dns_concurrency_server_main(const char *address,
               (size_t)length, &source, source_length, 200u)) goto done;
         } else if (strcmp(name, "timeout.example") == 0) {
           timeout_count++;
+        } else if (strcmp(name, "isolate.example") == 0) {
+          if (isolated_count >= 2u || !dns_delayed_store(
+              &isolated[isolated_count], query, (size_t)length, &source,
+              source_length, 200u)) goto done;
+          isolated_count++;
+        } else if (strncmp(name, "flood", 5u) == 0) {
+          /* 持续无响应输入用于验证容量满时其他监听器仍可前进。 */
         } else if (!dns_test_reply(descriptor, query, (size_t)length, &source,
                                    source_length, "127.0.0.4")) {
           goto done;
@@ -1564,6 +1720,19 @@ static int dns_concurrency_server_main(const char *address,
       }
       slow.active = false;
     }
+    {
+      size_t isolated_index;
+      for (isolated_index = 0u; isolated_index < 2u; isolated_index++) {
+        if (isolated[isolated_index].active &&
+            now_ms >= isolated[isolated_index].due_ms) {
+          if (!dns_test_reply(descriptor, isolated[isolated_index].wire,
+              isolated[isolated_index].length,
+              &isolated[isolated_index].peer,
+              isolated[isolated_index].peer_length, "127.0.0.5")) goto done;
+          isolated[isolated_index].active = false;
+        }
+      }
+    }
   }
   result = 0;
 
@@ -1574,8 +1743,9 @@ done:
     if (output >= 0) {
       char summary[128];
       int length = snprintf(summary, sizeof(summary),
-        "slow=%u fast=%u shared=%u timeout=%u status=%d\n",
-        slow_count, fast_count, shared_count, timeout_count, result);
+        "slow=%u fast=%u shared=%u timeout=%u isolate=%u status=%d\n",
+        slow_count, fast_count, shared_count, timeout_count, isolated_count,
+        result);
       if (length > 0 && (size_t)length < sizeof(summary)) {
         (void)write(output, summary, (size_t)length);
       }
@@ -1863,6 +2033,138 @@ static int dns_concurrency_client_main(const char *address_text,
 
 fail:
   (void)close(descriptor);
+  return 1;
+}
+
+static int dns_flood_client_main(const char *address_text,
+                                 const char *port_text,
+                                 const char *duration_text)
+{
+  struct sockaddr_in target;
+  uint8_t query[64];
+  uint8_t response[512];
+  char *tail = NULL;
+  unsigned long port;
+  unsigned long duration_ms;
+  uint64_t deadline;
+  unsigned int sequence = 0u;
+  int descriptor;
+  errno = 0;
+  port = strtoul(port_text, &tail, 10);
+  if (errno != 0 || tail == port_text || *tail != '\0' || port == 0u ||
+      port > UINT16_MAX) return 1;
+  errno = 0;
+  duration_ms = strtoul(duration_text, &tail, 10);
+  if (errno != 0 || tail == duration_text || *tail != '\0' ||
+      duration_ms == 0u || duration_ms > 30000u) return 1;
+  descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                      IPPROTO_UDP);
+  if (descriptor < 0) return 1;
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons((uint16_t)port);
+  if (inet_pton(AF_INET, address_text, &target.sin_addr) != 1 ||
+      connect(descriptor, (const struct sockaddr *)&target,
+              (socklen_t)sizeof(target)) != 0) goto fail;
+  deadline = deadline_after((uint64_t)duration_ms);
+  if (deadline == 0u) goto fail;
+  for (;;) {
+    uint64_t now_ms = 0u;
+    size_t batch;
+    for (batch = 0u; batch < 32u; batch++) {
+      char label[16];
+      size_t length;
+      ssize_t sent;
+      uint16_t id = (uint16_t)(sequence + 1u);
+      if (snprintf(label, sizeof(label), "flood%05u",
+                   sequence % 100000u) <= 0) goto fail;
+      length = dns_test_query(query, sizeof(query), id, label);
+      if (length == 0u) goto fail;
+      sent = send(descriptor, query, length, 0);
+      if (sent < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+          errno != ENOBUFS) goto fail;
+      sequence++;
+    }
+    while (recv(descriptor, response, sizeof(response), 0) > 0) {}
+    if (ftun_monotonic_now(&now_ms) != FTUN_OK) goto fail;
+    if (now_ms >= deadline) break;
+    {
+      struct timespec pause = {0, 1000000L};
+      while (nanosleep(&pause, &pause) != 0 && errno == EINTR) {}
+    }
+  }
+  (void)close(descriptor);
+  return sequence >= 256u ? 0 : 1;
+
+fail:
+  (void)close(descriptor);
+  return 1;
+}
+
+static int dns_isolation_client_main(const char *address_text,
+                                     const char *first_port_text,
+                                     const char *second_port_text)
+{
+  const char *ports[2] = {first_port_text, second_port_text};
+  struct pollfd items[2];
+  uint8_t query[64];
+  uint8_t response[512];
+  bool completed[2] = {false, false};
+  uint64_t started;
+  size_t index;
+  memset(items, 0, sizeof(items));
+  items[0].fd = -1;
+  items[1].fd = -1;
+  for (index = 0u; index < 2u; index++) {
+    struct sockaddr_in target;
+    char *tail = NULL;
+    unsigned long port;
+    errno = 0;
+    port = strtoul(ports[index], &tail, 10);
+    if (errno != 0 || tail == ports[index] || *tail != '\0' || port == 0u ||
+        port > UINT16_MAX) goto fail;
+    items[index].fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+    if (items[index].fd < 0) goto fail;
+    items[index].events = POLLIN;
+    memset(&target, 0, sizeof(target));
+    target.sin_family = AF_INET;
+    target.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, address_text, &target.sin_addr) != 1 ||
+        connect(items[index].fd, (const struct sockaddr *)&target,
+                (socklen_t)sizeof(target)) != 0) goto fail;
+  }
+  if (ftun_monotonic_now(&started) != FTUN_OK) goto fail;
+  for (index = 0u; index < 2u; index++) {
+    size_t length = dns_test_query(query, sizeof(query),
+      (uint16_t)(0x4001u + index), "isolate");
+    if (length == 0u ||
+        send(items[index].fd, query, length, 0) != (ssize_t)length) goto fail;
+  }
+  while (!completed[0] || !completed[1]) {
+    int ready = poll(items, 2u, 1200);
+    if (ready <= 0) goto fail;
+    for (index = 0u; index < 2u; index++) {
+      if ((items[index].revents & POLLIN) != 0) {
+        ssize_t length = recv(items[index].fd, response, sizeof(response), 0);
+        if (length < 12 || response[0] != 0x40u ||
+            response[1] != (uint8_t)(1u + index) ||
+            (response[2] & 0x80u) == 0u) goto fail;
+        completed[index] = true;
+      }
+    }
+  }
+  {
+    uint64_t finished;
+    if (ftun_monotonic_now(&finished) != FTUN_OK || finished < started ||
+        finished - started >= 1000u) goto fail;
+  }
+  (void)close(items[0].fd);
+  (void)close(items[1].fd);
+  return 0;
+
+fail:
+  if (items[0].fd >= 0) (void)close(items[0].fd);
+  if (items[1].fd >= 0) (void)close(items[1].fd);
   return 1;
 }
 
@@ -2157,7 +2459,7 @@ typedef struct integration integration_t;
 typedef struct {
   integration_t *integration;
   int descriptor;
-  ftun_stream_write_t *pending;
+  ftun_stream_write_token_t pending;
   bool write_shutdown;
 } socket_stream_t;
 
@@ -2207,10 +2509,23 @@ struct integration {
   ftun_worker_t *worker;
   ftun_core_t *core;
   ftun_config_t *config;
-  ftun_packet_port_t *port;
+  ftun_buffer_pool_t *tun_buffers;
+  ftun_tun_service_t *tun_service;
+  ftun_tun_lease_t proxy_tun_lease;
+  ftun_tun_lease_t mesh_tun_lease;
   ftun_tun_ingress_context_t *ingress;
   ftun_udp_flow_table_t *udp_flows;
-  ftun_route_transaction_t *routes;
+  ftun_linux_route_async_t *routes;
+  ftun_linux_route_async_t *network_guard;
+  ftun_linux_route_async_t *overlay_routes;
+  ftun_network_view_t *network_view;
+  int mesh_wire;
+  size_t mesh_packets_sent;
+  size_t mesh_packets_received;
+  size_t mesh_packet_errors;
+  size_t mesh_feedback_sent;
+  size_t mesh_path_updates;
+  ftun_tun_packet_error_t mesh_last_error;
   ftun_packet_port_info_t port_info;
   tcp_flow_t tcp;
   udp_slot_t udp[UDP_SLOTS];
@@ -2255,15 +2570,17 @@ static ftun_status_t socket_stream_read(void *user, void *buffer,
 }
 
 static ftun_status_t socket_stream_write_start(
-  void *user, ftun_stream_write_t *write, const ftun_buffer_slice_t *slice,
+  void *user, ftun_stream_write_token_t write,
+  const ftun_buffer_slice_t *slice,
   size_t *accepted)
 {
   socket_stream_t *stream = (socket_stream_t *)user;
   ftun_bytes_t bytes;
   ssize_t length;
   if (accepted != NULL) *accepted = 0u;
-  if (stream == NULL || stream->descriptor < 0 || stream->pending != NULL ||
-      write == NULL || slice == NULL || accepted == NULL ||
+  if (stream == NULL || stream->descriptor < 0 ||
+      stream->pending.stream != NULL || write.stream == NULL ||
+      slice == NULL || accepted == NULL ||
       ftun_buffer_slice_data(slice, &bytes) != FTUN_OK ||
       bytes.length == 0u) return FTUN_E_INVALID;
   do {
@@ -2277,11 +2594,13 @@ static ftun_status_t socket_stream_write_start(
 }
 
 static ftun_status_t socket_stream_write_cancel(
-  void *user, ftun_stream_write_t *write)
+  void *user, ftun_stream_write_token_t write)
 {
   socket_stream_t *stream = (socket_stream_t *)user;
-  if (stream == NULL || stream->pending != write) return FTUN_E_STALE;
-  stream->pending = NULL;
+  if (stream == NULL || stream->pending.stream != write.stream ||
+      stream->pending.slot != write.slot ||
+      stream->pending.generation != write.generation) return FTUN_E_STALE;
+  memset(&stream->pending, 0, sizeof(stream->pending));
   return FTUN_OK;
 }
 
@@ -2303,7 +2622,7 @@ static void socket_stream_destroy(void *user)
   if (stream == NULL) return;
   if (stream->descriptor >= 0) (void)close(stream->descriptor);
   stream->descriptor = -1;
-  stream->pending = NULL;
+  memset(&stream->pending, 0, sizeof(stream->pending));
 }
 
 static void stream_completion(ftun_operation_t *operation,
@@ -2486,16 +2805,14 @@ static void inbound_stream_event(void *user, ftun_stream_t *stream,
   }
 }
 
-static ftun_status_t output_packet(void *user, ftun_packet_port_t *port,
-                                   ftun_bytes_t packet)
+static ftun_status_t output_packet(void *user, ftun_bytes_t packet)
 {
   integration_t *integration = (integration_t *)user;
-  if (port != integration->port) return FTUN_E_STATE_CORRUPT;
-  return ftun_packet_port_write(port, packet.data, packet.length);
+  return ftun_tun_service_write(integration->proxy_tun_lease, packet);
 }
 
 static ftun_status_t datagram_send_start(
-  void *user, ftun_datagram_send_t *datagram_send,
+  void *user, ftun_datagram_send_token_t datagram_send,
   const ftun_endpoint_t *target,
   const ftun_packet_t *packet)
 {
@@ -2517,7 +2834,7 @@ static ftun_status_t datagram_send_start(
 }
 
 static ftun_status_t datagram_send_cancel(void *user,
-                                          ftun_datagram_send_t *send)
+                                          ftun_datagram_send_token_t send)
 {
   (void)user;
   (void)send;
@@ -2694,7 +3011,7 @@ static ftun_status_t packet_from_bytes(integration_t *integration,
   (void)ftun_buffer_slice_release(&slice);
   (void)ftun_buffer_release(&buffer);
   if (status == FTUN_OK) {
-    status = ftun_tun_ingress(integration->core, integration->port, &packet);
+    status = ftun_tun_ingress(integration->ingress, &packet);
   }
   if (ftun_packet_release(&packet) != FTUN_OK && status == FTUN_OK) {
     status = FTUN_E_STATE_CORRUPT;
@@ -2702,45 +3019,110 @@ static ftun_status_t packet_from_bytes(integration_t *integration,
   return status;
 }
 
+static ftun_status_t integration_proxy_tun_packet(
+  void *user, ftun_tun_lease_t lease, ftun_bytes_t packet)
+{
+  integration_t *integration = (integration_t *)user;
+  ftun_status_t status;
+  if (integration == NULL || lease.service != integration->proxy_tun_lease.service ||
+      lease.generation != integration->proxy_tun_lease.generation) {
+    return FTUN_E_STALE;
+  }
+  status = packet_from_bytes(integration, packet.data, packet.length);
+  if (status == FTUN_E_PROTOCOL && packet.length != 0u &&
+      (packet.data[0] >> 4u) == 6u) {
+    integration->rejected_ipv6++;
+    return FTUN_OK;
+  }
+  return status;
+}
+
+static ftun_status_t integration_mesh_tun_packet(
+  void *user, ftun_tun_lease_t lease, ftun_bytes_t packet)
+{
+  integration_t *integration = (integration_t *)user;
+  ssize_t sent;
+  if (integration == NULL || lease.service != integration->mesh_tun_lease.service ||
+      lease.generation != integration->mesh_tun_lease.generation ||
+      packet.length < 20u || (packet.data[0] >> 4u) != 4u ||
+      packet.data[16] != 198u || packet.data[17] != 18u) {
+    return FTUN_E_STATE_CORRUPT;
+  }
+  sent = send(integration->mesh_wire, packet.data, packet.length,
+              MSG_NOSIGNAL);
+  if (sent != (ssize_t)packet.length) return FTUN_E_IO;
+  integration->mesh_packets_sent++;
+  return FTUN_OK;
+}
+
+static void integration_tun_event(void *user, ftun_tun_lease_t lease,
+                                  ftun_tun_service_event_t event,
+                                  ftun_status_t status)
+{
+  integration_t *integration = (integration_t *)user;
+  if (integration != NULL && event == FTUN_TUN_SERVICE_PATH_UPDATED &&
+      lease.service == integration->mesh_tun_lease.service &&
+      lease.generation == integration->mesh_tun_lease.generation) {
+    integration->mesh_path_updates++;
+  }
+  if (integration != NULL && status != FTUN_OK) {
+    integration->callback_failed = true;
+  }
+}
+
+static void integration_mesh_packet_error(
+  void *user, ftun_tun_lease_t lease,
+  const ftun_tun_packet_error_t *error)
+{
+  integration_t *integration = (integration_t *)user;
+  if (integration == NULL || error == NULL ||
+      lease.service != integration->mesh_tun_lease.service ||
+      lease.generation != integration->mesh_tun_lease.generation) {
+    if (integration != NULL) integration->callback_failed = true;
+    return;
+  }
+  integration->mesh_packet_errors++;
+  integration->mesh_last_error = *error;
+  if (error->feedback_sent) integration->mesh_feedback_sent++;
+}
+
 static ftun_status_t process_tun(integration_t *integration)
 {
+  size_t work = 0u;
+  ftun_status_t status = ftun_tun_service_notify(
+    integration->tun_service, FTUN_EVENT_READ | FTUN_EVENT_WRITE);
+  if (status != FTUN_OK) return status;
+  return ftun_tun_service_run(integration->tun_service, &work);
+}
+
+static ftun_status_t process_mesh_wire(integration_t *integration)
+{
   uint8_t packet[TUN_MTU];
-  ftun_status_t status;
   for (;;) {
-    size_t length = 0u;
-    status = ftun_packet_port_read(integration->port, packet,
-                                   sizeof(packet), &length);
-    if (status == FTUN_E_AGAIN) return FTUN_OK;
-    if (status != FTUN_OK) {
-      fprintf(stderr, "TUN read failed: %d\n", (int)status);
-      return status;
-    }
-    status = packet_from_bytes(integration, packet, length);
-    if (status == FTUN_E_PROTOCOL && length != 0u &&
-        (packet[0] >> 4) == 6u) {
-      integration->rejected_ipv6++;
+    ssize_t length = recv(integration->mesh_wire, packet, sizeof(packet), 0);
+    if (length > 0) {
+      ftun_status_t status = ftun_tun_service_write(
+        integration->mesh_tun_lease,
+        (ftun_bytes_t){packet, (size_t)length});
+      if (status != FTUN_OK) return status;
+      integration->mesh_packets_received++;
       continue;
     }
-    if (status != FTUN_OK) {
-      fprintf(stderr, "TUN ingress failed: %d version=%u protocol=%u "
-              "length=%zu target=%u.%u.%u.%u\n", (int)status,
-              length == 0u ? 0u : packet[0] >> 4,
-              length <= 9u ? 0u : packet[9], length,
-              length <= 19u ? 0u : packet[16],
-              length <= 19u ? 0u : packet[17],
-              length <= 19u ? 0u : packet[18],
-              length <= 19u ? 0u : packet[19]);
-      return status;
+    if (length < 0 && errno == EINTR) continue;
+    if (length < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+      return process_tun(integration);
     }
+    return FTUN_E_IO;
   }
 }
 
 static ftun_status_t complete_socket_write(integration_t *integration)
 {
-  ftun_stream_write_t *pending = integration->tcp.socket.pending;
+  ftun_stream_write_token_t pending = integration->tcp.socket.pending;
   ftun_error_t result;
-  if (pending == NULL) return FTUN_OK;
-  integration->tcp.socket.pending = NULL;
+  if (pending.stream == NULL) return FTUN_OK;
+  memset(&integration->tcp.socket.pending, 0,
+         sizeof(integration->tcp.socket.pending));
   memset(&result, 0, sizeof(result));
   result.status = FTUN_OK;
   return ftun_stream_write_complete(pending, result);
@@ -3028,16 +3410,68 @@ static int drive_socks_completion(integration_t *integration,
 {
   uint64_t deadline = deadline_after(5000u);
   while (completion->calls == 0) {
+    struct pollfd descriptors[2];
     size_t callbacks = 0u;
     size_t dispatched = 0u;
     uint64_t now = 0u;
-    if (ftun_event_loop_run_once(integration->loop, true, 32u,
+    memset(descriptors, 0, sizeof(descriptors));
+    descriptors[0].fd = (int)integration->port_info.native_socket;
+    descriptors[0].events = POLLIN;
+    descriptors[1].fd = integration->mesh_wire;
+    descriptors[1].events = POLLIN;
+    if (poll(descriptors, 2u, 1) < 0 && errno != EINTR) return 1;
+    if ((descriptors[0].revents & POLLIN) != 0 &&
+        process_tun(integration) != FTUN_OK) return 1;
+    if ((descriptors[1].revents & POLLIN) != 0 &&
+        process_mesh_wire(integration) != FTUN_OK) return 1;
+    if (ftun_event_loop_run_once(integration->loop, false, 32u,
                                  &callbacks) != FTUN_OK ||
         ftun_operation_dispatch(integration->operations, SIZE_MAX,
                                 &dispatched) != FTUN_OK ||
         ftun_monotonic_now(&now) != FTUN_OK || now >= deadline) return 1;
   }
   return completion->calls == 1 ? 0 : 1;
+}
+
+static int overlay_exchange(integration_t *integration, int descriptor,
+                            const uint8_t *message, size_t length)
+{
+  uint8_t response[256];
+  uint64_t deadline = deadline_after(5000u);
+  size_t sent = 0u;
+  size_t received = 0u;
+  while (sent < length || received < length) {
+    struct pollfd descriptors[3];
+    ssize_t amount;
+    memset(descriptors, 0, sizeof(descriptors));
+    descriptors[0] = (struct pollfd){
+      (int)integration->port_info.native_socket, POLLIN, 0};
+    descriptors[1] = (struct pollfd){integration->mesh_wire, POLLIN, 0};
+    descriptors[2] = (struct pollfd){descriptor,
+      (short)(POLLIN | (sent < length ? POLLOUT : 0)), 0};
+    if (poll(descriptors, 3u, 10) < 0 && errno != EINTR) return 1;
+    if ((descriptors[0].revents & POLLIN) != 0 &&
+        process_tun(integration) != FTUN_OK) return 1;
+    if ((descriptors[1].revents & POLLIN) != 0 &&
+        process_mesh_wire(integration) != FTUN_OK) return 1;
+    if (sent < length && (descriptors[2].revents & POLLOUT) != 0) {
+      amount = send(descriptor, message + sent, length - sent, MSG_NOSIGNAL);
+      if (amount > 0) sent += (size_t)amount;
+      else if (amount < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
+               errno != EINTR) return 1;
+    }
+    if (received < length && (descriptors[2].revents & POLLIN) != 0) {
+      amount = recv(descriptor, response + received, length - received, 0);
+      if (amount > 0) received += (size_t)amount;
+      else if (amount == 0) return 1;
+      else if (errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        return 1;
+      }
+    }
+    if ((descriptors[2].revents & (POLLERR | POLLNVAL)) != 0 ||
+        deadline_after(0u) >= deadline) return 1;
+  }
+  return memcmp(response, message, length) == 0 ? 0 : 1;
 }
 
 static int nonblocking_exchange(int descriptor, const uint8_t *message,
@@ -3075,7 +3509,7 @@ static int nonblocking_exchange(int descriptor, const uint8_t *message,
 
 static int start_socks(integration_t *integration,
                        ftun_dial_transport_t transport, uint16_t target_port,
-                       socks_completion_t *completion)
+                       bool overlay, socks_completion_t *completion)
 {
   ftun_endpoint_t candidate = endpoint4(PEER_ADDRESS, target_port);
   ftun_target_t target;
@@ -3108,7 +3542,8 @@ static int start_socks(integration_t *integration,
   leaf.supports_tcp = true;
   leaf.supports_udp = true;
   memset(&proxy, 0, sizeof(proxy));
-  proxy.server = endpoint4(PEER_ADDRESS, SOCKS_PORT);
+  proxy.server = endpoint4(overlay ? MESH_ADDRESS : PEER_ADDRESS,
+                           overlay ? MESH_SOCKS_PORT : SOCKS_PORT);
   proxy.udp_enabled = true;
   memset(&socks, 0, sizeof(socks));
   socks.loop = integration->loop;
@@ -3116,6 +3551,8 @@ static int start_socks(integration_t *integration,
   socks.budget = integration->budget;
   socks.proxy = &proxy;
   socks.target = &target;
+  socks.network_view = overlay ? integration->network_view : NULL;
+  socks.network_generation = overlay ? 1u : 0u;
   socks.protection.mark = PROTECTION_MARK;
   socks.deadline_ms = deadline_after(5000u);
   socks.transport = transport;
@@ -3147,7 +3584,7 @@ static int test_socks(integration_t *integration)
   size_t consumed = 0u;
   ssize_t length;
   CHECK(start_socks(integration, FTUN_DIAL_TCP, DIRECT_TCP_PORT,
-                    &completion) == 0);
+                    false, &completion) == 0);
   if (completion.error.status != FTUN_OK) {
     fprintf(stderr, "SOCKS TCP failed: status=%d stage=%u\n",
             (int)completion.error.status, completion.error.stage);
@@ -3161,7 +3598,7 @@ static int test_socks(integration_t *integration)
   CHECK(ftun_socks5_connection_close(&completion.connection) == FTUN_OK);
 
   CHECK(start_socks(integration, FTUN_DIAL_UDP, DIRECT_UDP_PORT,
-                    &completion) == 0);
+                    false, &completion) == 0);
   CHECK(completion.error.status == FTUN_OK && completion.connection != NULL);
   CHECK(ftun_socks5_connection_get_info(completion.connection, &info) ==
         FTUN_OK && info.transport == FTUN_DIAL_UDP &&
@@ -3189,9 +3626,26 @@ static int test_socks(integration_t *integration)
         &decoded, &consumed) == FTUN_E_REJECTED);
   CHECK(ftun_socks5_connection_close(&completion.connection) == FTUN_OK);
 
-  CHECK(start_socks(integration, FTUN_DIAL_TCP, 9u, &completion) == 0);
+  CHECK(start_socks(integration, FTUN_DIAL_TCP, 9u, false, &completion) == 0);
   CHECK(completion.error.status == FTUN_E_REJECTED &&
         completion.connection == NULL);
+
+  {
+    size_t sent_before = integration->mesh_packets_sent;
+    size_t received_before = integration->mesh_packets_received;
+    CHECK(start_socks(integration, FTUN_DIAL_TCP, DIRECT_TCP_PORT,
+                      true, &completion) == 0);
+    CHECK(completion.error.status == FTUN_OK && completion.connection != NULL);
+    CHECK(ftun_socks5_connection_get_info(completion.connection, &info) ==
+          FTUN_OK && info.transport == FTUN_DIAL_TCP &&
+          info.proxy_domain == FTUN_DIAL_DOMAIN_OVERLAY &&
+          info.network_generation == 1u);
+    CHECK(overlay_exchange(integration, (int)info.data_socket, tcp_payload,
+                           sizeof(tcp_payload) - 1u) == 0);
+    CHECK(integration->mesh_packets_sent > sent_before &&
+          integration->mesh_packets_received > received_before);
+    CHECK(ftun_socks5_connection_close(&completion.connection) == FTUN_OK);
+  }
   return 0;
 }
 
@@ -3350,22 +3804,63 @@ static ftun_config_t *integration_config(void)
   return config;
 }
 
+static int integration_route_drive(integration_t *integration,
+                                   ftun_linux_route_async_t *routes,
+                                   ftun_linux_route_async_state_t terminal,
+                                   uint64_t deadline_ms)
+{
+  for (;;) {
+    ftun_linux_route_async_info_t info;
+    size_t route_work = 0u;
+    size_t callbacks = 0u;
+    bool block;
+    if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+        integration->now_ms >= deadline_ms ||
+        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) {
+      return 1;
+    }
+    if (info.state == terminal) return 0;
+    if (info.state == FTUN_LINUX_ROUTE_ASYNC_FAILED ||
+        info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED) return 1;
+    if (ftun_linux_route_async_run(routes, integration->now_ms,
+                                   16u, &route_work) != FTUN_OK ||
+        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) {
+      return 1;
+    }
+    if (info.state == terminal) return 0;
+    block = route_work == 0u && !info.runnable;
+    if (ftun_event_loop_run_once(integration->loop, block, 16u,
+                                 &callbacks) != FTUN_OK) return 1;
+  }
+}
+
 static int integration_start(integration_t *integration)
 {
   ftun_runtime_t *candidate = NULL;
   ftun_runtime_manager_info_t manager_info;
   ftun_tun_spec_t tun_spec;
   ftun_route_policy_t route_policy;
+  ftun_network_prefix_t protected_prefix;
+  ftun_network_route_t overlay_route;
+  ftun_network_view_spec_t network_spec;
+  ftun_linux_route_plan_t network_plan;
+  ftun_tun_service_spec_t tun_service_spec;
+  ftun_tun_consumer_t proxy_consumer;
+  ftun_tun_consumer_spec_t mesh_consumer;
+  ftun_tun_service_usage_t tun_usage;
   ftun_tun_ingress_spec_t ingress_spec;
   ftun_udp_flow_table_spec_t flow_spec;
   size_t index;
   memset(integration, 0, sizeof(*integration));
+  integration->mesh_wire = -1;
   integration->tcp.socket.descriptor = -1;
   for (index = 0u; index < UDP_SLOTS; index++) {
     integration->udp[index].descriptor = -1;
   }
   if (ftun_budget_create(NULL, 16u * 1024u * 1024u, 65536u,
                          &integration->budget) != FTUN_OK ||
+      ftun_buffer_pool_create(integration->budget, 65536u, 128u,
+                              &integration->tun_buffers) != FTUN_OK ||
       ftun_operation_queue_create(integration->budget, 256u,
                                   &integration->operations) != FTUN_OK ||
       ftun_event_loop_create(NULL, &integration->loop) != FTUN_OK ||
@@ -3389,23 +3884,131 @@ static int integration_start(integration_t *integration)
   tun_spec.name.data = "ftun-it0";
   tun_spec.name.length = 8u;
   tun_spec.mtu = TUN_MTU;
-  if (ftun_linux_tun_open(&tun_spec, &integration->port) != FTUN_OK ||
-      ftun_packet_port_get_info(integration->port,
-                                &integration->port_info) != FTUN_OK) return 1;
+  memset(&tun_service_spec, 0, sizeof(tun_service_spec));
+  tun_service_spec.core = integration->core;
+  tun_service_spec.budget = integration->budget;
+  tun_service_spec.loop = integration->loop;
+  tun_service_spec.buffers = integration->tun_buffers;
+  tun_service_spec.device = tun_spec;
+  tun_service_spec.consumer_capacity = 2u;
+  tun_service_spec.input_capacity = 16u;
+  tun_service_spec.consumer_quota = 16u;
+  tun_service_spec.output_capacity = 32u;
+  tun_service_spec.read_quota = 32u;
+  tun_service_spec.write_quota = 32u;
+  memset(&proxy_consumer, 0, sizeof(proxy_consumer));
+  proxy_consumer.packet = integration_proxy_tun_packet;
+  proxy_consumer.event = integration_tun_event;
+  proxy_consumer.user = integration;
+  memset(&mesh_consumer, 0, sizeof(mesh_consumer));
+  mesh_consumer.consumer.packet = integration_mesh_tun_packet;
+  mesh_consumer.consumer.event = integration_tun_event;
+  mesh_consumer.consumer.packet_error = integration_mesh_packet_error;
+  mesh_consumer.consumer.user = integration;
+  mesh_consumer.route.kind = FTUN_TUN_ROUTE_IPV4_PREFIX;
+  memcpy(mesh_consumer.route.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  mesh_consumer.route.prefix_length = 16u;
+  mesh_consumer.route.priority = 1u;
+  mesh_consumer.path.carrier_mtu = 1500u;
+  mesh_consumer.path.headroom = 100u;
+  mesh_consumer.path.flags = FTUN_TUN_PATH_ALLOW_IPV4_FRAGMENTS |
+    FTUN_TUN_PATH_VALIDATE_OUTPUT_SOURCE;
+  if (ftun_tun_service_create(&tun_service_spec,
+                              &integration->tun_service) != FTUN_OK ||
+      ftun_tun_service_acquire(integration->tun_service, &proxy_consumer,
+                               &integration->proxy_tun_lease) != FTUN_OK ||
+      ftun_tun_service_acquire_routed(integration->tun_service,
+        &mesh_consumer, &integration->mesh_tun_lease) != FTUN_OK ||
+      ftun_tun_service_get_usage(integration->tun_service, &tun_usage) !=
+        FTUN_OK) return 1;
+  integration->port_info = tun_usage.device;
+  integration->mesh_wire = socket_bound(SOCK_DGRAM, MAIN_ADDRESS,
+                                         MESH_WIRE_PORT);
+  if (integration->mesh_wire < 0 ||
+      setsockopt(integration->mesh_wire, SOL_SOCKET, SO_MARK,
+                 &(uint32_t){PROTECTION_MARK},
+                 (socklen_t)sizeof(uint32_t)) != 0 ||
+      !set_nonblocking(integration->mesh_wire)) return 1;
+  {
+    struct sockaddr_in peer_wire;
+    memset(&peer_wire, 0, sizeof(peer_wire));
+    peer_wire.sin_family = AF_INET;
+    peer_wire.sin_port = htons(MESH_WIRE_PORT);
+    if (inet_pton(AF_INET, PEER_ADDRESS, &peer_wire.sin_addr) != 1 ||
+        connect(integration->mesh_wire, (const struct sockaddr *)&peer_wire,
+                (socklen_t)sizeof(peer_wire)) != 0) return 1;
+  }
   memset(&route_policy, 0, sizeof(route_policy));
   route_policy.tun_interface = tun_spec.name;
   CHECK(inet_pton(AF_INET, "10.77.0.1", route_policy.tun_ipv4) == 1);
   route_policy.tun_prefix_length = 30u;
   route_policy.route_table = 100u;
   route_policy.rule_priority = 12340u;
+  route_policy.capture_priority_offset = 100u;
   route_policy.protection_mark = PROTECTION_MARK;
   route_policy.protection_mark_mask = UINT32_MAX;
   route_policy.manage_local = true;
   route_policy.lan_interface.data = "lan0";
   route_policy.lan_interface.length = 4u;
   route_policy.strict_route = true;
-  if (ftun_linux_route_prepare(&route_policy, &integration->routes) !=
-      FTUN_OK) return 1;
+  if (ftun_linux_route_async_start(&route_policy, integration->loop,
+      integration->now_ms, 250u, integration->now_ms + 5000u,
+      &integration->routes) != FTUN_OK ||
+      integration_route_drive(integration, integration->routes,
+                              FTUN_LINUX_ROUTE_ASYNC_READY,
+                              integration->now_ms + 5000u) != 0) return 1;
+
+  memset(&protected_prefix, 0, sizeof(protected_prefix));
+  memcpy(protected_prefix.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  protected_prefix.prefix_length = 16u;
+  memset(&overlay_route, 0, sizeof(overlay_route));
+  overlay_route.prefix = protected_prefix;
+  overlay_route.purpose_mask =
+    FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_PROXY) |
+    FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_BUSINESS);
+  memset(&network_spec, 0, sizeof(network_spec));
+  network_spec.generation = 1u;
+  network_spec.protected_prefixes = &protected_prefix;
+  network_spec.protected_prefix_count = 1u;
+  network_spec.overlay_routes = &overlay_route;
+  network_spec.overlay_route_count = 1u;
+  if (ftun_network_view_create(&network_spec, &integration->network_view) !=
+        FTUN_OK ||
+      ftun_linux_route_guard_plan(integration->network_view, 100u, 12341u,
+                                  &network_plan) != FTUN_OK ||
+      ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+      ftun_linux_route_async_start_plan(&network_plan, integration->loop,
+        integration->now_ms, 250u, integration->now_ms + 5000u,
+        &integration->network_guard) != FTUN_OK ||
+      integration_route_drive(integration, integration->network_guard,
+        FTUN_LINUX_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0 ||
+      ftun_linux_route_overlay_plan(integration->network_view, tun_spec.name,
+                                    100u, 100u, &network_plan) != FTUN_OK ||
+      ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+      ftun_linux_route_async_start_plan(&network_plan, integration->loop,
+        integration->now_ms, 250u, integration->now_ms + 5000u,
+        &integration->overlay_routes) != FTUN_OK ||
+      integration_route_drive(integration, integration->overlay_routes,
+        FTUN_LINUX_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0) {
+    return 1;
+  }
+  for (index = 0u; index < 3u; index++) {
+    ftun_route_policy_t probe_policy = route_policy;
+    ftun_linux_route_async_t *duplicate_routes = NULL;
+    ftun_linux_route_async_info_t duplicate_info;
+    if (index >= 1u) probe_policy.tun_ipv4[2] = 1u;
+    if (index >= 2u) probe_policy.protection_mark = UINT32_C(0x46000002);
+    if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+        ftun_linux_route_async_start(&probe_policy, integration->loop,
+          integration->now_ms, 250u, integration->now_ms + 5000u,
+          &duplicate_routes) != FTUN_OK ||
+        integration_route_drive(integration, duplicate_routes,
+          FTUN_LINUX_ROUTE_ASYNC_FAILED, integration->now_ms + 5000u) != 0 ||
+        ftun_linux_route_async_get_info(duplicate_routes, &duplicate_info) !=
+          FTUN_OK || duplicate_info.result != FTUN_E_REJECTED ||
+        duplicate_info.active_count != 0u ||
+        ftun_linux_route_async_destroy(&duplicate_routes) != FTUN_OK) return 1;
+  }
 
   memset(&flow_spec, 0, sizeof(flow_spec));
   flow_spec.core = integration->core;
@@ -3419,8 +4022,6 @@ static int integration_start(integration_t *integration)
                                  &integration->udp_flows) != FTUN_OK) return 1;
 
   memset(&ingress_spec, 0, sizeof(ingress_spec));
-  ingress_spec.core = integration->core;
-  ingress_spec.port = integration->port;
   ingress_spec.budget = integration->budget;
   ingress_spec.operations = integration->operations;
   ingress_spec.generation = integration->generation;
@@ -3443,6 +4044,266 @@ static int integration_start(integration_t *integration)
     FTUN_OK ? 0 : 1;
 }
 
+static int overlay_tcp_open(integration_t *integration,
+                            const struct sockaddr_in *target)
+{
+  uint64_t deadline = deadline_after(5000u);
+  int descriptor = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                          IPPROTO_TCP);
+  int result;
+  if (descriptor < 0) return -1;
+  result = connect(descriptor, (const struct sockaddr *)target,
+                   (socklen_t)sizeof(*target));
+  if (result == 0) return descriptor;
+  if (errno != EINPROGRESS) {
+    (void)close(descriptor);
+    return -1;
+  }
+  for (;;) {
+    struct pollfd descriptors[3];
+    int error_code = 0;
+    socklen_t error_length = (socklen_t)sizeof(error_code);
+    memset(descriptors, 0, sizeof(descriptors));
+    descriptors[0] = (struct pollfd){
+      (int)integration->port_info.native_socket, POLLIN, 0};
+    descriptors[1] = (struct pollfd){integration->mesh_wire, POLLIN, 0};
+    descriptors[2] = (struct pollfd){descriptor, POLLOUT, 0};
+    if (poll(descriptors, 3u, 10) < 0 && errno != EINTR) break;
+    if ((descriptors[0].revents & POLLIN) != 0 &&
+        process_tun(integration) != FTUN_OK) break;
+    if ((descriptors[1].revents & POLLIN) != 0 &&
+        process_mesh_wire(integration) != FTUN_OK) break;
+    if ((descriptors[2].revents & (POLLOUT | POLLERR | POLLHUP)) != 0) {
+      if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error_code,
+                     &error_length) != 0 || error_length != sizeof(error_code) ||
+          error_code != 0) break;
+      return descriptor;
+    }
+    if (deadline_after(0u) >= deadline) break;
+  }
+  (void)close(descriptor);
+  return -1;
+}
+
+static int test_mesh_path_mtu(integration_t *integration)
+{
+  ftun_tun_path_t path;
+  ftun_tun_consumer_usage_t usage;
+  struct sockaddr_in target;
+  struct pollfd descriptor;
+  uint8_t payload[1272];
+  size_t sent_before = integration->mesh_packets_sent;
+  size_t errors_before = integration->mesh_packet_errors;
+  size_t feedback_before = integration->mesh_feedback_sent;
+  int discovery = IP_PMTUDISC_DO;
+  int mtu = 0;
+  socklen_t mtu_length = (socklen_t)sizeof(mtu);
+  int blocked = -1;
+  int probe = -1;
+  int result;
+
+  memset(payload, 0x5au, sizeof(payload));
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons(19091u);
+  CHECK(inet_pton(AF_INET, MESH_ADDRESS, &target.sin_addr) == 1);
+  memset(&path, 0, sizeof(path));
+  path.carrier_mtu = 1300u;
+  path.headroom = 100u;
+  path.flags = FTUN_TUN_PATH_ALLOW_IPV4_FRAGMENTS |
+    FTUN_TUN_PATH_VALIDATE_OUTPUT_SOURCE;
+  CHECK(ftun_tun_service_update_path(integration->mesh_tun_lease, &path) ==
+        FTUN_OK);
+  CHECK(ftun_tun_service_get_consumer_usage(
+          integration->mesh_tun_lease, &usage) == FTUN_OK &&
+        usage.inner_mtu == 1200u && usage.path_generation == 2u);
+
+  blocked = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  CHECK(blocked >= 0 &&
+        setsockopt(blocked, IPPROTO_IP, IP_MTU_DISCOVER, &discovery,
+                   (socklen_t)sizeof(discovery)) == 0 &&
+        connect(blocked, (const struct sockaddr *)&target,
+                (socklen_t)sizeof(target)) == 0);
+  CHECK(send(blocked, payload, sizeof(payload), 0) == (ssize_t)sizeof(payload));
+  descriptor = (struct pollfd){
+    (int)integration->port_info.native_socket, POLLIN, 0};
+  CHECK(poll(&descriptor, 1u, 1000) == 1 &&
+        (descriptor.revents & POLLIN) != 0 &&
+        process_tun(integration) == FTUN_OK);
+  CHECK(integration->mesh_packets_sent == sent_before &&
+        integration->mesh_packet_errors == errors_before + 1u &&
+        integration->mesh_feedback_sent == feedback_before + 1u &&
+        integration->mesh_last_error.reason == FTUN_TUN_PACKET_TOO_BIG &&
+        integration->mesh_last_error.direction == FTUN_TUN_PACKET_FROM_DEVICE &&
+        integration->mesh_last_error.packet_length == 1300u &&
+        integration->mesh_last_error.inner_mtu == 1200u &&
+        integration->mesh_last_error.feedback_sent);
+  descriptor = (struct pollfd){blocked, POLLERR, 0};
+  CHECK(poll(&descriptor, 1u, 1000) == 1 &&
+        (descriptor.revents & POLLERR) != 0 &&
+        getsockopt(blocked, IPPROTO_IP, IP_MTU, &mtu, &mtu_length) == 0 &&
+        mtu_length == sizeof(mtu) && mtu == 1200);
+  errno = 0;
+  result = (int)send(blocked, payload, sizeof(payload), 0);
+  CHECK(result < 0 && errno == EMSGSIZE);
+  CHECK(close(blocked) == 0);
+  blocked = -1;
+
+  path.carrier_mtu = 1500u;
+  CHECK(ftun_tun_service_update_path(integration->mesh_tun_lease, &path) ==
+        FTUN_OK);
+  CHECK(ftun_tun_service_get_consumer_usage(
+          integration->mesh_tun_lease, &usage) == FTUN_OK &&
+        usage.inner_mtu == TUN_MTU && usage.path_generation == 3u &&
+        usage.queued_inputs == 0u && usage.queued_outputs == 0u);
+  discovery = IP_PMTUDISC_PROBE;
+  probe = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  CHECK(probe >= 0 &&
+        setsockopt(probe, IPPROTO_IP, IP_MTU_DISCOVER, &discovery,
+                   (socklen_t)sizeof(discovery)) == 0 &&
+        connect(probe, (const struct sockaddr *)&target,
+                (socklen_t)sizeof(target)) == 0 &&
+        send(probe, payload, sizeof(payload), 0) == (ssize_t)sizeof(payload));
+  descriptor = (struct pollfd){
+    (int)integration->port_info.native_socket, POLLIN, 0};
+  CHECK(poll(&descriptor, 1u, 1000) == 1 &&
+        (descriptor.revents & POLLIN) != 0 &&
+        process_tun(integration) == FTUN_OK &&
+        integration->mesh_packets_sent == sent_before + 1u);
+  CHECK(close(probe) == 0);
+  CHECK(integration->mesh_path_updates == 2u &&
+        !integration->callback_failed);
+  return 0;
+}
+
+static int test_network_protection(integration_t *integration)
+{
+  ftun_network_prefix_t protected_prefix;
+  ftun_network_view_spec_t spec;
+  ftun_network_view_t *revoked = NULL;
+  ftun_linux_route_plan_t guard_plan;
+  struct sockaddr_in target;
+  struct sockaddr_ll capture_address;
+  uint8_t packet[2048];
+  uint8_t byte = 0x5au;
+  int old_socket = -1;
+  int old_tcp = -1;
+  int new_socket = -1;
+  int capture = -1;
+  int result;
+  ssize_t length;
+  unsigned int interface_index = if_nametoindex("phys0");
+
+  CHECK(interface_index != 0u);
+  capture = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK | SOCK_CLOEXEC,
+                   htons(ETH_P_IP));
+  CHECK(capture >= 0);
+  memset(&capture_address, 0, sizeof(capture_address));
+  capture_address.sll_family = AF_PACKET;
+  capture_address.sll_protocol = htons(ETH_P_IP);
+  capture_address.sll_ifindex = (int)interface_index;
+  CHECK(bind(capture, (const struct sockaddr *)&capture_address,
+             (socklen_t)sizeof(capture_address)) == 0);
+
+  memset(&target, 0, sizeof(target));
+  target.sin_family = AF_INET;
+  target.sin_port = htons(1080u);
+  CHECK(inet_pton(AF_INET, "198.18.1.2", &target.sin_addr) == 1);
+  old_socket = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  CHECK(old_socket >= 0);
+  CHECK(connect(old_socket, (const struct sockaddr *)&target,
+                (socklen_t)sizeof(target)) == 0);
+  target.sin_port = htons(MESH_SOCKS_PORT);
+  old_tcp = overlay_tcp_open(integration, &target);
+  CHECK(old_tcp >= 0);
+
+  memset(&protected_prefix, 0, sizeof(protected_prefix));
+  memcpy(protected_prefix.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  protected_prefix.prefix_length = 16u;
+  memset(&spec, 0, sizeof(spec));
+  spec.generation = 2u;
+  spec.protected_prefixes = &protected_prefix;
+  spec.protected_prefix_count = 1u;
+  CHECK(ftun_network_view_create(&spec, &revoked) == FTUN_OK);
+  CHECK(ftun_network_view_release(&integration->network_view) == FTUN_OK);
+  integration->network_view = revoked;
+  revoked = NULL;
+
+  CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
+  CHECK(ftun_linux_route_async_release(integration->overlay_routes,
+          integration->now_ms, integration->now_ms + 5000u) == FTUN_OK);
+  CHECK(integration_route_drive(integration, integration->overlay_routes,
+          FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+          integration->now_ms + 5000u) == 0);
+  CHECK(ftun_linux_route_async_destroy(&integration->overlay_routes) ==
+        FTUN_OK);
+
+  errno = 0;
+  result = (int)send(old_socket, &byte, 1u, 0);
+  CHECK(result < 0 && (errno == ENETUNREACH || errno == EHOSTUNREACH ||
+                       errno == EACCES));
+  {
+    size_t mesh_before = integration->mesh_packets_sent;
+    struct pollfd descriptor;
+    (void)send(old_tcp, &byte, 1u, MSG_NOSIGNAL);
+    memset(&descriptor, 0, sizeof(descriptor));
+    descriptor.fd = (int)integration->port_info.native_socket;
+    descriptor.events = POLLIN;
+    if (poll(&descriptor, 1u, 50) == 1 &&
+        (descriptor.revents & POLLIN) != 0) {
+      CHECK(process_tun(integration) == FTUN_OK);
+    }
+    CHECK(integration->mesh_packets_sent == mesh_before);
+  }
+  target.sin_port = htons(1080u);
+  new_socket = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  CHECK(new_socket >= 0);
+  errno = 0;
+  result = connect(new_socket, (const struct sockaddr *)&target,
+                   (socklen_t)sizeof(target));
+  CHECK(result < 0 && (errno == ENETUNREACH || errno == EHOSTUNREACH ||
+                       errno == EACCES));
+  do {
+    length = recv(capture, packet, sizeof(packet), 0);
+    if (length >= 34 && packet[12] == 0x08u && packet[13] == 0x00u) {
+      CHECK(!(packet[30] == 198u && packet[31] == 18u));
+    }
+  } while (length >= 0 || errno == EINTR);
+  CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+  CHECK(close(new_socket) == 0 && close(old_tcp) == 0 &&
+        close(old_socket) == 0);
+  new_socket = old_tcp = old_socket = -1;
+
+  /* 清理退出后按同一撤销视图重建 guard，模拟干净重启。保护必须先恢复，
+   * 才允许后续使用该代 NetworkView。 */
+  CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
+  CHECK(ftun_linux_route_async_release(integration->network_guard,
+          integration->now_ms, integration->now_ms + 5000u) == FTUN_OK);
+  CHECK(integration_route_drive(integration, integration->network_guard,
+          FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+          integration->now_ms + 5000u) == 0);
+  CHECK(ftun_linux_route_async_destroy(&integration->network_guard) ==
+        FTUN_OK);
+  CHECK(ftun_linux_route_guard_plan(integration->network_view, 100u, 12341u,
+                                    &guard_plan) == FTUN_OK);
+  CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
+  CHECK(ftun_linux_route_async_start_plan(&guard_plan, integration->loop,
+          integration->now_ms, 250u, integration->now_ms + 5000u,
+          &integration->network_guard) == FTUN_OK);
+  CHECK(integration_route_drive(integration, integration->network_guard,
+          FTUN_LINUX_ROUTE_ASYNC_READY,
+          integration->now_ms + 5000u) == 0);
+  new_socket = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
+  CHECK(new_socket >= 0);
+  errno = 0;
+  result = connect(new_socket, (const struct sockaddr *)&target,
+                   (socklen_t)sizeof(target));
+  CHECK(result < 0 && (errno == ENETUNREACH || errno == EHOSTUNREACH ||
+                       errno == EACCES));
+  CHECK(close(new_socket) == 0 && close(capture) == 0);
+  return 0;
+}
+
 static int integration_stop(integration_t *integration)
 {
   ftun_budget_usage_t budget_usage;
@@ -3451,8 +4312,26 @@ static int integration_stop(integration_t *integration)
   if (integration->tcp.active || integration->callback_failed) return 1;
   if (ftun_udp_flow_table_destroy(&integration->udp_flows) != FTUN_OK ||
       ftun_tun_ingress_close(&integration->ingress) != FTUN_OK ||
-      ftun_linux_route_release(&integration->routes) != FTUN_OK ||
-      ftun_packet_port_close(&integration->port) != FTUN_OK ||
+      ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+      ftun_linux_route_async_release(integration->network_guard,
+        integration->now_ms, integration->now_ms + 5000u) != FTUN_OK ||
+      integration_route_drive(integration, integration->network_guard,
+                              FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+                              integration->now_ms + 5000u) != 0 ||
+      ftun_linux_route_async_destroy(&integration->network_guard) != FTUN_OK ||
+      ftun_network_view_release(&integration->network_view) != FTUN_OK ||
+      ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+      ftun_linux_route_async_release(integration->routes,
+        integration->now_ms, integration->now_ms + 5000u) != FTUN_OK ||
+      integration_route_drive(integration, integration->routes,
+                              FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+                              integration->now_ms + 5000u) != 0 ||
+      ftun_linux_route_async_destroy(&integration->routes) != FTUN_OK ||
+      close(integration->mesh_wire) != 0 ||
+      ftun_tun_service_quiesce(integration->tun_service) != FTUN_OK ||
+      ftun_tun_service_release(&integration->mesh_tun_lease) != FTUN_OK ||
+      ftun_tun_service_release(&integration->proxy_tun_lease) != FTUN_OK ||
+      ftun_tun_service_destroy(&integration->tun_service) != FTUN_OK ||
       ftun_worker_stop(integration->worker) != FTUN_OK ||
       ftun_worker_join(integration->worker) != FTUN_OK ||
       ftun_worker_poll(integration->worker, SIZE_MAX, &dispatched) != FTUN_OK ||
@@ -3465,6 +4344,7 @@ static int integration_stop(integration_t *integration)
       operation_usage.inflight != 0u ||
       ftun_operation_queue_stop(integration->operations) != FTUN_OK ||
       ftun_operation_queue_destroy(&integration->operations) != FTUN_OK ||
+      ftun_buffer_pool_destroy(&integration->tun_buffers) != FTUN_OK ||
       ftun_runtime_manager_destroy(&integration->core) != FTUN_OK ||
       ftun_budget_get_usage(integration->budget, &budget_usage) != FTUN_OK ||
       budget_usage.used != 0u ||
@@ -3480,7 +4360,9 @@ static int integration_main(const char *self)
   CHECK(integration_start(&integration) == 0);
   CHECK(test_strict_ipv6() == 0);
   CHECK(test_system_resolver(&integration) == 0);
+  CHECK(test_mesh_path_mtu(&integration) == 0);
   CHECK(test_socks(&integration) == 0);
+  CHECK(test_network_protection(&integration) == 0);
   CHECK(run_data_case(&integration, self, false, "tcp", "local-tcp") == 0);
   CHECK(run_data_case(&integration, self, false, "udp", "local-udp") == 0);
   CHECK(run_data_case(&integration, self, true, "tcp", "lan-tcp") == 0);
@@ -3491,8 +4373,13 @@ static int integration_main(const char *self)
   CHECK(ftun_tun_ingress_tick(integration.ingress, expire_at) == FTUN_OK);
   CHECK(ftun_udp_flow_tick(integration.udp_flows, expire_at) == FTUN_OK);
   CHECK(ftun_udp_flow_get_usage(integration.udp_flows, &flow_usage) ==
-        FTUN_OK && flow_usage.active == 0u && flow_usage.expired == 2u &&
-        flow_usage.created == 2u);
+        FTUN_OK);
+  if (flow_usage.active != 0u || flow_usage.expired != 2u ||
+      flow_usage.created != 2u) {
+    fprintf(stderr, "UDP usage active=%zu expired=%zu created=%zu\n",
+            flow_usage.active, flow_usage.expired, flow_usage.created);
+    return 1;
+  }
   CHECK(integration.accepted_tcp == 2u && integration.received_udp == 2u);
   CHECK(integration_stop(&integration) == 0);
   return 0;
@@ -3578,6 +4465,12 @@ int main(int argc, char **argv)
   if (argc == 4 && strcmp(argv[1], "--dns-concurrency-client") == 0) {
     return dns_concurrency_client_main(argv[2], argv[3]);
   }
+  if (argc == 5 && strcmp(argv[1], "--dns-flood-client") == 0) {
+    return dns_flood_client_main(argv[2], argv[3], argv[4]);
+  }
+  if (argc == 5 && strcmp(argv[1], "--dns-isolation-client") == 0) {
+    return dns_isolation_client_main(argv[2], argv[3], argv[4]);
+  }
   if (argc == 2 && strcmp(argv[1], "--run") == 0) {
     return integration_main(argv[0]);
   }
@@ -3589,6 +4482,8 @@ int main(int argc, char **argv)
                   "--dns-concurrency-server ADDRESS PORT READY RESULT | "
                   "--dns-tcp-concurrency-server ADDRESS PORT READY RESULT | "
                   "--dns-concurrency-client ADDRESS PORT | "
+                  "--dns-flood-client ADDRESS PORT DURATION_MS | "
+                  "--dns-isolation-client ADDRESS PORT PORT | "
                   "--socks-client PORT TARGET | "
                   "--socks-hold-client PORT TARGET HOLD_MS | "
                   "--socks-stall-client PORT HOLD_MS | "

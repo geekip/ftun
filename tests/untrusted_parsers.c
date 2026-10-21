@@ -1,12 +1,12 @@
 #include "protocol/http.h"
 #include "protocol/socks5.h"
-#include "sniff/sniff.h"
+#include "proxy/sniff/sniff.h"
 
 #if defined(FTUN_TEST_DNS)
 #include "dns/wire.h"
 #endif
 #if defined(FTUN_TEST_FRS)
-#include "frs/format.h"
+#include "proxy/frs/format.h"
 #include "frs_fixture.h"
 #endif
 

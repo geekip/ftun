@@ -3,9 +3,9 @@
 #endif
 
 #include "core/budget.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include "core/worker.h"
-#include "dns/fakeip.h"
+#include "proxy/dns/fakeip.h"
 
 #include <sched.h>
 #include <stdio.h>
@@ -162,15 +162,13 @@ static int test_persistent_boundary_and_core(void)
   CHECK(ftun_fakeip_handle_get(handle, &address, &domain) == FTUN_OK &&
         address == 100u);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_fakeip(core, service) == FTUN_OK);
   CHECK(ftun_fakeip_handle_release(&handle) == FTUN_OK);
-  CHECK(ftun_fakeip_acquire(core, (ftun_string_t){"one.test", 8u},
+  CHECK(ftun_fakeip_acquire(service, (ftun_string_t){"one.test", 8u},
                             &handle) == FTUN_OK);
   CHECK(ftun_fakeip_handle_release(&handle) == FTUN_OK);
   CHECK(ftun_fakeip_service_snapshot(service, &snapshot) == FTUN_OK &&
         snapshot->mapping_count == 1u && snapshot->sequence == 1u);
   CHECK(ftun_fakeip_snapshot_destroy(&snapshot) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_fakeip(core, NULL) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
   CHECK(snprintf(reservation_path, sizeof(reservation_path),
                  "%s/reservations", directory) > 0);

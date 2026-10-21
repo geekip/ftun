@@ -3,7 +3,7 @@
 #endif
 
 #include "logger.h"
-#include "core/runtime.h"
+#include "core/context.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* REQ-OBS-001 / TASK-UTIL-001 / TEST-UTIL-001，目标 0.5.0：
@@ -44,6 +45,8 @@ struct ftun_logger {
   int descriptor;
   int accepting;
   int stopping;
+  int exited;
+  int joined;
 };
 
 static const char *const ftun_log_names[] = {
@@ -96,8 +99,10 @@ static void *ftun_logger_thread(void *argument)
       (void)pthread_cond_wait(&logger->available, &logger->mutex);
     }
     if (logger->count == 0u && logger->stopping) {
+      logger->exited = 1;
+      (void)pthread_cond_broadcast(&logger->drained);
       (void)pthread_mutex_unlock(&logger->mutex);
-      break;
+      return NULL;
     }
     slot = logger->head;
     length = logger->lengths[slot];
@@ -114,13 +119,13 @@ static void *ftun_logger_thread(void *argument)
     if (logger->count == 0u) (void)pthread_cond_broadcast(&logger->drained);
     (void)pthread_mutex_unlock(&logger->mutex);
   }
-  return NULL;
 }
 
 ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
                                  ftun_logger_t **out)
 {
   ftun_logger_t *logger;
+  pthread_condattr_t condition_attributes;
   size_t capacity;
   size_t line_capacity;
   if (out != NULL) *out = NULL;
@@ -142,8 +147,17 @@ ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
   logger->lengths = (size_t *)calloc(capacity, sizeof(*logger->lengths));
   if (logger->lines == NULL || logger->lengths == NULL) goto limit;
   if (pthread_mutex_init(&logger->mutex, NULL) != 0) goto io;
-  if (pthread_cond_init(&logger->available, NULL) != 0) goto mutex_io;
-  if (pthread_cond_init(&logger->drained, NULL) != 0) goto available_io;
+  if (pthread_condattr_init(&condition_attributes) != 0) goto mutex_io;
+  if (pthread_condattr_setclock(&condition_attributes, CLOCK_MONOTONIC) != 0) {
+    goto attributes_io;
+  }
+  if (pthread_cond_init(&logger->available, &condition_attributes) != 0) {
+    goto attributes_io;
+  }
+  if (pthread_cond_init(&logger->drained, &condition_attributes) != 0) {
+    goto attributes_available_io;
+  }
+  (void)pthread_condattr_destroy(&condition_attributes);
   logger->capacity = capacity;
   logger->line_capacity = line_capacity;
   logger->level = options->level;
@@ -167,7 +181,6 @@ descriptor_io:
   if (logger->descriptor >= 0) (void)close(logger->descriptor);
 drained_io:
   (void)pthread_cond_destroy(&logger->drained);
-available_io:
   (void)pthread_cond_destroy(&logger->available);
 mutex_io:
   (void)pthread_mutex_destroy(&logger->mutex);
@@ -176,6 +189,11 @@ io:
   free(logger->lines);
   free(logger);
   return FTUN_E_IO;
+attributes_available_io:
+  (void)pthread_cond_destroy(&logger->available);
+attributes_io:
+  (void)pthread_condattr_destroy(&condition_attributes);
+  goto mutex_io;
 limit:
   free(logger->lengths);
   free(logger->lines);
@@ -274,11 +292,90 @@ ftun_status_t ftun_logger_write(ftun_logger_t *logger, ftun_log_level_t level,
 
 ftun_status_t ftun_logger_flush(ftun_logger_t *logger)
 {
+  return ftun_logger_flush_until(logger, UINT64_MAX);
+}
+
+ftun_status_t ftun_logger_flush_until(ftun_logger_t *logger,
+                                      uint64_t deadline_ms)
+{
+  int wait_status = 0;
   if (logger == NULL) return FTUN_E_INVALID;
   (void)pthread_mutex_lock(&logger->mutex);
-  while (logger->count != 0u || logger->writing != 0u) {
-    (void)pthread_cond_wait(&logger->drained, &logger->mutex);
+  while ((logger->count != 0u || logger->writing != 0u) && wait_status == 0) {
+    if (deadline_ms == UINT64_MAX) {
+      wait_status = pthread_cond_wait(&logger->drained, &logger->mutex);
+    } else {
+      struct timespec deadline;
+      uint64_t seconds = deadline_ms / UINT64_C(1000);
+      deadline.tv_sec = (time_t)seconds;
+      if ((uint64_t)deadline.tv_sec != seconds) {
+        (void)pthread_mutex_unlock(&logger->mutex);
+        return FTUN_E_LIMIT;
+      }
+      deadline.tv_nsec = (long)((deadline_ms % UINT64_C(1000)) *
+                                UINT64_C(1000000));
+      wait_status = pthread_cond_timedwait(&logger->drained, &logger->mutex,
+                                           &deadline);
+    }
   }
+  if (logger->count != 0u || logger->writing != 0u) {
+    (void)pthread_mutex_unlock(&logger->mutex);
+    return wait_status == ETIMEDOUT ? FTUN_E_TIMEOUT : FTUN_E_IO;
+  }
+  (void)pthread_mutex_unlock(&logger->mutex);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_logger_stop(ftun_logger_t *logger)
+{
+  if (logger == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&logger->mutex);
+  logger->accepting = 0;
+  logger->stopping = 1;
+  (void)pthread_cond_broadcast(&logger->available);
+  (void)pthread_mutex_unlock(&logger->mutex);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_logger_join_until(ftun_logger_t *logger,
+                                     uint64_t deadline_ms)
+{
+  int wait_status = 0;
+  if (logger == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&logger->mutex);
+  if (logger->joined) {
+    (void)pthread_mutex_unlock(&logger->mutex);
+    return FTUN_OK;
+  }
+  if (!logger->stopping) {
+    (void)pthread_mutex_unlock(&logger->mutex);
+    return FTUN_E_AGAIN;
+  }
+  while (!logger->exited && wait_status == 0) {
+    if (deadline_ms == UINT64_MAX) {
+      wait_status = pthread_cond_wait(&logger->drained, &logger->mutex);
+    } else {
+      struct timespec deadline;
+      uint64_t seconds = deadline_ms / UINT64_C(1000);
+      deadline.tv_sec = (time_t)seconds;
+      if ((uint64_t)deadline.tv_sec != seconds) {
+        (void)pthread_mutex_unlock(&logger->mutex);
+        return FTUN_E_LIMIT;
+      }
+      deadline.tv_nsec = (long)((deadline_ms % UINT64_C(1000)) *
+                                UINT64_C(1000000));
+      wait_status = pthread_cond_timedwait(&logger->drained, &logger->mutex,
+                                           &deadline);
+    }
+  }
+  if (!logger->exited) {
+    (void)pthread_mutex_unlock(&logger->mutex);
+    return wait_status == ETIMEDOUT ? FTUN_E_TIMEOUT : FTUN_E_IO;
+  }
+  (void)pthread_mutex_unlock(&logger->mutex);
+  if (pthread_join(logger->thread, NULL) != 0) return FTUN_E_IO;
+  (void)pthread_mutex_lock(&logger->mutex);
+  logger->joined = 1;
   (void)pthread_mutex_unlock(&logger->mutex);
   return FTUN_OK;
 }
@@ -296,23 +393,30 @@ ftun_status_t ftun_logger_get_usage(ftun_logger_t *logger,
   out->dropped = logger->dropped;
   out->io_errors = logger->io_errors;
   out->accepting = logger->accepting != 0;
+  out->stopping = logger->stopping != 0;
+  out->exited = logger->exited != 0;
+  out->joined = logger->joined != 0;
   (void)pthread_mutex_unlock(&logger->mutex);
   return FTUN_OK;
 }
 
 ftun_status_t ftun_logger_destroy(ftun_logger_t **logger)
 {
+  return ftun_logger_destroy_until(logger, UINT64_MAX);
+}
+
+ftun_status_t ftun_logger_destroy_until(ftun_logger_t **logger,
+                                        uint64_t deadline_ms)
+{
   ftun_logger_t *owned;
+  ftun_status_t status;
   int close_status = 0;
   if (logger == NULL) return FTUN_E_INVALID;
   owned = *logger;
   if (owned == NULL) return FTUN_OK;
-  (void)pthread_mutex_lock(&owned->mutex);
-  owned->accepting = 0;
-  owned->stopping = 1;
-  (void)pthread_cond_broadcast(&owned->available);
-  (void)pthread_mutex_unlock(&owned->mutex);
-  if (pthread_join(owned->thread, NULL) != 0) return FTUN_E_IO;
+  status = ftun_logger_stop(owned);
+  if (status == FTUN_OK) status = ftun_logger_join_until(owned, deadline_ms);
+  if (status != FTUN_OK) return status;
   if (owned->descriptor >= 0) close_status = close(owned->descriptor);
   (void)pthread_cond_destroy(&owned->drained);
   (void)pthread_cond_destroy(&owned->available);
@@ -330,7 +434,7 @@ ftun_status_t ftun_log_emit(ftun_core_t *core, const ftun_diagnostic_t *diagnost
   ftun_logger_t *logger = NULL;
   ftun_status_t status;
   if (core == NULL || diagnostic == NULL) return FTUN_E_INVALID;
-  status = ftun_runtime_manager_logger(core, &logger);
+  status = ftun_core_context_logger(core, &logger);
   if (status != FTUN_OK) return status;
   return ftun_logger_write(logger,
     diagnostic->error.status == FTUN_OK ? FTUN_LOG_INFO : FTUN_LOG_ERROR,

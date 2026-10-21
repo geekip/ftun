@@ -1,7 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "config/model.h"
 #include "config/parser.h"
-#include "state/group_cache.h"
+#include "proxy/state/group_cache.h"
 
 #include <fcntl.h>
 #include <stdio.h>

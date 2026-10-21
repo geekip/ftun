@@ -54,6 +54,15 @@
     "tls-sni": true,
     "http-host": true
   },
+  "tun": {
+    "interface": "ftun0",
+    "mtu": 1500,
+    "ipv4": {
+      "address": "172.19.0.1/30"
+    },
+    "auto-route": true,
+    "strict-route": true
+  },
   "inbounds": [
     {
       "name": "mixed-in",
@@ -70,18 +79,9 @@
     {
       "name": "tun-in",
       "type": "tun",
-      "interface": {
-        "name": "ftun0",
-        "mtu": 1500
-      },
       "stack": "lwip",
-      "ipv4": {
-        "address": "172.19.0.1/30"
-      },
       "tcp": true,
       "udp": true,
-      "auto-route": true,
-      "strict-route": true,
       "dns-hijack": true
     }
   ],

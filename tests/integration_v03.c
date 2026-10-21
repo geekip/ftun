@@ -7,10 +7,13 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include "core/worker.h"
-#include "dns/dns.h"
-#include "route/router.h"
+#include "dns/dispatcher.h"
+#include "proxy/dns/dispatch_adapter.h"
+#include "proxy/dns/fakeip.h"
+#include "proxy/dns/runtime_adapter.h"
+#include "proxy/route/router.h"
 
 #include <fcntl.h>
 #include <sched.h>
@@ -77,12 +80,15 @@ static int poll_worker(ftun_worker_t *worker, store_completion_t *completion,
 }
 
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, const ftun_endpoint_t *upstream,
+  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
   void **out_request)
 {
   transport_t *transport = (transport_t *)user;
+  (void)policy_fingerprint;
+  (void)server_fingerprint;
   (void)query;
   (void)deadline;
   if (transport->pending) return FTUN_E_LIMIT;
@@ -244,6 +250,7 @@ int main(void)
   ftun_fakeip_service_options_t fake_options;
   ftun_dns_server_options_t server_options;
   ftun_dns_dispatcher_options_t dispatcher_options;
+  ftun_proxy_dns_runtime_adapter_t dns_adapter;
   ftun_metadata_t metadata;
   ftun_endpoint_t candidates[2];
   ftun_route_result_t route;
@@ -264,6 +271,7 @@ int main(void)
   memset(&fake_options, 0, sizeof(fake_options));
   memset(&server_options, 0, sizeof(server_options));
   memset(&dispatcher_options, 0, sizeof(dispatcher_options));
+  memset(&dns_adapter, 0, sizeof(dns_adapter));
   memset(&store_completion, 0, sizeof(store_completion));
   memset(&dns_completion, 0, sizeof(dns_completion));
   memset(&transport, 0, sizeof(transport));
@@ -280,10 +288,13 @@ int main(void)
   CHECK(config != NULL);
   CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+  dns_adapter.core = core;
+  dns_adapter.fakeip_slot = &fakeip;
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
   dns_query(&query, &dns_completion, request, FTUN_DNS_ENTRY_FIXED);
-  CHECK(ftun_dns_dispatch(core, &query, &operation) == FTUN_E_AGAIN);
+  CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
+        &operation) == FTUN_E_AGAIN);
   store_options.directory = directory;
   store_options.budget = budget;
   store_options.worker = worker;
@@ -342,16 +353,15 @@ int main(void)
   dispatcher_options.operations = operations;
   dispatcher_options.servers = views;
   dispatcher_options.server_count = 2u;
-  dispatcher_options.fakeip = fakeip;
   dispatcher_options.select_server = select_server;
   dispatcher_options.select_user = &selected_outbound;
   CHECK(ftun_dns_dispatcher_create(&dispatcher_options, &dispatcher) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_dns(core, dispatcher) == FTUN_OK);
 
   memset(&dns_completion, 0, sizeof(dns_completion));
   dns_query(&query, &dns_completion, request, FTUN_DNS_ENTRY_FIXED);
   query.fixed_server = 0u;
-  CHECK(ftun_dns_dispatch(core, &query, &operation) == FTUN_OK);
+  CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
+        &operation) == FTUN_OK);
   CHECK(dispatch_one(operations) && dns_completion.status == FTUN_OK &&
         dns_completion.response[39] == 198u &&
         dns_completion.response[40] == 18u);
@@ -384,7 +394,8 @@ int main(void)
   memset(&dns_completion, 0, sizeof(dns_completion));
   dns_query(&query, &dns_completion, request, FTUN_DNS_ENTRY_POLICY);
   query.metadata = &metadata;
-  CHECK(ftun_dns_dispatch(core, &query, &operation) == FTUN_OK &&
+  CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
+        &operation) == FTUN_OK &&
         transport.pending && selected_outbound == FTUN_OUTBOUND_ID_NAMED_BASE &&
         transport.outbound == 11u);
   dns_response(response);
@@ -392,7 +403,6 @@ int main(void)
   CHECK(dispatch_one(operations) && dns_completion.status == FTUN_OK &&
         dns_completion.response[42] == 8u);
 
-  CHECK(ftun_runtime_manager_set_dns(core, NULL) == FTUN_OK);
   CHECK(ftun_dns_dispatcher_destroy(&dispatcher) == FTUN_OK);
   CHECK(ftun_dns_server_destroy(&servers[1]) == FTUN_OK);
   CHECK(ftun_dns_server_destroy(&servers[0]) == FTUN_OK);

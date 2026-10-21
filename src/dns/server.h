@@ -12,6 +12,8 @@ typedef void (*ftun_dns_transport_completion_fn)(
 typedef struct {
   /* 成功接纳后不得在 submit 返回前同步回调；response 仅借到回调返回。 */
   ftun_status_t (*submit)(void *context, uint32_t outbound_id,
+                          uint64_t policy_fingerprint,
+                          uint64_t server_fingerprint,
                           const ftun_endpoint_t *upstream,
                           ftun_dns_transport_t transport,
                           ftun_bytes_t query, uint64_t deadline_ms,

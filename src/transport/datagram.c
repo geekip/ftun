@@ -12,7 +12,10 @@ struct ftun_datagram_send {
   ftun_endpoint_t target;
   char domain[FTUN_DATAGRAM_DOMAIN_BYTES];
   ftun_error_t early_result;
+  size_t slot;
+  uint64_t generation;
   int starting;
+  int cancelling;
   int backend_owned;
   int early_complete;
 };
@@ -35,6 +38,7 @@ struct ftun_datagram {
   size_t completed_packets;
   size_t failed_packets;
   size_t callbacks;
+  uint64_t next_generation;
   int accepting;
   int stopping;
 };
@@ -49,6 +53,32 @@ static int ftun_datagram_options_valid(const ftun_datagram_options_t *options)
 {
   return options != NULL && options->budget != NULL &&
          options->max_pending_packets != 0u;
+}
+
+static ftun_datagram_send_token_t ftun_datagram_send_token(
+  const ftun_datagram_send_t *send)
+{
+  ftun_datagram_send_token_t token;
+  memset(&token, 0, sizeof(token));
+  if (send != NULL) {
+    token.channel = send->owner;
+    token.slot = send->slot;
+    token.generation = send->generation;
+  }
+  return token;
+}
+
+static ftun_datagram_send_t *ftun_datagram_send_resolve(
+  ftun_datagram_send_token_t token)
+{
+  ftun_datagram_send_t *send;
+  if (token.channel == NULL || token.generation == 0u ||
+      token.slot >= token.channel->max_pending_packets) return NULL;
+  send = &token.channel->storage[token.slot];
+  if (send->owner != token.channel || send->generation != token.generation) {
+    return NULL;
+  }
+  return send;
 }
 
 static ftun_status_t ftun_datagram_endpoint_valid(const ftun_endpoint_t *endpoint)
@@ -253,6 +283,10 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
   memset(send, 0, sizeof(*send));
   send->owner = channel;
   send->channel = channel;
+  channel->next_generation++;
+  if (channel->next_generation == 0u) channel->next_generation++;
+  send->slot = (size_t)(send - channel->storage);
+  send->generation = channel->next_generation;
   status = ftun_packet_clone(packet, &send->packet);
   if (status != FTUN_OK) {
     ftun_datagram_release_send(send);
@@ -262,7 +296,8 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
   ftun_datagram_link(channel, send);
   send->starting = 1;
   send->backend_owned = 1;
-  status = channel->backend.send_start(channel->backend.context, send,
+  status = channel->backend.send_start(channel->backend.context,
+                                       ftun_datagram_send_token(send),
                                        &send->target, &send->packet);
   send->starting = 0;
   if (status != FTUN_OK) {
@@ -279,25 +314,36 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_datagram_send_view(const ftun_datagram_send_t *send,
+ftun_status_t ftun_datagram_send_view(ftun_datagram_send_token_t token,
                                       const ftun_endpoint_t **target,
                                       const ftun_packet_t **packet)
 {
+  ftun_datagram_send_t *send;
   if (target != NULL) *target = NULL;
   if (packet != NULL) *packet = NULL;
-  if (send == NULL || target == NULL || packet == NULL) return FTUN_E_INVALID;
-  if (send->channel == NULL || !send->backend_owned) return FTUN_E_STALE;
+  if (token.channel == NULL || token.generation == 0u ||
+      target == NULL || packet == NULL) return FTUN_E_INVALID;
+  send = ftun_datagram_send_resolve(token);
+  if (send == NULL || send->channel == NULL || !send->backend_owned) {
+    return FTUN_E_STALE;
+  }
+  if (send->cancelling) return FTUN_E_AGAIN;
   *target = &send->target;
   *packet = &send->packet;
   return FTUN_OK;
 }
 
-ftun_status_t ftun_datagram_send_complete(ftun_datagram_send_t *send,
+ftun_status_t ftun_datagram_send_complete(ftun_datagram_send_token_t token,
                                           ftun_error_t error)
 {
-  if (send == NULL) return FTUN_E_INVALID;
+  ftun_datagram_send_t *send;
+  if (token.channel == NULL || token.generation == 0u) return FTUN_E_INVALID;
   if (error.status == FTUN_E_AGAIN) return FTUN_E_INVALID;
-  if (send->channel == NULL || !send->backend_owned) return FTUN_E_STALE;
+  send = ftun_datagram_send_resolve(token);
+  if (send == NULL || send->channel == NULL || !send->backend_owned) {
+    return FTUN_E_STALE;
+  }
+  if (send->cancelling) return FTUN_E_AGAIN;
   if (send->starting) {
     if (error.status != FTUN_OK || send->early_complete) return FTUN_E_INVALID;
     send->backend_owned = 0;
@@ -348,7 +394,10 @@ ftun_status_t ftun_datagram_stop(ftun_datagram_t *channel)
   channel->stopping = 1;
   while (channel->head != NULL) {
     ftun_datagram_send_t *send = channel->head;
-    status = channel->backend.send_cancel(channel->backend.context, send);
+    send->cancelling = 1;
+    status = channel->backend.send_cancel(channel->backend.context,
+                                          ftun_datagram_send_token(send));
+    send->cancelling = 0;
     if (status != FTUN_OK) {
       channel->stopping = 0;
       return status;

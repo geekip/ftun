@@ -138,6 +138,11 @@ int main(int argc, char **argv)
   CHECK(config->inbound_count == 3u &&
         config->inbounds[2].kind == FTUN_CONFIG_INBOUND_TUN &&
         config->inbounds[2].mtu == 1500u && config->inbounds[2].strict_route);
+  CHECK(config->tun.present && !config->tun.legacy_fields &&
+        strcmp(config->tun.interface_name, "ftun0") == 0 &&
+        config->tun.mtu == 1500u &&
+        strcmp(config->tun.ipv4_address, "172.19.0.1/30") == 0 &&
+        config->tun.auto_route && config->tun.strict_route);
   CHECK(config->outbound_count == 4u &&
         config->outbounds[2].kind == FTUN_CONFIG_OUTBOUND_URL_TEST &&
         config->outbounds[2].expected_status == 204u &&
@@ -147,11 +152,60 @@ int main(int argc, char **argv)
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
+  CHECK(parse_text("{\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
+                   "\"interface\":{\"name\":\"ftun0\",\"mtu\":1420},"
+                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
+                   "\"auto-route\":true}]}", &config) == FTUN_OK);
+  CHECK(config->tun.present && config->tun.legacy_fields &&
+        strcmp(config->tun.interface_name, "ftun0") == 0 &&
+        config->tun.mtu == 1420u && config->tun.auto_route);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(parse_text("{\"tun\":{\"interface\":\"ftun0\",\"mtu\":1420,"
+                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
+                   "\"auto-route\":true,\"strict-route\":true},"
+                   "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\"}]}",
+                   &config) == FTUN_OK);
+  CHECK(config->tun.present && !config->tun.legacy_fields &&
+        config->tun.mtu == 1420u && config->inbound_count == 1u &&
+        strcmp(config->inbounds[0].interface_name, "ftun0") == 0 &&
+        config->inbounds[0].mtu == 1420u &&
+        strcmp(config->inbounds[0].ipv4_address, "172.19.0.1/30") == 0 &&
+        config->inbounds[0].auto_route && config->inbounds[0].strict_route);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(parse_text("{\"tun\":{\"interface\":\"ftun0\",\"mtu\":1420,"
+                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"}},"
+                   "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
+                   "\"interface\":{\"name\":\"ftun0\",\"mtu\":1420},"
+                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"}}]}",
+                   &config) == FTUN_OK);
+  CHECK(config->tun.present && config->tun.legacy_fields);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(expect_status("{\"tun\":{\"interface\":\"ftun0\","
+                      "\"ipv4\":{\"address\":\"172.19.0.1/30\"}},"
+                      "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
+                      "\"interface\":{\"name\":\"other0\"},"
+                      "\"ipv4\":{\"address\":\"172.19.0.1/30\"}}]}",
+                      FTUN_E_INVALID));
+
   CHECK(parse_text("{}", &config) == FTUN_OK);
   CHECK(!config->base.ipv6 && !config->base.allow_lan && config->base.state_cache &&
+        config->base.capacity.tcp_flows == FTUN_CONFIG_CAPACITY_DEFAULT &&
+        config->base.capacity.udp_flows == FTUN_CONFIG_CAPACITY_DEFAULT &&
+        config->base.capacity.udp_associations == FTUN_CONFIG_CAPACITY_DEFAULT &&
         strcmp(config->log.level, "warn") == 0 && config->dns.enable &&
         strcmp(config->dns.fake_ip.range, "198.18.0.0/15") == 0 &&
         config->sniff.tls_sni && config->sniff.http_host);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  CHECK(parse_text("{\"base\":{\"capacity\":{\"tcp-flows\":1000,"
+                   "\"udp-flows\":2000,\"udp-associations\":3000}}}",
+                   &config) == FTUN_OK);
+  CHECK(config->base.capacity.tcp_flows == 1000u &&
+        config->base.capacity.udp_flows == 2000u &&
+        config->base.capacity.udp_associations == 3000u);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
   CHECK(parse_text(disabled_dns, &config) == FTUN_OK);
@@ -186,6 +240,15 @@ int main(int argc, char **argv)
   CHECK(expect_status("{\"unknown\":1}", FTUN_E_INVALID));
   CHECK(expect_status("{\"base\":{\"unknown\":1}}", FTUN_E_INVALID));
   CHECK(expect_status("{\"base\":{\"ipv6\":0}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"capacity\":{\"tcp-flows\":0}}}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"capacity\":{\"udp-flows\":10001}}}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"capacity\":{\"udp-associations\":1.5}}}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"capacity\":{\"unknown\":1}}}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"capacity\":[]}}", FTUN_E_INVALID));
   CHECK(expect_status("{\"api\":{}}", FTUN_E_UNSUPPORTED));
   CHECK(expect_status("{\"plugins\":[]}", FTUN_E_UNSUPPORTED));
   CHECK(expect_status("{\"inbounds\":[{\"name\":\"x\",\"type\":\"http\","

@@ -1,6 +1,6 @@
 #include "frs_fixture.h"
 
-#include "frs/format.h"
+#include "proxy/frs/format.h"
 
 #include <stdio.h>
 #include <stdlib.h>

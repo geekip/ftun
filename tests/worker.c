@@ -178,6 +178,16 @@ static int wait_for_calls(ftun_worker_t *worker, completion_state_t *state,
   return 0;
 }
 
+static int wait_for_ready(ftun_worker_t *worker)
+{
+  size_t attempt;
+  for (attempt = 0u; attempt < 5000u; attempt++) {
+    if (ftun_worker_has_ready(worker)) return 1;
+    sleep_one_millisecond();
+  }
+  return 0;
+}
+
 static int wait_for_empty(ftun_worker_t *worker)
 {
   size_t attempt;
@@ -244,6 +254,7 @@ int main(void)
   CHECK(ftun_worker_create(budget, 1u, &worker) == FTUN_OK);
   CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
   CHECK(usage.capacity == 1u && usage.tasks == 0u && usage.accepting && !usage.joined);
+  CHECK(!ftun_worker_has_ready(worker) && !ftun_worker_has_ready(NULL));
   CHECK(ftun_worker_join(worker) == FTUN_E_AGAIN);
   CHECK(ftun_worker_poll(worker, 0u, &dispatched) == FTUN_E_INVALID && dispatched == 0u);
   CHECK(ftun_worker_submit(worker, NULL, completed, &echoed, &operation) == FTUN_E_INVALID);
@@ -260,9 +271,11 @@ int main(void)
   memcpy(mutable_input, "xxxx", 4u);
   CHECK(wait_for_gate());
   CHECK(ftun_operation_cancel(operation) == FTUN_OK);
+  CHECK(ftun_worker_has_ready(worker));
   CHECK(ftun_worker_poll(worker, 1u, &dispatched) == FTUN_OK);
   CHECK(dispatched == 1u && cancelled.calls == 1 &&
         cancelled.status == FTUN_E_CANCELLED && cancelled.result_size == 0u);
+  CHECK(!ftun_worker_has_ready(worker));
   CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
   CHECK(usage.tasks == 1u && usage.running == 1u);
   operation = (ftun_operation_t *)(uintptr_t)1;
@@ -284,7 +297,8 @@ int main(void)
   job.deadline_ms = 0u;
   job.result_cleanup = NULL;
   CHECK(ftun_worker_submit(worker, &job, completed, &echoed, &operation) == FTUN_OK);
-  CHECK(echoed.calls == 0 && wait_for_calls(worker, &echoed, 1));
+  CHECK(echoed.calls == 0 && wait_for_ready(worker) &&
+        wait_for_calls(worker, &echoed, 1));
   CHECK(echoed.status == FTUN_OK && echoed.result_size == 4u &&
         memcmp(echoed.result, "echo", 4u) == 0);
 
@@ -338,14 +352,21 @@ int main(void)
   operation = (ftun_operation_t *)(uintptr_t)1;
   CHECK(ftun_worker_submit(worker, &job, completed, &echoed, &operation) == FTUN_E_CANCELLED);
   CHECK(operation == NULL);
+  CHECK(ftun_monotonic_now(&now) == FTUN_OK);
+  CHECK(ftun_worker_join_until(worker, now) == FTUN_E_TIMEOUT);
+  CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
+  CHECK(usage.stopping && !usage.exited && !usage.joined &&
+        usage.tasks == 1u && usage.running == 1u);
+  CHECK(ftun_worker_destroy(&worker) == FTUN_E_AGAIN && worker != NULL);
   open_gate();
-  CHECK(ftun_worker_join(worker) == FTUN_OK);
+  CHECK(ftun_worker_join_until(worker, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_worker_join(worker) == FTUN_OK);
   CHECK(wait_for_empty(worker));
   CHECK(stopped.calls == 1);
   CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
   CHECK(usage.tasks == 0u && usage.pending == 0u && usage.running == 0u &&
-        usage.completed == 0u && !usage.accepting && usage.joined);
+        usage.completed == 0u && !usage.accepting && usage.stopping &&
+        usage.exited && usage.joined);
 
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
   CHECK(budget_usage.used > 0u);
@@ -353,6 +374,42 @@ int main(void)
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
   CHECK(budget_usage.used == 0u);
+
+  /* Completion ingestion and callback dispatch share a finite owner round.
+   * Leaving two completions queued after a quota-one poll proves the worker
+   * cannot hide an unbounded completion drain behind max_callbacks. */
+  {
+    completion_state_t burst[3] = {{0}, {0}, {0}};
+    size_t index;
+    CHECK(ftun_worker_create(budget, 3u, &worker) == FTUN_OK);
+    memset(&job, 0, sizeof(job));
+    job.execute = echo_execute;
+    job.input.data = echo_input;
+    job.input.length = 4u;
+    job.result_capacity = 4u;
+    for (index = 0u; index < 3u; index++) {
+      CHECK(ftun_worker_submit(worker, &job, completed, &burst[index],
+                               &operation) == FTUN_OK);
+    }
+    for (index = 0u; index < 5000u; index++) {
+      CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
+      if (usage.completed == 3u) break;
+      sleep_one_millisecond();
+    }
+    CHECK(usage.completed == 3u);
+    CHECK(ftun_worker_poll(worker, 1u, &dispatched) == FTUN_OK &&
+          dispatched == 1u && burst[0].calls == 1);
+    CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK &&
+          usage.completed == 2u);
+    CHECK(ftun_worker_poll(worker, 1u, &dispatched) == FTUN_OK &&
+          dispatched == 1u);
+    CHECK(ftun_worker_poll(worker, 1u, &dispatched) == FTUN_OK &&
+          dispatched == 1u && burst[0].calls + burst[1].calls +
+          burst[2].calls == 3);
+    CHECK(ftun_worker_stop(worker) == FTUN_OK);
+    CHECK(ftun_worker_join(worker) == FTUN_OK);
+    CHECK(ftun_worker_destroy(&worker) == FTUN_OK && worker == NULL);
+  }
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   worker = (ftun_worker_t *)(uintptr_t)1;

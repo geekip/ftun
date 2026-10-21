@@ -1,6 +1,6 @@
 #include "listener.h"
 
-#include "core/runtime.h"
+#include "core/context.h"
 #include "util/time.h"
 
 #include <stdlib.h>
@@ -14,6 +14,9 @@
 struct ftun_dns_listener {
   ftun_core_t *core;
   ftun_budget_t *budget;
+  ftun_dns_dispatcher_t *dispatcher;
+  ftun_dns_dispatch_fn dispatch;
+  void *dispatch_user;
   ftun_reservation_t *reservation;
   ftun_dns_entry_t entry;
   size_t fixed_server;
@@ -167,7 +170,7 @@ static ftun_status_t ftun_dns_listener_accept(
   ftun_dns_message_t *message = NULL;
   ftun_dns_listener_request_t *request;
   ftun_reservation_t *reservation = NULL;
-  ftun_runtime_manager_info_t runtime_info;
+  uint64_t generation;
   ftun_dns_query_t query;
   ftun_metadata_t metadata;
   size_t bytes = sizeof(*request);
@@ -224,10 +227,10 @@ static ftun_status_t ftun_dns_listener_accept(
     status = status == FTUN_OK ? FTUN_E_LIMIT : status;
     goto fail;
   }
-  status = ftun_runtime_manager_get_info(listener->core, &runtime_info);
+  status = ftun_core_context_generation(listener->core, &generation);
   if (status != FTUN_OK) goto fail;
   memset(&metadata, 0, sizeof(metadata));
-  metadata.generation = runtime_info.generation;
+  metadata.generation = generation;
   metadata.known_fields = FTUN_META_DOMAIN | FTUN_META_SOURCE;
   metadata.inbound_id = listener->inbound_id;
   metadata.domain.data = (const char *)request->domain;
@@ -245,6 +248,8 @@ static ftun_status_t ftun_dns_listener_accept(
   query.wire.data = message->wire;
   query.wire.length = message->wire_length;
   query.deadline_ms = now + listener->query_timeout_ms;
+  query.policy_fingerprint =
+    ((uint64_t)listener->inbound_id << 32u) | (uint64_t)listener->entry;
   query.resolution_mode = 1u;
   for (record_index = 0u; record_index < message->record_count;
        record_index++) {
@@ -259,7 +264,8 @@ static ftun_status_t ftun_dns_listener_accept(
   query.entry = listener->entry;
   query.fixed_server = listener->fixed_server;
   query.metadata = listener->entry == FTUN_DNS_ENTRY_POLICY ? &metadata : NULL;
-  status = ftun_dns_dispatch(listener->core, &query, out);
+  status = listener->dispatch(listener->dispatch_user, listener->core,
+                              listener->dispatcher, &query, out);
   if (status != FTUN_OK) goto fail;
   listener->inflight++;
   if (connection != NULL) connection->inflight++;
@@ -282,8 +288,9 @@ ftun_status_t ftun_dns_listen(ftun_core_t *core,
   ftun_budget_t *core_budget = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
-  if (core == NULL || spec == NULL || spec->budget == NULL || out == NULL ||
-      ftun_runtime_manager_budget(core, &core_budget) != FTUN_OK ||
+  if (core == NULL || spec == NULL || spec->budget == NULL ||
+      spec->dispatcher == NULL || spec->dispatch == NULL || out == NULL ||
+      ftun_core_context_budget(core, &core_budget) != FTUN_OK ||
       (spec->entry != FTUN_DNS_ENTRY_FIXED &&
        spec->entry != FTUN_DNS_ENTRY_POLICY) ||
       spec->query_timeout_ms == 0u || spec->udp_payload_limit < 512u ||
@@ -302,6 +309,9 @@ ftun_status_t ftun_dns_listen(ftun_core_t *core,
   }
   listener->core = core;
   listener->budget = spec->budget;
+  listener->dispatcher = spec->dispatcher;
+  listener->dispatch = spec->dispatch;
+  listener->dispatch_user = spec->dispatch_user;
   listener->reservation = reservation;
   listener->entry = spec->entry;
   listener->fixed_server = spec->fixed_server;

@@ -36,6 +36,13 @@ typedef struct {
   size_t source_count;
   size_t ready_count;
   size_t wakeups;
+  uint64_t polls;
+  uint64_t callbacks;
+  uint64_t quota_exhaustions;
+  uint64_t last_dispatch_ms;
+  uint64_t max_dispatch_ms;
+  uint64_t max_timer_lateness_ms;
+  size_t max_callbacks_per_poll;
   bool accepting;
   bool dispatching;
   bool stopped;
@@ -49,6 +56,9 @@ typedef struct {
  * 非空时才唤醒后端。除 defer 外的可变状态只由 owner loop 访问。
  */
 ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out);
+/* source_capacity 在创建后固定；普通调用保留 1024 的兼容默认值。 */
+ftun_status_t ftun_event_loop_create_with_capacity(
+  ftun_core_t *core, size_t source_capacity, ftun_event_loop_t **out);
 ftun_status_t ftun_event_loop_set_wakeup(ftun_event_loop_t *loop,
                                          ftun_event_wakeup_fn wakeup, void *user);
 /* backend 必须在创建 source 前附加，ops/context 保持有效至 detach。 */

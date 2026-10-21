@@ -1,6 +1,6 @@
 #include "server.h"
 
-#include "core/runtime.h"
+#include "core/context.h"
 #include "util/time.h"
 
 #include <stdlib.h>
@@ -34,6 +34,7 @@ struct ftun_dns_server {
 typedef struct {
   ftun_dns_server_t *server;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_reservation_t *reservation;
   ftun_dns_query_t query;
   ftun_dns_query_completion_fn completion;
@@ -112,7 +113,7 @@ static ftun_status_t ftun_dns_server_finish(
   ftun_dns_exchange_context_t *context, ftun_status_t status,
   uint32_t stage)
 {
-  return ftun_operation_complete(context->operation,
+  return ftun_operation_complete(context->completion_token,
                                   ftun_dns_server_error(status, stage));
 }
 
@@ -164,8 +165,10 @@ static ftun_status_t ftun_dns_server_submit(
   context->query.transport = transport;
   context->current_transport = transport;
   status = server->query_transport.submit(
-    server->query_transport.context, server->outbound_id, &server->upstream,
-    transport, context->query.wire, context->query.deadline_ms,
+    server->query_transport.context, server->outbound_id,
+    context->query.policy_fingerprint, context->query.server_fingerprint,
+    &server->upstream, transport, context->query.wire,
+    context->query.deadline_ms,
     ftun_dns_server_transport_completed, context,
     &context->transport_request);
   if (status != FTUN_OK || context->transport_request == NULL) {
@@ -312,7 +315,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || server == NULL || query == NULL || out == NULL ||
-      ftun_runtime_manager_budget(core, &core_budget) != FTUN_OK) {
+      ftun_core_context_budget(core, &core_budget) != FTUN_OK) {
     return FTUN_E_INVALID;
   }
   (void)core_budget;
@@ -369,7 +372,8 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   context->query.server_fingerprint = server->fingerprint;
   context->query.outbound_id = server->outbound_id;
   status = ftun_operation_accept(server->operations,
-    ftun_dns_server_operation_completed, context, &context->operation);
+    ftun_dns_server_operation_completed, context, &context->operation,
+    &context->completion_token);
   if (status != FTUN_OK) goto fail;
   status = ftun_operation_set_cancel_hook(context->operation,
                                           ftun_dns_server_cancel, context);

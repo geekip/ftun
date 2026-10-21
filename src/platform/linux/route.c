@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "route.h"
+#include "route_internal.h"
 #include "uapi.h"
 #include <errno.h>
 #include <net/if.h>
@@ -11,28 +12,12 @@
 #include <unistd.h>
 
 #define FTUN_LINUX_ROUTE_MAGIC UINT32_C(0x46545254)
-#define FTUN_NETLINK_MESSAGE_BYTES 512u
 
 #if IFNAMSIZ != FTUN_LINUX_ROUTE_NAME_BYTES
 #error "FTUN Linux route name size must match IFNAMSIZ"
 #endif
 
-struct ftun_route_transaction {
-  uint32_t magic;
-  ftun_linux_route_resource_t resources[FTUN_LINUX_ROUTE_MAX_RESOURCES];
-  bool active[FTUN_LINUX_ROUTE_MAX_RESOURCES];
-  size_t resource_count;
-  size_t active_count;
-  bool strict_route;
-  ftun_linux_route_io_t io;
-};
-
-typedef struct {
-  struct ftun_nlmsghdr header;
-  uint8_t body[FTUN_NETLINK_MESSAGE_BYTES - sizeof(struct ftun_nlmsghdr)];
-} ftun_netlink_message_t;
-
-static ftun_status_t ftun_linux_route_errno(int error_code, bool removing)
+ftun_status_t ftun_linux_route_errno(int error_code, bool removing)
 {
   if (removing && (error_code == ENOENT || error_code == ESRCH)) {
     return FTUN_E_STALE;
@@ -77,9 +62,195 @@ static int ftun_route_names_equal(ftun_string_t left, ftun_string_t right)
          memcmp(left.data, right.data, left.length) == 0;
 }
 
-static int ftun_route_policy_valid(const ftun_route_policy_t *policy)
+static int ftun_route_c_name_valid(const char *name, bool optional)
 {
-  if (policy == NULL || !ftun_route_name_valid(policy->tun_interface, false) ||
+  ftun_string_t value;
+  if (name == NULL) return 0;
+  value.data = name;
+  value.length = strnlen(name, FTUN_LINUX_ROUTE_NAME_BYTES);
+  if (value.length == FTUN_LINUX_ROUTE_NAME_BYTES) return 0;
+  return ftun_route_name_valid(value, optional);
+}
+
+static int ftun_route_network_normalized(const uint8_t address[4],
+                                         uint8_t prefix_length)
+{
+  uint32_t value;
+  uint32_t mask;
+  if (prefix_length > 32u) return 0;
+  value = ((uint32_t)address[0] << 24u) |
+          ((uint32_t)address[1] << 16u) |
+          ((uint32_t)address[2] << 8u) | (uint32_t)address[3];
+  mask = prefix_length == 0u ? 0u :
+    UINT32_MAX << (32u - (uint32_t)prefix_length);
+  return (value & ~mask) == 0u;
+}
+
+static int ftun_route_resource_valid(
+  const ftun_linux_route_resource_t *resource)
+{
+  if (resource == NULL || resource->protocol != FTUN_LINUX_ROUTE_PROTOCOL) {
+    return 0;
+  }
+  switch (resource->kind) {
+    case FTUN_LINUX_ROUTE_ADDRESS:
+      return resource->family == AF_INET &&
+        ftun_route_c_name_valid(resource->interface_name, false) &&
+        resource->prefix_length != 0u && resource->prefix_length <= 32u;
+    case FTUN_LINUX_ROUTE_MARK_RULE:
+      return resource->family == AF_INET && resource->table != 0u &&
+        resource->priority != 0u && resource->mark != 0u &&
+        resource->mark_mask != 0u &&
+        (resource->mark & ~resource->mark_mask) == 0u;
+    case FTUN_LINUX_ROUTE_DEFAULT:
+      return resource->family == AF_INET && resource->table != 0u &&
+        ftun_route_c_name_valid(resource->interface_name, false) &&
+        resource->prefix_length == 0u;
+    case FTUN_LINUX_ROUTE_CAPTURE_RULE:
+      return resource->family == AF_INET && resource->table != 0u &&
+        resource->priority != 0u &&
+        ftun_route_c_name_valid(resource->interface_name, false);
+    case FTUN_LINUX_ROUTE_BLOCK_IPV6:
+      return resource->family == AF_INET6 && resource->priority != 0u &&
+        ftun_route_c_name_valid(resource->interface_name, false);
+    case FTUN_LINUX_ROUTE_PROTECT_RULE:
+      return resource->family == AF_INET && resource->table != 0u &&
+        resource->priority != 0u &&
+        ftun_route_network_normalized(resource->address,
+                                      resource->prefix_length);
+    case FTUN_LINUX_ROUTE_OVERLAY:
+      return resource->family == AF_INET && resource->table != 0u &&
+        resource->metric != 0u &&
+        ftun_route_c_name_valid(resource->interface_name, false) &&
+        ftun_route_network_normalized(resource->address,
+                                      resource->prefix_length);
+    case FTUN_LINUX_ROUTE_UNREACHABLE:
+      return resource->family == AF_INET && resource->table != 0u &&
+        resource->metric != 0u && resource->interface_name[0] == '\0' &&
+        ftun_route_network_normalized(resource->address,
+                                      resource->prefix_length);
+    default:
+      return 0;
+  }
+}
+
+static int ftun_route_resource_equal(
+  const ftun_linux_route_resource_t *left,
+  const ftun_linux_route_resource_t *right)
+{
+  return left->kind == right->kind && left->family == right->family &&
+    strcmp(left->interface_name, right->interface_name) == 0 &&
+    memcmp(left->address, right->address, sizeof(left->address)) == 0 &&
+    left->prefix_length == right->prefix_length &&
+    left->table == right->table && left->priority == right->priority &&
+    left->mark == right->mark && left->mark_mask == right->mark_mask &&
+    left->metric == right->metric && left->protocol == right->protocol;
+}
+
+int ftun_linux_route_plan_valid(const ftun_linux_route_plan_t *plan)
+{
+  size_t index;
+  size_t previous;
+  if (plan == NULL || plan->resource_count == 0u ||
+      plan->resource_count > FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES) return 0;
+  for (index = 0u; index < plan->resource_count; index++) {
+    if (!ftun_route_resource_valid(&plan->resources[index])) return 0;
+    for (previous = 0u; previous < index; previous++) {
+      if (ftun_route_resource_equal(&plan->resources[index],
+                                    &plan->resources[previous])) return 0;
+    }
+  }
+  return 1;
+}
+
+ftun_status_t ftun_linux_route_guard_plan(
+  const ftun_network_view_t *view, uint32_t table, uint32_t first_priority,
+  ftun_linux_route_plan_t *out)
+{
+  ftun_network_view_info_t info;
+  size_t index;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (view == NULL || out == NULL || table == FTUN_RT_TABLE_UNSPEC ||
+      table == FTUN_RT_TABLE_DEFAULT || table == FTUN_RT_TABLE_MAIN ||
+      table == FTUN_RT_TABLE_LOCAL || first_priority == 0u ||
+      ftun_network_view_get_info(view, &info) != FTUN_OK ||
+      info.protected_prefix_count == 0u ||
+      info.protected_prefix_count >
+        FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES / 2u ||
+      info.protected_prefix_count - 1u > UINT32_MAX - first_priority) {
+    return FTUN_E_INVALID;
+  }
+  for (index = 0u; index < info.protected_prefix_count; index++) {
+    ftun_network_prefix_t prefix;
+    ftun_linux_route_resource_t *resource;
+    if (ftun_network_view_get_protected(view, index, &prefix) != FTUN_OK) {
+      memset(out, 0, sizeof(*out));
+      return FTUN_E_STATE_CORRUPT;
+    }
+    resource = &out->resources[out->resource_count++];
+    resource->kind = FTUN_LINUX_ROUTE_UNREACHABLE;
+    resource->family = AF_INET;
+    memcpy(resource->address, prefix.network, 4u);
+    resource->prefix_length = prefix.prefix_length;
+    resource->table = table;
+    resource->metric = UINT32_C(32767);
+    resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
+    resource = &out->resources[out->resource_count++];
+    resource->kind = FTUN_LINUX_ROUTE_PROTECT_RULE;
+    resource->family = AF_INET;
+    memcpy(resource->address, prefix.network, 4u);
+    resource->prefix_length = prefix.prefix_length;
+    resource->table = table;
+    resource->priority = first_priority + (uint32_t)index;
+    resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
+  }
+  return ftun_linux_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
+}
+
+ftun_status_t ftun_linux_route_overlay_plan(
+  const ftun_network_view_t *view, ftun_string_t tun_interface,
+  uint32_t table, uint32_t metric, ftun_linux_route_plan_t *out)
+{
+  ftun_network_view_info_t info;
+  size_t index;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (view == NULL || out == NULL ||
+      !ftun_route_name_valid(tun_interface, false) ||
+      table == FTUN_RT_TABLE_UNSPEC || table == FTUN_RT_TABLE_DEFAULT ||
+      table == FTUN_RT_TABLE_MAIN || table == FTUN_RT_TABLE_LOCAL ||
+      metric == 0u || ftun_network_view_get_info(view, &info) != FTUN_OK ||
+      info.overlay_route_count == 0u ||
+      info.overlay_route_count > FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES) {
+    return FTUN_E_INVALID;
+  }
+  for (index = 0u; index < info.overlay_route_count; index++) {
+    ftun_network_route_t route;
+    ftun_linux_route_resource_t *resource =
+      &out->resources[out->resource_count++];
+    if (ftun_network_view_get_route(view, index, &route) != FTUN_OK) {
+      memset(out, 0, sizeof(*out));
+      return FTUN_E_STATE_CORRUPT;
+    }
+    resource->kind = FTUN_LINUX_ROUTE_OVERLAY;
+    resource->family = AF_INET;
+    memcpy(resource->interface_name, tun_interface.data,
+           tun_interface.length);
+    memcpy(resource->address, route.prefix.network, 4u);
+    resource->prefix_length = route.prefix.prefix_length;
+    resource->table = table;
+    resource->metric = metric;
+    resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
+  }
+  return ftun_linux_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
+}
+
+int ftun_route_policy_valid(const ftun_route_policy_t *policy)
+{
+  uint32_t offset;
+  if (policy == NULL) return 0;
+  offset = policy->capture_priority_offset == 0u ? 1u :
+           policy->capture_priority_offset;
+  if (!ftun_route_name_valid(policy->tun_interface, false) ||
       !ftun_route_name_valid(policy->lan_interface, true) ||
       ftun_route_name_equals(policy->tun_interface, "lo") ||
       ftun_route_name_equals(policy->lan_interface, "lo") ||
@@ -91,7 +262,8 @@ static int ftun_route_policy_valid(const ftun_route_policy_t *policy)
       policy->route_table == FTUN_RT_TABLE_MAIN ||
       policy->route_table == FTUN_RT_TABLE_LOCAL ||
       policy->rule_priority == 0u ||
-      policy->rule_priority > UINT32_MAX - 2u ||
+      offset == 0u || offset > UINT32_MAX - policy->rule_priority ||
+      policy->rule_priority + offset > UINT32_MAX - 1u ||
       policy->protection_mark == 0u || policy->protection_mark_mask == 0u ||
       (policy->protection_mark & ~policy->protection_mark_mask) != 0u) return 0;
   return 1;
@@ -118,12 +290,14 @@ static ftun_linux_route_resource_t *ftun_route_append(
   return resource;
 }
 
-static int ftun_route_build(const ftun_route_policy_t *policy,
-                            ftun_route_transaction_t *transaction)
+int ftun_route_build(const ftun_route_policy_t *policy,
+                     ftun_route_transaction_t *transaction)
 {
   ftun_linux_route_resource_t *resource;
-  uint32_t local_priority = policy->rule_priority + 1u;
-  uint32_t lan_priority = policy->rule_priority + 2u;
+  uint32_t offset = policy->capture_priority_offset == 0u ? 1u :
+                    policy->capture_priority_offset;
+  uint32_t local_priority = policy->rule_priority + offset;
+  uint32_t lan_priority = local_priority + 1u;
   resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_ADDRESS, AF_INET);
   if (resource == NULL) return 0;
   ftun_route_copy_name(resource->interface_name, policy->tun_interface);
@@ -233,6 +407,9 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
   rule = (struct ftun_fib_rule_hdr *)FTUN_NLMSG_DATA(&message->header);
   memset(rule, 0, sizeof(*rule));
   rule->family = (uint8_t)resource->family;
+  if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE) {
+    rule->dst_len = resource->prefix_length;
+  }
   rule->action = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
                  FTUN_FR_ACT_UNREACHABLE : FTUN_FR_ACT_TO_TBL;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
@@ -258,6 +435,11 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                                    FTUN_FRA_FWMASK,
                                    &resource->mark_mask,
                                    sizeof(resource->mark_mask)))) return FTUN_E_LIMIT;
+  if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE &&
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_FRA_DST, resource->address, 4u)) {
+    return FTUN_E_LIMIT;
+  }
   if ((resource->kind == FTUN_LINUX_ROUTE_CAPTURE_RULE ||
        resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6) &&
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
@@ -269,14 +451,18 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_netlink_default_route(
+static ftun_status_t ftun_netlink_route(
   ftun_netlink_message_t *message,
   const ftun_linux_route_resource_t *resource, bool add)
 {
   struct ftun_rtmsg *route;
-  unsigned int interface_index = if_nametoindex(resource->interface_name);
+  unsigned int interface_index = 0u;
   uint8_t table_byte;
-  if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
+  bool unreachable = resource->kind == FTUN_LINUX_ROUTE_UNREACHABLE;
+  if (!unreachable) {
+    interface_index = if_nametoindex(resource->interface_name);
+    if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
+  }
   message->header.nlmsg_type = add ? FTUN_RTM_NEWROUTE : FTUN_RTM_DELROUTE;
   message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
   if (add) message->header.nlmsg_flags |= FTUN_NLM_F_CREATE | FTUN_NLM_F_EXCL;
@@ -284,33 +470,48 @@ static ftun_status_t ftun_netlink_default_route(
   route = (struct ftun_rtmsg *)FTUN_NLMSG_DATA(&message->header);
   memset(route, 0, sizeof(*route));
   route->rtm_family = AF_INET;
+  route->rtm_dst_len = resource->prefix_length;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
                (uint8_t)FTUN_RT_TABLE_UNSPEC;
   route->rtm_table = table_byte;
   route->rtm_protocol = resource->protocol;
-  route->rtm_scope = FTUN_RT_SCOPE_LINK;
-  route->rtm_type = FTUN_RTN_UNICAST;
+  route->rtm_scope = unreachable ? FTUN_RT_SCOPE_UNIVERSE :
+                                   FTUN_RT_SCOPE_LINK;
+  route->rtm_type = unreachable ? FTUN_RTN_UNREACHABLE : FTUN_RTN_UNICAST;
   if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_RTA_TABLE,
-                                  &resource->table, sizeof(resource->table)) ||
+                                  &resource->table, sizeof(resource->table))) {
+    return FTUN_E_LIMIT;
+  }
+  if (resource->prefix_length != 0u &&
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
-                                  FTUN_RTA_OIF,
-                                  &interface_index,
+                                  FTUN_RTA_DST, resource->address, 4u)) {
+    return FTUN_E_LIMIT;
+  }
+  if (!unreachable &&
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_RTA_OIF, &interface_index,
                                   sizeof(interface_index))) return FTUN_E_LIMIT;
+  if (resource->metric != 0u &&
+      !ftun_netlink_add_attribute(&message->header, sizeof(*message),
+                                  FTUN_RTA_PRIORITY, &resource->metric,
+                                  sizeof(resource->metric))) return FTUN_E_LIMIT;
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_netlink_build(ftun_netlink_message_t *message,
-                                        const ftun_linux_route_resource_t *resource,
-                                        bool add)
+ftun_status_t ftun_netlink_build(ftun_netlink_message_t *message,
+                                 const ftun_linux_route_resource_t *resource,
+                                 bool add)
 {
   memset(message, 0, sizeof(*message));
   message->header.nlmsg_seq = 1u;
   if (resource->kind == FTUN_LINUX_ROUTE_ADDRESS) {
     return ftun_netlink_address(message, resource, add);
   }
-  if (resource->kind == FTUN_LINUX_ROUTE_DEFAULT) {
-    return ftun_netlink_default_route(message, resource, add);
+  if (resource->kind == FTUN_LINUX_ROUTE_DEFAULT ||
+      resource->kind == FTUN_LINUX_ROUTE_OVERLAY ||
+      resource->kind == FTUN_LINUX_ROUTE_UNREACHABLE) {
+    return ftun_netlink_route(message, resource, add);
   }
   return ftun_netlink_rule(message, resource, add);
 }

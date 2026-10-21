@@ -1,7 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include "core/budget.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include "util/logger.h"
+#include "util/time.h"
 
 #include <pthread.h>
 #include <stdio.h>
@@ -128,14 +129,46 @@ int main(void)
 
   CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_logger(core, logger) == FTUN_OK);
+  CHECK(ftun_core_context_set_logger(core, logger) == FTUN_OK);
   item = diagnostic("/runtime", "reload failed");
   CHECK(ftun_log_emit(core, &item) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_logger(core, NULL) == FTUN_OK);
+  CHECK(ftun_core_context_set_logger(core, NULL) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_logger_destroy(&logger) == FTUN_OK && logger == NULL);
+
+  /* writer 进入不可硬取消调用后，到期回收必须保留 logger；writer 静默后
+   * 同一个对象可以重试回收，且不会重复 join 或提前释放队列内存。 */
+  writer.entered = 0;
+  (void)pthread_mutex_lock(&writer.mutex);
+  writer.blocked = 1;
+  (void)pthread_mutex_unlock(&writer.mutex);
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  item = diagnostic("/blocked", "slow writer");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  (void)pthread_mutex_lock(&writer.mutex);
+  while (!writer.entered) {
+    (void)pthread_cond_wait(&writer.condition, &writer.mutex);
+  }
+  (void)pthread_mutex_unlock(&writer.mutex);
+  {
+    uint64_t now_ms = 0u;
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+    CHECK(ftun_logger_flush_until(logger, now_ms) == FTUN_E_TIMEOUT);
+    CHECK(ftun_logger_stop(logger) == FTUN_OK);
+    CHECK(ftun_logger_join_until(logger, now_ms) == FTUN_E_TIMEOUT);
+    CHECK(ftun_logger_destroy_until(&logger, now_ms) == FTUN_E_TIMEOUT &&
+          logger != NULL);
+  }
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
+        !usage.accepting && usage.stopping && !usage.exited && !usage.joined);
+  (void)pthread_mutex_lock(&writer.mutex);
+  writer.blocked = 0;
+  (void)pthread_cond_broadcast(&writer.condition);
+  (void)pthread_mutex_unlock(&writer.mutex);
+  CHECK(ftun_logger_destroy_until(&logger, UINT64_MAX) == FTUN_OK &&
+        logger == NULL);
 
   options.level = FTUN_LOG_SILENT;
   CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);

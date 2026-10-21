@@ -28,7 +28,11 @@ typedef struct {
   bool right_write_shutdown;
   bool stopped;
   bool complete;
+  bool left_buffer_waiting;
+  bool right_buffer_waiting;
 } ftun_relay_usage_t;
+
+typedef void (*ftun_relay_progress_fn)(void *user);
 
 /* 双向背压中继。
  * 需求 REQ-PERF-001；任务 TASK-TRANSPORT-004；目标 0.2.0；验收 TEST-TRANSPORT-004。
@@ -46,6 +50,11 @@ ftun_status_t ftun_relay_start_with_options(
 ftun_status_t ftun_relay_start_with_pool(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
   ftun_buffer_pool_t *pool, ftun_relay_t **out);
+/* Pool 压力解除时 progress 只安排 owner 再推进一次，不得销毁 relay。 */
+ftun_status_t ftun_relay_start_with_pool_options(
+  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
+  ftun_buffer_pool_t *pool, const ftun_relay_options_t *options,
+  ftun_relay_progress_fn progress, void *progress_user, ftun_relay_t **out);
 /* events 是本轮已就绪位；单次最多执行 options.max_work_per_round 个动作。 */
 ftun_status_t ftun_relay_process(ftun_relay_t *relay,
                                  uint32_t left_events,

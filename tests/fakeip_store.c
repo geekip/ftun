@@ -4,7 +4,7 @@
 
 #include "core/budget.h"
 #include "core/worker.h"
-#include "state/fakeip_store.h"
+#include "proxy/state/fakeip_store.h"
 
 #include <sched.h>
 #include <stdio.h>

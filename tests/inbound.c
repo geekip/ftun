@@ -1,6 +1,6 @@
 #include "core/budget.h"
-#include "core/runtime.h"
-#include "inbound/inbound.h"
+#include "proxy/runtime_state.h"
+#include "proxy/inbound/inbound.h"
 
 #include <stdint.h>
 #include <stdio.h>

@@ -1,51 +1,59 @@
 # FTUN
 
-FTUN 的目标是成为轻量、可裁剪的跨平台代理内核，提供命令行程序与供宿主集成的 C 接口，并通过 TUN、规则、DNS、FakeIP、FRS 规则集合和代理组处理透明 TCP/UDP 流量。
+FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明代理和嵌入式宿主集成。它提供独立命令行程序和稳定的 C API，通过规则、DNS、FakeIP、FRS 规则集合与代理组处理 TCP/UDP 流量。
 
-架构采用核心加可选编译模块：功能在构建时选择并静态内置，取消运行时动态插件。已编译功能按配置激活资源；Linux musl 全静态交付继续保留。
+当前版本为 **1.0.2**，正式支持 Linux x86_64 IPv4。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
 
-## 当前状态
+## 主要能力
 
-当前源码版本为 **1.0.1**，正式支持 Linux x86_64 IPv4。`ftun run` 会装配
-TUN、SOCKS5、Mixed、DNS、FakeIP、FRS、规则、Select/URL-Test、DIRECT、
-REJECT 和 SOCKS5 出站数据面，并支持 TCP/UDP、TLS SNI/HTTP Host 嗅探及
-SIGHUP 事务重载。
+- TUN、SOCKS5 和 Mixed 入站，支持 TCP 与 UDP。
+- DIRECT、REJECT、SOCKS5、Select 和 URL-Test 出站与代理组。
+- 顺序匹配规则，支持域名、IP、端口、网络类型与 FRS 规则集合。
+- DNS UDP/TCP 服务、Bootstrap、FakeIP 映射和状态持久化。
+- TLS SNI 与 HTTP Host 嗅探。
+- 配置检查、事务重载、进程控制和宿主 C API。
+- Core、DNS、Proxy 与 TUN provider 模块化构建，可按组合裁剪。
 
-首版不包含 IPv6、AnyTLS、管理 HTTP API、Full Cone 和非 Linux 平台。
-TUN/自动路由需要 root 或相应网络能力，且必需的 socket mark
-保护无法建立时会在启动阶段明确失败。只使用 SOCKS5/Mixed 入站时不设置
-`SO_MARK`，普通用户只需满足监听端口、配置和状态文件权限。
+FTUN 当前不提供 IPv6、AnyTLS、管理 HTTP API、Full Cone、Mesh、NAT 穿透、P2P/Relay、QUIC 或协议混淆。`ftun version` 会列出产物实际内置的能力。
 
-## 文档
+## 快速开始
 
-- [公开 C API](include/ftun/ftun.h)
-- [CLI、运行与宿主控制](document/control.md)
-- [v1.0 构建、交付与验证基线](document/build-release.md)
-- [v1.0.1 发行说明](document/release-v1.0.1.md)
-- [v1.0 发行说明](document/release-v1.0.md)
-- [配置 JSON Schema](schema.json)
-- [配置样例](examples/)
-- [用户手册目录](document/)（随可用功能逐步补充）
-
-## 构建与测试
-
-需要 C99 编译器与 CMake 3.21 或更新版本。配置与构建默认不联网；所需第三方源码通过仓库锁定。项目预设启用 DNS、FakeIP、TUN 和 FRS 内置模块，也可以通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 内置时要求 DNS 同时内置。
+需要 C99 编译器和 CMake 3.21 或更新版本。配置与构建默认不联网，第三方源码按仓库锁定版本使用。
 
 ```sh
 cmake --preset debug
 cmake --build --preset debug --parallel
 ctest --preset debug
+
 ./build/debug/ftun version
-./build/debug/ftun check -c /path/to/config.json
-./build/debug/ftun run -c /path/to/config.json
+./build/debug/ftun check -c examples/minimal.json
+./build/debug/ftun run -c examples/minimal.json
 ```
 
-`ftun version` 同时报告构建时源码 revision（工作树有改动时带 `-dirty`）和实际
-内置能力清单，便于把运行产物关联到固定源码与裁剪配置。
+可用命令：
 
-公开接口位于 [include/ftun/ftun.h](include/ftun/ftun.h)，内部接口位于各模块目录。FRS 配置和规则示例见 [examples/frs.json](examples/frs.json)；`.frs` 生成工具属于独立项目，不随 FTUN 构建或安装。
+```text
+ftun version
+ftun help
+ftun check -c CONFIG
+ftun run -c CONFIG
+ftun stop PID
+ftun reload PID
+ftun fakeip init -c CONFIG
+```
 
-FTUN 采用 [GNU GPL v3](LICENSE)。依赖锁见
-[third_party/LOCK.json](third_party/LOCK.json)，第三方许可说明见
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)；wolfSSL 当前按 GPLv3 开放源码许可
-组合分发，商业闭源用途需另行取得适当的商业许可。
+TUN 与自动路由需要 root 或相应网络能力。只使用 SOCKS5/Mixed 入站时，普通用户只需具备监听端口、配置文件和状态文件权限。系统无法建立必需的出口保护时，FTUN 会在启动阶段失败并报告原因。
+
+## 配置与集成
+
+- [配置 JSON Schema](schema.json)
+- [可运行配置样例](examples/)
+- [公开 C API](include/ftun/ftun.h)
+
+默认预设内置 DNS、FakeIP、TUN 和 FRS。可通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 依赖 DNS。构建生成的 `ftun-build-modules.txt` 记录实际模块组合。
+
+完整样例包含需要替换的测试地址、端点和探测 URL。运行前先阅读 [样例说明](examples/README.md)，再准备网络权限、CA、FRS 文件和 FakeIP 状态。
+
+## 许可
+
+FTUN 使用 [GNU GPL v3](LICENSE)。依赖版本见 [third_party/LOCK.json](third_party/LOCK.json)，第三方许可见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。wolfSSL 当前按 GPLv3 开放源码许可组合分发；商业闭源分发需要另行取得合适许可并复核整体许可义务。

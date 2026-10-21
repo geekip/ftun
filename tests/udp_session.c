@@ -2,10 +2,10 @@
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/budget.h"
-#include "core/runtime.h"
-#include "route/rule.h"
+#include "proxy/runtime_state.h"
+#include "proxy/route/rule.h"
 #include "transport/datagram.h"
-#include "tun/udp_session.h"
+#include "proxy/udp/session.h"
 #include "util/buffer.h"
 
 #include <stdio.h>
@@ -27,7 +27,7 @@ typedef struct fixture fixture_t;
 typedef struct {
   fixture_t *fixture;
   ftun_datagram_t *channel;
-  ftun_datagram_send_t *pending;
+  ftun_datagram_send_token_t pending;
   ftun_endpoint_t target;
   uint8_t payload[PAYLOAD_BYTES];
   size_t payload_length;
@@ -143,7 +143,8 @@ static void fill_fake_metadata(ftun_metadata_t *metadata,
 }
 
 static ftun_status_t outbound_send_start(
-  void *user, ftun_datagram_send_t *send, const ftun_endpoint_t *target,
+  void *user, ftun_datagram_send_token_t send,
+  const ftun_endpoint_t *target,
   const ftun_packet_t *packet)
 {
   outbound_slot_t *slot = (outbound_slot_t *)user;
@@ -169,14 +170,18 @@ static ftun_status_t outbound_send_start(
 }
 
 static ftun_status_t outbound_send_cancel(void *user,
-                                           ftun_datagram_send_t *send)
+                                           ftun_datagram_send_token_t send)
 {
   outbound_slot_t *slot = (outbound_slot_t *)user;
   if (slot->fixture->cancel_failures != 0) {
     slot->fixture->cancel_failures--;
     return FTUN_E_AGAIN;
   }
-  if (slot->pending == send) slot->pending = NULL;
+  if (slot->pending.channel == send.channel &&
+      slot->pending.slot == send.slot &&
+      slot->pending.generation == send.generation) {
+    memset(&slot->pending, 0, sizeof(slot->pending));
+  }
   return FTUN_OK;
 }
 
@@ -242,7 +247,8 @@ static ftun_status_t open_outbound(
 }
 
 static ftun_status_t inbound_send_start(
-  void *user, ftun_datagram_send_t *send, const ftun_endpoint_t *target,
+  void *user, ftun_datagram_send_token_t send,
+  const ftun_endpoint_t *target,
   const ftun_packet_t *packet)
 {
   fixture_t *fixture = (fixture_t *)user;
@@ -260,7 +266,7 @@ static ftun_status_t inbound_send_start(
 }
 
 static ftun_status_t inbound_send_cancel(void *user,
-                                          ftun_datagram_send_t *send)
+                                          ftun_datagram_send_token_t send)
 {
   (void)user;
   (void)send;
@@ -355,11 +361,11 @@ static int make_packet(ftun_budget_t *budget, const uint8_t *payload,
 static int complete_pending(outbound_slot_t *slot, ftun_status_t status)
 {
   ftun_error_t result;
-  if (slot->pending == NULL) return 1;
+  if (slot->pending.channel == NULL) return 1;
   memset(&result, 0, sizeof(result));
   result.status = status;
   if (ftun_datagram_send_complete(slot->pending, result) != FTUN_OK) return 1;
-  slot->pending = NULL;
+  memset(&slot->pending, 0, sizeof(slot->pending));
   return 0;
 }
 
@@ -371,7 +377,11 @@ static int test_key_runtime_and_idle(void)
   ftun_packet_t packet = {{0}, 0u};
   ftun_udp_flow_usage_t usage;
   ftun_runtime_manager_info_t manager;
+  uint64_t deadline_ms = 0u;
+  bool deadline_present = false;
   CHECK(fixture_start(&fixture, 4u, 100u) == 0);
+  CHECK(ftun_udp_flow_next_deadline(fixture.table, &deadline_ms,
+        &deadline_present) == FTUN_OK && !deadline_present);
   fill_real_metadata(&metadata);
   CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
   CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK);
@@ -382,6 +392,9 @@ static int test_key_runtime_and_idle(void)
                        &metadata.original_target));
   CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
         usage.active == 1u && usage.created == 1u && usage.capacity == 4u);
+  CHECK(ftun_udp_flow_next_deadline(fixture.table, &deadline_ms,
+        &deadline_present) == FTUN_OK && deadline_present &&
+        deadline_ms == 1100u);
   CHECK(install_runtime(&fixture, "two", 10002u) == 0);
   CHECK(ftun_runtime_manager_get_info(fixture.core, &manager) == FTUN_OK &&
         manager.generation == 2u && manager.retained_count == 1u);
@@ -406,8 +419,49 @@ static int test_key_runtime_and_idle(void)
   CHECK(ftun_udp_flow_tick(fixture.table, 1100u) == FTUN_OK);
   CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
         usage.active == 0u && usage.expired == 4u);
+  CHECK(ftun_udp_flow_next_deadline(fixture.table, &deadline_ms,
+        &deadline_present) == FTUN_OK && !deadline_present);
   CHECK(ftun_runtime_manager_get_info(fixture.core, &manager) == FTUN_OK &&
         manager.retained_count == 0u);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_active_flow_refreshes_idle_deadline(void)
+{
+  static const uint8_t bytes[] = {'k'};
+  fixture_t fixture;
+  ftun_metadata_t metadata;
+  ftun_packet_t packet = {{0}, 0u};
+  ftun_udp_flow_usage_t usage;
+  uint64_t deadline_ms = 0u;
+  bool deadline_present = false;
+  CHECK(fixture_start(&fixture, 2u, 100u) == 0);
+  fill_real_metadata(&metadata);
+  CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
+  CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK);
+  /* Simulate an owner returning from a blocking event wait immediately before
+   * the old idle deadline.  It must advance the table clock before delivering
+   * the new packet, otherwise this activity would only extend by 1 ms. */
+  CHECK(ftun_udp_flow_set_now(fixture.table, 1099u) == FTUN_OK);
+  CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK);
+
+  /* The cached wake may remain conservative until it fires, but maintenance
+   * must observe the refreshed per-flow expiry and schedule its exact value. */
+  CHECK(ftun_udp_flow_next_deadline(fixture.table, &deadline_ms,
+        &deadline_present) == FTUN_OK && deadline_present &&
+        deadline_ms == 1100u);
+  CHECK(ftun_udp_flow_tick(fixture.table, 1100u) == FTUN_OK);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
+        usage.active == 1u && usage.expired == 0u && usage.now_ms == 1100u);
+  CHECK(ftun_udp_flow_next_deadline(fixture.table, &deadline_ms,
+        &deadline_present) == FTUN_OK && deadline_present &&
+        deadline_ms == 1199u);
+  CHECK(ftun_udp_flow_tick(fixture.table, 1199u) == FTUN_OK);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
+        usage.active == 0u && usage.expired == 1u);
+  CHECK(ftun_udp_flow_set_now(fixture.table, 1198u) == FTUN_E_INVALID);
   CHECK(ftun_packet_release(&packet) == FTUN_OK);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
@@ -489,14 +543,14 @@ static int test_failure_no_replay_and_cancel(void)
   fixture.async_send = 1;
   metadata.source.port++;
   CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK &&
-        fixture.slots[2].pending != NULL);
+        fixture.slots[2].pending.channel != NULL);
   CHECK(complete_pending(&fixture.slots[2], FTUN_E_IO) == 0);
   CHECK(ftun_udp_flow_tick(fixture.table, 1000u) == FTUN_OK);
   CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK &&
         usage.active == 1u && usage.failed == 2u);
   metadata.source.port++;
   CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_OK &&
-        fixture.slots[3].pending != NULL);
+        fixture.slots[3].pending.channel != NULL);
   fixture.cancel_failures = 1;
   CHECK(ftun_udp_flow_table_destroy(&fixture.table) == FTUN_E_AGAIN &&
         fixture.table != NULL);
@@ -676,6 +730,7 @@ static int test_boundaries(void)
 int main(void)
 {
   CHECK(test_key_runtime_and_idle() == 0);
+  CHECK(test_active_flow_refreshes_idle_deadline() == 0);
   CHECK(test_fake_reply_and_fixed_remote() == 0);
   CHECK(test_failure_no_replay_and_cancel() == 0);
   CHECK(test_isolated_outbound_failure() == 0);

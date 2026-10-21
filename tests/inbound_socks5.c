@@ -1,4 +1,4 @@
-#include "inbound/socks5.h"
+#include "proxy/inbound/socks5.h"
 
 #include <stdio.h>
 #include <string.h>

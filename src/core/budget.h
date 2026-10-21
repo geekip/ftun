@@ -3,29 +3,80 @@
 #include "internal/contracts.h"
 
 typedef struct {
+  size_t memory_bytes;
+  size_t descriptors;
+  size_t queue_slots;
+} ftun_budget_resources_t;
+
+typedef struct {
+  ftun_budget_resources_t limit;
+  ftun_budget_resources_t cleanup_reserve;
+  ftun_budget_resources_t guarantee;
+} ftun_budget_options_t;
+
+typedef struct {
+  /* Legacy memory fields remain available to existing callers. */
   size_t limit;
   size_t cleanup_reserve;
   size_t used;
   size_t normal_available;
   size_t total_available;
   size_t child_count;
+  ftun_budget_resources_t limits;
+  ftun_budget_resources_t cleanup_reserves;
+  ftun_budget_resources_t guarantees;
+  ftun_budget_resources_t used_resources;
+  ftun_budget_resources_t normal_available_resources;
+  ftun_budget_resources_t total_available_resources;
+  ftun_budget_resources_t borrowed_resources;
+  ftun_budget_resources_t high_watermarks;
+  size_t rejected_reservations;
 } ftun_budget_usage_t;
 
-/* 统一资源准入。
- * 需求 REQ-PERF-001；任务 TASK-CORE-004；目标 0.2.0；验收 TEST-CORE-004。
- * 所有可变计数只由 owner loop 串行访问，本模块不提供跨线程同步。
- * parent 为全局预算的借用指针，必须比子预算和它的全部预留长寿。
- * cleanup_reserve 不可被普通请求使用，保留给清理和终结通知路径。
- * 计数是逻辑准入证据，不是 RSS/PSS 测量。
- */
+/* ftun_budget_reserve implements TASK-CORE-004 / TEST-CORE-004, target
+ * 0.2.0; Core v1.0 extends the same admission contract to typed resources. */
+/* Hierarchical resource admission.  Each resource is checked independently.
+ * A child's guarantee is protected at its parent while unused; the child can
+ * consume that share first and borrow only genuinely shared capacity.  A
+ * normal reservation cannot consume cleanup reserve or another child's
+ * unused guarantee.  Cleanup reservations may use the full limit and are for
+ * bounded termination/rollback paths only.
+ *
+ * All mutable accounting is owner-serialized.  Guaranteed shares belong to
+ * direct children of the global root; deeper object budgets scope actual
+ * reservations and use a zero guarantee, so the module's aggregate guarantee
+ * remains the single source of protected capacity.  Every child and
+ * reservation must be destroyed before its parent.  Counters are logical
+ * admission evidence; they do not claim to measure RSS, kernel socket memory,
+ * or third-party allocator retention. */
+ftun_status_t ftun_budget_create_resources(
+  ftun_budget_t *parent, const ftun_budget_options_t *options,
+  ftun_budget_t **out);
+
+/* Compatibility constructor for memory-only callers.  Descriptor and queue
+ * resources are unbounded for this budget; new production roots use the
+ * resource-vector constructor. */
 ftun_status_t ftun_budget_create(ftun_budget_t *parent, size_t limit,
                                  size_t cleanup_reserve, ftun_budget_t **out);
-ftun_status_t ftun_budget_reserve(ftun_budget_t *budget, size_t bytes, ftun_reservation_t **out);
+
+ftun_status_t ftun_budget_reserve_resources(
+  ftun_budget_t *budget, ftun_budget_resources_t resources,
+  ftun_reservation_t **out);
+ftun_status_t ftun_budget_reserve_cleanup_resources(
+  ftun_budget_t *budget, ftun_budget_resources_t resources,
+  ftun_reservation_t **out);
+ftun_status_t ftun_budget_reserve(ftun_budget_t *budget, size_t bytes,
+                                  ftun_reservation_t **out);
 ftun_status_t ftun_budget_reserve_cleanup(ftun_budget_t *budget, size_t bytes,
                                           ftun_reservation_t **out);
-ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget, ftun_budget_usage_t *out);
-/* release 将调用者句柄置空；NULL 句柄是幂等成功。 */
+ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget,
+                                    ftun_budget_usage_t *out);
+/* Returns whether both budgets belong to the same global admission tree. */
+ftun_status_t ftun_budget_same_root(const ftun_budget_t *left,
+                                    const ftun_budget_t *right,
+                                    bool *out_same);
+/* release consumes and clears a non-NULL handle; a NULL handle is idempotent. */
 ftun_status_t ftun_reservation_release(ftun_reservation_t **reservation);
-/* 仍有子预算或活动预留时返回 AGAIN 并保留句柄。 */
+/* An active reservation or child returns AGAIN and preserves the handle. */
 ftun_status_t ftun_budget_destroy(ftun_budget_t **budget);
 #endif

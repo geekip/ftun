@@ -1,7 +1,10 @@
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include "dns/listener.h"
+#include "proxy/dns/dispatch_adapter.h"
+#include "proxy/dns/fakeip.h"
+#include "proxy/dns/runtime_adapter.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -33,13 +36,16 @@ typedef struct {
 } reply_t;
 
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, const ftun_endpoint_t *upstream,
+  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
   void **out_request)
 {
   transport_t *transport = (transport_t *)user;
   (void)outbound;
+  (void)policy_fingerprint;
+  (void)server_fingerprint;
   (void)query;
   (void)deadline;
   if (transport->pending) return FTUN_E_LIMIT;
@@ -141,6 +147,7 @@ int main(void)
   ftun_dns_server_options_t server_options;
   ftun_dns_dispatcher_options_t dispatcher_options;
   ftun_dns_listener_spec_t spec;
+  ftun_proxy_dns_runtime_adapter_t dns_adapter;
   ftun_dns_listener_info_t info;
   transport_t transport;
   reply_t result;
@@ -153,6 +160,7 @@ int main(void)
   memset(&server_options, 0, sizeof(server_options));
   memset(&dispatcher_options, 0, sizeof(dispatcher_options));
   memset(&spec, 0, sizeof(spec));
+  memset(&dns_adapter, 0, sizeof(dns_adapter));
   memset(&transport, 0, sizeof(transport));
   memset(&result, 0, sizeof(result));
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
@@ -186,11 +194,14 @@ int main(void)
   dispatcher_options.operations = operations;
   dispatcher_options.servers = servers;
   dispatcher_options.server_count = 1u;
-  dispatcher_options.fakeip = fakeip;
   dispatcher_options.select_server = select_server;
   CHECK(ftun_dns_dispatcher_create(&dispatcher_options, &dispatcher) == FTUN_OK);
-  CHECK(ftun_runtime_manager_set_dns(core, dispatcher) == FTUN_OK);
+  dns_adapter.core = core;
+  dns_adapter.fakeip_slot = &fakeip;
   spec.budget = budget;
+  spec.dispatcher = dispatcher;
+  spec.dispatch = ftun_proxy_dns_dispatch;
+  spec.dispatch_user = &dns_adapter;
   spec.entry = FTUN_DNS_ENTRY_FIXED;
   spec.fixed_server = 0u;
   spec.query_timeout_ms = 5000u;
@@ -244,7 +255,6 @@ int main(void)
     (ftun_bytes_t){request, sizeof(request)}, &operation) == FTUN_E_CANCELLED);
   CHECK(ftun_dns_listener_destroy(&listener) == FTUN_OK);
 
-  CHECK(ftun_runtime_manager_set_dns(core, NULL) == FTUN_OK);
   CHECK(ftun_dns_dispatcher_destroy(&dispatcher) == FTUN_OK);
   CHECK(ftun_dns_server_destroy(&server) == FTUN_OK);
   CHECK(ftun_fakeip_service_destroy(&fakeip) == FTUN_OK);

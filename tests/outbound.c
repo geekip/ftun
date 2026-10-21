@@ -1,4 +1,4 @@
-#include "outbound/outbound.h"
+#include "proxy/outbound/outbound.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -34,6 +34,7 @@ typedef struct {
   int reject_calls;
   int completion_calls;
   ftun_error_t completion_error;
+  ftun_operation_token_t mock_completion;
 } fixture_t;
 
 static void operation_completed(ftun_operation_t *operation,
@@ -57,7 +58,7 @@ static ftun_status_t mock_direct_open(
   if (out != NULL) *out = NULL;
   if (fixture->direct_status != FTUN_OK) return fixture->direct_status;
   return ftun_operation_accept(request->operations, operation_completed,
-                               fixture, out);
+                               fixture, out, &fixture->mock_completion);
 }
 
 static ftun_status_t mock_socks5_open(
@@ -72,7 +73,7 @@ static ftun_status_t mock_socks5_open(
   if (out != NULL) *out = NULL;
   if (fixture->socks5_status != FTUN_OK) return fixture->socks5_status;
   return ftun_operation_accept(request->operations, operation_completed,
-                               fixture, out);
+                               fixture, out, &fixture->mock_completion);
 }
 
 static ftun_status_t mock_reject_classify(

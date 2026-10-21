@@ -1,6 +1,6 @@
 #include "ftun/ftun.h"
-#include "route/router.h"
 #include "transport/stream.h"
+#include <stddef.h>
 #include <stdio.h>
 /* TEST-INTEGRATION-005：公开 C 边界的同步拒绝与创建/销毁契约。
  * 不用 assert，Release 的 NDEBUG 不得移除验收。 */
@@ -13,7 +13,6 @@ int main(void) {
   ftun_core_options_t options = {0};
   ftun_core_t *core = (ftun_core_t *)(uintptr_t)1;
   ftun_operation_t *operation = (ftun_operation_t *)(uintptr_t)1;
-  ftun_route_result_t route;
   size_t accepted = 123;
   ftun_core_info_t info;
   options.struct_size = sizeof(options);
@@ -24,11 +23,14 @@ int main(void) {
         info.pending_operations == 0u);
   CHECK(ftun_core_post(core, done, NULL, &operation) == FTUN_E_STALE);
   CHECK(operation == NULL && callbacks == 0);
-  CHECK(ftun_core_select(core, "proxy", "node", done, NULL, &operation) == FTUN_E_STALE);
+#if defined(FTUN_EXPECT_PROXY)
+  CHECK(ftun_core_select(core, "proxy", "node", done, NULL, &operation) ==
+        FTUN_E_STALE);
+#else
+  CHECK(ftun_core_select(core, "proxy", "node", done, NULL, &operation) ==
+        FTUN_E_UNSUPPORTED);
+#endif
   CHECK(operation == NULL && callbacks == 0);
-  /* 已交付的 Router 对无效输入同步拒绝，仍保持失败输出清空。 */
-  CHECK(ftun_route_evaluate(NULL, NULL, 0, &route) == FTUN_E_INVALID);
-  CHECK(route.kind == FTUN_ROUTE_UNSET && route.allowed == NULL);
   CHECK(ftun_stream_write_ref(NULL, NULL, &accepted, &operation) == FTUN_E_INVALID);
   CHECK(accepted == 0 && operation == NULL);
   CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
@@ -38,5 +40,32 @@ int main(void) {
   options.abi_version = FTUN_ABI_VERSION;
   options.owned_memory_limit = 1u;
   CHECK(ftun_core_create(&options, &core) == FTUN_E_LIMIT && core == NULL);
+  options.owned_memory_limit = 0u;
+  options.owned_descriptor_limit = 1u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_E_LIMIT && core == NULL);
+  options.owned_descriptor_limit = 0u;
+  options.owned_queue_limit = 1u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_E_LIMIT && core == NULL);
+  options.owned_queue_limit = 0u;
+  options.operation_capacity = 3u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_E_LIMIT && core == NULL);
+  options.operation_capacity = 0u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_OK && core != NULL);
+  CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
+  options.struct_size = offsetof(ftun_core_options_t, owned_descriptor_limit);
+  options.owned_descriptor_limit = 1u;
+  options.owned_queue_limit = 1u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_OK && core != NULL);
+  CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
+  options.owned_descriptor_limit = 0u;
+  options.owned_queue_limit = 0u;
+  options.struct_size = offsetof(ftun_core_options_t,
+                                 retained_runtime_bytes_limit);
+  options.retained_runtime_bytes_limit = 1u;
+  CHECK(ftun_core_create(&options, &core) == FTUN_OK && core != NULL);
+  CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
+  options.struct_size = sizeof(options);
+  CHECK(ftun_core_create(&options, &core) == FTUN_OK && core != NULL);
+  CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
   return 0;
 }

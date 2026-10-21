@@ -1,6 +1,6 @@
 #ifndef FTUN_PLATFORM_LINUX_TUN_H
 #define FTUN_PLATFORM_LINUX_TUN_H
-#include "tun/tun.h"
+#include "tun/device.h"
 
 #define FTUN_LINUX_TUN_NAME_BYTES FTUN_PACKET_PORT_NAME_BYTES
 #define FTUN_LINUX_TUN_MIN_MTU 68u
@@ -29,7 +29,7 @@ typedef struct {
 /* Linux TUN 设备。
  * 需求 REQ-PLAT-001；任务 TASK-PLATFORM-001；目标 0.2.0；验收 TEST-PLATFORM-001。
  * 实现路径：显式权限检查和非阻塞设备接入；处理 MTU、整包边界和关闭；初版不宣称支持未实现的 offload。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
+ * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * spec 仅在调用期间借用；成功后 port 独占 fd，必须由 close 终结。
  * port 只由 owner loop 使用；每次 read/write 对应一个无 PI 的三层包。
  */

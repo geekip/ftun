@@ -32,6 +32,8 @@ typedef struct {
   size_t running;
   size_t completed;
   bool accepting;
+  bool stopping;
+  bool exited;
   bool joined;
 } ftun_worker_usage_t;
 
@@ -57,7 +59,13 @@ ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t 
                                  ftun_operation_t **out);
 ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
                                size_t *out_callbacks);
+/* Owner 热路径判断完成队列或待派发回调，无锁且不复制完整统计。 */
+bool ftun_worker_has_ready(const ftun_worker_t *worker);
 ftun_status_t ftun_worker_stop(ftun_worker_t *worker);
+/* 等待到绝对单调 deadline；超时保留 worker、任务输入/结果和线程引用，
+ * 后续可再次 join_until。UINT64_MAX 保持原无限等待语义。 */
+ftun_status_t ftun_worker_join_until(ftun_worker_t *worker,
+                                     uint64_t deadline_ms);
 ftun_status_t ftun_worker_join(ftun_worker_t *worker);
 ftun_status_t ftun_worker_get_usage(ftun_worker_t *worker, ftun_worker_usage_t *out);
 ftun_status_t ftun_worker_destroy(ftun_worker_t **worker);

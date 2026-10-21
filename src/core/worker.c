@@ -1,9 +1,16 @@
+#if !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include "worker.h"
 #include "core/operation.h"
 #include "util/time.h"
+#include <errno.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct ftun_worker_task ftun_worker_task_t;
 
@@ -23,6 +30,7 @@ struct ftun_worker_task {
   size_t cleanup_result_size;
   uint64_t deadline_ms;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_reservation_t *reservation;
   ftun_error_t error;
   int worker_done;
@@ -44,11 +52,12 @@ struct ftun_worker {
   size_t tasks;
   size_t pending;
   size_t running;
-  size_t completed;
+  _Atomic size_t completed;
   ftun_worker_wakeup_fn wakeup;
   void *wakeup_user;
   int accepting;
   int stopping;
+  int exited;
   int joined;
   int polling;
   int cleanup_failed;
@@ -80,7 +89,8 @@ static void ftun_worker_complete_list(ftun_worker_t *worker, ftun_worker_task_t 
   if (worker->completed_tail != NULL) worker->completed_tail->next = task;
   else worker->completed_head = task;
   worker->completed_tail = task;
-  worker->completed++;
+  (void)atomic_fetch_add_explicit(&worker->completed, 1u,
+                                  memory_order_release);
 }
 
 static void ftun_worker_task_dispose(ftun_worker_task_t *task)
@@ -172,6 +182,8 @@ static void *ftun_worker_thread(void *user)
       (void)pthread_cond_wait(&worker->ready, &worker->mutex);
     }
     if (worker->pending_head == NULL && worker->stopping) {
+      worker->exited = 1;
+      (void)pthread_cond_broadcast(&worker->ready);
       (void)pthread_mutex_unlock(&worker->mutex);
       break;
     }
@@ -206,8 +218,10 @@ ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
   ftun_worker_t *worker;
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
+  pthread_condattr_t condition_attributes;
   int mutex_ready = 0;
   int condition_ready = 0;
+  int condition_attributes_ready = 0;
 
   if (out != NULL) *out = NULL;
   if (budget == NULL || capacity == 0u || out == NULL) return FTUN_E_INVALID;
@@ -222,10 +236,18 @@ ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
   worker->reservation = reservation;
   worker->capacity = capacity;
   worker->accepting = 1;
+  atomic_init(&worker->completed, 0u);
   if (pthread_mutex_init(&worker->mutex, NULL) != 0) goto io_error;
   mutex_ready = 1;
-  if (pthread_cond_init(&worker->ready, NULL) != 0) goto io_error;
+  if (pthread_condattr_init(&condition_attributes) != 0) goto io_error;
+  condition_attributes_ready = 1;
+  if (pthread_condattr_setclock(&condition_attributes, CLOCK_MONOTONIC) != 0 ||
+      pthread_cond_init(&worker->ready, &condition_attributes) != 0) {
+    goto io_error;
+  }
   condition_ready = 1;
+  (void)pthread_condattr_destroy(&condition_attributes);
+  condition_attributes_ready = 0;
   status = ftun_operation_queue_create(budget, capacity, &worker->operations);
   if (status != FTUN_OK) goto status_error;
   if (pthread_create(&worker->thread, NULL, ftun_worker_thread, worker) != 0) {
@@ -238,6 +260,9 @@ ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
 queue_error:
   (void)ftun_operation_queue_destroy(&worker->operations);
 status_error:
+  if (condition_attributes_ready) {
+    (void)pthread_condattr_destroy(&condition_attributes);
+  }
   if (condition_ready) (void)pthread_cond_destroy(&worker->ready);
   if (mutex_ready) (void)pthread_mutex_destroy(&worker->mutex);
   reservation = worker->reservation;
@@ -332,7 +357,8 @@ ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t 
   task->deadline_ms = job->deadline_ms;
   task->reservation = reservation;
   status = ftun_operation_accept(worker->operations, ftun_worker_operation_done,
-                                 task, &task->operation);
+                                 task, &task->operation,
+                                 &task->completion_token);
   if (status != FTUN_OK) goto accept_error;
   worker->tasks++;
   if (worker->pending_tail != NULL) worker->pending_tail->next = task;
@@ -361,14 +387,16 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
 {
   ftun_status_t status = FTUN_OK;
   size_t dispatched = 0u;
+  size_t completed = 0u;
 
   if (out_callbacks != NULL) *out_callbacks = 0u;
   if (worker == NULL || max_callbacks == 0u || out_callbacks == NULL) {
     return FTUN_E_INVALID;
   }
+  if (!ftun_worker_has_ready(worker)) return FTUN_OK;
   if (worker->polling) return FTUN_E_AGAIN;
   worker->polling = 1;
-  for (;;) {
+  while (completed < max_callbacks) {
     ftun_worker_task_t *task;
     int dispose;
 
@@ -378,13 +406,16 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
       worker->completed_head = task->next;
       if (worker->completed_head == NULL) worker->completed_tail = NULL;
       task->next = NULL;
-      worker->completed--;
+      (void)atomic_fetch_sub_explicit(&worker->completed, 1u,
+                                      memory_order_relaxed);
       task->worker_done = 1;
     }
     (void)pthread_mutex_unlock(&worker->mutex);
     if (task == NULL) break;
+    completed++;
     if (task->operation != NULL) {
-      ftun_status_t complete_status = ftun_operation_complete(task->operation, task->error);
+      ftun_status_t complete_status = ftun_operation_complete(
+        task->completion_token, task->error);
       if (complete_status != FTUN_OK && complete_status != FTUN_E_STALE) {
         status = complete_status;
       }
@@ -401,6 +432,13 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
   return status;
 }
 
+bool ftun_worker_has_ready(const ftun_worker_t *worker)
+{
+  return worker != NULL &&
+    (atomic_load_explicit(&worker->completed, memory_order_acquire) != 0u ||
+     ftun_operation_queue_has_ready(worker->operations));
+}
+
 ftun_status_t ftun_worker_stop(ftun_worker_t *worker)
 {
   if (worker == NULL) return FTUN_E_INVALID;
@@ -414,15 +452,45 @@ ftun_status_t ftun_worker_stop(ftun_worker_t *worker)
 
 ftun_status_t ftun_worker_join(ftun_worker_t *worker)
 {
-  int joined;
-  int stopping;
+  return ftun_worker_join_until(worker, UINT64_MAX);
+}
+
+ftun_status_t ftun_worker_join_until(ftun_worker_t *worker,
+                                     uint64_t deadline_ms)
+{
+  int wait_status = 0;
   if (worker == NULL) return FTUN_E_INVALID;
   (void)pthread_mutex_lock(&worker->mutex);
-  joined = worker->joined;
-  stopping = worker->stopping;
+  if (worker->joined) {
+    (void)pthread_mutex_unlock(&worker->mutex);
+    return FTUN_OK;
+  }
+  if (!worker->stopping) {
+    (void)pthread_mutex_unlock(&worker->mutex);
+    return FTUN_E_AGAIN;
+  }
+  while (!worker->exited && wait_status == 0) {
+    if (deadline_ms == UINT64_MAX) {
+      wait_status = pthread_cond_wait(&worker->ready, &worker->mutex);
+    } else {
+      struct timespec deadline;
+      uint64_t seconds = deadline_ms / UINT64_C(1000);
+      deadline.tv_sec = (time_t)seconds;
+      if ((uint64_t)deadline.tv_sec != seconds) {
+        (void)pthread_mutex_unlock(&worker->mutex);
+        return FTUN_E_LIMIT;
+      }
+      deadline.tv_nsec = (long)((deadline_ms % UINT64_C(1000)) *
+                                UINT64_C(1000000));
+      wait_status = pthread_cond_timedwait(&worker->ready, &worker->mutex,
+                                           &deadline);
+    }
+  }
+  if (!worker->exited) {
+    (void)pthread_mutex_unlock(&worker->mutex);
+    return wait_status == ETIMEDOUT ? FTUN_E_TIMEOUT : FTUN_E_IO;
+  }
   (void)pthread_mutex_unlock(&worker->mutex);
-  if (joined) return FTUN_OK;
-  if (!stopping) return FTUN_E_AGAIN;
   if (pthread_join(worker->thread, NULL) != 0) return FTUN_E_IO;
   (void)pthread_mutex_lock(&worker->mutex);
   worker->joined = 1;
@@ -439,8 +507,11 @@ ftun_status_t ftun_worker_get_usage(ftun_worker_t *worker, ftun_worker_usage_t *
   out->tasks = worker->tasks;
   out->pending = worker->pending;
   out->running = worker->running;
-  out->completed = worker->completed;
+  out->completed = atomic_load_explicit(&worker->completed,
+                                        memory_order_acquire);
   out->accepting = worker->accepting != 0;
+  out->stopping = worker->stopping != 0;
+  out->exited = worker->exited != 0;
   out->joined = worker->joined != 0;
   (void)pthread_mutex_unlock(&worker->mutex);
   return FTUN_OK;
@@ -458,7 +529,9 @@ ftun_status_t ftun_worker_destroy(ftun_worker_t **worker)
   if (owned == NULL) return FTUN_OK;
   (void)pthread_mutex_lock(&owned->mutex);
   can_destroy = owned->joined && owned->tasks == 0u && owned->pending == 0u &&
-    owned->running == 0u && owned->completed == 0u && !owned->polling &&
+    owned->running == 0u &&
+    atomic_load_explicit(&owned->completed, memory_order_relaxed) == 0u &&
+    !owned->polling &&
     !owned->cleanup_failed;
   (void)pthread_mutex_unlock(&owned->mutex);
   if (!can_destroy) return FTUN_E_AGAIN;

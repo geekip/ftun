@@ -3,11 +3,11 @@
 #include "frs_fixture.h"
 
 #include "core/budget.h"
-#include "core/runtime.h"
-#include "frs/domain.h"
-#include "frs/format.h"
-#include "frs/frs.h"
-#include "frs/ip.h"
+#include "proxy/runtime_state.h"
+#include "proxy/frs/domain.h"
+#include "proxy/frs/format.h"
+#include "proxy/frs/frs.h"
+#include "proxy/frs/ip.h"
 
 #include <stdio.h>
 #include <stdlib.h>

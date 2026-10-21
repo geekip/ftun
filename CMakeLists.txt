@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FTUN VERSION 1.0.1 LANGUAGES C)
+project(FTUN VERSION 1.0.2 LANGUAGES C)
 include(GNUInstallDirs)
 include(CTest)
 find_package(Threads REQUIRED)
@@ -10,10 +10,12 @@ option(FTUN_SANITIZERS "Enable address and undefined behavior checks" OFF)
 option(FTUN_LTO "Require supported interprocedural optimization" OFF)
 option(FTUN_SECTION_GC "Remove unused code and data on supported toolchains" ON)
 option(FTUN_STATIC "Build fully static Linux executables" OFF)
+set(FTUN_MODULE_PROXY "BUILTIN" CACHE STRING "Build the Proxy module: OFF or BUILTIN")
 set(FTUN_MODULE_DNS "OFF" CACHE STRING "Build the DNS module: OFF or BUILTIN")
 set(FTUN_MODULE_FAKEIP "OFF" CACHE STRING "Build the FakeIP module: OFF or BUILTIN")
 set(FTUN_MODULE_TUN "OFF" CACHE STRING "Build the TUN module: OFF or BUILTIN")
 set(FTUN_MODULE_FRS "OFF" CACHE STRING "Build the FRS module: OFF or BUILTIN")
+set_property(CACHE FTUN_MODULE_PROXY PROPERTY STRINGS OFF BUILTIN)
 set_property(CACHE FTUN_MODULE_DNS PROPERTY STRINGS OFF BUILTIN)
 set_property(CACHE FTUN_MODULE_FAKEIP PROPERTY STRINGS OFF BUILTIN)
 set_property(CACHE FTUN_MODULE_TUN PROPERTY STRINGS OFF BUILTIN)
@@ -55,15 +57,21 @@ endif()
 if(NOT FTUN_OPTIMIZATION MATCHES "^(balanced|speed|size)$")
   message(FATAL_ERROR "Unsupported FTUN_OPTIMIZATION")
 endif()
-foreach(ftun_module DNS FAKEIP TUN FRS)
+foreach(ftun_module PROXY DNS FAKEIP TUN FRS)
   if(NOT FTUN_MODULE_${ftun_module} MATCHES "^(OFF|BUILTIN)$")
     message(FATAL_ERROR
       "FTUN_MODULE_${ftun_module} must be OFF or BUILTIN; dynamic modules are not supported")
   endif()
 endforeach()
 if(FTUN_MODULE_FAKEIP STREQUAL "BUILTIN" AND
-   NOT FTUN_MODULE_DNS STREQUAL "BUILTIN")
-  message(FATAL_ERROR "FTUN_MODULE_FAKEIP=BUILTIN requires FTUN_MODULE_DNS=BUILTIN")
+   (NOT FTUN_MODULE_DNS STREQUAL "BUILTIN" OR
+    NOT FTUN_MODULE_PROXY STREQUAL "BUILTIN"))
+  message(FATAL_ERROR
+    "FTUN_MODULE_FAKEIP=BUILTIN requires FTUN_MODULE_PROXY=BUILTIN and FTUN_MODULE_DNS=BUILTIN")
+endif()
+if(FTUN_MODULE_FRS STREQUAL "BUILTIN" AND
+   NOT FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+  message(FATAL_ERROR "FTUN_MODULE_FRS=BUILTIN requires FTUN_MODULE_PROXY=BUILTIN")
 endif()
 if(FTUN_MODULE_TUN STREQUAL "BUILTIN" AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR "FTUN_MODULE_TUN=BUILTIN requires a Linux target")
@@ -172,6 +180,13 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     if(FTUN_SANITIZERS)
       target_compile_options(ftun_libev PRIVATE
         -fsanitize=address,undefined -fno-omit-frame-pointer)
+      # libev intentionally stores typed watcher callbacks behind its common
+      # ev_watcher callback slot.  Clang's function sanitizer diagnoses that
+      # established C layout at the generic dispatch site, including libev's
+      # own pipecb.  Keep ASan and all other UBSan checks on the vendor target.
+      if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+        target_compile_options(ftun_libev PRIVATE -fno-sanitize=function)
+      endif()
     endif()
   endif()
   target_compile_options(ftun_libev PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
@@ -215,41 +230,81 @@ endif()
 target_compile_options(wolfssl PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
 list(APPEND ftun_internal_dependencies wolfssl::wolfssl)
 # 当前库不在配置期发现或下载第三方库；依赖均由本地锁定源构建。
-# 核心保留 SystemResolver、通用 Datagram 和 SOCKS5，不反向依赖 TUN。
+# C10-011 使用对象目标固定源码归属，再由 ftun_runtime 聚合成兼容的
+# libftun_core.a。对象目标避免在 C10-012 收窄兼容接口前引入静态库循环。
 set(ftun_core_sources
-    src/core/core.c
-    src/core/http_fetch.c
-    src/core/control_resolver.c
-  src/core/engine.c
-  src/core/engine_dns.c
-  src/core/state.c
-  src/util/error.c
-  src/core/runtime.c
-  src/core/session.c
+  src/core/core.c
+  src/core/context.c
+  src/core/service.c
+  src/core/module_plan.c
   src/core/budget.c
   src/core/operation.c
   src/core/worker.c
+)
+
+set(ftun_app_sources
+  src/app/composition/default.c
+  src/app/cli/dispatch.c
+  src/app/cli/run.c
+  src/app/cli/check.c
+  src/app/cli/control.c
+  src/app/cli/fakeip.c
+  src/app/cli/version.c
+)
+if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+  list(APPEND ftun_app_sources src/app/runtime.c)
+else()
+  list(APPEND ftun_app_sources src/app/service_runtime.c)
+endif()
+
+set(ftun_proxy_sources)
+if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+  list(APPEND ftun_proxy_sources
+  src/proxy/service.c
+  src/proxy/bindings.c
+  src/proxy/runtime.c
+  src/proxy/slot_pool.c
+  src/proxy/dns/dispatch_adapter.c
+  src/proxy/dns/runtime_adapter.c
+  src/proxy/dns/control_path_adapter.c
+  src/proxy/snapshot.c
+  src/proxy/runtime_state.c
+  src/proxy/session.c
+  src/proxy/http_fetch.c
+  src/proxy/control_resolver.c
+  src/proxy/state/restore.c
+  src/proxy/state/group_cache.c
+  src/proxy/udp/session.c
+  src/proxy/inbound/inbound.c
+  src/proxy/inbound/socks5.c
+  src/proxy/inbound/mixed.c
+  src/proxy/outbound/outbound.c
+  src/proxy/outbound/direct.c
+  src/proxy/outbound/reject.c
+  src/proxy/outbound/socks5.c
+  src/proxy/route/router.c
+  src/proxy/route/rule.c
+  src/proxy/route/target.c
+  src/proxy/route/group.c
+  src/proxy/group/select.c
+  src/proxy/group/url_test.c
+  src/proxy/group/health.c
+  src/proxy/sniff/sniff.c
+  src/proxy/sniff/tls_sni.c
+  src/proxy/sniff/http_host.c
+  src/proxy/dns/resolver_adapter.c
+  )
+endif()
+
+set(ftun_shared_sources
+  src/util/error.c
   src/config/config.c
   src/config/parser.c
   src/config/validate.c
   src/config/compile.c
-  src/inbound/inbound.c
-  src/inbound/socks5.c
-  src/inbound/mixed.c
-  src/outbound/outbound.c
-  src/outbound/direct.c
-  src/outbound/reject.c
-  src/outbound/socks5.c
-  src/route/router.c
-  src/route/rule.c
-  src/route/target.c
-  src/route/group.c
-  src/group/select.c
-  src/group/url_test.c
-  src/group/health.c
   src/tls/tls.c
   src/tls/wolfssl_adapter.c
-  src/dns/resolver.c
+  src/dns/control_transport.c
   src/platform/linux/socket_protect.c
   src/platform/system_resolver.c
   src/platform/file.c
@@ -259,43 +314,53 @@ set(ftun_core_sources
   src/util/time.c
   src/event/event.c
   src/event/libev_adapter.c
+  src/network/view.c
+  src/network/resolver.c
   src/transport/dialer.c
-    src/transport/stream.c
-    src/transport/datagram.c
-    src/transport/relay.c
-    src/tun/udp_session.c
+  src/transport/path.c
+  src/transport/blocking.c
+  src/transport/carrier.c
+  src/transport/stream.c
+  src/transport/datagram.c
+  src/transport/relay.c
   src/protocol/socks5.c
   src/protocol/http.c
-  src/sniff/sniff.c
-  src/sniff/tls_sni.c
-  src/sniff/http_host.c
-  src/state/group_cache.c
 )
+
+set(ftun_tun_sources)
+set(ftun_dns_sources)
+set(ftun_fakeip_sources)
+set(ftun_frs_sources)
 
 # 这些源码属于后续版本的可选模块，当前不加入任何 target。
 # 各模块交付时再与其注册项、独占依赖和 OFF/BUILTIN 测试一起接入。
 set(ftun_deferred_module_sources
-  src/inbound/anytls.c
-  src/outbound/anytls.c
-  src/api/api.c
+  src/proxy/inbound/anytls.c
+  src/proxy/outbound/anytls.c
+  src/app/api/api.c
   src/protocol/anytls.c
   src/protocol/uot.c
 )
 
 set(ftun_module_definitions)
+if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+  list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_PROXY=1)
+endif()
 if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
-  list(APPEND ftun_core_sources
-    src/frs/format.c
-    src/frs/frs.c
-    src/frs/ip.c
-    src/frs/domain.c
-    src/frs/update.c
+  list(APPEND ftun_frs_sources
+    src/proxy/frs/format.c
+    src/proxy/frs/frs.c
+    src/proxy/frs/ip.c
+    src/proxy/frs/domain.c
+    src/proxy/frs/update.c
   )
   list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_FRS=1)
 endif()
 if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
-  list(APPEND ftun_core_sources
-    src/dns/dns.c
+  list(APPEND ftun_dns_sources
+    src/dns/dispatcher.c
+    src/dns/service.c
+    src/dns/core_service.c
     src/dns/server.c
     src/dns/listener.c
     src/dns/bootstrap.c
@@ -305,15 +370,20 @@ if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
   list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_DNS=1)
 endif()
 if(FTUN_MODULE_FAKEIP STREQUAL "BUILTIN")
-  list(APPEND ftun_core_sources
-    src/dns/fakeip.c
-    src/state/fakeip_store.c
-    src/state/snapshot.c
+  list(APPEND ftun_fakeip_sources
+    src/proxy/dns/fakeip.c
+    src/proxy/state/fakeip_store.c
+    src/proxy/state/fakeip_snapshot.c
   )
   list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_FAKEIP=1)
 endif()
 if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
-  add_library(ftun_lwip STATIC
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    list(APPEND ftun_proxy_sources
+      src/proxy/tun/ingress.c
+      src/proxy/tun/lwip_adapter.c
+    )
+    add_library(ftun_lwip STATIC
     third_party/lwip/src/core/def.c
     third_party/lwip/src/core/inet_chksum.c
     third_party/lwip/src/core/init.c
@@ -332,47 +402,175 @@ if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
     third_party/lwip/src/core/ipv4/ip4.c
     third_party/lwip/src/core/ipv4/ip4_addr.c
     third_party/lwip/src/core/ipv4/ip4_frag.c)
-  target_include_directories(ftun_lwip PUBLIC
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/lwip/src/include>"
-    "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/tun/lwip_port>")
-  if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-    target_compile_options(ftun_lwip PRIVATE -Wall -Wextra -fno-strict-aliasing
-      "$<$<CONFIG:Debug>:-O0;-g>" "$<$<NOT:$<CONFIG:Debug>>:${ftun_opt}>")
-    if(FTUN_SECTION_GC)
-      target_compile_options(ftun_lwip PRIVATE -ffunction-sections -fdata-sections)
+    target_include_directories(ftun_lwip PUBLIC
+      "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/lwip/src/include>"
+      "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/proxy/tun/lwip_port>")
+    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+      target_compile_options(ftun_lwip PRIVATE -Wall -Wextra -fno-strict-aliasing
+        "$<$<CONFIG:Debug>:-O0;-g>" "$<$<NOT:$<CONFIG:Debug>>:${ftun_opt}>")
+      if(FTUN_SECTION_GC)
+        target_compile_options(ftun_lwip PRIVATE -ffunction-sections -fdata-sections)
+      endif()
+      if(FTUN_SANITIZERS)
+        target_compile_options(ftun_lwip PRIVATE
+          -fsanitize=address,undefined -fno-omit-frame-pointer)
+      endif()
     endif()
-    if(FTUN_SANITIZERS)
-      target_compile_options(ftun_lwip PRIVATE
-        -fsanitize=address,undefined -fno-omit-frame-pointer)
-    endif()
+    target_compile_options(ftun_lwip PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
+    list(APPEND ftun_internal_dependencies ftun_lwip)
   endif()
-  target_compile_options(ftun_lwip PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
-  list(APPEND ftun_internal_dependencies ftun_lwip)
-  list(APPEND ftun_core_sources
-    src/inbound/tun.c
-    src/tun/tun.c
-    src/tun/lwip_adapter.c
+  list(APPEND ftun_tun_sources
+    src/tun/device.c
+    src/tun/service.c
+    src/tun/dispatch.c
+    src/tun/route.c
+    src/tun/path.c
+    src/tun/owner.c
     src/platform/linux/tun.c
     src/platform/linux/route.c
+    src/platform/linux/route_async.c
   )
   list(APPEND ftun_module_definitions FTUN_HAVE_MODULE_TUN=1)
 endif()
 
-add_library(ftun_core STATIC ${ftun_core_sources})
-target_include_directories(ftun_core PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+function(ftun_configure_object_target target)
+  target_include_directories(${target}
+    PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  target_compile_definitions(${target} PRIVATE ${ARGN}
+    "$<$<TARGET_EXISTS:ftun_libev>:FTUN_HAVE_LIBEV=1>")
+  target_link_libraries(${target} PRIVATE ftun_options Threads::Threads)
+endfunction()
+
+add_library(ftun_core OBJECT ${ftun_core_sources})
+ftun_configure_object_target(ftun_core)
+add_library(ftun_shared_services OBJECT ${ftun_shared_sources})
+ftun_configure_object_target(ftun_shared_services
+  ${ftun_module_definitions})
+target_link_libraries(ftun_shared_services PRIVATE ftun_cjson wolfssl::wolfssl)
+if(TARGET ftun_libev)
+  target_link_libraries(ftun_shared_services PRIVATE ftun_libev)
+endif()
+if(ftun_proxy_sources)
+  add_library(ftun_proxy OBJECT ${ftun_proxy_sources})
+  ftun_configure_object_target(ftun_proxy ${ftun_module_definitions})
+  if(TARGET ftun_lwip)
+    target_link_libraries(ftun_proxy PRIVATE ftun_lwip)
+  endif()
+endif()
+add_library(ftun_app OBJECT ${ftun_app_sources})
+ftun_configure_object_target(ftun_app
+  ${ftun_module_definitions})
+target_compile_definitions(ftun_app PRIVATE
+  FTUN_SOURCE_REVISION="${ftun_source_revision}")
+
+set(ftun_runtime_objects
+  $<TARGET_OBJECTS:ftun_core>
+  $<TARGET_OBJECTS:ftun_shared_services>
+  $<TARGET_OBJECTS:ftun_app>)
+set(ftun_layer_targets
+  ftun_core ftun_shared_services ftun_app)
+if(TARGET ftun_proxy)
+  list(APPEND ftun_runtime_objects $<TARGET_OBJECTS:ftun_proxy>)
+  list(APPEND ftun_layer_targets ftun_proxy)
+endif()
+
+if(ftun_dns_sources)
+  add_library(ftun_module_dns OBJECT ${ftun_dns_sources})
+  ftun_configure_object_target(ftun_module_dns FTUN_HAVE_MODULE_DNS=1)
+  list(APPEND ftun_runtime_objects $<TARGET_OBJECTS:ftun_module_dns>)
+  list(APPEND ftun_layer_targets ftun_module_dns)
+endif()
+if(ftun_fakeip_sources)
+  add_library(ftun_module_fakeip OBJECT ${ftun_fakeip_sources})
+  ftun_configure_object_target(ftun_module_fakeip
+    FTUN_HAVE_MODULE_DNS=1 FTUN_HAVE_MODULE_FAKEIP=1)
+  list(APPEND ftun_runtime_objects $<TARGET_OBJECTS:ftun_module_fakeip>)
+  list(APPEND ftun_layer_targets ftun_module_fakeip)
+endif()
+if(ftun_frs_sources)
+  add_library(ftun_module_frs OBJECT ${ftun_frs_sources})
+  ftun_configure_object_target(ftun_module_frs FTUN_HAVE_MODULE_FRS=1)
+  list(APPEND ftun_runtime_objects $<TARGET_OBJECTS:ftun_module_frs>)
+  list(APPEND ftun_layer_targets ftun_module_frs)
+endif()
+if(ftun_tun_sources)
+  add_library(ftun_tun OBJECT ${ftun_tun_sources})
+  ftun_configure_object_target(ftun_tun FTUN_HAVE_MODULE_TUN=1)
+  list(APPEND ftun_runtime_objects $<TARGET_OBJECTS:ftun_tun>)
+  list(APPEND ftun_layer_targets ftun_tun)
+endif()
+
+add_library(ftun_runtime STATIC ${ftun_runtime_objects})
+set_target_properties(ftun_runtime PROPERTIES OUTPUT_NAME ftun_core)
+target_include_directories(ftun_runtime
+  PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-target_compile_definitions(ftun_core PRIVATE ${ftun_module_definitions}
+target_compile_definitions(ftun_runtime PRIVATE ${ftun_module_definitions}
   "$<$<TARGET_EXISTS:ftun_libev>:FTUN_HAVE_LIBEV=1>")
-target_link_libraries(ftun_core PRIVATE ftun_options Threads::Threads
+target_link_libraries(ftun_runtime PRIVATE ftun_options Threads::Threads
   ${ftun_internal_dependencies})
+
+# 目标边只允许工具链/线程和各层明确需要的第三方编译接口；第一方层通过对象聚合，
+# 不能偷偷以 target_link_libraries 反向引入另一业务层。
+function(ftun_assert_target_dependencies target)
+  set(allowed ${ARGN})
+  get_target_property(actual ${target} LINK_LIBRARIES)
+  if(NOT actual)
+    return()
+  endif()
+  foreach(dependency IN LISTS actual)
+    if(TARGET "${dependency}")
+      list(FIND allowed "${dependency}" found)
+      if(found EQUAL -1)
+        message(FATAL_ERROR
+          "${target} has undeclared target dependency: ${dependency}")
+      endif()
+    endif()
+  endforeach()
+endfunction()
+ftun_assert_target_dependencies(ftun_core ftun_options Threads::Threads)
+if(TARGET ftun_proxy)
+  ftun_assert_target_dependencies(ftun_proxy
+    ftun_options Threads::Threads ftun_lwip)
+endif()
+ftun_assert_target_dependencies(ftun_app
+  ftun_options Threads::Threads)
+ftun_assert_target_dependencies(ftun_shared_services
+  ftun_options Threads::Threads ftun_cjson wolfssl::wolfssl ftun_libev)
+if(TARGET ftun_tun)
+  ftun_assert_target_dependencies(ftun_tun
+    ftun_options Threads::Threads)
+endif()
+foreach(target ftun_module_dns ftun_module_fakeip ftun_module_frs)
+  if(TARGET ${target})
+    ftun_assert_target_dependencies(${target} ftun_options Threads::Threads)
+  endif()
+endforeach()
+ftun_assert_target_dependencies(ftun_runtime
+  ftun_options Threads::Threads ftun_cjson wolfssl::wolfssl
+  ftun_libev ftun_lwip)
 file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ftun-build-modules.txt" CONTENT
-  "core=BUILTIN\ndns=${FTUN_MODULE_DNS}\nfakeip=${FTUN_MODULE_FAKEIP}\ntun=${FTUN_MODULE_TUN}\nfrs=${FTUN_MODULE_FRS}\n")
-add_executable(ftun src/main.c src/cli/cli.c)
+  "core=BUILTIN\nproxy=${FTUN_MODULE_PROXY}\ndns=${FTUN_MODULE_DNS}\nfakeip=${FTUN_MODULE_FAKEIP}\ntun=${FTUN_MODULE_TUN}\nfrs=${FTUN_MODULE_FRS}\nmesh=OFF\n")
+file(GENERATE OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/ftun-build-targets.txt" CONTENT
+  "core=ftun_core\nshared=ftun_shared_services\nproxy=$<IF:$<TARGET_EXISTS:ftun_proxy>,ftun_proxy,OFF>\napp=ftun_app\ntun=$<IF:$<TARGET_EXISTS:ftun_tun>,ftun_tun,OFF>\nlwip=$<IF:$<TARGET_EXISTS:ftun_lwip>,ftun_lwip,OFF>\ndns=$<IF:$<TARGET_EXISTS:ftun_module_dns>,ftun_module_dns,OFF>\nfakeip=$<IF:$<TARGET_EXISTS:ftun_module_fakeip>,ftun_module_fakeip,OFF>\nfrs=$<IF:$<TARGET_EXISTS:ftun_module_frs>,ftun_module_frs,OFF>\nmesh=OFF\n")
+set(ftun_layer_policy "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ftun-layer-policy.json")
+if(NOT EXISTS "${ftun_layer_policy}")
+  message(FATAL_ERROR "missing frozen source-layer policy: ${ftun_layer_policy}")
+endif()
+file(READ "${ftun_layer_policy}" ftun_layer_policy_json)
+string(JSON ftun_layer_policy_schema ERROR_VARIABLE ftun_layer_policy_error
+  GET "${ftun_layer_policy_json}" schema)
+if(ftun_layer_policy_error OR
+   NOT ftun_layer_policy_schema STREQUAL "ftun-layer-policy-v1")
+  message(FATAL_ERROR "invalid frozen source-layer policy schema")
+endif()
+add_executable(ftun src/app/main.c)
 target_include_directories(ftun PRIVATE src)
 target_compile_definitions(ftun PRIVATE ${ftun_module_definitions}
   FTUN_SOURCE_REVISION="${ftun_source_revision}")
-target_link_libraries(ftun PRIVATE ftun_core ftun_options)
-set(ftun_targets ftun_core ftun)
+target_link_libraries(ftun PRIVATE ftun_runtime ftun_options)
+set(ftun_targets ftun_runtime ftun ${ftun_layer_targets})
 list(APPEND ftun_targets ftun_cjson wolfssl)
 if(TARGET ftun_lwip)
   list(APPEND ftun_targets ftun_lwip)
@@ -386,7 +584,7 @@ endif()
 if(FTUN_LTO)
   set_property(TARGET ${ftun_targets} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
 endif()
-install(TARGETS ftun ftun_core RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+install(TARGETS ftun ftun_runtime RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
   ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(TARGETS ftun_cjson ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(TARGETS wolfssl ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
@@ -403,9 +601,7 @@ install(FILES third_party/cjson/LICENSE
 install(FILES third_party/wolfssl/COPYING
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES LICENSE README.md document/control.md document/build-release.md
-  document/release-v1.0.md document/release-v1.0.1.md
-  THIRD_PARTY_NOTICES.md third_party/LOCK.json
+install(FILES LICENSE README.md THIRD_PARTY_NOTICES.md third_party/LOCK.json
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 if(TARGET ftun_libev)
   install(FILES third_party/libev/LICENSE
@@ -416,14 +612,57 @@ add_custom_target(uninstall COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_D
 if(BUILD_TESTING)
   add_executable(ftun-contract-test tests/skeleton_contract.c)
   target_include_directories(ftun-contract-test PRIVATE src)
-  target_link_libraries(ftun-contract-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-contract-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-contract-test PRIVATE FTUN_EXPECT_PROXY=1)
+  endif()
   if(FTUN_STATIC)
     target_link_options(ftun-contract-test PRIVATE -static)
   endif()
   add_test(NAME skeleton-contract COMMAND ftun-contract-test)
+  add_executable(ftun-core-service-test tests/core_service.c)
+  target_include_directories(ftun-core-service-test PRIVATE src)
+  target_link_libraries(ftun-core-service-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-core-service-test PRIVATE -static)
+  endif()
+  add_test(NAME core-service-contract COMMAND ftun-core-service-test)
+  if(FTUN_MODULE_PROXY STREQUAL "OFF" AND
+     FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    add_executable(ftun-service-runtime-test tests/service_runtime.c)
+    target_include_directories(ftun-service-runtime-test PRIVATE src)
+    target_link_libraries(ftun-service-runtime-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-service-runtime-test PRIVATE -static)
+    endif()
+    add_test(NAME service-runtime-stop-contract
+      COMMAND ftun-service-runtime-test)
+  endif()
+  add_executable(ftun-core-module-plan-test tests/core_module_plan.c)
+  target_include_directories(ftun-core-module-plan-test PRIVATE src)
+  target_link_libraries(ftun-core-module-plan-test PRIVATE
+    ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-core-module-plan-test PRIVATE -static)
+  endif()
+  add_test(NAME core-module-plan-contract COMMAND ftun-core-module-plan-test)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-proxy-slot-pool-test tests/proxy_slot_pool.c)
+    target_include_directories(ftun-proxy-slot-pool-test PRIVATE src)
+    target_link_libraries(ftun-proxy-slot-pool-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-proxy-slot-pool-test PRIVATE -static)
+    endif()
+    add_test(NAME proxy-slot-pool-contract COMMAND ftun-proxy-slot-pool-test)
+  endif()
   add_executable(ftun-build-modules-test tests/build_modules.c)
   target_include_directories(ftun-build-modules-test PRIVATE src)
-  target_link_libraries(ftun-build-modules-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-build-modules-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_PROXY=1)
+  endif()
   if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
     target_compile_definitions(ftun-build-modules-test PRIVATE FTUN_EXPECT_DNS=1)
   endif()
@@ -442,252 +681,284 @@ if(BUILD_TESTING)
   add_test(NAME build-modules-capabilities COMMAND ftun-build-modules-test)
   add_executable(ftun-budget-test tests/budget.c)
   target_include_directories(ftun-budget-test PRIVATE src)
-  target_link_libraries(ftun-budget-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-budget-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-budget-test PRIVATE -static)
   endif()
   add_test(NAME budget-contract COMMAND ftun-budget-test)
-  add_executable(ftun-runtime-test tests/runtime.c)
-  target_include_directories(ftun-runtime-test PRIVATE src)
-  target_link_libraries(ftun-runtime-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-runtime-test PRIVATE -static)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-runtime-test tests/runtime.c)
+    target_include_directories(ftun-runtime-test PRIVATE src)
+    target_link_libraries(ftun-runtime-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-runtime-test PRIVATE -static)
+    endif()
+    add_test(NAME runtime-contract COMMAND ftun-runtime-test)
+    add_executable(ftun-session-test tests/session.c)
+    target_include_directories(ftun-session-test PRIVATE src)
+    target_link_libraries(ftun-session-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-session-test PRIVATE -static)
+    endif()
+    add_test(NAME session-contract COMMAND ftun-session-test)
   endif()
-  add_test(NAME runtime-contract COMMAND ftun-runtime-test)
-  add_executable(ftun-session-test tests/session.c)
-  target_include_directories(ftun-session-test PRIVATE src)
-  target_link_libraries(ftun-session-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-session-test PRIVATE -static)
-  endif()
-  add_test(NAME session-contract COMMAND ftun-session-test)
   add_executable(ftun-buffer-test tests/buffer.c)
   target_include_directories(ftun-buffer-test PRIVATE src)
-  target_link_libraries(ftun-buffer-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-buffer-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-buffer-test PRIVATE -static)
   endif()
   add_test(NAME buffer-contract COMMAND ftun-buffer-test)
   add_executable(ftun-hash-test tests/hash.c)
   target_include_directories(ftun-hash-test PRIVATE src)
-  target_link_libraries(ftun-hash-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-hash-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-hash-test PRIVATE -static)
   endif()
   add_test(NAME hash-contract COMMAND ftun-hash-test)
   add_executable(ftun-operation-test tests/operation.c)
   target_include_directories(ftun-operation-test PRIVATE src)
-  target_link_libraries(ftun-operation-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-operation-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-operation-test PRIVATE -static)
   endif()
   add_test(NAME operation-contract COMMAND ftun-operation-test)
   add_executable(ftun-worker-test tests/worker.c)
   target_include_directories(ftun-worker-test PRIVATE src)
-  target_link_libraries(ftun-worker-test PRIVATE ftun_core ftun_options Threads::Threads)
+  target_link_libraries(ftun-worker-test PRIVATE ftun_runtime ftun_options Threads::Threads)
   if(FTUN_STATIC)
     target_link_options(ftun-worker-test PRIVATE -static)
   endif()
   add_test(NAME worker-contract COMMAND ftun-worker-test)
   add_executable(ftun-event-test tests/event.c)
   target_include_directories(ftun-event-test PRIVATE src)
-  target_link_libraries(ftun-event-test PRIVATE ftun_core ftun_options Threads::Threads)
+  target_link_libraries(ftun-event-test PRIVATE ftun_runtime ftun_options Threads::Threads)
   if(FTUN_STATIC)
     target_link_options(ftun-event-test PRIVATE -static)
   endif()
   add_test(NAME event-contract COMMAND ftun-event-test)
   add_executable(ftun-dialer-test tests/dialer.c)
   target_include_directories(ftun-dialer-test PRIVATE src)
-  target_link_libraries(ftun-dialer-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-dialer-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-dialer-test PRIVATE -static)
   endif()
   add_test(NAME dialer-contract COMMAND ftun-dialer-test)
+  add_executable(ftun-network-view-test tests/network_view.c)
+  target_include_directories(ftun-network-view-test PRIVATE src)
+  target_link_libraries(ftun-network-view-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-network-view-test PRIVATE -static)
+  endif()
+  add_test(NAME network-view-contract COMMAND ftun-network-view-test)
+  add_executable(ftun-provider-bindings-test tests/provider_bindings.c)
+  target_include_directories(ftun-provider-bindings-test PRIVATE src)
+  target_link_libraries(ftun-provider-bindings-test PRIVATE
+    ftun_runtime ftun_options)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-provider-bindings-test PRIVATE
+      FTUN_EXPECT_PROXY=1)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-provider-bindings-test PRIVATE -static)
+  endif()
+  add_test(NAME provider-bindings-contract COMMAND ftun-provider-bindings-test)
   add_executable(ftun-stream-test tests/stream.c)
   target_include_directories(ftun-stream-test PRIVATE src)
-  target_link_libraries(ftun-stream-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-stream-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-stream-test PRIVATE -static)
   endif()
   add_test(NAME stream-contract COMMAND ftun-stream-test)
   add_executable(ftun-datagram-test tests/datagram.c)
   target_include_directories(ftun-datagram-test PRIVATE src)
-  target_link_libraries(ftun-datagram-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-datagram-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-datagram-test PRIVATE -static)
   endif()
   add_test(NAME datagram-contract COMMAND ftun-datagram-test)
+  add_executable(ftun-carrier-test tests/carrier.c)
+  target_include_directories(ftun-carrier-test PRIVATE src)
+  target_link_libraries(ftun-carrier-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-carrier-test PRIVATE -static)
+  endif()
+  add_test(NAME carrier-owner-contract COMMAND ftun-carrier-test)
   add_executable(ftun-relay-test tests/relay.c)
   target_include_directories(ftun-relay-test PRIVATE src)
-  target_link_libraries(ftun-relay-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-relay-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-relay-test PRIVATE -static)
   endif()
   add_test(NAME relay-contract COMMAND ftun-relay-test)
   add_executable(ftun-protocol-socks5-test tests/protocol_socks5.c)
   target_include_directories(ftun-protocol-socks5-test PRIVATE src)
-  target_link_libraries(ftun-protocol-socks5-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-protocol-socks5-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-protocol-socks5-test PRIVATE -static)
   endif()
   add_test(NAME protocol-socks5-contract COMMAND ftun-protocol-socks5-test)
   add_executable(ftun-protocol-http-test tests/protocol_http.c)
   target_include_directories(ftun-protocol-http-test PRIVATE src)
-  target_link_libraries(ftun-protocol-http-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-protocol-http-test PRIVATE ftun_runtime ftun_options)
   add_test(NAME protocol-http-contract COMMAND ftun-protocol-http-test)
-  add_executable(ftun-inbound-socks5-test tests/inbound_socks5.c)
-  target_include_directories(ftun-inbound-socks5-test PRIVATE src)
-  target_link_libraries(ftun-inbound-socks5-test PRIVATE ftun_core ftun_options)
-  add_test(NAME inbound-socks5-contract COMMAND ftun-inbound-socks5-test)
-  add_executable(ftun-inbound-mixed-test tests/inbound_mixed.c)
-  target_include_directories(ftun-inbound-mixed-test PRIVATE src)
-  target_link_libraries(ftun-inbound-mixed-test PRIVATE
-    ftun_core ftun_options)
-  add_test(NAME inbound-mixed-contract COMMAND ftun-inbound-mixed-test)
-  add_executable(ftun-v04-group-test tests/group.c)
-  target_include_directories(ftun-v04-group-test PRIVATE src)
-  target_link_libraries(ftun-v04-group-test PRIVATE ftun_core ftun_options)
-  add_test(NAME group-contract COMMAND ftun-v04-group-test)
-  add_executable(ftun-sniff-tls-test tests/sniff_tls.c)
-  target_include_directories(ftun-sniff-tls-test PRIVATE src)
-  target_link_libraries(ftun-sniff-tls-test PRIVATE ftun_core ftun_options)
-  add_test(NAME sniff-tls-contract COMMAND ftun-sniff-tls-test)
-  add_executable(ftun-sniff-http-test tests/sniff_http.c)
-  target_include_directories(ftun-sniff-http-test PRIVATE src)
-  target_link_libraries(ftun-sniff-http-test PRIVATE ftun_core ftun_options)
-  add_test(NAME sniff-http-contract COMMAND ftun-sniff-http-test)
-  add_executable(ftun-sniff-test tests/sniff.c)
-  target_include_directories(ftun-sniff-test PRIVATE src)
-  target_link_libraries(ftun-sniff-test PRIVATE ftun_core ftun_options)
-  add_test(NAME sniff-contract COMMAND ftun-sniff-test)
-  set(ftun_untrusted_parser_sources tests/untrusted_parsers.c)
-  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
-    list(APPEND ftun_untrusted_parser_sources tests/frs_fixture.c)
-  endif()
-  add_executable(ftun-untrusted-parsers-test
-    ${ftun_untrusted_parser_sources})
-  target_include_directories(ftun-untrusted-parsers-test PRIVATE src tests)
-  target_link_libraries(ftun-untrusted-parsers-test PRIVATE
-    ftun_core ftun_options)
-  if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
-    target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
-      FTUN_TEST_DNS=1)
-  endif()
-  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
-    target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
-      FTUN_TEST_FRS=1)
-  endif()
-  if(FTUN_STATIC)
-    target_link_options(ftun-untrusted-parsers-test PRIVATE -static)
-  endif()
-  add_test(NAME untrusted-parsers-regression
-    COMMAND ftun-untrusted-parsers-test)
-  add_executable(ftun-group-cache-test tests/group_cache.c)
-  target_include_directories(ftun-group-cache-test PRIVATE src)
-  target_link_libraries(ftun-group-cache-test PRIVATE ftun_core ftun_options)
-  add_test(NAME group-cache-contract COMMAND ftun-group-cache-test)
-  add_executable(ftun-core-state-test tests/core_state.c)
-  target_include_directories(ftun-core-state-test PRIVATE src)
-  target_link_libraries(ftun-core-state-test PRIVATE ftun_core ftun_options)
-  add_test(NAME core-state-contract COMMAND ftun-core-state-test)
-  add_executable(ftun-logger-test tests/logger.c)
-  target_include_directories(ftun-logger-test PRIVATE src)
-  target_link_libraries(ftun-logger-test PRIVATE
-    ftun_core ftun_options Threads::Threads)
-  add_test(NAME logger-contract COMMAND ftun-logger-test)
-  add_executable(ftun-v05-integration-test tests/integration_v05.c)
-  target_include_directories(ftun-v05-integration-test PRIVATE src)
-  target_link_libraries(ftun-v05-integration-test PRIVATE
-    ftun_core ftun_options Threads::Threads)
-  add_test(NAME integration-v05-contract COMMAND ftun-v05-integration-test)
-  add_executable(ftun-control-resolver-test tests/control_resolver.c)
-  target_include_directories(ftun-control-resolver-test PRIVATE src)
-  target_link_libraries(ftun-control-resolver-test PRIVATE
-    ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-control-resolver-test PRIVATE -static)
-  endif()
-  add_test(NAME control-resolver-contract COMMAND ftun-control-resolver-test)
-  if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
-    add_executable(ftun-v04-frs-test tests/frs.c tests/frs_fixture.c)
-    target_include_directories(ftun-v04-frs-test PRIVATE src tests)
-    target_link_libraries(ftun-v04-frs-test PRIVATE ftun_core ftun_options)
-    add_test(NAME frs-contract COMMAND ftun-v04-frs-test)
-    add_executable(ftun-v04-frs-update-test
-      tests/frs_update.c tests/frs_fixture.c)
-    target_include_directories(ftun-v04-frs-update-test PRIVATE src tests)
-    target_link_libraries(ftun-v04-frs-update-test PRIVATE
-      ftun_core ftun_options)
-    add_test(NAME frs-update-contract COMMAND ftun-v04-frs-update-test)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-inbound-socks5-test tests/inbound_socks5.c)
+    target_include_directories(ftun-inbound-socks5-test PRIVATE src)
+    target_link_libraries(ftun-inbound-socks5-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME inbound-socks5-contract COMMAND ftun-inbound-socks5-test)
+    add_executable(ftun-inbound-mixed-test tests/inbound_mixed.c)
+    target_include_directories(ftun-inbound-mixed-test PRIVATE src)
+    target_link_libraries(ftun-inbound-mixed-test PRIVATE
+      ftun_runtime ftun_options)
+    add_test(NAME inbound-mixed-contract COMMAND ftun-inbound-mixed-test)
+    add_executable(ftun-v04-group-test tests/group.c)
+    target_include_directories(ftun-v04-group-test PRIVATE src)
+    target_link_libraries(ftun-v04-group-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME group-contract COMMAND ftun-v04-group-test)
+    add_executable(ftun-sniff-tls-test tests/sniff_tls.c)
+    target_include_directories(ftun-sniff-tls-test PRIVATE src)
+    target_link_libraries(ftun-sniff-tls-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME sniff-tls-contract COMMAND ftun-sniff-tls-test)
+    add_executable(ftun-sniff-http-test tests/sniff_http.c)
+    target_include_directories(ftun-sniff-http-test PRIVATE src)
+    target_link_libraries(ftun-sniff-http-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME sniff-http-contract COMMAND ftun-sniff-http-test)
+    add_executable(ftun-sniff-test tests/sniff.c)
+    target_include_directories(ftun-sniff-test PRIVATE src)
+    target_link_libraries(ftun-sniff-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME sniff-contract COMMAND ftun-sniff-test)
+    set(ftun_untrusted_parser_sources tests/untrusted_parsers.c)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      list(APPEND ftun_untrusted_parser_sources tests/frs_fixture.c)
+    endif()
+    add_executable(ftun-untrusted-parsers-test
+      ${ftun_untrusted_parser_sources})
+    target_include_directories(ftun-untrusted-parsers-test PRIVATE src tests)
+    target_link_libraries(ftun-untrusted-parsers-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+      target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
+        FTUN_TEST_DNS=1)
+    endif()
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      target_compile_definitions(ftun-untrusted-parsers-test PRIVATE
+        FTUN_TEST_FRS=1)
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(ftun-untrusted-parsers-test PRIVATE -static)
+    endif()
+    add_test(NAME untrusted-parsers-regression
+      COMMAND ftun-untrusted-parsers-test)
+    add_executable(ftun-group-cache-test tests/group_cache.c)
+    target_include_directories(ftun-group-cache-test PRIVATE src)
+    target_link_libraries(ftun-group-cache-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME group-cache-contract COMMAND ftun-group-cache-test)
+    add_executable(ftun-core-state-test tests/core_state.c)
+    target_include_directories(ftun-core-state-test PRIVATE src)
+    target_link_libraries(ftun-core-state-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME core-state-contract COMMAND ftun-core-state-test)
+    add_executable(ftun-logger-test tests/logger.c)
+    target_include_directories(ftun-logger-test PRIVATE src)
+    target_link_libraries(ftun-logger-test PRIVATE
+      ftun_runtime ftun_options Threads::Threads)
+    add_test(NAME logger-contract COMMAND ftun-logger-test)
+    add_executable(ftun-v05-integration-test tests/integration_v05.c)
+    target_include_directories(ftun-v05-integration-test PRIVATE src)
+    target_link_libraries(ftun-v05-integration-test PRIVATE
+      ftun_runtime ftun_options Threads::Threads)
+    add_test(NAME integration-v05-contract COMMAND ftun-v05-integration-test)
+    add_executable(ftun-control-resolver-test tests/control_resolver.c)
+    target_include_directories(ftun-control-resolver-test PRIVATE src)
+    target_link_libraries(ftun-control-resolver-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-control-resolver-test PRIVATE -static)
+    endif()
+    add_test(NAME control-resolver-contract COMMAND ftun-control-resolver-test)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      add_executable(ftun-v04-frs-test tests/frs.c tests/frs_fixture.c)
+      target_include_directories(ftun-v04-frs-test PRIVATE src tests)
+      target_link_libraries(ftun-v04-frs-test PRIVATE ftun_runtime ftun_options)
+      add_test(NAME frs-contract COMMAND ftun-v04-frs-test)
+      add_executable(ftun-v04-frs-update-test
+        tests/frs_update.c tests/frs_fixture.c)
+      target_include_directories(ftun-v04-frs-update-test PRIVATE src tests)
+      target_link_libraries(ftun-v04-frs-update-test PRIVATE
+        ftun_runtime ftun_options)
+      add_test(NAME frs-update-contract COMMAND ftun-v04-frs-update-test)
+    endif()
   endif()
   add_executable(ftun-v04-tls-test tests/tls.c)
   target_include_directories(ftun-v04-tls-test PRIVATE src)
   target_compile_definitions(ftun-v04-tls-test PRIVATE
     "FTUN_TEST_CERT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/third_party/wolfssl/certs")
   target_link_libraries(ftun-v04-tls-test PRIVATE
-    ftun_core ftun_options wolfssl::wolfssl)
+    ftun_runtime ftun_options wolfssl::wolfssl)
   add_test(NAME tls-wolfssl-contract COMMAND ftun-v04-tls-test)
   if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
     add_executable(ftun-v04-integration-test
       tests/integration_v04.c tests/frs_fixture.c)
     target_include_directories(ftun-v04-integration-test PRIVATE src tests)
     target_link_libraries(ftun-v04-integration-test PRIVATE
-      ftun_core ftun_options)
+      ftun_runtime ftun_options)
     add_test(NAME integration-v04-contract COMMAND ftun-v04-integration-test)
   endif()
-  add_executable(ftun-route-target-test tests/route_target.c)
-  target_include_directories(ftun-route-target-test PRIVATE src)
-  target_link_libraries(ftun-route-target-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-route-target-test PRIVATE -static)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-route-target-test tests/route_target.c)
+    target_include_directories(ftun-route-target-test PRIVATE src)
+    target_link_libraries(ftun-route-target-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-route-target-test PRIVATE -static)
+    endif()
+    add_test(NAME route-target-contract COMMAND ftun-route-target-test)
+    add_executable(ftun-route-rule-test tests/route_rule.c)
+    target_include_directories(ftun-route-rule-test PRIVATE src)
+    target_link_libraries(ftun-route-rule-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-route-rule-test PRIVATE -static)
+    endif()
+    add_test(NAME route-rule-contract COMMAND ftun-route-rule-test)
+    add_executable(ftun-route-router-test tests/route_router.c)
+    target_include_directories(ftun-route-router-test PRIVATE src)
+    target_link_libraries(ftun-route-router-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-route-router-test PRIVATE -static)
+    endif()
+    add_test(NAME route-router-contract COMMAND ftun-route-router-test)
+    add_executable(ftun-outbound-reject-test tests/outbound_reject.c)
+    target_include_directories(ftun-outbound-reject-test PRIVATE src)
+    target_link_libraries(ftun-outbound-reject-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-outbound-reject-test PRIVATE -static)
+    endif()
+    add_test(NAME outbound-reject-contract COMMAND ftun-outbound-reject-test)
+    add_executable(ftun-outbound-direct-test tests/outbound_direct.c)
+    target_include_directories(ftun-outbound-direct-test PRIVATE src)
+    target_link_libraries(ftun-outbound-direct-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-outbound-direct-test PRIVATE -static)
+    endif()
+    add_test(NAME outbound-direct-contract COMMAND ftun-outbound-direct-test)
+    add_executable(ftun-outbound-socks5-test tests/outbound_socks5.c)
+    target_include_directories(ftun-outbound-socks5-test PRIVATE src)
+    target_link_libraries(ftun-outbound-socks5-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-outbound-socks5-test PRIVATE -static)
+    endif()
+    add_test(NAME outbound-socks5-contract COMMAND ftun-outbound-socks5-test)
+    add_executable(ftun-outbound-test tests/outbound.c)
+    target_include_directories(ftun-outbound-test PRIVATE src)
+    target_link_libraries(ftun-outbound-test PRIVATE ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-outbound-test PRIVATE -static)
+    endif()
+    add_test(NAME outbound-contract COMMAND ftun-outbound-test)
   endif()
-  add_test(NAME route-target-contract COMMAND ftun-route-target-test)
-  add_executable(ftun-route-rule-test tests/route_rule.c)
-  target_include_directories(ftun-route-rule-test PRIVATE src)
-  target_link_libraries(ftun-route-rule-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-route-rule-test PRIVATE -static)
-  endif()
-  add_test(NAME route-rule-contract COMMAND ftun-route-rule-test)
-  add_executable(ftun-route-router-test tests/route_router.c)
-  target_include_directories(ftun-route-router-test PRIVATE src)
-  target_link_libraries(ftun-route-router-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-route-router-test PRIVATE -static)
-  endif()
-  add_test(NAME route-router-contract COMMAND ftun-route-router-test)
-  add_executable(ftun-outbound-reject-test tests/outbound_reject.c)
-  target_include_directories(ftun-outbound-reject-test PRIVATE src)
-  target_link_libraries(ftun-outbound-reject-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-outbound-reject-test PRIVATE -static)
-  endif()
-  add_test(NAME outbound-reject-contract COMMAND ftun-outbound-reject-test)
-  add_executable(ftun-outbound-direct-test tests/outbound_direct.c)
-  target_include_directories(ftun-outbound-direct-test PRIVATE src)
-  target_link_libraries(ftun-outbound-direct-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-outbound-direct-test PRIVATE -static)
-  endif()
-  add_test(NAME outbound-direct-contract COMMAND ftun-outbound-direct-test)
-  add_executable(ftun-outbound-socks5-test tests/outbound_socks5.c)
-  target_include_directories(ftun-outbound-socks5-test PRIVATE src)
-  target_link_libraries(ftun-outbound-socks5-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-outbound-socks5-test PRIVATE -static)
-  endif()
-  add_test(NAME outbound-socks5-contract COMMAND ftun-outbound-socks5-test)
-  add_executable(ftun-outbound-test tests/outbound.c)
-  target_include_directories(ftun-outbound-test PRIVATE src)
-  target_link_libraries(ftun-outbound-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-outbound-test PRIVATE -static)
-  endif()
-  add_test(NAME outbound-contract COMMAND ftun-outbound-test)
   if(TARGET ftun_libev)
     add_executable(ftun-libev-test tests/libev_adapter.c)
     target_include_directories(ftun-libev-test PRIVATE src)
-    target_link_libraries(ftun-libev-test PRIVATE ftun_core ftun_options Threads::Threads)
+    target_link_libraries(ftun-libev-test PRIVATE ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-libev-test PRIVATE -static)
     endif()
@@ -703,7 +974,7 @@ if(BUILD_TESTING)
   endif()
   add_executable(ftun-config-parser-test tests/config_parser.c)
   target_include_directories(ftun-config-parser-test PRIVATE src)
-  target_link_libraries(ftun-config-parser-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-config-parser-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-config-parser-test PRIVATE -static)
   endif()
@@ -711,31 +982,38 @@ if(BUILD_TESTING)
     ${CMAKE_CURRENT_SOURCE_DIR}/examples/full.json)
   add_executable(ftun-config-validate-test tests/config_validate.c)
   target_include_directories(ftun-config-validate-test PRIVATE src)
-  target_link_libraries(ftun-config-validate-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-config-validate-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-config-validate-test PRIVATE -static)
   endif()
-  add_test(NAME config-validate COMMAND ftun-config-validate-test
-    ${CMAKE_CURRENT_SOURCE_DIR}/examples/full.json)
   add_executable(ftun-config-compile-test tests/config_compile.c)
   target_include_directories(ftun-config-compile-test PRIVATE src)
-  target_link_libraries(ftun-config-compile-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-config-compile-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-config-compile-test PRIVATE -static)
   endif()
-  add_test(NAME config-compile COMMAND ftun-config-compile-test
-    ${CMAKE_CURRENT_SOURCE_DIR}/examples/full.json)
   add_executable(ftun-config-load-test tests/config_load.c)
   target_include_directories(ftun-config-load-test PRIVATE src)
-  target_link_libraries(ftun-config-load-test PRIVATE ftun_core ftun_options)
+  target_link_libraries(ftun-config-load-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
     target_link_options(ftun-config-load-test PRIVATE -static)
   endif()
-  add_test(NAME config-load COMMAND ftun-config-load-test)
+  # 这三项深入验证完整配置的 FRS/DNS/FakeIP/TUN 计划；裁剪档由
+  # build-modules-capabilities 覆盖缺席能力的拒绝语义。
+  if(FTUN_MODULE_DNS STREQUAL "BUILTIN" AND
+     FTUN_MODULE_FAKEIP STREQUAL "BUILTIN" AND
+     FTUN_MODULE_TUN STREQUAL "BUILTIN" AND
+     FTUN_MODULE_FRS STREQUAL "BUILTIN")
+    add_test(NAME config-validate COMMAND ftun-config-validate-test
+      ${CMAKE_CURRENT_SOURCE_DIR}/examples/full.json)
+    add_test(NAME config-compile COMMAND ftun-config-compile-test
+      ${CMAKE_CURRENT_SOURCE_DIR}/examples/full.json)
+    add_test(NAME config-load COMMAND ftun-config-load-test)
+  endif()
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(ftun-platform-file-test tests/platform_file.c)
     target_include_directories(ftun-platform-file-test PRIVATE src)
-    target_link_libraries(ftun-platform-file-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-platform-file-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-platform-file-test PRIVATE -static)
     endif()
@@ -744,7 +1022,7 @@ if(BUILD_TESTING)
       tests/platform_linux_socket_protect.c)
     target_include_directories(ftun-platform-linux-socket-protect-test PRIVATE src)
     target_link_libraries(ftun-platform-linux-socket-protect-test PRIVATE
-      ftun_core ftun_options)
+      ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-platform-linux-socket-protect-test PRIVATE -static)
     endif()
@@ -754,7 +1032,7 @@ if(BUILD_TESTING)
       tests/platform_system_resolver.c)
     target_include_directories(ftun-platform-system-resolver-test PRIVATE src)
     target_link_libraries(ftun-platform-system-resolver-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
+      ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-platform-system-resolver-test PRIVATE -static)
     endif()
@@ -765,7 +1043,7 @@ if(BUILD_TESTING)
     add_executable(ftun-fakeip-store-test tests/fakeip_store.c)
     target_include_directories(ftun-fakeip-store-test PRIVATE src)
     target_link_libraries(ftun-fakeip-store-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
+      ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-fakeip-store-test PRIVATE -static)
     endif()
@@ -773,7 +1051,7 @@ if(BUILD_TESTING)
     add_executable(ftun-fakeip-snapshot-test tests/fakeip_snapshot.c)
     target_include_directories(ftun-fakeip-snapshot-test PRIVATE src)
     target_link_libraries(ftun-fakeip-snapshot-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
+      ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-fakeip-snapshot-test PRIVATE -static)
     endif()
@@ -781,52 +1059,72 @@ if(BUILD_TESTING)
     add_executable(ftun-fakeip-test tests/fakeip.c)
     target_include_directories(ftun-fakeip-test PRIVATE src)
     target_link_libraries(ftun-fakeip-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
+      ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-fakeip-test PRIVATE -static)
     endif()
     add_test(NAME fakeip-contract COMMAND ftun-fakeip-test)
   endif()
   if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    add_executable(ftun-dns-service-test
+      tests/dns_service.c
+      $<TARGET_OBJECTS:ftun_core>
+      $<TARGET_OBJECTS:ftun_shared_services>
+      $<TARGET_OBJECTS:ftun_module_dns>)
+    target_include_directories(ftun-dns-service-test PRIVATE include src)
+    target_compile_definitions(ftun-dns-service-test PRIVATE
+      FTUN_HAVE_MODULE_DNS=1)
+    target_link_libraries(ftun-dns-service-test PRIVATE
+      ftun_options Threads::Threads ftun_cjson wolfssl::wolfssl)
+    if(TARGET ftun_libev)
+      target_link_libraries(ftun-dns-service-test PRIVATE ftun_libev)
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(ftun-dns-service-test PRIVATE -static)
+    endif()
+    add_test(NAME dns-service-independent-contract
+      COMMAND ftun-dns-service-test)
     add_executable(ftun-dns-cache-test tests/dns_cache.c)
     target_include_directories(ftun-dns-cache-test PRIVATE src)
-    target_link_libraries(ftun-dns-cache-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-dns-cache-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-dns-cache-test PRIVATE -static)
     endif()
     add_test(NAME dns-cache-contract COMMAND ftun-dns-cache-test)
-    add_executable(ftun-dns-server-test tests/dns_server.c)
-    target_include_directories(ftun-dns-server-test PRIVATE src)
-    target_link_libraries(ftun-dns-server-test PRIVATE ftun_core ftun_options)
-    if(FTUN_STATIC)
-      target_link_options(ftun-dns-server-test PRIVATE -static)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-dns-server-test tests/dns_server.c)
+      target_include_directories(ftun-dns-server-test PRIVATE src)
+      target_link_libraries(ftun-dns-server-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-dns-server-test PRIVATE -static)
+      endif()
+      add_test(NAME dns-server-contract COMMAND ftun-dns-server-test)
+      add_executable(ftun-dns-dispatch-test tests/dns_dispatch.c)
+      target_include_directories(ftun-dns-dispatch-test PRIVATE src)
+      target_link_libraries(ftun-dns-dispatch-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-dns-dispatch-test PRIVATE -static)
+      endif()
+      add_test(NAME dns-dispatch-contract COMMAND ftun-dns-dispatch-test)
+      add_executable(ftun-dns-listener-test tests/dns_listener.c)
+      target_include_directories(ftun-dns-listener-test PRIVATE src)
+      target_link_libraries(ftun-dns-listener-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-dns-listener-test PRIVATE -static)
+      endif()
+      add_test(NAME dns-listener-contract COMMAND ftun-dns-listener-test)
+      add_executable(ftun-v03-integration-test tests/integration_v03.c)
+      target_include_directories(ftun-v03-integration-test PRIVATE src)
+      target_link_libraries(ftun-v03-integration-test PRIVATE
+        ftun_runtime ftun_options Threads::Threads)
+      if(FTUN_STATIC)
+        target_link_options(ftun-v03-integration-test PRIVATE -static)
+      endif()
+      add_test(NAME integration-v03-contract COMMAND ftun-v03-integration-test)
     endif()
-    add_test(NAME dns-server-contract COMMAND ftun-dns-server-test)
-    add_executable(ftun-dns-dispatch-test tests/dns_dispatch.c)
-    target_include_directories(ftun-dns-dispatch-test PRIVATE src)
-    target_link_libraries(ftun-dns-dispatch-test PRIVATE ftun_core ftun_options)
-    if(FTUN_STATIC)
-      target_link_options(ftun-dns-dispatch-test PRIVATE -static)
-    endif()
-    add_test(NAME dns-dispatch-contract COMMAND ftun-dns-dispatch-test)
-    add_executable(ftun-dns-listener-test tests/dns_listener.c)
-    target_include_directories(ftun-dns-listener-test PRIVATE src)
-    target_link_libraries(ftun-dns-listener-test PRIVATE ftun_core ftun_options)
-    if(FTUN_STATIC)
-      target_link_options(ftun-dns-listener-test PRIVATE -static)
-    endif()
-    add_test(NAME dns-listener-contract COMMAND ftun-dns-listener-test)
-    add_executable(ftun-v03-integration-test tests/integration_v03.c)
-    target_include_directories(ftun-v03-integration-test PRIVATE src)
-    target_link_libraries(ftun-v03-integration-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
-    if(FTUN_STATIC)
-      target_link_options(ftun-v03-integration-test PRIVATE -static)
-    endif()
-    add_test(NAME integration-v03-contract COMMAND ftun-v03-integration-test)
     add_executable(ftun-dns-wire-test tests/dns_wire.c)
     target_include_directories(ftun-dns-wire-test PRIVATE src)
-    target_link_libraries(ftun-dns-wire-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-dns-wire-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-dns-wire-test PRIVATE -static)
     endif()
@@ -834,74 +1132,125 @@ if(BUILD_TESTING)
     add_executable(ftun-dns-bootstrap-test tests/dns_bootstrap.c)
     target_include_directories(ftun-dns-bootstrap-test PRIVATE src)
     target_link_libraries(ftun-dns-bootstrap-test PRIVATE
-      ftun_core ftun_options Threads::Threads)
+      ftun_runtime ftun_options Threads::Threads)
     if(FTUN_STATIC)
       target_link_options(ftun-dns-bootstrap-test PRIVATE -static)
     endif()
     add_test(NAME dns-bootstrap-contract COMMAND ftun-dns-bootstrap-test)
-    add_executable(ftun-dns-resolver-test tests/dns_resolver.c)
-    target_include_directories(ftun-dns-resolver-test PRIVATE src)
-    target_link_libraries(ftun-dns-resolver-test PRIVATE ftun_core ftun_options)
-    if(FTUN_STATIC)
-      target_link_options(ftun-dns-resolver-test PRIVATE -static)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-dns-resolver-test tests/dns_resolver.c)
+      target_include_directories(ftun-dns-resolver-test PRIVATE src)
+      target_link_libraries(ftun-dns-resolver-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-dns-resolver-test PRIVATE -static)
+      endif()
+      add_test(NAME dns-resolver-contract COMMAND ftun-dns-resolver-test)
     endif()
-    add_test(NAME dns-resolver-contract COMMAND ftun-dns-resolver-test)
   endif()
   if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
-    add_executable(ftun-inbound-test tests/inbound.c)
-    target_include_directories(ftun-inbound-test PRIVATE src)
-    target_link_libraries(ftun-inbound-test PRIVATE ftun_core ftun_options)
-    if(FTUN_STATIC)
-      target_link_options(ftun-inbound-test PRIVATE -static)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-inbound-test tests/inbound.c)
+      target_include_directories(ftun-inbound-test PRIVATE src)
+      target_link_libraries(ftun-inbound-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-inbound-test PRIVATE -static)
+      endif()
+      add_test(NAME inbound-contract COMMAND ftun-inbound-test)
     endif()
-    add_test(NAME inbound-contract COMMAND ftun-inbound-test)
     add_executable(ftun-platform-linux-tun-test tests/platform_linux_tun.c)
     target_include_directories(ftun-platform-linux-tun-test PRIVATE src)
-    target_link_libraries(ftun-platform-linux-tun-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-platform-linux-tun-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-platform-linux-tun-test PRIVATE -static)
     endif()
     add_test(NAME platform-linux-tun COMMAND ftun-platform-linux-tun-test)
     add_executable(ftun-platform-linux-route-test tests/platform_linux_route.c)
     target_include_directories(ftun-platform-linux-route-test PRIVATE src)
-    target_link_libraries(ftun-platform-linux-route-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-platform-linux-route-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-platform-linux-route-test PRIVATE -static)
     endif()
     add_test(NAME platform-linux-route COMMAND ftun-platform-linux-route-test)
+    add_executable(ftun-platform-linux-route-async-test
+      tests/platform_linux_route_async.c)
+    target_include_directories(ftun-platform-linux-route-async-test PRIVATE src)
+    target_link_libraries(ftun-platform-linux-route-async-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-platform-linux-route-async-test PRIVATE -static)
+    endif()
+    add_test(NAME platform-linux-route-async
+      COMMAND ftun-platform-linux-route-async-test)
     add_executable(ftun-tun-port-test tests/tun_port.c)
     target_include_directories(ftun-tun-port-test PRIVATE src)
-    target_link_libraries(ftun-tun-port-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-tun-port-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-tun-port-test PRIVATE -static)
     endif()
     add_test(NAME tun-packet-port COMMAND ftun-tun-port-test)
-    add_executable(ftun-lwip-adapter-test tests/lwip_adapter.c)
-    target_include_directories(ftun-lwip-adapter-test PRIVATE src)
-    target_link_libraries(ftun-lwip-adapter-test PRIVATE ftun_core ftun_options)
+    add_executable(ftun-tun-service-test tests/tun_service.c)
+    target_include_directories(ftun-tun-service-test PRIVATE src)
+    target_link_libraries(ftun-tun-service-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
-      target_link_options(ftun-lwip-adapter-test PRIVATE -static)
+      target_link_options(ftun-tun-service-test PRIVATE -static)
     endif()
-    add_test(NAME tun-lwip-adapter COMMAND ftun-lwip-adapter-test)
-    add_executable(ftun-inbound-tun-test tests/inbound_tun.c)
-    target_include_directories(ftun-inbound-tun-test PRIVATE src)
-    target_link_libraries(ftun-inbound-tun-test PRIVATE ftun_core ftun_options)
+    add_test(NAME tun-service-contract COMMAND ftun-tun-service-test)
+    add_executable(ftun-tun-owner-test tests/tun_owner.c)
+    target_include_directories(ftun-tun-owner-test PRIVATE src)
+    target_link_libraries(ftun-tun-owner-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
-      target_link_options(ftun-inbound-tun-test PRIVATE -static)
+      target_link_options(ftun-tun-owner-test PRIVATE -static)
     endif()
-    add_test(NAME inbound-tun-contract COMMAND ftun-inbound-tun-test)
-    add_executable(ftun-udp-session-test tests/udp_session.c)
-    target_include_directories(ftun-udp-session-test PRIVATE src)
-    target_link_libraries(ftun-udp-session-test PRIVATE ftun_core ftun_options)
+    add_test(NAME tun-owner-composition-contract COMMAND ftun-tun-owner-test)
+    if(FTUN_MODULE_PROXY STREQUAL "OFF")
+      # 真实 Mesh 尚未进入产品；此测试用窄 L3 provider 模拟未来 consumer。
+      add_test(NAME mesh-provider-fixture-contract COMMAND ftun-tun-owner-test)
+    endif()
+    # raw-L3 仅为共享 TUN 生产接口的测试消费者，不进入能力清单。
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-tun-shared-test tests/tun_shared.c)
+      target_include_directories(ftun-tun-shared-test PRIVATE src)
+      target_link_libraries(ftun-tun-shared-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-tun-shared-test PRIVATE -static)
+      endif()
+      add_test(NAME tun-shared-consumers-contract COMMAND ftun-tun-shared-test)
+    endif()
+    add_executable(ftun-tun-path-test tests/tun_path.c)
+    target_include_directories(ftun-tun-path-test PRIVATE src)
+    target_link_libraries(ftun-tun-path-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
-      target_link_options(ftun-udp-session-test PRIVATE -static)
+      target_link_options(ftun-tun-path-test PRIVATE -static)
     endif()
-    add_test(NAME tun-udp-flow-contract COMMAND ftun-udp-session-test)
-    if(UNIX)
+    add_test(NAME tun-path-contract COMMAND ftun-tun-path-test)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-lwip-adapter-test tests/lwip_adapter.c)
+      target_include_directories(ftun-lwip-adapter-test PRIVATE src)
+      target_link_libraries(ftun-lwip-adapter-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-lwip-adapter-test PRIVATE -static)
+      endif()
+      add_test(NAME tun-lwip-adapter COMMAND ftun-lwip-adapter-test)
+      add_executable(ftun-inbound-tun-test tests/inbound_tun.c)
+      target_include_directories(ftun-inbound-tun-test PRIVATE src)
+      target_link_libraries(ftun-inbound-tun-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-inbound-tun-test PRIVATE -static)
+      endif()
+      add_test(NAME inbound-tun-contract COMMAND ftun-inbound-tun-test)
+      add_executable(ftun-udp-session-test tests/udp_session.c)
+      target_include_directories(ftun-udp-session-test PRIVATE src)
+      target_link_libraries(ftun-udp-session-test PRIVATE ftun_runtime ftun_options)
+      if(FTUN_STATIC)
+        target_link_options(ftun-udp-session-test PRIVATE -static)
+      endif()
+      add_test(NAME tun-udp-flow-contract COMMAND ftun-udp-session-test)
+    endif()
+    if(UNIX AND FTUN_MODULE_PROXY STREQUAL "BUILTIN")
       add_executable(ftun-linux-integration-test tests/integration_linux.c)
       target_include_directories(ftun-linux-integration-test PRIVATE src)
       target_link_libraries(ftun-linux-integration-test PRIVATE
-        ftun_core ftun_options Threads::Threads)
+        ftun_runtime ftun_options Threads::Threads)
       if(FTUN_STATIC)
         target_link_options(ftun-linux-integration-test PRIVATE -static)
       endif()
@@ -926,13 +1275,13 @@ if(BUILD_TESTING)
             ENVIRONMENT "FTUN_RELEASE_RESOURCE_LIMIT_KIB=262144")
         endif()
         add_executable(ftun-send-eagain-test
-          src/main.c src/cli/cli.c tests/send_eagain_wrap.c)
+          src/app/main.c tests/send_eagain_wrap.c)
         target_include_directories(ftun-send-eagain-test PRIVATE src)
         target_compile_definitions(ftun-send-eagain-test PRIVATE
           ${ftun_module_definitions}
           FTUN_SOURCE_REVISION="${ftun_source_revision}")
         target_link_libraries(ftun-send-eagain-test PRIVATE
-          ftun_core ftun_options)
+          ftun_runtime ftun_options)
         target_link_options(ftun-send-eagain-test PRIVATE -Wl,--wrap=send)
         if(FTUN_STATIC)
           target_link_options(ftun-send-eagain-test PRIVATE -static)
@@ -964,6 +1313,12 @@ if(BUILD_TESTING)
                    $<TARGET_FILE:ftun-linux-integration-test>)
       set_tests_properties(dns-tcp-concurrency-production PROPERTIES
         TIMEOUT 15 RESOURCE_LOCK ftun_host_socket)
+      add_test(NAME dns-fairness-production
+        COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/dns_fairness.sh
+                   $<TARGET_FILE:ftun>
+                   $<TARGET_FILE:ftun-linux-integration-test>)
+      set_tests_properties(dns-fairness-production PROPERTIES
+        TIMEOUT 15 RESOURCE_LOCK ftun_host_socket)
       add_test(NAME reload-async-production
         COMMAND sh ${CMAKE_CURRENT_SOURCE_DIR}/tests/reload_async.sh
                    $<TARGET_FILE:ftun>
@@ -983,22 +1338,28 @@ if(BUILD_TESTING)
   if(UNIX)
     add_executable(ftun-time-test tests/monotonic_time.c)
     target_include_directories(ftun-time-test PRIVATE src)
-    target_link_libraries(ftun-time-test PRIVATE ftun_core ftun_options)
+    target_link_libraries(ftun-time-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)
       target_link_options(ftun-time-test PRIVATE -static)
     endif()
     add_test(NAME monotonic-time COMMAND ftun-time-test)
   endif()
-  add_executable(ftun-performance-test tests/performance.c)
-  target_include_directories(ftun-performance-test PRIVATE src)
-  target_link_libraries(ftun-performance-test PRIVATE ftun_core ftun_options)
-  if(FTUN_STATIC)
-    target_link_options(ftun-performance-test PRIVATE -static)
-  endif()
-  if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
-    add_test(NAME performance-baseline COMMAND ftun-performance-test)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-performance-test tests/performance.c)
+    target_include_directories(ftun-performance-test PRIVATE src)
+    target_link_libraries(ftun-performance-test PRIVATE
+      ftun_runtime ftun_options)
+    if(FTUN_STATIC)
+      target_link_options(ftun-performance-test PRIVATE -static)
+    endif()
+    if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+      add_test(NAME performance-baseline COMMAND ftun-performance-test)
+    endif()
   endif()
   set(ftun_cli_capabilities "core")
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    string(APPEND ftun_cli_capabilities ",proxy")
+  endif()
   foreach(ftun_module DNS FAKEIP TUN FRS)
     if(FTUN_MODULE_${ftun_module} STREQUAL "BUILTIN")
       string(TOLOWER "${ftun_module}" ftun_capability)
@@ -1014,7 +1375,7 @@ if(BUILD_TESTING)
   set_tests_properties(cli-help PROPERTIES PASS_REGULAR_EXPRESSION "ftun check -c CONFIG")
   add_test(NAME cli-refuses-run COMMAND ftun run)
   set_tests_properties(cli-refuses-run PROPERTIES WILL_FAIL TRUE)
-  if(UNIX)
+  if(UNIX AND FTUN_MODULE_PROXY STREQUAL "BUILTIN")
     if(FTUN_MODULE_FAKEIP STREQUAL "BUILTIN")
       set(ftun_cli_dns_enabled 1)
     else()
@@ -1030,10 +1391,45 @@ if(BUILD_TESTING)
   endif()
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME core-proxy-boundary
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_proxy_boundary.py
+        ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME build-target-boundaries
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_target_boundaries.py
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json
+        ${CMAKE_CURRENT_BINARY_DIR}/ftun-build-targets.txt)
+    add_test(NAME structure-boundaries
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/structure_boundaries.py
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json
+        ${CMAKE_CURRENT_BINARY_DIR}/ftun-build-targets.txt
+        ${ftun_layer_policy})
+    add_test(NAME structure-boundaries-illegal-include
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/structure_boundaries.py
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json
+        ${CMAKE_CURRENT_BINARY_DIR}/ftun-build-targets.txt
+        ${ftun_layer_policy} --self-test illegal-include)
+    add_test(NAME structure-boundaries-illegal-source
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/structure_boundaries.py
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CURRENT_BINARY_DIR}/compile_commands.json
+        ${CMAKE_CURRENT_BINARY_DIR}/ftun-build-targets.txt
+        ${ftun_layer_policy} --self-test illegal-source)
     add_test(NAME dependency-lock
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/dependency_lock.py
         ${CMAKE_CURRENT_SOURCE_DIR})
+    add_test(NAME cross-build-contract
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/cross_build_contract.py
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_COMMAND})
     add_test(NAME config-schema COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/config_schema.py)
     if(TARGET ftun_libev)
       add_test(NAME libev-vendor
@@ -1063,7 +1459,40 @@ if(BUILD_TESTING)
           $<TARGET_FILE:ftun>
           ${CMAKE_CURRENT_BINARY_DIR}/ftun-build-modules.txt
           ${ftun_expect_static})
-      if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$")
+      if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+        add_test(NAME proxy-reload-established-flows
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_qualification.py reload
+            $<TARGET_FILE:ftun>)
+        set_tests_properties(proxy-reload-established-flows PROPERTIES
+          RESOURCE_LOCK "ftun_host_socket;ftun_capacity"
+          SKIP_RETURN_CODE 77 TIMEOUT 60)
+      endif()
+      if(CMAKE_BUILD_TYPE MATCHES "^(Release|MinSizeRel)$" AND
+         FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+        add_test(NAME core-capacity-production
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_capacity.py
+            $<TARGET_FILE:ftun>)
+        set_tests_properties(core-capacity-production PROPERTIES
+          RESOURCE_LOCK "ftun_host_socket;ftun_capacity"
+          SKIP_RETURN_CODE 77 TIMEOUT 240)
+        add_test(NAME core-qualification-formal
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_qualification.py formal
+            $<TARGET_FILE:ftun>)
+        set_tests_properties(core-qualification-formal PROPERTIES
+          RESOURCE_LOCK "ftun_host_socket;ftun_capacity"
+          SKIP_RETURN_CODE 77 TIMEOUT 300)
+        if(UNIX AND FTUN_MODULE_TUN STREQUAL "BUILTIN")
+          add_test(NAME core-capacity-matrix-production
+            COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_capacity_matrix.py
+              $<TARGET_FILE:ftun>)
+          set_tests_properties(core-capacity-matrix-production PROPERTIES
+            RESOURCE_LOCK "ftun_linux_namespace;ftun_capacity"
+            SKIP_RETURN_CODE 77 TIMEOUT 420)
+        endif()
         add_test(NAME release-resource-profile
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/resource_profile.py
@@ -1071,6 +1500,13 @@ if(BUILD_TESTING)
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/cli-run.json.in)
         set_tests_properties(release-resource-profile PROPERTIES
           RESOURCE_LOCK ftun_host_socket)
+        add_test(NAME core-baseline-profile
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_baseline.py
+            $<TARGET_FILE:ftun>)
+        set_tests_properties(core-baseline-profile PROPERTIES
+          ENVIRONMENT "FTUN_BASELINE_RUNS=1;FTUN_BASELINE_ACTIVE_SECONDS=1;FTUN_BASELINE_TOTAL_TIMEOUT_SECONDS=120"
+          RESOURCE_LOCK ftun_host_socket TIMEOUT 180)
       endif()
     endif()
     # Optional development dependency: skip explicitly if jsonschema is absent.
@@ -1082,6 +1518,7 @@ if(BUILD_TESTING)
       -DFTUN_MATRIX_DIR=${CMAKE_CURRENT_BINARY_DIR}/module-matrix
       -DFTUN_MATRIX_GENERATOR=${CMAKE_GENERATOR}
       -DFTUN_MATRIX_COMPILER=${CMAKE_C_COMPILER}
+      -DFTUN_MATRIX_PYTHON=${Python3_EXECUTABLE}
       -P ${CMAKE_CURRENT_SOURCE_DIR}/tests/build_modules.cmake)
   # 工程检查不能因运行环境或工具故障无限阻塞。
   get_property(ftun_tests DIRECTORY PROPERTY TESTS)
@@ -1095,5 +1532,8 @@ if(BUILD_TESTING)
   endif()
   if(TEST idle-tcp-resource-profile)
     set_tests_properties(idle-tcp-resource-profile PROPERTIES TIMEOUT 75)
+  endif()
+  if(TEST core-baseline-profile)
+    set_tests_properties(core-baseline-profile PROPERTIES TIMEOUT 180)
   endif()
 endif()

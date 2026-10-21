@@ -17,6 +17,7 @@ typedef struct {
   int calls;
   int wakeups;
   int recursive_again;
+  size_t busy_requeues;
   uint32_t events;
 } event_state_t;
 
@@ -42,6 +43,18 @@ static void deferred(void *user)
   state->calls++;
   if (ftun_event_loop_poll(state->loop, 0u, 1u, &callbacks) == FTUN_E_AGAIN &&
       callbacks == 0u) state->recursive_again++;
+}
+
+static void busy_deferred(void *user)
+{
+  event_state_t *state = (event_state_t *)user;
+  state->calls++;
+  if (state->busy_requeues != 0u) {
+    state->busy_requeues--;
+    if (ftun_event_defer(state->loop, busy_deferred, state) != FTUN_OK) {
+      state->calls = -1000;
+    }
+  }
 }
 
 static void source_ready(ftun_event_source_t *source, uint32_t events, void *user)
@@ -86,6 +99,7 @@ int main(void)
   state.calls = 0;
   state.wakeups = 0;
   state.recursive_again = 0;
+  state.busy_requeues = 0u;
   state.events = 0u;
 
   CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
@@ -117,6 +131,11 @@ int main(void)
   (void)pthread_mutex_lock(&state.mutex);
   CHECK(state.wakeups == 2);
   (void)pthread_mutex_unlock(&state.mutex);
+  CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK &&
+        usage.wakeups == 2u && usage.deferred_count ==
+          usage.deferred_capacity - 10u && usage.polls == 1u &&
+        usage.callbacks == 10u && usage.quota_exhaustions == 1u &&
+        usage.max_callbacks_per_poll == 10u);
   CHECK(ftun_event_loop_poll(loop, 0u, SIZE_MAX, &callbacks) == FTUN_OK);
   CHECK(callbacks == usage.deferred_capacity - 10u);
   CHECK(state.calls == (int)usage.deferred_capacity &&
@@ -157,12 +176,31 @@ int main(void)
   CHECK(ftun_event_io_ready(timer, FTUN_EVENT_READ) == FTUN_E_INVALID);
   CHECK(ftun_event_loop_poll(loop, 99u, 2u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 0u && state.calls == 0);
-  CHECK(ftun_event_loop_poll(loop, 100u, 2u, &callbacks) == FTUN_OK);
+  CHECK(ftun_event_loop_poll(loop, 110u, 2u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 1u && state.calls == 1 && state.events == FTUN_EVENT_TIMER);
+  CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK &&
+        usage.max_timer_lateness_ms == 10u);
   CHECK(ftun_event_loop_poll(loop, 101u, 2u, &callbacks) == FTUN_OK);
   CHECK(callbacks == 0u && state.calls == 1);
   CHECK(ftun_event_source_cancel(&timer) == FTUN_OK && timer == NULL);
   CHECK(ftun_event_source_cancel(&timer) == FTUN_OK);
+
+  /* A permanently busy deferred lane must not starve an already-ready I/O
+   * source.  The dispatcher alternates lanes within the same quota. */
+  state.calls = 0;
+  state.events = 0u;
+  state.busy_requeues = 8u;
+  CHECK(ftun_event_defer(loop, busy_deferred, &state) == FTUN_OK);
+  CHECK(ftun_event_io_ready(io, FTUN_EVENT_WRITE) == FTUN_OK);
+  CHECK(ftun_event_loop_poll(loop, 200u, 2u, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 2u && state.calls == 2 &&
+        state.events == FTUN_EVENT_WRITE);
+  while (state.busy_requeues != 0u) {
+    CHECK(ftun_event_loop_poll(loop, 200u, 2u, &callbacks) == FTUN_OK &&
+          callbacks != 0u);
+  }
+  CHECK(ftun_event_loop_poll(loop, 200u, 2u, &callbacks) == FTUN_OK &&
+        callbacks == 0u);
 
   CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK);
   sources = (ftun_event_source_t **)calloc(usage.source_capacity,
@@ -195,17 +233,38 @@ int main(void)
   free(sources);
   CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK);
   CHECK(usage.deferred_count == 0u && usage.source_count == 0u &&
-        !usage.accepting && usage.stopped);
+        usage.wakeups >= 3u && !usage.accepting && usage.stopped);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK && loop == NULL);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
 
+  sources = (ftun_event_source_t **)calloc(3u, sizeof(*sources));
+  CHECK(sources != NULL);
+  CHECK(ftun_event_loop_create_with_capacity(NULL, 3u, &loop) == FTUN_OK);
+  CHECK(ftun_event_loop_get_usage(loop, &usage) == FTUN_OK &&
+        usage.source_capacity == 3u);
+  for (index = 0u; index < 3u; index++) {
+    CHECK(ftun_event_timer_start(loop, UINT64_MAX, source_ready, &state,
+                                 &sources[index]) == FTUN_OK);
+  }
+  CHECK(ftun_event_timer_start(loop, UINT64_MAX, source_ready, &state,
+                               &timer) == FTUN_E_LIMIT && timer == NULL);
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
+  for (index = 0u; index < 3u; index++) {
+    CHECK(ftun_event_source_cancel(&sources[index]) == FTUN_OK);
+  }
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  free(sources);
+
   loop = (ftun_event_loop_t *)(uintptr_t)1;
   CHECK(ftun_event_loop_create(NULL, NULL) == FTUN_E_INVALID);
+  CHECK(ftun_event_loop_create_with_capacity(NULL, 0u, &loop) ==
+        FTUN_E_INVALID && loop == NULL);
   CHECK(ftun_event_loop_get_usage(NULL, &usage) == FTUN_E_INVALID);
   CHECK(usage.deferred_capacity == 0u && usage.source_count == 0u);
   CHECK(ftun_event_loop_poll(NULL, 0u, 1u, &callbacks) == FTUN_E_INVALID);
   CHECK(callbacks == 0u);
   CHECK(ftun_event_source_cancel(NULL) == FTUN_E_INVALID);
+  loop = (ftun_event_loop_t *)(uintptr_t)1;
   CHECK(ftun_event_loop_destroy(NULL) == FTUN_E_INVALID);
   CHECK(loop == (ftun_event_loop_t *)(uintptr_t)1);
   CHECK(pthread_mutex_destroy(&state.mutex) == 0);

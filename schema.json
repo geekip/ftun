@@ -29,6 +29,9 @@
     "sniff": {
       "$ref": "#/$defs/Sniff"
     },
+    "tun": {
+      "$ref": "#/$defs/TunDevice"
+    },
     "inbounds": {
       "type": "array",
       "items": {
@@ -114,6 +117,39 @@
         "properties": {
           "frs": {
             "$ref": "#/$defs/FRS"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "not": {
+          "required": [
+            "tun"
+          ]
+        }
+      },
+      "then": {
+        "properties": {
+          "inbounds": {
+            "items": {
+              "if": {
+                "properties": {
+                  "type": {
+                    "const": "tun"
+                  }
+                },
+                "required": [
+                  "type"
+                ]
+              },
+              "then": {
+                "required": [
+                  "interface",
+                  "ipv4"
+                ]
+              }
+            }
           }
         }
       }
@@ -260,6 +296,11 @@
           "type": "boolean",
           "default": true,
           "description": "Group/Health 状态持久化开关，独立于 FakeIP persist 和未来 api.cache。"
+        },
+        "capacity": {
+          "$ref": "#/$defs/Capacity",
+          "default": {},
+          "description": "Proxy 运行时对象容量。三个维度分别计数。"
         }
       },
       "additionalProperties": false
@@ -578,6 +619,64 @@
         "address"
       ]
     },
+    "TunDevice": {
+      "title": "共享 TUN 设备",
+      "type": "object",
+      "properties": {
+        "interface": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 15,
+          "description": "平台 TUN 设备名。"
+        },
+        "mtu": {
+          "type": "integer",
+          "minimum": 1,
+          "default": 1500
+        },
+        "ipv4": {
+          "$ref": "#/$defs/TunIPv4"
+        },
+        "auto-route": {
+          "type": "boolean",
+          "default": false
+        },
+        "strict-route": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "interface",
+        "ipv4"
+      ],
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "strict-route": {
+                "const": true
+              }
+            },
+            "required": [
+              "strict-route"
+            ]
+          },
+          "then": {
+            "required": [
+              "auto-route"
+            ],
+            "properties": {
+              "auto-route": {
+                "const": true
+              }
+            }
+          }
+        }
+      ],
+      "description": "物理 TUN 的规范配置。旧 inbounds[].type=tun 的 interface/ipv4 字段兼容读取但已弃用。"
+    },
     "TunInbound": {
       "title": "TUN 入站",
       "type": "object",
@@ -632,9 +731,7 @@
       "additionalProperties": false,
       "required": [
         "name",
-        "type",
-        "interface",
-        "ipv4"
+        "type"
       ],
       "allOf": [
         {
@@ -979,6 +1076,34 @@
         }
       ],
       "description": "First Match Wins。保留配置顺序，解析失败终止；IP 命中后只拨命中子集。无正则、no-resolve 或 INBOUND matcher。"
+    },
+    "Capacity": {
+      "title": "运行容量",
+      "type": "object",
+      "properties": {
+        "tcp-flows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的普通 TCP 流上限；仅启动时生效。"
+        },
+        "udp-flows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的 UDP 五元组流上限；仅启动时生效。"
+        },
+        "udp-associations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的 SOCKS5 UDP 关联上限；仅启动时生效。"
+        }
+      },
+      "additionalProperties": false
     }
   }
 }

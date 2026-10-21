@@ -39,9 +39,16 @@ struct ftun_nlmsgerr {
 
 #define FTUN_NLM_F_REQUEST 0x01
 #define FTUN_NLM_F_ACK 0x04
+#define FTUN_NLM_F_DUMP_INTR 0x10
+#define FTUN_NLM_F_ROOT 0x100
+#define FTUN_NLM_F_MATCH 0x200
+#define FTUN_NLM_F_DUMP (FTUN_NLM_F_ROOT | FTUN_NLM_F_MATCH)
 #define FTUN_NLM_F_EXCL 0x200
 #define FTUN_NLM_F_CREATE 0x400
+#define FTUN_NLMSG_NOOP 0x1
 #define FTUN_NLMSG_ERROR 0x2
+#define FTUN_NLMSG_DONE 0x3
+#define FTUN_NLMSG_OVERRUN 0x4
 #define FTUN_NLMSG_ALIGNTO 4u
 #define FTUN_NLMSG_ALIGN(length) \
   (((length) + FTUN_NLMSG_ALIGNTO - 1u) & ~(FTUN_NLMSG_ALIGNTO - 1u))
@@ -97,18 +104,24 @@ struct ftun_rtmsg {
 
 #define FTUN_RTM_NEWADDR 20
 #define FTUN_RTM_DELADDR 21
+#define FTUN_RTM_GETADDR 22
 #define FTUN_RTM_NEWROUTE 24
 #define FTUN_RTM_DELROUTE 25
+#define FTUN_RTM_GETROUTE 26
 #define FTUN_RTM_NEWRULE 32
 #define FTUN_RTM_DELRULE 33
+#define FTUN_RTM_GETRULE 34
 #define FTUN_RTN_UNICAST 1
+#define FTUN_RTN_UNREACHABLE 7
 #define FTUN_RT_SCOPE_UNIVERSE 0
 #define FTUN_RT_SCOPE_LINK 253
 #define FTUN_RT_TABLE_UNSPEC 0u
 #define FTUN_RT_TABLE_DEFAULT 253u
 #define FTUN_RT_TABLE_MAIN 254u
 #define FTUN_RT_TABLE_LOCAL 255u
+#define FTUN_RTA_DST 1
 #define FTUN_RTA_OIF 4
+#define FTUN_RTA_PRIORITY 6
 #define FTUN_RTA_TABLE 15
 
 struct ftun_fib_rule_hdr {
@@ -123,6 +136,7 @@ struct ftun_fib_rule_hdr {
   uint32_t flags;
 };
 
+#define FTUN_FRA_DST 1
 #define FTUN_FRA_IIFNAME 3
 #define FTUN_FRA_PRIORITY 6
 #define FTUN_FRA_FWMARK 10

@@ -4,6 +4,7 @@
 #include "core/budget.h"
 #include "core/operation.h"
 #include "event/event.h"
+#include "network/view.h"
 #include "platform/linux/socket_protect.h"
 
 #define FTUN_INVALID_SOCKET ((ftun_native_socket_t)UINTPTR_MAX)
@@ -20,20 +21,13 @@ typedef enum {
   FTUN_DIAL_UDP
 } ftun_dial_transport_t;
 
-typedef enum {
-  FTUN_DIAL_PURPOSE_BUSINESS = 1,
-  FTUN_DIAL_PURPOSE_PROXY,
-  FTUN_DIAL_PURPOSE_DNS,
-  FTUN_DIAL_PURPOSE_BOOTSTRAP,
-  FTUN_DIAL_PURPOSE_PROBE,
-  FTUN_DIAL_PURPOSE_FRS_UPDATE
-} ftun_dial_purpose_t;
-
 typedef struct {
   ftun_native_socket_t socket;
   ftun_endpoint_t endpoint;
   ftun_dial_transport_t transport;
   ftun_dial_purpose_t purpose;
+  ftun_dial_domain_t domain;
+  uint64_t network_generation;
 } ftun_dial_result_t;
 
 typedef void (*ftun_dial_completion_fn)(ftun_operation_t *operation,
@@ -46,6 +40,11 @@ struct ftun_dial_request {
   ftun_operation_queue_t *operations;
   ftun_budget_t *budget;
   ftun_endpoint_t endpoint;
+  const ftun_endpoint_t *allowed;
+  size_t allowed_count;
+  const ftun_network_view_t *network_view;
+  uint64_t network_generation;
+  ftun_dial_domain_t requested_domain;
   ftun_socket_policy_t protection;
   uint64_t deadline_ms;
   ftun_dial_transport_t transport;
@@ -70,8 +69,10 @@ typedef struct {
 
 /* 唯一物理拨号入口。
  * 需求 REQ-GUARD-001；任务 TASK-TRANSPORT-001；目标 0.2.0；验收 TEST-TRANSPORT-001。
- * 实现路径：先 resource admission 和 socket protection，再异步建连；记录 purpose；业务流量不按目的地址全局豁免规则。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
+ * 实现路径：先核验 endpoint 属于 allowed 集合并通过 NetworkView 收窄
+ * Underlay/Overlay，再做 resource admission、必要的 socket protection 和异步
+ * 建连。Overlay 不设置 Underlay 绕行标记；受保护但不可达的目标明确拒绝。
+ * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * request 在返回前复制；成功 socket 仅在 completion 的 OK 结果中转移给调用方。
  * 同步拒绝清空 out 且零回调；接纳后由 Event/Operation 恰好一次终结。
  */

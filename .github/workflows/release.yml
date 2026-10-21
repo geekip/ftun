@@ -130,22 +130,12 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF_NAME}"
-          notes_file="document/release-${tag}.md"
           if gh release view "${tag}" >/dev/null 2>&1; then
-            if [[ -f "${notes_file}" ]]; then
-              gh release edit "${tag}" --title "FTUN ${tag#v}" \
-                --notes-file "${notes_file}"
-            fi
             gh release upload "${tag}" "${ARCHIVE}" "${CHECKSUM}" --clobber
             exit 0
           fi
 
-          release_flags=(--verify-tag --title "FTUN ${tag#v}")
-          if [[ -f "${notes_file}" ]]; then
-            release_flags+=(--notes-file "${notes_file}")
-          else
-            release_flags+=(--generate-notes)
-          fi
+          release_flags=(--verify-tag --title "FTUN ${tag#v}" --generate-notes)
           if [[ "${tag}" == *-* ]]; then
             release_flags+=(--prerelease)
           fi

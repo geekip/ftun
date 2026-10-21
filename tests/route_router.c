@@ -2,8 +2,8 @@
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/budget.h"
-#include "core/runtime.h"
-#include "route/router.h"
+#include "proxy/runtime_state.h"
+#include "proxy/route/router.h"
 
 #include <stdio.h>
 #include <string.h>

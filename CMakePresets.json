@@ -55,6 +55,32 @@
       }
     },
     {
+      "name": "release-trimmed",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/release-trimmed",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "FTUN_OPTIMIZATION": "balanced",
+        "FTUN_SANITIZERS": false,
+        "FTUN_LTO": false,
+        "FTUN_SECTION_GC": true,
+        "FTUN_MODULE_DNS": "OFF",
+        "FTUN_MODULE_FAKEIP": "OFF",
+        "FTUN_MODULE_TUN": "OFF",
+        "FTUN_MODULE_FRS": "OFF",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true
+      }
+    },
+    {
+      "name": "linux-openwrt-arm",
+      "inherits": "release-trimmed",
+      "binaryDir": "${sourceDir}/build/linux-openwrt-arm",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-openwrt-arm.cmake",
+      "cacheVariables": {
+        "BUILD_TESTING": false
+      }
+    },
+    {
       "name": "release-size",
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/release-size",
@@ -118,6 +144,14 @@
       "configurePreset": "release"
     },
     {
+      "name": "release-trimmed",
+      "configurePreset": "release-trimmed"
+    },
+    {
+      "name": "linux-openwrt-arm",
+      "configurePreset": "linux-openwrt-arm"
+    },
+    {
       "name": "release-size",
       "configurePreset": "release-size"
     },
@@ -148,6 +182,13 @@
     {
       "name": "release",
       "configurePreset": "release",
+      "output": {
+        "outputOnFailure": true
+      }
+    },
+    {
+      "name": "release-trimmed",
+      "configurePreset": "release-trimmed",
       "output": {
         "outputOnFailure": true
       }

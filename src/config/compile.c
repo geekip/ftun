@@ -6,6 +6,9 @@
 
 static const char *const ftun_builtin_module_names[] = {
   "core",
+#if defined(FTUN_HAVE_MODULE_PROXY)
+  "proxy",
+#endif
 #if defined(FTUN_HAVE_MODULE_DNS)
   "dns",
 #endif
@@ -22,6 +25,9 @@ static const char *const ftun_builtin_module_names[] = {
 
 static const ftun_build_capabilities_t ftun_capabilities = {
   FTUN_BUILD_MODULE_CORE
+#if defined(FTUN_HAVE_MODULE_PROXY)
+    | FTUN_BUILD_MODULE_PROXY
+#endif
 #if defined(FTUN_HAVE_MODULE_DNS)
     | FTUN_BUILD_MODULE_DNS
 #endif
@@ -52,6 +58,41 @@ static void ftun_build_diagnostic(ftun_diagnostic_t *out, ftun_status_t status,
 const ftun_build_capabilities_t *ftun_build_capabilities(void)
 {
   return &ftun_capabilities;
+}
+
+uint32_t ftun_config_required_modules(const ftun_config_t *config)
+{
+  uint32_t required = FTUN_BUILD_MODULE_CORE;
+  size_t index;
+  if (config == NULL) return 0u;
+  if (config->dns.enable) required |= FTUN_BUILD_MODULE_DNS;
+  if (config->inbound_count != 0u) {
+    required |= FTUN_BUILD_MODULE_PROXY;
+  }
+  if (config->rules.count != 0u) {
+    required |= FTUN_BUILD_MODULE_PROXY;
+  }
+  if (config->dns.enable) {
+    for (index = 0u; index < config->dns.server_count; index++) {
+      const ftun_config_dns_server_t *server = &config->dns.servers[index];
+      if (server->fake_ip) {
+        required |= FTUN_BUILD_MODULE_FAKEIP | FTUN_BUILD_MODULE_PROXY;
+      }
+      if (server->outbound != NULL &&
+          strcmp(server->outbound, "DIRECT") != 0) {
+        required |= FTUN_BUILD_MODULE_PROXY;
+      }
+    }
+  }
+  if (config->frs.active) {
+    required |= FTUN_BUILD_MODULE_FRS | FTUN_BUILD_MODULE_PROXY;
+  }
+  for (index = 0u; index < config->inbound_count; index++) {
+    if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
+      required |= FTUN_BUILD_MODULE_TUN | FTUN_BUILD_MODULE_PROXY;
+    }
+  }
+  return required;
 }
 
 ftun_status_t ftun_build_require_modules(uint32_t required, ftun_diagnostic_t *out)
@@ -506,7 +547,6 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
   ftun_feature_plan_t *plan;
   ftun_status_t status;
   int needs_default_dns = 0;
-  size_t index;
   if (out != NULL) *out = NULL;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_config_validate(config, NULL);
@@ -534,22 +574,7 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
     return FTUN_E_LIMIT;
   }
   plan->built_modules = ftun_build_capabilities()->builtins;
-  plan->required_modules = FTUN_BUILD_MODULE_CORE;
-  if (config->dns.enable) plan->required_modules |= FTUN_BUILD_MODULE_DNS;
-  if (config->dns.enable) {
-    for (index = 0u; index < config->dns.server_count; index++) {
-      if (config->dns.servers[index].fake_ip) {
-        plan->required_modules |= FTUN_BUILD_MODULE_FAKEIP;
-        break;
-      }
-    }
-  }
-  if (config->frs.active) plan->required_modules |= FTUN_BUILD_MODULE_FRS;
-  for (index = 0u; index < config->inbound_count; index++) {
-    if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
-      plan->required_modules |= FTUN_BUILD_MODULE_TUN;
-    }
-  }
+  plan->required_modules = ftun_config_required_modules(config);
   ftun_plan_compile_definitions(config, plan);
   status = ftun_plan_rules(config, plan, &needs_default_dns);
   if (status == FTUN_OK) status = ftun_plan_inbounds(config, plan,

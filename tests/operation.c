@@ -51,6 +51,9 @@ int main(void)
   ftun_operation_t *first = (ftun_operation_t *)(uintptr_t)1;
   ftun_operation_t *second = (ftun_operation_t *)(uintptr_t)1;
   ftun_operation_t *third = (ftun_operation_t *)(uintptr_t)1;
+  ftun_operation_token_t first_completion = {0};
+  ftun_operation_token_t second_completion = {0};
+  ftun_operation_token_t third_completion = {0};
   ftun_operation_queue_usage_t queue_usage;
   ftun_budget_usage_t budget_usage;
   callback_state_t one = {0}, two = {0}, three = {0};
@@ -66,38 +69,47 @@ int main(void)
   CHECK(baseline > 0u);
   CHECK(ftun_operation_queue_get_usage(queue, &queue_usage) == FTUN_OK);
   CHECK(queue_usage.capacity == 2u && queue_usage.inflight == 0u && queue_usage.accepting);
+  CHECK(!ftun_operation_queue_has_ready(queue));
 
   one.queue = queue;
   one.expected = FTUN_E_CANCELLED;
   two.queue = queue;
   two.expected = FTUN_E_CANCELLED;
-  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
-  CHECK(ftun_operation_accept(queue, completed, &two, &second) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &one, &first,
+                              &first_completion) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &two, &second,
+                              &second_completion) == FTUN_OK);
   CHECK(one.calls == 0 && two.calls == 0);
-  CHECK(ftun_operation_accept(queue, completed, &three, &third) == FTUN_E_LIMIT);
-  CHECK(third == NULL);
-  CHECK(ftun_operation_complete(first, success) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &three, &third,
+                              &third_completion) == FTUN_E_LIMIT);
+  CHECK(third == NULL && third_completion.queue == NULL &&
+        third_completion.generation == 0u);
+  CHECK(ftun_operation_complete(first_completion, success) == FTUN_OK);
   CHECK(one.calls == 0);
   CHECK(ftun_operation_cancel(first) == FTUN_OK);
-  CHECK(ftun_operation_complete(first, success) == FTUN_E_STALE);
+  CHECK(ftun_operation_complete(first_completion, success) == FTUN_E_STALE);
   CHECK(ftun_operation_cancel(second) == FTUN_OK);
   CHECK(ftun_operation_cancel(second) == FTUN_E_STALE);
+  CHECK(ftun_operation_queue_has_ready(queue));
 
   CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
   CHECK(dispatched == 1u && one.calls == 1 && two.calls == 0);
   CHECK(one.cancel_was_stale == 1 && one.recursive_was_again == 1);
+  CHECK(ftun_operation_queue_has_ready(queue));
   CHECK(ftun_operation_dispatch(queue, 2u, &dispatched) == FTUN_OK);
   CHECK(dispatched == 1u && two.calls == 1);
   CHECK(two.cancel_was_stale == 1 && two.recursive_was_again == 1);
+  CHECK(!ftun_operation_queue_has_ready(queue));
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
   CHECK(budget_usage.used == baseline);
 
   three.queue = queue;
   three.expected = FTUN_OK;
-  CHECK(ftun_operation_accept(queue, completed, &three, &third) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &three, &third,
+                              &third_completion) == FTUN_OK);
   CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
   CHECK(dispatched == 0u && three.calls == 0);
-  CHECK(ftun_operation_complete(third, success) == FTUN_OK);
+  CHECK(ftun_operation_complete(third_completion, success) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&queue) == FTUN_E_AGAIN && queue != NULL);
   CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
   CHECK(dispatched == 1u && three.calls == 1);
@@ -107,7 +119,8 @@ int main(void)
   one.expected = FTUN_E_CANCELLED;
   hook.calls = 0;
   hook.failures = 1;
-  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &one, &first,
+                              &first_completion) == FTUN_OK);
   CHECK(ftun_operation_set_cancel_hook(first, cancel_hook, &hook) == FTUN_OK);
   CHECK(ftun_operation_cancel(first) == FTUN_E_IO);
   CHECK(hook.calls == 1 && one.calls == 0);
@@ -119,7 +132,8 @@ int main(void)
   one.calls = one.cancel_was_stale = one.recursive_was_again = 0;
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
   baseline = budget_usage.used;
-  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &one, &first,
+                              &first_completion) == FTUN_OK);
   CHECK(ftun_operation_reject(&first) == FTUN_OK && first == NULL);
   CHECK(one.calls == 0);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
@@ -129,28 +143,33 @@ int main(void)
   one.expected = FTUN_E_CANCELLED;
   hook.calls = 0;
   hook.failures = 1;
-  CHECK(ftun_operation_accept(queue, completed, &one, &first) == FTUN_OK);
-  CHECK(ftun_operation_complete(first, success) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, completed, &one, &first,
+                              &first_completion) == FTUN_OK);
+  CHECK(ftun_operation_complete(first_completion, success) == FTUN_OK);
   CHECK(ftun_operation_set_cancel_hook(first, cancel_hook, &hook) == FTUN_OK);
   CHECK(ftun_operation_queue_stop(queue) == FTUN_E_IO);
   CHECK(one.calls == 0 && hook.calls == 1);
   CHECK(ftun_operation_queue_stop(queue) == FTUN_OK);
   CHECK(hook.calls == 2);
-  CHECK(ftun_operation_accept(queue, completed, &two, &second) == FTUN_E_CANCELLED);
-  CHECK(second == NULL);
+  CHECK(ftun_operation_accept(queue, completed, &two, &second,
+                              &second_completion) == FTUN_E_CANCELLED);
+  CHECK(second == NULL && second_completion.queue == NULL &&
+        second_completion.generation == 0u);
   CHECK(ftun_operation_dispatch(queue, SIZE_MAX, &dispatched) == FTUN_OK);
   CHECK(dispatched == 1u && one.calls == 1);
   CHECK(ftun_operation_queue_get_usage(queue, &queue_usage) == FTUN_OK);
   CHECK(queue_usage.inflight == 0u && !queue_usage.accepting && !queue_usage.dispatching);
 
   CHECK(ftun_operation_cancel(NULL) == FTUN_E_INVALID);
-  CHECK(ftun_operation_complete(NULL, success) == FTUN_E_INVALID);
+  CHECK(ftun_operation_complete((ftun_operation_token_t){0}, success) ==
+        FTUN_E_INVALID);
   CHECK(ftun_operation_set_cancel_hook(NULL, cancel_hook, &hook) == FTUN_E_INVALID);
   CHECK(ftun_operation_reject(NULL) == FTUN_E_INVALID);
   CHECK(ftun_operation_dispatch(queue, 0u, &dispatched) == FTUN_E_INVALID);
   CHECK(dispatched == 0u);
   CHECK(ftun_operation_dispatch(queue, 1u, NULL) == FTUN_E_INVALID);
   CHECK(ftun_operation_queue_get_usage(NULL, &queue_usage) == FTUN_E_INVALID);
+  CHECK(!ftun_operation_queue_has_ready(NULL));
   CHECK(queue_usage.capacity == 0u && queue_usage.inflight == 0u);
   CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK && queue == NULL);
   CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
@@ -168,6 +187,8 @@ int main(void)
   {
     ftun_reservation_t *blocker = NULL;
     callback_state_t rejected_state = {0};
+    ftun_operation_t *reused = NULL;
+    ftun_operation_token_t late_completion = {0};
     CHECK(ftun_budget_create(NULL, 512u, 0u, &budget) == FTUN_OK);
     CHECK(ftun_operation_queue_create(budget, 1u, &queue) == FTUN_OK);
     CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
@@ -177,13 +198,71 @@ int main(void)
     rejected_state.expected = FTUN_OK;
     third = (ftun_operation_t *)(uintptr_t)1;
     /* Operation 槽位随队列预留，因此稳态接纳不依赖分配器或剩余预算。 */
-    CHECK(ftun_operation_accept(queue, completed, &rejected_state, &third) == FTUN_OK);
+    CHECK(ftun_operation_accept(queue, completed, &rejected_state, &third,
+                                &third_completion) == FTUN_OK);
     CHECK(third != NULL && rejected_state.calls == 0);
-    CHECK(ftun_operation_complete(third, success) == FTUN_OK);
+    CHECK(ftun_operation_complete(third_completion, success) == FTUN_OK);
     CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
     CHECK(dispatched == 1u && rejected_state.calls == 1);
+    late_completion = third_completion;
+    reused = third;
+    CHECK(ftun_operation_accept(queue, completed, &rejected_state, &third,
+                                &third_completion) == FTUN_OK);
+    CHECK(third == reused &&
+          third_completion.generation != late_completion.generation);
+    CHECK(ftun_operation_complete(late_completion, success) == FTUN_E_STALE);
+    CHECK(rejected_state.calls == 1);
+    CHECK(ftun_operation_complete(third_completion, success) == FTUN_OK);
+    CHECK(ftun_operation_complete(third_completion, success) == FTUN_E_STALE);
+    CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
+    CHECK(dispatched == 1u && rejected_state.calls == 2);
     CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
     CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
+    CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  }
+
+  {
+    callback_state_t normal_one = {0}, normal_two = {0}, administrative = {0};
+    ftun_operation_t *normal_operation_one = NULL;
+    ftun_operation_t *normal_operation_two = NULL;
+    ftun_operation_t *administrative_operation = NULL;
+    ftun_operation_token_t normal_token_one = {0};
+    ftun_operation_token_t normal_token_two = {0};
+    ftun_operation_token_t administrative_token = {0};
+    CHECK(ftun_budget_create(NULL, 4096u, 0u, &budget) == FTUN_OK);
+    CHECK(ftun_operation_queue_create_reserved(budget, 3u, 1u,
+                                                &queue) == FTUN_OK);
+    normal_one.queue = normal_two.queue = administrative.queue = queue;
+    normal_one.expected = normal_two.expected = administrative.expected = FTUN_OK;
+    CHECK(ftun_operation_accept(queue, completed, &normal_one,
+      &normal_operation_one, &normal_token_one) == FTUN_OK);
+    CHECK(ftun_operation_accept(queue, completed, &normal_two,
+      &normal_operation_two, &normal_token_two) == FTUN_OK);
+    third = (ftun_operation_t *)(uintptr_t)1;
+    CHECK(ftun_operation_accept(queue, completed, &three, &third,
+      &third_completion) == FTUN_E_LIMIT && third == NULL);
+    CHECK(ftun_operation_accept_control(queue, completed, &administrative,
+      &administrative_operation, &administrative_token) == FTUN_OK);
+    CHECK(ftun_operation_queue_get_usage(queue, &queue_usage) == FTUN_OK &&
+          queue_usage.capacity == 3u && queue_usage.control_reserve == 1u &&
+          queue_usage.normal_inflight == 2u &&
+          queue_usage.control_inflight == 1u &&
+          queue_usage.rejected_normal == 1u);
+    CHECK(ftun_operation_complete(normal_token_one, success) == FTUN_OK);
+    CHECK(ftun_operation_complete(normal_token_two, success) == FTUN_OK);
+    CHECK(ftun_operation_complete(administrative_token, success) == FTUN_OK);
+    CHECK(ftun_operation_dispatch(queue, SIZE_MAX, &dispatched) == FTUN_OK &&
+          dispatched == 3u && normal_one.calls == 1 && normal_two.calls == 1 &&
+          administrative.calls == 1);
+    CHECK(ftun_operation_queue_get_usage(queue, &queue_usage) == FTUN_OK &&
+          queue_usage.inflight == 0u && queue_usage.normal_inflight == 0u &&
+          queue_usage.control_inflight == 0u);
+    CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
+    CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+    CHECK(ftun_budget_create(NULL, 4096u, 0u, &budget) == FTUN_OK);
+    CHECK(ftun_operation_queue_create_reserved(budget, 1u, 1u,
+                                                &queue) == FTUN_E_INVALID &&
+          queue == NULL);
     CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   }
   return 0;

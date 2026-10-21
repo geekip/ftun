@@ -4,7 +4,7 @@
 /* 无副作用语义校验，diagnostic 中的字符串为静态借用视图。
  * 需求 REQ-CONF-001；任务 TASK-CONFIG-003；目标 0.2.0；验收 TEST-CONFIG-003。
  * 实现路径：验证名称、端口冲突、能力、引用和组环；校验不 bind、不解析网络、不创建闲置节点资源。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
+ * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；不转移输入所有权，不执行文件或网络 I/O。
  */
 ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_t *out);

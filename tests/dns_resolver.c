@@ -3,9 +3,9 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "core/session.h"
-#include "dns/resolver.h"
+#include "proxy/runtime_state.h"
+#include "proxy/session.h"
+#include "proxy/dns/resolver_adapter.h"
 #include "transport/stream.h"
 
 #include <stdint.h>
@@ -27,6 +27,7 @@ typedef struct {
 typedef struct {
   ftun_operation_queue_t *operations;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_system_resolve_completion_fn completion;
   void *completion_user;
   ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
@@ -97,7 +98,7 @@ static ftun_config_t *make_config(void)
 }
 
 static ftun_status_t stream_write_start(void *user,
-                                         ftun_stream_write_t *write,
+                                         ftun_stream_write_token_t write,
                                          const ftun_buffer_slice_t *slice,
                                          size_t *accepted)
 {
@@ -109,7 +110,7 @@ static ftun_status_t stream_write_start(void *user,
 }
 
 static ftun_status_t stream_write_cancel(void *user,
-                                          ftun_stream_write_t *write)
+                                          ftun_stream_write_token_t write)
 {
   (void)user;
   (void)write;
@@ -195,7 +196,10 @@ static ftun_status_t backend_start(
   state->completion = completion;
   state->completion_user = completion_user;
   if (ftun_operation_accept(state->operations, backend_completed, state,
-                            &state->operation) != FTUN_OK) return FTUN_E_LIMIT;
+                            &state->operation,
+                            &state->completion_token) != FTUN_OK) {
+    return FTUN_E_LIMIT;
+  }
   *out = state->operation;
   return FTUN_OK;
 }
@@ -357,7 +361,7 @@ static void fill_request(ftun_resolve_request_t *request,
 static int finish_backend(fixture_t *fixture, ftun_error_t error)
 {
   size_t dispatched = 0u;
-  if (ftun_operation_complete(fixture->backend_state.operation,
+  if (ftun_operation_complete(fixture->backend_state.completion_token,
                               error) != FTUN_OK) return 1;
   if (ftun_operation_dispatch(fixture->operations, 1u,
                               &dispatched) != FTUN_OK) return 1;

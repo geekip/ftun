@@ -7,10 +7,10 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "frs/format.h"
-#include "frs/update.h"
-#include "route/router.h"
+#include "proxy/runtime_state.h"
+#include "proxy/frs/format.h"
+#include "proxy/frs/update.h"
+#include "proxy/route/router.h"
 
 #include <stdio.h>
 #include <stdlib.h>

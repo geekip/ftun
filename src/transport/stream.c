@@ -17,6 +17,7 @@ struct ftun_stream {
   size_t pending_bytes;
   size_t completions;
   size_t reference_count;
+  uint64_t next_generation;
   ftun_stream_write_t *storage;
   ftun_stream_write_t *free_head;
   int accepting;
@@ -26,11 +27,15 @@ struct ftun_stream {
 struct ftun_stream_write {
   ftun_stream_t *stream;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_stream_write_t *free_next;
   ftun_buffer_slice_t slice;
   ftun_completion_fn completion;
   void *completion_user;
+  size_t slot;
+  uint64_t generation;
   int starting;
+  int cancelling;
   int backend_owned;
 };
 
@@ -47,6 +52,32 @@ static int ftun_stream_options_valid(const ftun_stream_options_t *options)
          options->max_pending_bytes != 0u && options->completion != NULL;
 }
 
+static ftun_stream_write_token_t ftun_stream_write_token(
+  const ftun_stream_write_t *write)
+{
+  ftun_stream_write_token_t token;
+  memset(&token, 0, sizeof(token));
+  if (write != NULL) {
+    token.stream = write->stream;
+    token.slot = write->slot;
+    token.generation = write->generation;
+  }
+  return token;
+}
+
+static ftun_stream_write_t *ftun_stream_write_resolve(
+  ftun_stream_write_token_t token)
+{
+  ftun_stream_write_t *write;
+  if (token.stream == NULL || token.generation == 0u ||
+      token.slot >= token.stream->max_pending_writes) return NULL;
+  write = &token.stream->storage[token.slot];
+  if (write->stream != token.stream || write->generation != token.generation) {
+    return NULL;
+  }
+  return write;
+}
+
 static ftun_status_t ftun_stream_write_cancel(void *user)
 {
   ftun_stream_write_t *write = (ftun_stream_write_t *)user;
@@ -55,8 +86,10 @@ static ftun_status_t ftun_stream_write_cancel(void *user)
     return FTUN_E_STATE_CORRUPT;
   }
   if (!write->backend_owned) return FTUN_OK;
+  write->cancelling = 1;
   status = write->stream->backend.write_cancel(
-    write->stream->backend.context, write);
+    write->stream->backend.context, ftun_stream_write_token(write));
+  write->cancelling = 0;
   if (status != FTUN_OK) return status;
   write->backend_owned = 0;
   return FTUN_OK;
@@ -196,11 +229,15 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   stream->free_head = write->free_next;
   memset(write, 0, sizeof(*write));
   write->stream = stream;
+  stream->next_generation++;
+  if (stream->next_generation == 0u) stream->next_generation++;
+  write->slot = (size_t)(write - stream->storage);
+  write->generation = stream->next_generation;
   write->completion = completion;
   write->completion_user = completion_user;
   status = ftun_operation_accept(stream->operations,
                                  ftun_stream_write_dispatched, write,
-                                 &write->operation);
+                                 &write->operation, &write->completion_token);
   if (status != FTUN_OK) {
     ftun_stream_write_release(write);
     return status;
@@ -213,13 +250,17 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   if (status != FTUN_OK) return ftun_stream_write_reject(write, status);
 
   write->starting = 1;
-  status = stream->backend.write_start(stream->backend.context, write,
+  status = stream->backend.write_start(stream->backend.context,
+                                       ftun_stream_write_token(write),
                                        &write->slice, &backend_accepted);
   write->starting = 0;
   if (status != FTUN_OK) return ftun_stream_write_reject(write, status);
   write->backend_owned = 1;
   if (backend_accepted == 0u || backend_accepted > offered) {
-    status = stream->backend.write_cancel(stream->backend.context, write);
+    write->cancelling = 1;
+    status = stream->backend.write_cancel(stream->backend.context,
+                                          ftun_stream_write_token(write));
+    write->cancelling = 0;
     if (status != FTUN_OK) return status;
     write->backend_owned = 0;
     return ftun_stream_write_reject(write, FTUN_E_STATE_CORRUPT);
@@ -310,28 +351,35 @@ ftun_status_t ftun_stream_release(ftun_stream_t **stream)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_stream_write_data(const ftun_stream_write_t *write,
+ftun_status_t ftun_stream_write_data(ftun_stream_write_token_t token,
                                      ftun_bytes_t *out)
 {
+  ftun_stream_write_t *write;
   if (out != NULL) memset(out, 0, sizeof(*out));
-  if (write == NULL || out == NULL) return FTUN_E_INVALID;
-  if (write->stream == NULL || (!write->starting && !write->backend_owned)) {
+  if (token.stream == NULL || token.generation == 0u || out == NULL) {
+    return FTUN_E_INVALID;
+  }
+  write = ftun_stream_write_resolve(token);
+  if (write == NULL || (!write->starting && !write->backend_owned)) {
     return FTUN_E_STALE;
   }
   return ftun_buffer_slice_data(&write->slice, out);
 }
 
-ftun_status_t ftun_stream_write_complete(ftun_stream_write_t *write,
+ftun_status_t ftun_stream_write_complete(ftun_stream_write_token_t token,
                                          ftun_error_t error)
 {
+  ftun_stream_write_t *write;
   ftun_status_t status;
-  if (write == NULL) return FTUN_E_INVALID;
+  if (token.stream == NULL || token.generation == 0u) return FTUN_E_INVALID;
   if (error.status == FTUN_E_AGAIN) return FTUN_E_INVALID;
-  if (write->stream == NULL || write->starting || !write->backend_owned) {
+  write = ftun_stream_write_resolve(token);
+  if (write == NULL || write->starting || !write->backend_owned) {
     return FTUN_E_STALE;
   }
+  if (write->cancelling) return FTUN_E_AGAIN;
   write->backend_owned = 0;
-  status = ftun_operation_complete(write->operation, error);
+  status = ftun_operation_complete(write->completion_token, error);
   if (status != FTUN_OK) return status;
   return FTUN_OK;
 }

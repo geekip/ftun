@@ -1,6 +1,6 @@
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
+#include "proxy/runtime_state.h"
 #include "dns/server.h"
 
 #include <stdio.h>
@@ -20,6 +20,8 @@ typedef struct {
   ftun_endpoint_t upstream;
   ftun_dns_transport_t protocol;
   uint32_t outbound;
+  uint64_t policy_fingerprint;
+  uint64_t server_fingerprint;
   uint64_t deadline;
   unsigned int submits;
   unsigned int cancels;
@@ -40,7 +42,8 @@ static uint64_t fake_now(void *user)
 }
 
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, const ftun_endpoint_t *upstream,
+  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
   void **out_request)
@@ -55,6 +58,8 @@ static ftun_status_t transport_submit(
   transport->upstream = *upstream;
   transport->protocol = protocol;
   transport->outbound = outbound;
+  transport->policy_fingerprint = policy_fingerprint;
+  transport->server_fingerprint = server_fingerprint;
   transport->deadline = deadline;
   transport->submits++;
   transport->pending = 1;
@@ -125,6 +130,7 @@ static void query_init(ftun_dns_query_t *query, completion_t *completion,
   query->wire.data = wire;
   query->wire.length = 29u;
   query->deadline_ms = deadline;
+  query->policy_fingerprint = 77u;
   query->resolution_mode = 1u;
   query->completion = completed;
   query->completion_user = completion;
@@ -203,6 +209,8 @@ int main(void)
   CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK &&
         operation != NULL && transport.pending &&
         transport.outbound == 42u && transport.deadline == 5000u &&
+        transport.policy_fingerprint == 77u &&
+        transport.server_fingerprint == 99u &&
         transport.protocol == FTUN_DNS_TRANSPORT_UDP);
   response_init(response, 0x8380u, query.id);
   CHECK(transport_deliver(&transport, FTUN_OK, response, 29u));

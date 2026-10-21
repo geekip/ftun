@@ -464,6 +464,94 @@ static int test_all_purposes_protected(void)
   return 0;
 }
 
+static int test_network_view_domains(void)
+{
+  ftun_network_prefix_t prefix = {{10u, 0u, 0u, 0u}, 8u};
+  ftun_network_route_t route = {
+    {{10u, 0u, 0u, 0u}, 8u},
+    FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_PROXY)
+  };
+  ftun_network_view_spec_t spec;
+  ftun_network_view_t *view = NULL;
+  ftun_network_view_t *revoked = NULL;
+  ftun_endpoint_t allowed[2];
+  fixture_t fixture;
+  ftun_operation_t *operation = NULL;
+
+  memset(&spec, 0, sizeof(spec));
+  spec.generation = 41u;
+  spec.protected_prefixes = &prefix;
+  spec.protected_prefix_count = 1u;
+  spec.overlay_routes = &route;
+  spec.overlay_route_count = 1u;
+  CHECK(ftun_network_view_create(&spec, &view) == FTUN_OK);
+  CHECK(fixture_start(&fixture, 16384u, 4u) == 0);
+  fixture.request.endpoint.address[0] = 10u;
+  fixture.request.endpoint.address[1] = 2u;
+  fixture.request.endpoint.address[2] = 3u;
+  fixture.request.endpoint.address[3] = 4u;
+  allowed[0] = fixture.request.endpoint;
+  allowed[1] = fixture.request.endpoint;
+  allowed[1].address[3] = 5u;
+  fixture.request.allowed = allowed;
+  fixture.request.allowed_count = 2u;
+  fixture.request.network_view = view;
+  fixture.request.network_generation = 41u;
+  fixture.socket.connect_status = FTUN_OK;
+  CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
+                                &operation) == FTUN_OK);
+  CHECK(operation != NULL && fixture.socket.protect_calls == 0 &&
+        fixture.socket.connect_calls == 1);
+  CHECK(dispatch_all(&fixture) == 0 && fixture.completion.calls == 1 &&
+        fixture.completion.error.status == FTUN_OK &&
+        fixture.completion.result.domain == FTUN_DIAL_DOMAIN_OVERLAY &&
+        fixture.completion.result.network_generation == 41u);
+  CHECK(fixture_stop(&fixture) == 0);
+
+  CHECK(fixture_start(&fixture, 16384u, 4u) == 0);
+  fixture.request.network_view = view;
+  fixture.request.network_generation = 40u;
+  CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
+                                &operation) == FTUN_E_STALE &&
+        operation == NULL && fixture.socket.open_calls == 0);
+  fixture.request.network_generation = 0u;
+  fixture.request.requested_domain = FTUN_DIAL_DOMAIN_OVERLAY;
+  fixture.request.network_view = NULL;
+  CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
+                                &operation) == FTUN_E_UNSUPPORTED &&
+        operation == NULL && fixture.socket.open_calls == 0);
+  CHECK(fixture_stop(&fixture) == 0);
+
+  CHECK(fixture_start(&fixture, 16384u, 4u) == 0);
+  fixture.request.allowed = allowed;
+  fixture.request.allowed_count = 1u;
+  allowed[0] = fixture.request.endpoint;
+  allowed[0].address[3] = 99u;
+  CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
+                                &operation) == FTUN_E_REJECTED &&
+        operation == NULL && fixture.socket.open_calls == 0);
+  CHECK(fixture_stop(&fixture) == 0);
+
+  spec.generation = 42u;
+  spec.overlay_routes = NULL;
+  spec.overlay_route_count = 0u;
+  CHECK(ftun_network_view_create(&spec, &revoked) == FTUN_OK);
+  CHECK(fixture_start(&fixture, 16384u, 4u) == 0);
+  fixture.request.endpoint.address[0] = 10u;
+  fixture.request.endpoint.address[1] = 2u;
+  fixture.request.endpoint.address[2] = 3u;
+  fixture.request.endpoint.address[3] = 4u;
+  fixture.request.network_view = revoked;
+  fixture.request.network_generation = 42u;
+  CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
+                                &operation) == FTUN_E_REJECTED &&
+        operation == NULL && fixture.socket.open_calls == 0);
+  CHECK(fixture_stop(&fixture) == 0);
+  CHECK(ftun_network_view_release(&revoked) == FTUN_OK);
+  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  return 0;
+}
+
 static void dummy_completed(ftun_operation_t *operation, ftun_error_t error,
                             void *user)
 {
@@ -478,18 +566,20 @@ static int test_admission_and_boundaries(void)
   fixture_t fixture;
   ftun_operation_t *operation = (ftun_operation_t *)(uintptr_t)1;
   ftun_operation_t *blocker = NULL;
+  ftun_operation_token_t blocker_completion = {0};
   ftun_reservation_t *reservation = NULL;
   ftun_budget_usage_t usage;
   ftun_error_t cancelled = {FTUN_E_CANCELLED, 0u, 0};
   int dummy_calls = 0;
   CHECK(fixture_start(&fixture, 16384u, 1u) == 0);
   CHECK(ftun_operation_accept(fixture.operations, dummy_completed,
-                              &dummy_calls, &blocker) == FTUN_OK);
+                              &dummy_calls, &blocker,
+                              &blocker_completion) == FTUN_OK);
   CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
                                 &operation) == FTUN_E_LIMIT);
   CHECK(operation == NULL && fixture.socket.open_calls == 0 &&
         fixture.completion.calls == 0);
-  CHECK(ftun_operation_complete(blocker, cancelled) == FTUN_OK);
+  CHECK(ftun_operation_complete(blocker_completion, cancelled) == FTUN_OK);
   CHECK(dispatch_all(&fixture) == 0 && dummy_calls == 1);
   CHECK(fixture_stop(&fixture) == 0);
 
@@ -643,6 +733,7 @@ int main(int argc, char **argv)
   CHECK(test_async_failures() == 0);
   CHECK(test_synchronous_rejection() == 0);
   CHECK(test_all_purposes_protected() == 0);
+  CHECK(test_network_view_domains() == 0);
   CHECK(test_admission_and_boundaries() == 0);
   return 0;
 }

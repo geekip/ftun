@@ -1,14 +1,14 @@
-#include "group/health.h"
-#include "group/select.h"
-#include "group/url_test.h"
+#include "proxy/group/health.h"
+#include "proxy/group/select.h"
+#include "proxy/group/url_test.h"
 #include "config/compile.h"
 #include "config/model.h"
 #include "config/parser.h"
 #include "config/validate.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "route/group.h"
+#include "proxy/runtime_state.h"
+#include "proxy/route/group.h"
 
 #include <stdio.h>
 #include <string.h>

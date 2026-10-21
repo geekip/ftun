@@ -110,6 +110,8 @@ int main(void)
   ftun_dns_query_t isolated;
   uint8_t response[45];
   uint8_t negative[63];
+  static const uint32_t heap_ttls[] = {30u, 5u, 20u, 10u};
+  size_t index;
   uint64_t now = 1000u;
   memset(&options, 0, sizeof(options));
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
@@ -160,6 +162,39 @@ int main(void)
         usage.positive == 0u && usage.negative == 1u && usage.failures == 0u);
   now = 9000u;
   CHECK(ftun_dns_cache_lookup(cache, &query, &answer) == FTUN_E_EOF);
+  CHECK(ftun_dns_cache_destroy(&cache) == FTUN_OK);
+
+  now = 1000u;
+  CHECK(ftun_dns_cache_create(&options, &cache) == FTUN_OK);
+  for (index = 0u; index < 4u; index++) {
+    query_init(&query, (uint16_t)(0x3000u + index), 100u + index, 2u);
+    response_init(response, query.id, (uint8_t)(20u + index),
+                  heap_ttls[index], 0u);
+    CHECK(ftun_dns_cache_store(cache, &query,
+      (ftun_bytes_t){response, sizeof(response)}) == FTUN_OK);
+  }
+  query_init(&query, 0x3005u, 105u, 2u);
+  response_init(response, query.id, 25u, 15u, 0u);
+  CHECK(ftun_dns_cache_store(cache, &query,
+    (ftun_bytes_t){response, sizeof(response)}) == FTUN_OK);
+  query_init(&isolated, 0x3001u, 101u, 2u);
+  CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_E_EOF);
+  query_init(&isolated, 0x3000u, 100u, 2u);
+  CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_OK);
+  CHECK(ftun_dns_answer_release(&answer) == FTUN_OK);
+  CHECK(ftun_dns_cache_get_usage(cache, &usage) == FTUN_OK &&
+        usage.entries == 4u && usage.evictions == 1u &&
+        usage.expirations == 0u && usage.hits == 1u && usage.misses == 1u);
+  now = 12000u;
+  query_init(&query, 0x3006u, 106u, 2u);
+  response_init(response, query.id, 26u, 40u, 0u);
+  CHECK(ftun_dns_cache_store(cache, &query,
+    (ftun_bytes_t){response, sizeof(response)}) == FTUN_OK);
+  query_init(&isolated, 0x3003u, 103u, 2u);
+  CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_E_EOF);
+  CHECK(ftun_dns_cache_get_usage(cache, &usage) == FTUN_OK &&
+        usage.entries == 4u && usage.evictions == 1u &&
+        usage.expirations == 1u && usage.misses == 2u);
   CHECK(ftun_dns_cache_destroy(&cache) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;

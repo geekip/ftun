@@ -1,4 +1,4 @@
-#include "sniff/tls_sni.h"
+#include "proxy/sniff/tls_sni.h"
 
 #include <stdio.h>
 #include <string.h>

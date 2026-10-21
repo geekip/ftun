@@ -44,6 +44,7 @@ typedef struct ftun_inbound ftun_inbound_t;
 typedef struct ftun_index ftun_index_t;
 typedef struct ftun_lwip ftun_lwip_t;
 typedef struct ftun_logger ftun_logger_t;
+typedef struct ftun_network_view ftun_network_view_t;
 typedef struct ftun_operation_queue ftun_operation_queue_t;
 typedef struct ftun_packet_port ftun_packet_port_t;
 typedef struct ftun_packet ftun_packet_t;
@@ -53,6 +54,7 @@ typedef struct ftun_reservation ftun_reservation_t;
 typedef struct ftun_resolve_request ftun_resolve_request_t;
 typedef struct ftun_relay ftun_relay_t;
 typedef struct ftun_route_policy ftun_route_policy_t;
+typedef struct ftun_linux_route_async ftun_linux_route_async_t;
 typedef struct ftun_route_table ftun_route_table_t;
 typedef struct ftun_route_transaction ftun_route_transaction_t;
 typedef struct ftun_rule ftun_rule_t;
@@ -140,11 +142,12 @@ typedef enum {
   FTUN_BUILD_MODULE_DNS = 1u << 1,
   FTUN_BUILD_MODULE_TUN = 1u << 2,
   FTUN_BUILD_MODULE_FRS = 1u << 3,
-  FTUN_BUILD_MODULE_FAKEIP = 1u << 4
+  FTUN_BUILD_MODULE_FAKEIP = 1u << 4,
+  FTUN_BUILD_MODULE_PROXY = 1u << 5
 } ftun_build_module_t;
 #define FTUN_BUILD_MODULE_ALL \
   (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS | FTUN_BUILD_MODULE_TUN | \
-   FTUN_BUILD_MODULE_FRS | FTUN_BUILD_MODULE_FAKEIP)
+   FTUN_BUILD_MODULE_FRS | FTUN_BUILD_MODULE_FAKEIP | FTUN_BUILD_MODULE_PROXY)
 typedef struct {
   uint32_t builtins;
   const char *const *names;

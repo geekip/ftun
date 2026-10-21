@@ -547,6 +547,26 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
     return ftun_config_diagnostic(out, FTUN_E_UNSUPPORTED, "/base/ipv6",
                                   "IPv6 mode is not supported");
   }
+  if (config->base.capacity.tcp_flows < FTUN_CONFIG_CAPACITY_MINIMUM ||
+      config->base.capacity.tcp_flows > FTUN_CONFIG_CAPACITY_MAXIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID,
+                                  "/base/capacity/tcp-flows",
+                                  "TCP flow capacity is out of range");
+  }
+  if (config->base.capacity.udp_flows < FTUN_CONFIG_CAPACITY_MINIMUM ||
+      config->base.capacity.udp_flows > FTUN_CONFIG_CAPACITY_MAXIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID,
+                                  "/base/capacity/udp-flows",
+                                  "UDP flow capacity is out of range");
+  }
+  if (config->base.capacity.udp_associations <
+        FTUN_CONFIG_CAPACITY_MINIMUM ||
+      config->base.capacity.udp_associations >
+        FTUN_CONFIG_CAPACITY_MAXIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID,
+                                  "/base/capacity/udp-associations",
+                                  "UDP association capacity is out of range");
+  }
   if (!ftun_path_valid(config->base.cache_file)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/cache-file",
                                   "cache file path is invalid");
@@ -832,6 +852,37 @@ static ftun_status_t ftun_validate_inbounds(const ftun_config_t *config,
   return FTUN_OK;
 }
 
+static ftun_status_t ftun_validate_tun_device(
+  const ftun_config_t *config, const ftun_config_cidr_t *fake_range,
+  ftun_diagnostic_t *out)
+{
+  ftun_config_cidr_t tun_range;
+  const char *base;
+  if (config == NULL || !config->tun.present) return FTUN_OK;
+  base = config->tun.legacy_fields ? "/inbounds" : "/tun";
+  if (!ftun_path_valid(config->tun.interface_name) ||
+      strlen(config->tun.interface_name) > 15u) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+                                  "TUN interface name is invalid");
+  }
+  if (config->tun.mtu == 0u ||
+      (config->tun.strict_route && !config->tun.auto_route)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+                                  "TUN options are invalid");
+  }
+  if (!ftun_cidr(config->tun.ipv4_address, 0, &tun_range)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+                                  "TUN IPv4 address is invalid");
+  }
+  if (config->dns.enable && config->dns.fake_ip.enable &&
+      ftun_cidr_overlap(fake_range, &tun_range)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID,
+                                  "/dns/fake-ip/range",
+                                  "FakeIP range overlaps TUN network");
+  }
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_validate_listener_conflicts(const ftun_config_t *config,
                                                       ftun_diagnostic_t *out)
 {
@@ -920,7 +971,7 @@ static ftun_status_t ftun_validate_frs(const ftun_config_t *config,
 ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_t *out)
 {
   ftun_config_cidr_t fake_range;
-  uint32_t required = FTUN_BUILD_MODULE_CORE;
+  uint32_t required;
   size_t index;
   ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
@@ -928,30 +979,21 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "",
                                   "configuration is missing");
   }
-  if (config->dns.enable) required |= FTUN_BUILD_MODULE_DNS;
-  if (config->dns.enable) {
-    for (index = 0u; index < config->dns.server_count; index++) {
-      if (config->dns.servers[index].fake_ip) {
-        required |= FTUN_BUILD_MODULE_FAKEIP;
-        break;
-      }
-    }
-  }
-  if (config->frs.active) required |= FTUN_BUILD_MODULE_FRS;
-  for (index = 0u; index < config->inbound_count; index++) {
-    if (config->inbounds[index].kind == FTUN_CONFIG_INBOUND_TUN) {
-      required |= FTUN_BUILD_MODULE_TUN;
-    }
-  }
+  required = ftun_config_required_modules(config);
   status = ftun_build_require_modules(required, out);
   if (status != FTUN_OK) {
     if (out != NULL) {
       const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
+      static const char proxy_path[] = "/";
       static const char dns_path[] = "/dns/enable";
       static const char fakeip_path[] = "/dns/servers";
       static const char tun_path[] = "/inbounds";
       static const char frs_path[] = "/rules";
-      if ((required & FTUN_BUILD_MODULE_DNS) != 0u &&
+      if ((required & FTUN_BUILD_MODULE_PROXY) != 0u &&
+          (capabilities->builtins & FTUN_BUILD_MODULE_PROXY) == 0u) {
+        out->path.data = proxy_path;
+        out->path.length = sizeof(proxy_path) - 1u;
+      } else if ((required & FTUN_BUILD_MODULE_DNS) != 0u &&
           (capabilities->builtins & FTUN_BUILD_MODULE_DNS) == 0u) {
         out->path.data = dns_path;
         out->path.length = sizeof(dns_path) - 1u;
@@ -976,6 +1018,8 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
   if (status != FTUN_OK) return status;
   (void)ftun_cidr(config->dns.fake_ip.range, 0, &fake_range);
   status = ftun_validate_outbounds(config, &fake_range, out);
+  if (status != FTUN_OK) return status;
+  status = ftun_validate_tun_device(config, &fake_range, out);
   if (status != FTUN_OK) return status;
   status = ftun_validate_inbounds(config, &fake_range, out);
   if (status != FTUN_OK) return status;

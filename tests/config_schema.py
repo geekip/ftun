@@ -66,6 +66,8 @@ class ConfigSchemaTest(unittest.TestCase):
     def test_empty_objects_and_default_annotations(self):
         self.valid({})  # Embedding/fragments are distinct from CLI run's non-empty input requirement.
         self.valid({'base': {}, 'dns': {}, 'frs': {}, 'sniff': {}, 'rules': []})
+        self.valid({'base': {'capacity': {'tcp-flows': 1000, 'udp-flows': 1000,
+                                          'udp-associations': 1000}}})
         original = {'inbounds': [tun()]}
         value = copy.deepcopy(original)
         self.valid(value)
@@ -95,9 +97,14 @@ class ConfigSchemaTest(unittest.TestCase):
                  {'outbounds': [dict(node(), udp=1)]}, {'outbounds': [dict(group(), tolerance=20)]}]
         for value in cases:
             with self.subTest(value=value): self.invalid(value)
+        for value in [0, 10001, 1.5, '1000']:
+            with self.subTest(capacity=value):
+                self.invalid({'base': {'capacity': {'tcp-flows': value}}})
+        self.invalid({'base': {'capacity': {'unknown': 1}}})
 
     def test_future_features_are_rejected(self):
-        for value in [{'api': {'enable': False}}, {'base': {'ipv6': True}},
+        for value in [{'api': {'enable': False}}, {'mesh': {}},
+                      {'base': {'ipv6': True}},
                       {'inbounds': [{'name': 'a', 'type': 'anytls', 'listen': '127.0.0.1:443'}]},
                       {'outbounds': [{'name': 'a', 'type': 'anytls', 'server': 'example.com:443'}]},
                       {'outbounds': [{'name': 'custom', 'type': 'direct'}]},
@@ -162,6 +169,20 @@ class ConfigSchemaTest(unittest.TestCase):
                       dict(tun(), ipv4={}), dict(tun(), interface={})]:
             with self.subTest(value=value): self.invalid({'inbounds': [value]})
         self.invalid({'inbounds': [tun(), dict(tun(), name='tun2')]})
+
+    def test_canonical_tun_and_legacy_compatibility(self):
+        device = {'interface': 'ftun0', 'mtu': 1420,
+                  'ipv4': {'address': '172.19.0.1/30'},
+                  'auto-route': True, 'strict-route': True}
+        self.valid({'tun': device,
+                    'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
+        legacy = tun(**{'auto-route': True, 'strict-route': True})
+        legacy['interface']['mtu'] = 1420
+        self.valid({'tun': device, 'inbounds': [legacy]})
+        self.invalid({'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
+        self.invalid({'tun': dict(device, **{'strict-route': True,
+                                             'auto-route': False}),
+                      'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
 
     def test_cidr_limits(self):
         for cidr in ['0.0.0.0/0', '198.18.0.0/15', '255.255.255.255/32']:

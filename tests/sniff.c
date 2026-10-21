@@ -1,4 +1,4 @@
-#include "sniff/sniff.h"
+#include "proxy/sniff/sniff.h"
 
 #include <stdio.h>
 #include <string.h>

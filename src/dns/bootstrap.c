@@ -22,6 +22,7 @@ typedef enum {
 typedef struct {
   ftun_core_t *core;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_operation_t *child;
   ftun_reservation_t *reservation;
   ftun_event_loop_t *loop;
@@ -33,6 +34,8 @@ typedef struct {
   size_t server_count;
   size_t next_server;
   size_t current_server;
+  ftun_network_view_t *network_view;
+  uint64_t network_generation;
   ftun_socket_policy_t protection;
   char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
@@ -327,11 +330,15 @@ static ftun_status_t ftun_bootstrap_cancel(void *user)
 static void ftun_bootstrap_release_context(ftun_bootstrap_context_t *context)
 {
   ftun_reservation_t *reservation;
+  ftun_network_view_t *network_view;
   if (context == NULL) return;
   reservation = context->reservation;
+  network_view = context->network_view;
   context->reservation = NULL;
+  context->network_view = NULL;
   memset(context, 0, sizeof(*context));
   free(context);
+  (void)ftun_network_view_release(&network_view);
   (void)ftun_reservation_release(&reservation);
 }
 
@@ -382,7 +389,7 @@ static ftun_status_t ftun_bootstrap_finish(ftun_bootstrap_context_t *context,
   }
   context->pending_error = error;
   context->has_pending_error = 0;
-  return ftun_operation_complete(context->operation, error);
+  return ftun_operation_complete(context->completion_token, error);
 }
 
 static void ftun_bootstrap_cleanup_deferred(void *user)
@@ -571,6 +578,11 @@ static ftun_status_t ftun_bootstrap_start_attempt(
     request.operations = context->operations;
     request.budget = context->budget;
     request.endpoint = context->servers[context->current_server];
+    request.allowed = context->servers;
+    request.allowed_count = context->server_count;
+    request.network_view = context->network_view;
+    request.network_generation = context->network_generation;
+    request.requested_domain = FTUN_DIAL_DOMAIN_UNDERLAY;
     request.protection = context->protection;
     request.deadline_ms = context->deadline_ms;
     request.transport = FTUN_DIAL_UDP;
@@ -745,6 +757,16 @@ static ftun_status_t ftun_bootstrap_explicit(
   context->server_count = request->server_count;
   memcpy(context->servers, request->servers,
          request->server_count * sizeof(*context->servers));
+  if (request->network_view != NULL) {
+    status = ftun_network_view_retain((ftun_network_view_t *)
+                                      request->network_view);
+    if (status != FTUN_OK) {
+      ftun_bootstrap_release_context(context);
+      return status;
+    }
+    context->network_view = (ftun_network_view_t *)request->network_view;
+  }
+  context->network_generation = request->network_generation;
   context->protection.mark = request->protection.mark;
   if (request->protection.interface_name.length != 0u) {
     memcpy(context->interface_name, request->protection.interface_name.data,
@@ -772,7 +794,8 @@ static ftun_status_t ftun_bootstrap_explicit(
     return status;
   }
   status = ftun_operation_accept(request->operations, ftun_bootstrap_completed,
-                                 context, &context->operation);
+                                 context, &context->operation,
+                                 &context->completion_token);
   if (status != FTUN_OK) {
     ftun_bootstrap_release_context(context);
     return status;

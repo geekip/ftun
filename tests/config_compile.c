@@ -167,7 +167,8 @@ int main(int argc, char **argv)
   CHECK(compile_text("{}", &plan));
   CHECK(feature(plan->compiled, FTUN_PLAN_DNS));
   CHECK(no_feature(plan->prepare, FTUN_PLAN_DNS));
-  CHECK(plan->required_modules == (FTUN_BUILD_MODULE_CORE | FTUN_BUILD_MODULE_DNS));
+  CHECK(plan->required_modules == (FTUN_BUILD_MODULE_CORE |
+        FTUN_BUILD_MODULE_DNS));
   CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK);
 
   CHECK(compile_text(unused, &plan));

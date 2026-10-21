@@ -1,4 +1,4 @@
-#include "outbound/socks5.h"
+#include "proxy/outbound/socks5.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -604,6 +604,68 @@ static int test_udp_associate_and_source(void)
   return 0;
 }
 
+static int test_overlay_udp_domain_sticky(void)
+{
+  ftun_network_prefix_t prefix = {{198u, 0u, 0u, 0u}, 8u};
+  ftun_network_route_t route = {
+    {{198u, 0u, 0u, 0u}, 8u},
+    FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_PROXY)
+  };
+  ftun_network_view_spec_t spec;
+  ftun_network_view_t *view = NULL;
+  ftun_socks5_connection_info_t info;
+  ftun_operation_t *operation = NULL;
+  ftun_endpoint_t relay;
+  fixture_t fixture;
+
+  memset(&spec, 0, sizeof(spec));
+  spec.generation = 23u;
+  spec.protected_prefixes = &prefix;
+  spec.protected_prefix_count = 1u;
+  spec.overlay_routes = &route;
+  spec.overlay_route_count = 1u;
+  CHECK(ftun_network_view_create(&spec, &view) == FTUN_OK);
+
+  CHECK(fixture_start(&fixture, 65536u, 8u) == 0);
+  fixture.request.transport = FTUN_DIAL_UDP;
+  fixture.request.network_view = view;
+  fixture.request.network_generation = 23u;
+  endpoint_set(&relay, 192u, 2u, 5300u);
+  CHECK(add_server_script(&fixture, FTUN_SOCKS5_METHOD_NO_AUTH, 0, 0u,
+                          FTUN_SOCKS5_REPLY_SUCCEEDED, &relay) == 0);
+  CHECK(ftun_socks5_connect_with_io(NULL, &fixture.request,
+                                    &fixture.dial_io, &fixture.protocol_io,
+                                    &operation) == FTUN_OK);
+  CHECK(drive(&fixture) == 0 &&
+        fixture.completion.error.status == FTUN_E_REJECTED &&
+        fixture.completion.connection == NULL &&
+        fixture.socket.open_calls == 1u &&
+        fixture.socket.protect_calls == 0u &&
+        fixture.socket.close_calls == 1u);
+  CHECK(fixture_stop(&fixture) == 0);
+
+  CHECK(fixture_start(&fixture, 65536u, 8u) == 0);
+  fixture.request.transport = FTUN_DIAL_UDP;
+  fixture.request.network_view = view;
+  fixture.request.network_generation = 23u;
+  endpoint_set(&relay, 0u, 0u, 5300u);
+  CHECK(add_server_script(&fixture, FTUN_SOCKS5_METHOD_NO_AUTH, 0, 0u,
+                          FTUN_SOCKS5_REPLY_SUCCEEDED, &relay) == 0);
+  CHECK(ftun_socks5_connect_with_io(NULL, &fixture.request,
+                                    &fixture.dial_io, &fixture.protocol_io,
+                                    &operation) == FTUN_OK);
+  CHECK(drive(&fixture) == 0 && fixture.completion.error.status == FTUN_OK &&
+        fixture.completion.connection != NULL &&
+        fixture.socket.open_calls == 2u &&
+        fixture.socket.protect_calls == 0u);
+  CHECK(ftun_socks5_connection_get_info(fixture.completion.connection,
+        &info) == FTUN_OK && info.proxy_domain == FTUN_DIAL_DOMAIN_OVERLAY &&
+        info.network_generation == 23u && info.relay.address[0] == 198u);
+  CHECK(fixture_stop(&fixture) == 0);
+  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  return 0;
+}
+
 static int test_protocol_failures_timeout_and_cancel(void)
 {
   fixture_t fixture;
@@ -748,6 +810,7 @@ int main(void)
   if (test_tcp_candidates_partial_and_copy() != 0) return 1;
   if (test_authenticated_domain() != 0) return 1;
   if (test_udp_associate_and_source() != 0) return 1;
+  if (test_overlay_udp_domain_sticky() != 0) return 1;
   if (test_protocol_failures_timeout_and_cancel() != 0) return 1;
   if (test_synchronous_boundaries() != 0) return 1;
   return 0;

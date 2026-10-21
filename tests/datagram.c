@@ -13,7 +13,7 @@
 #define BACKEND_SENDS 8u
 
 typedef struct {
-  ftun_datagram_send_t *sends[BACKEND_SENDS];
+  ftun_datagram_send_token_t sends[BACKEND_SENDS];
   size_t send_count;
   ftun_status_t start_status;
   ftun_status_t cancel_status;
@@ -21,8 +21,10 @@ typedef struct {
   int cancel_calls;
   int destroy_calls;
   int complete_in_start;
+  int complete_in_cancel;
   int in_start;
   int early_complete_ok;
+  int cancel_complete_was_again;
   ftun_endpoint_t target;
   char target_domain[FTUN_DATAGRAM_DOMAIN_BYTES];
   size_t payload_length;
@@ -54,21 +56,30 @@ typedef struct {
   callback_state_t callback;
 } fixture_t;
 
-static void backend_remove(backend_state_t *state, ftun_datagram_send_t *send)
+static int send_equal(ftun_datagram_send_token_t left,
+                      ftun_datagram_send_token_t right)
+{
+  return left.channel == right.channel && left.slot == right.slot &&
+         left.generation == right.generation;
+}
+
+static void backend_remove(backend_state_t *state,
+                           ftun_datagram_send_token_t send)
 {
   size_t index;
   for (index = 0u; index < state->send_count; index++) {
-    if (state->sends[index] == send) {
+    if (send_equal(state->sends[index], send)) {
       state->send_count--;
       state->sends[index] = state->sends[state->send_count];
-      state->sends[state->send_count] = NULL;
+      memset(&state->sends[state->send_count], 0,
+             sizeof(state->sends[state->send_count]));
       return;
     }
   }
 }
 
 static ftun_status_t backend_send_start(void *user,
-                                        ftun_datagram_send_t *send,
+                                        ftun_datagram_send_token_t send,
                                         const ftun_endpoint_t *target,
                                         const ftun_packet_t *packet)
 {
@@ -108,12 +119,17 @@ static ftun_status_t backend_send_start(void *user,
 }
 
 static ftun_status_t backend_send_cancel(void *user,
-                                         ftun_datagram_send_t *send)
+                                         ftun_datagram_send_token_t send)
 {
   backend_state_t *state = (backend_state_t *)user;
   size_t before = state->send_count;
   state->cancel_calls++;
   if (state->cancel_status != FTUN_OK) return state->cancel_status;
+  if (state->complete_in_cancel) {
+    ftun_error_t success = {FTUN_OK, 0u, 0};
+    state->cancel_complete_was_again +=
+      ftun_datagram_send_complete(send, success) == FTUN_E_AGAIN;
+  }
   backend_remove(state, send);
   return state->send_count + 1u == before ? FTUN_OK : FTUN_E_STATE_CORRUPT;
 }
@@ -249,7 +265,7 @@ static ftun_endpoint_t ipv4_endpoint(uint16_t port, uint8_t last)
 
 static int complete_first(fixture_t *fixture, ftun_error_t error)
 {
-  ftun_datagram_send_t *send;
+  ftun_datagram_send_token_t send;
   if (fixture->backend.send_count == 0u) return 1;
   send = fixture->backend.sends[0];
   backend_remove(&fixture->backend, send);
@@ -258,7 +274,7 @@ static int complete_first(fixture_t *fixture, ftun_error_t error)
 
 static int complete_index(fixture_t *fixture, size_t index, ftun_error_t error)
 {
-  ftun_datagram_send_t *send;
+  ftun_datagram_send_token_t send;
   if (index >= fixture->backend.send_count) return 1;
   send = fixture->backend.sends[index];
   backend_remove(&fixture->backend, send);
@@ -427,13 +443,52 @@ static int test_rejection_limits_and_stop(void)
   CHECK(ftun_datagram_send(fixture.channel, &target, &first) == FTUN_E_CANCELLED);
   CHECK(ftun_packet_release(&first) == FTUN_OK);
   fixture.backend.cancel_status = FTUN_OK;
+  fixture.backend.complete_in_cancel = 1;
   CHECK(ftun_datagram_stop(fixture.channel) == FTUN_OK);
   CHECK(fixture.callback.result_calls == 1 &&
-        fixture.callback.error.status == FTUN_E_CANCELLED);
+        fixture.callback.error.status == FTUN_E_CANCELLED &&
+        fixture.backend.cancel_complete_was_again == 1);
   CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_OK &&
         fixture.channel == NULL && fixture.backend.destroy_calls == 1);
   CHECK(ftun_buffer_pool_destroy(&fixture.pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&fixture.budget) == FTUN_OK);
+  return 0;
+}
+
+static int test_generation_after_slot_reuse(void)
+{
+  fixture_t fixture;
+  ftun_packet_t packet = {{0}, 0u};
+  ftun_endpoint_t target = ipv4_endpoint(53u, 1u);
+  ftun_datagram_send_token_t late;
+  ftun_datagram_send_token_t current;
+  const ftun_endpoint_t *view_target = NULL;
+  const ftun_packet_t *view_packet = NULL;
+  ftun_error_t success = {FTUN_OK, 0u, 0};
+  CHECK(fixture_start(&fixture, 1u, 8u, 1) == 0);
+  CHECK(make_packet(&fixture, 70u, 2u, 1u, &packet) == 0);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_OK);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  late = fixture.backend.sends[0];
+  CHECK(complete_first(&fixture, success) == 0);
+  CHECK(fixture.callback.result_calls == 1);
+
+  CHECK(make_packet(&fixture, 80u, 2u, 2u, &packet) == 0);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_OK);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  current = fixture.backend.sends[0];
+  CHECK(current.channel == late.channel && current.slot == late.slot &&
+        current.generation != late.generation);
+  CHECK(ftun_datagram_send_view(late, &view_target, &view_packet) ==
+        FTUN_E_STALE && view_target == NULL && view_packet == NULL);
+  CHECK(ftun_datagram_send_complete(late, success) == FTUN_E_STALE);
+  CHECK(fixture.callback.result_calls == 1);
+  CHECK(ftun_datagram_send_view(current, &view_target, &view_packet) ==
+        FTUN_OK && view_packet->source_id == 2u);
+  CHECK(complete_first(&fixture, success) == 0);
+  CHECK(ftun_datagram_send_complete(current, success) == FTUN_E_STALE);
+  CHECK(fixture.callback.result_calls == 2);
+  CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }
 
@@ -484,8 +539,10 @@ static int test_receive_and_boundaries(void)
   CHECK(ftun_datagram_create(NULL, NULL, &fixture.channel) == FTUN_E_INVALID &&
         fixture.channel == NULL);
   CHECK(ftun_datagram_send(NULL, NULL, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_datagram_send_view(NULL, NULL, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_datagram_send_complete(NULL, (ftun_error_t){FTUN_OK, 0u, 0}) ==
+  CHECK(ftun_datagram_send_view((ftun_datagram_send_token_t){0}, NULL, NULL) ==
+        FTUN_E_INVALID);
+  CHECK(ftun_datagram_send_complete((ftun_datagram_send_token_t){0},
+                                    (ftun_error_t){FTUN_OK, 0u, 0}) ==
         FTUN_E_INVALID);
   CHECK(ftun_datagram_deliver(NULL, NULL, NULL) == FTUN_E_INVALID);
   CHECK(ftun_datagram_stop(NULL) == FTUN_E_INVALID);
@@ -503,6 +560,7 @@ int main(void)
   CHECK(test_zero_domain_and_immediate() == 0);
   CHECK(test_zero_boundaries_and_slots() == 0);
   CHECK(test_rejection_limits_and_stop() == 0);
+  CHECK(test_generation_after_slot_reuse() == 0);
   CHECK(test_receive_and_boundaries() == 0);
   return 0;
 }

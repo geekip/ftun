@@ -1,6 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
-#include "sniff/http_host.h"
-#include "sniff/tls_sni.h"
+#include "proxy/sniff/http_host.h"
+#include "proxy/sniff/tls_sni.h"
 
 #include <inttypes.h>
 #include <stdio.h>

@@ -23,6 +23,8 @@ typedef struct {
   ftun_string_t domain;
   const ftun_endpoint_t *servers;
   size_t server_count;
+  const ftun_network_view_t *network_view;
+  uint64_t network_generation;
   ftun_socket_policy_t protection;
   uint64_t deadline_ms;
   uint16_t query_id;

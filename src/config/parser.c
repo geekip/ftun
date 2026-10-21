@@ -344,6 +344,9 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
   if ((field) == NULL) return FTUN_E_LIMIT; \
 } while (0)
   config->base.state_cache = true;
+  config->base.capacity.tcp_flows = FTUN_CONFIG_CAPACITY_DEFAULT;
+  config->base.capacity.udp_flows = FTUN_CONFIG_CAPACITY_DEFAULT;
+  config->base.capacity.udp_associations = FTUN_CONFIG_CAPACITY_DEFAULT;
   FTUN_DEFAULT(config->base.cache_file, "~/.ftun/ftun.cache");
   FTUN_DEFAULT(config->log.level, "warn");
   FTUN_DEFAULT(config->log.file, "~/.ftun/ftun.log");
@@ -358,6 +361,7 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
   FTUN_DEFAULT(config->frs.dns_server, "");
   config->sniff.tls_sni = true;
   config->sniff.http_host = true;
+  config->tun.mtu = 1500u;
 #undef FTUN_DEFAULT
   return FTUN_OK;
 }
@@ -365,15 +369,33 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
 static ftun_status_t ftun_parse_base(const cJSON *item, ftun_config_t *config)
 {
   static const char *const fields[] = {
-    "ipv6", "allow-lan", "cache-file", "state-cache"
+    "ipv6", "allow-lan", "cache-file", "state-cache", "capacity"
   };
-  ftun_status_t status = ftun_check_fields(item, fields, 4u);
+  const cJSON *capacity;
+  ftun_status_t status = ftun_check_fields(item, fields, 5u);
   if (status != FTUN_OK) return status;
   status = ftun_optional_bool(item, "ipv6", &config->base.ipv6);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "allow-lan", &config->base.allow_lan);
   if (status == FTUN_OK) status = ftun_replace_string(&config->base.cache_file,
     cJSON_GetObjectItemCaseSensitive(item, "cache-file"), 0);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "state-cache", &config->base.state_cache);
+  capacity = cJSON_GetObjectItemCaseSensitive(item, "capacity");
+  if (status == FTUN_OK && capacity != NULL) {
+    static const char *const capacity_fields[] = {
+      "tcp-flows", "udp-flows", "udp-associations"
+    };
+    status = ftun_check_fields(capacity, capacity_fields, 3u);
+    if (status == FTUN_OK) status = ftun_optional_uint(
+      capacity, "tcp-flows", FTUN_CONFIG_CAPACITY_MINIMUM,
+      FTUN_CONFIG_CAPACITY_MAXIMUM, &config->base.capacity.tcp_flows);
+    if (status == FTUN_OK) status = ftun_optional_uint(
+      capacity, "udp-flows", FTUN_CONFIG_CAPACITY_MINIMUM,
+      FTUN_CONFIG_CAPACITY_MAXIMUM, &config->base.capacity.udp_flows);
+    if (status == FTUN_OK) status = ftun_optional_uint(
+      capacity, "udp-associations", FTUN_CONFIG_CAPACITY_MINIMUM,
+      FTUN_CONFIG_CAPACITY_MAXIMUM,
+      &config->base.capacity.udp_associations);
+  }
   return status;
 }
 
@@ -598,8 +620,48 @@ static ftun_status_t ftun_parse_users(const cJSON *item,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_parse_tun(const cJSON *item,
-                                    ftun_config_inbound_t *inbound)
+static ftun_status_t ftun_parse_tun_device(const cJSON *item,
+                                           ftun_config_t *config)
+{
+  static const char *const fields[] = {
+    "interface", "mtu", "ipv4", "auto-route", "strict-route"
+  };
+  static const char *const ipv4_fields[] = {"address"};
+  const cJSON *ipv4;
+  ftun_status_t status;
+  if (item == NULL || config == NULL || !cJSON_IsObject(item)) {
+    return FTUN_E_INVALID;
+  }
+  status = ftun_check_fields(item, fields, 5u);
+  if (status == FTUN_OK) {
+    status = ftun_replace_string(&config->tun.interface_name,
+      cJSON_GetObjectItemCaseSensitive(item, "interface"), 1);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_optional_uint(item, "mtu", 1u, UINT32_MAX,
+                                &config->tun.mtu);
+  }
+  ipv4 = cJSON_GetObjectItemCaseSensitive(item, "ipv4");
+  if (status == FTUN_OK && ipv4 == NULL) status = FTUN_E_INVALID;
+  if (status == FTUN_OK) status = ftun_check_fields(ipv4, ipv4_fields, 1u);
+  if (status == FTUN_OK) {
+    status = ftun_replace_string(&config->tun.ipv4_address,
+      cJSON_GetObjectItemCaseSensitive(ipv4, "address"), 1);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_optional_bool(item, "auto-route",
+                                &config->tun.auto_route);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_optional_bool(item, "strict-route",
+                                &config->tun.strict_route);
+  }
+  if (status == FTUN_OK) config->tun.present = true;
+  return status;
+}
+
+static ftun_status_t ftun_parse_tun_inbound(
+  const cJSON *item, ftun_config_inbound_t *inbound)
 {
   static const char *const fields[] = {
     "name", "type", "outbound", "interface", "stack", "ipv4", "tcp", "udp",
@@ -629,16 +691,28 @@ static ftun_status_t ftun_parse_tun(const cJSON *item,
   if (strcmp(inbound->stack, "lwip") != 0) return FTUN_E_UNSUPPORTED;
   interface_object = cJSON_GetObjectItemCaseSensitive(item, "interface");
   ipv4_object = cJSON_GetObjectItemCaseSensitive(item, "ipv4");
-  if (interface_object == NULL || ipv4_object == NULL) return FTUN_E_INVALID;
-  status = ftun_check_fields(interface_object, interface_fields, 2u);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->interface_name,
-    cJSON_GetObjectItemCaseSensitive(interface_object, "name"), 1);
-  if (status == FTUN_OK) status = ftun_optional_uint(interface_object, "mtu", 1u,
-    UINT32_MAX, &mtu);
-  inbound->mtu = mtu;
-  if (status == FTUN_OK) status = ftun_check_fields(ipv4_object, ipv4_fields, 1u);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->ipv4_address,
-    cJSON_GetObjectItemCaseSensitive(ipv4_object, "address"), 1);
+  if ((interface_object == NULL) != (ipv4_object == NULL)) {
+    return FTUN_E_INVALID;
+  }
+  if (interface_object != NULL) {
+    status = ftun_check_fields(interface_object, interface_fields, 2u);
+    if (status == FTUN_OK) {
+      status = ftun_replace_string(&inbound->interface_name,
+        cJSON_GetObjectItemCaseSensitive(interface_object, "name"), 1);
+    }
+    if (status == FTUN_OK) {
+      status = ftun_optional_uint(interface_object, "mtu", 1u,
+                                  UINT32_MAX, &mtu);
+    }
+    inbound->mtu = mtu;
+    if (status == FTUN_OK) {
+      status = ftun_check_fields(ipv4_object, ipv4_fields, 1u);
+    }
+    if (status == FTUN_OK) {
+      status = ftun_replace_string(&inbound->ipv4_address,
+        cJSON_GetObjectItemCaseSensitive(ipv4_object, "address"), 1);
+    }
+  }
   if (status == FTUN_OK) status = ftun_optional_bool(item, "tcp", &inbound->tcp);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "udp", &inbound->udp);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "auto-route", &inbound->auto_route);
@@ -697,7 +771,7 @@ static ftun_status_t ftun_parse_inbounds(const cJSON *array, ftun_config_t *conf
       status = ftun_parse_proxy_inbound(item, &config->inbounds[index],
                                         FTUN_CONFIG_INBOUND_SOCKS5);
     } else if (strcmp(type->valuestring, "tun") == 0) {
-      status = ftun_parse_tun(item, &config->inbounds[index]);
+      status = ftun_parse_tun_inbound(item, &config->inbounds[index]);
     } else {
       return FTUN_E_UNSUPPORTED;
     }
@@ -847,11 +921,71 @@ static void ftun_normalize_config_names(ftun_config_t *config)
   }
 }
 
+/* 顶层 tun 是物理设备的唯一内部模型。旧 TUN inbound 的设备字段在
+ * 解析末尾复制到这里；新旧同时出现时只接受完全相同的值。 */
+static ftun_status_t ftun_normalize_tun_device(ftun_config_t *config)
+{
+  ftun_config_inbound_t *legacy_source = NULL;
+  size_t tun_count = 0u;
+  size_t index;
+  if (config == NULL) return FTUN_E_INVALID;
+  for (index = 0u; index < config->inbound_count; index++) {
+    ftun_config_inbound_t *current = &config->inbounds[index];
+    if (current->kind != FTUN_CONFIG_INBOUND_TUN) continue;
+    tun_count++;
+    if ((current->interface_name == NULL) !=
+        (current->ipv4_address == NULL)) return FTUN_E_INVALID;
+    if (legacy_source == NULL && current->interface_name != NULL) {
+      legacy_source = current;
+    }
+  }
+  if (tun_count == 0u) return FTUN_OK;
+  if (!config->tun.present) {
+    if (legacy_source == NULL) return FTUN_E_INVALID;
+    config->tun.interface_name =
+      ftun_config_string_copy(legacy_source->interface_name);
+    config->tun.ipv4_address =
+      ftun_config_string_copy(legacy_source->ipv4_address);
+    if (config->tun.interface_name == NULL ||
+        config->tun.ipv4_address == NULL) return FTUN_E_LIMIT;
+    config->tun.mtu = legacy_source->mtu;
+    config->tun.auto_route = legacy_source->auto_route;
+    config->tun.strict_route = legacy_source->strict_route;
+    config->tun.present = true;
+  }
+  for (index = 0u; index < config->inbound_count; index++) {
+    ftun_config_inbound_t *inbound = &config->inbounds[index];
+    if (inbound->kind != FTUN_CONFIG_INBOUND_TUN) continue;
+    if (inbound->interface_name != NULL) {
+      if (strcmp(config->tun.interface_name, inbound->interface_name) != 0 ||
+          strcmp(config->tun.ipv4_address, inbound->ipv4_address) != 0 ||
+          config->tun.mtu != inbound->mtu ||
+          config->tun.auto_route != inbound->auto_route ||
+          config->tun.strict_route != inbound->strict_route) {
+        return FTUN_E_INVALID;
+      }
+      config->tun.legacy_fields = true;
+      continue;
+    }
+    inbound->interface_name =
+      ftun_config_string_copy(config->tun.interface_name);
+    inbound->ipv4_address =
+      ftun_config_string_copy(config->tun.ipv4_address);
+    if (inbound->interface_name == NULL || inbound->ipv4_address == NULL) {
+      return FTUN_E_LIMIT;
+    }
+    inbound->mtu = config->tun.mtu;
+    inbound->auto_route = config->tun.auto_route;
+    inbound->strict_route = config->tun.strict_route;
+  }
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
 {
   static const char *const fields[] = {
     "$schema", "base", "log", "dns", "frs", "sniff", "inbounds", "outbounds",
-    "rules"
+    "rules", "tun"
   };
   const cJSON *item;
   ftun_status_t status = FTUN_OK;
@@ -859,7 +993,7 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
       cJSON_GetObjectItemCaseSensitive(root, "plugins") != NULL) {
     return FTUN_E_UNSUPPORTED;
   }
-  status = ftun_check_fields(root, fields, 9u);
+  status = ftun_check_fields(root, fields, 10u);
   if (status != FTUN_OK) return status;
   item = cJSON_GetObjectItemCaseSensitive(root, "$schema");
   if (item != NULL && (!cJSON_IsString(item) || item->valuestring == NULL ||
@@ -872,6 +1006,10 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
   if (status == FTUN_OK && item != NULL) status = ftun_parse_dns(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "sniff");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_sniff(item, config);
+  item = cJSON_GetObjectItemCaseSensitive(root, "tun");
+  if (status == FTUN_OK && item != NULL) {
+    status = ftun_parse_tun_device(item, config);
+  }
   item = cJSON_GetObjectItemCaseSensitive(root, "inbounds");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_inbounds(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "outbounds");
@@ -883,6 +1021,7 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
   if (status == FTUN_OK && config->frs.active && item != NULL) {
     status = ftun_parse_frs(item, config);
   }
+  if (status == FTUN_OK) status = ftun_normalize_tun_device(config);
   if (status == FTUN_OK) ftun_normalize_config_names(config);
   return status;
 }
@@ -934,6 +1073,8 @@ ftun_status_t ftun_config_destroy(ftun_config_t **config)
   free(owned->frs.update_interval);
   free(owned->frs.update_outbound);
   free(owned->frs.dns_server);
+  free(owned->tun.interface_name);
+  free(owned->tun.ipv4_address);
   for (index = 0u; index < owned->inbound_count; index++) {
     ftun_config_inbound_t *inbound = &owned->inbounds[index];
     size_t user_index;

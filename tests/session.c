@@ -3,8 +3,8 @@
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/operation.h"
-#include "core/runtime.h"
-#include "core/session.h"
+#include "proxy/runtime_state.h"
+#include "proxy/session.h"
 #include "transport/stream.h"
 
 #include <stdint.h>
@@ -33,6 +33,7 @@ typedef struct {
 typedef struct {
   ftun_session_t *session;
   ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
   ftun_error_t result;
   int calls;
   int session_completed;
@@ -66,7 +67,7 @@ static ftun_config_t *make_config(const char *name, unsigned int port)
 }
 
 static ftun_status_t backend_write_start(void *context,
-                                         ftun_stream_write_t *write,
+                                         ftun_stream_write_token_t write,
                                          const ftun_buffer_slice_t *slice,
                                          size_t *accepted)
 {
@@ -78,7 +79,7 @@ static ftun_status_t backend_write_start(void *context,
 }
 
 static ftun_status_t backend_write_cancel(void *context,
-                                          ftun_stream_write_t *write)
+                                          ftun_stream_write_token_t write)
 {
   (void)context;
   (void)write;
@@ -202,7 +203,8 @@ static int begin_child(fixture_t *fixture, ftun_session_t *session,
   memset(child, 0, sizeof(*child));
   child->session = session;
   if (ftun_operation_accept(fixture->operations, child_complete, child,
-                            &child->operation) != FTUN_OK) return 1;
+                            &child->operation,
+                            &child->completion_token) != FTUN_OK) return 1;
   if (ftun_session_transition(session, state, child->operation) != FTUN_OK) {
     (void)ftun_operation_reject(&child->operation);
     return 1;
@@ -217,7 +219,9 @@ static int finish_child(fixture_t *fixture, child_t *child,
   size_t dispatched = 0u;
   memset(&result, 0, sizeof(result));
   result.status = result_status;
-  if (ftun_operation_complete(child->operation, result) != FTUN_OK) return 1;
+  if (ftun_operation_complete(child->completion_token, result) != FTUN_OK) {
+    return 1;
+  }
   if (ftun_operation_dispatch(fixture->operations, 1u,
                               &dispatched) != FTUN_OK) return 1;
   return dispatched == 1u && child->calls == 1 &&

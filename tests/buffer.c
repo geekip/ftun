@@ -5,10 +5,133 @@
 
 #define CHECK(x) do { \
   if (!(x)) { \
-    fprintf(stderr, "buffer contract failed: %s\n", #x); \
+    fprintf(stderr, "buffer contract failed at line %d: %s\n", __LINE__, #x); \
     return 1; \
   } \
 } while (0)
+
+typedef struct {
+  ftun_buffer_pool_t *pool;
+  ftun_buffer_t *buffer;
+  ftun_status_t status;
+  size_t calls;
+} waiter_state_t;
+
+static void pool_wakeup(void *user)
+{
+  size_t *calls = (size_t *)user;
+  (*calls)++;
+}
+
+static void waiter_ready(void *user)
+{
+  waiter_state_t *state = (waiter_state_t *)user;
+  state->calls++;
+  state->status = ftun_buffer_pool_acquire(state->pool, 256u,
+                                            &state->buffer);
+}
+
+static int test_waiters(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_buffer_pool_t *pool = NULL;
+  ftun_buffer_t *first = NULL;
+  ftun_buffer_t *second = NULL;
+  ftun_buffer_t *available = NULL;
+  ftun_reservation_t *blocker = NULL;
+  ftun_budget_usage_t budget_usage;
+  ftun_buffer_pool_usage_t usage;
+  ftun_buffer_wait_token_t first_token;
+  ftun_buffer_wait_token_t first_stale;
+  ftun_buffer_wait_token_t second_token;
+  ftun_buffer_wait_token_t cancelled_token;
+  ftun_buffer_wait_token_t rejected_token;
+  waiter_state_t first_waiter;
+  waiter_state_t second_waiter;
+  waiter_state_t cancelled_waiter;
+  size_t wakeups = 0u;
+  size_t callbacks = SIZE_MAX;
+
+  memset(&first_waiter, 0, sizeof(first_waiter));
+  memset(&second_waiter, 0, sizeof(second_waiter));
+  memset(&cancelled_waiter, 0, sizeof(cancelled_waiter));
+  CHECK(ftun_budget_create(NULL, 8192u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create_waitable(budget, 1024u, 4u, 3u, 1u,
+                                         &pool) == FTUN_OK);
+  first_waiter.pool = pool;
+  second_waiter.pool = pool;
+  cancelled_waiter.pool = pool;
+  CHECK(ftun_buffer_pool_set_wakeup(pool, pool_wakeup, &wakeups) == FTUN_OK);
+  CHECK(ftun_buffer_pool_acquire(pool, 256u, &first) == FTUN_OK);
+  CHECK(ftun_buffer_pool_acquire(pool, 256u, &second) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available,
+                            &blocker) == FTUN_OK);
+
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &first_waiter,
+                              &first_token) == FTUN_OK);
+  first_stale = first_token;
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &second_waiter,
+                              &second_token) == FTUN_OK);
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &cancelled_waiter,
+                              &cancelled_token) == FTUN_OK);
+  memset(&rejected_token, 0xff, sizeof(rejected_token));
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &cancelled_waiter,
+                              &rejected_token) == FTUN_E_LIMIT);
+  CHECK(rejected_token.pool == NULL && rejected_token.generation == 0u);
+  CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
+
+  CHECK(ftun_buffer_release(&first) == FTUN_OK);
+  CHECK(ftun_buffer_release(&second) == FTUN_OK);
+  CHECK(wakeups == 1u);
+  CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK);
+  CHECK(usage.waiter_capacity == 3u && usage.waiting == 3u &&
+        usage.wake_quota == 1u && usage.notifications == 1u &&
+        usage.rejected_waiters == 1u && !usage.dispatching);
+
+  CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 1u && first_waiter.calls == 1u &&
+        first_waiter.status == FTUN_OK && first_waiter.buffer != NULL);
+  CHECK(wakeups == 2u);
+  CHECK(ftun_buffer_pool_wait_cancel(&first_stale) == FTUN_E_STALE);
+  CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK);
+  CHECK(callbacks == 1u && second_waiter.calls == 1u &&
+        second_waiter.status == FTUN_OK && second_waiter.buffer != NULL);
+  CHECK(cancelled_waiter.calls == 0u && wakeups == 2u);
+
+  CHECK(ftun_buffer_release(&first_waiter.buffer) == FTUN_OK);
+  CHECK(wakeups == 3u);
+  CHECK(ftun_buffer_pool_wait_cancel(&cancelled_token) == FTUN_OK);
+  CHECK(cancelled_token.pool == NULL && cancelled_token.generation == 0u);
+  CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK);
+  CHECK(usage.waiting == 0u && usage.wake_callbacks == 2u &&
+        usage.cancelled_waiters == 1u && usage.notifications == 3u);
+
+  /* Resource returned before registration: wait reports retry without
+   * creating a waiter, closing the release/register lost-wakeup window. */
+  memset(&rejected_token, 0xff, sizeof(rejected_token));
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &cancelled_waiter,
+                              &rejected_token) == FTUN_E_AGAIN);
+  CHECK(rejected_token.pool == NULL && rejected_token.generation == 0u);
+  CHECK(ftun_buffer_pool_acquire(pool, 256u, &available) == FTUN_OK);
+  /* Cancelling the last notified waiter clears coalescing state.  A later
+   * registration and release must produce a fresh notification. */
+  CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &cancelled_waiter,
+                              &cancelled_token) == FTUN_OK);
+  CHECK(ftun_buffer_release(&available) == FTUN_OK);
+  CHECK(wakeups == 4u);
+  CHECK(ftun_buffer_pool_wait_cancel(&cancelled_token) == FTUN_OK);
+  CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK &&
+        callbacks == 0u && cancelled_waiter.calls == 0u);
+  CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK &&
+        usage.waiting == 0u && usage.cancelled_waiters == 2u &&
+        usage.notifications == 4u);
+  CHECK(ftun_buffer_release(&second_waiter.buffer) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK && pool == NULL);
+  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
 
 /* TASK-UTIL-002 / TEST-UTIL-002：分档、slice 所有权和有界闲置保留。 */
 int main(void)
@@ -166,5 +289,6 @@ int main(void)
   CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
   CHECK(ftun_buffer_pool_destroy(&pressure_pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&pressure_budget) == FTUN_OK);
+  CHECK(test_waiters() == 0);
   return 0;
 }

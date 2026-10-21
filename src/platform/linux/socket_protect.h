@@ -22,7 +22,7 @@ typedef struct {
 /* 物理出口保护。
  * 需求 REQ-GUARD-001；任务 TASK-PLATFORM-003；目标 0.2.0；验收 TEST-PLATFORM-003。
  * 实现路径：在 bind/connect/send 前设置必需 mark/出口约束；DIRECT、DNS、探测、relay 同样保护；必需项失败不得忽略。
- * 调用边界见 document/ftun.modules.md；不访问配置 AST，不跨线程修改 Session。
+ * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；必须在 bind/connect/send 前调用。非零 mark 必需，接口名可选；
  * 声明的任一保护失败都返回错误，不允许调用者继续未保护拨号。
  * 已有不同 mark/device 视为冲突，不覆盖其他管理者设置。

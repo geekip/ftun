@@ -1,5 +1,5 @@
 #include "core/budget.h"
-#include "tun/lwip_adapter.h"
+#include "proxy/tun/lwip_adapter.h"
 #include "util/buffer.h"
 
 #include <stdio.h>
@@ -235,6 +235,7 @@ static int test_tcp_lifecycle(void)
   uint8_t packet[128];
   uint32_t server_sequence;
   uint32_t reply_sequence = 0u;
+  uint64_t deadline_ms = 0u;
   size_t count;
   size_t available;
   size_t accepted;
@@ -255,9 +256,13 @@ static int test_tcp_lifecycle(void)
   spec.tcp_event = tcp_event;
   spec.user = &context;
   CHECK(ftun_lwip_create(&spec, &stack) == FTUN_OK);
+  CHECK(ftun_lwip_next_deadline(stack, &deadline_ms) == FTUN_OK &&
+        deadline_ms == 1250u);
   CHECK(ftun_lwip_create(&spec, &other) == FTUN_E_INVALID && other == NULL);
   CHECK(ftun_lwip_tick(stack, 999u) == FTUN_E_INVALID);
   CHECK(ftun_lwip_tick(stack, 2000u) == FTUN_OK);
+  CHECK(ftun_lwip_next_deadline(stack, &deadline_ms) == FTUN_OK &&
+        deadline_ms == 2250u);
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK);
   CHECK(usage.tcp_timer_ticks == 4u && usage.reassembly_timer_ticks == 1u);
   CHECK(establish(stack, budget, &context, &server_sequence) == 0);

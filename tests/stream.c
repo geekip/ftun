@@ -11,7 +11,7 @@
 } while (0)
 
 typedef struct {
-  ftun_stream_write_t *write;
+  ftun_stream_write_token_t write;
   ftun_status_t start_status;
   ftun_status_t cancel_status;
   size_t accept_count;
@@ -19,6 +19,8 @@ typedef struct {
   int cancel_calls;
   int destroy_calls;
   int complete_during_start_was_stale;
+  int complete_during_cancel;
+  int complete_during_cancel_was_again;
   uint8_t first_byte;
   size_t offered;
 } backend_state_t;
@@ -41,7 +43,7 @@ typedef struct {
 } fixture_t;
 
 static ftun_status_t backend_write_start(void *user,
-                                         ftun_stream_write_t *write,
+                                         ftun_stream_write_token_t write,
                                          const ftun_buffer_slice_t *slice,
                                          size_t *accepted)
 {
@@ -64,13 +66,21 @@ static ftun_status_t backend_write_start(void *user,
 }
 
 static ftun_status_t backend_write_cancel(void *user,
-                                          ftun_stream_write_t *write)
+                                          ftun_stream_write_token_t write)
 {
   backend_state_t *state = (backend_state_t *)user;
   state->cancel_calls++;
-  if (state->write != write) return FTUN_E_STATE_CORRUPT;
+  if (state->write.stream != write.stream || state->write.slot != write.slot ||
+      state->write.generation != write.generation) {
+    return FTUN_E_STATE_CORRUPT;
+  }
   if (state->cancel_status != FTUN_OK) return state->cancel_status;
-  state->write = NULL;
+  if (state->complete_during_cancel) {
+    ftun_error_t success = {FTUN_OK, 0u, 0};
+    state->complete_during_cancel_was_again +=
+      ftun_stream_write_complete(write, success) == FTUN_E_AGAIN;
+  }
+  memset(&state->write, 0, sizeof(state->write));
   return FTUN_OK;
 }
 
@@ -166,10 +176,10 @@ static int dispatch_one(fixture_t *fixture)
 
 static int complete_backend(fixture_t *fixture, ftun_error_t error)
 {
-  ftun_stream_write_t *write = fixture->backend.write;
-  if (write == NULL) return 1;
+  ftun_stream_write_token_t write = fixture->backend.write;
+  if (write.stream == NULL) return 1;
   if (ftun_stream_write_complete(write, error) != FTUN_OK) return 1;
-  fixture->backend.write = NULL;
+  memset(&fixture->backend.write, 0, sizeof(fixture->backend.write));
   return 0;
 }
 
@@ -178,7 +188,7 @@ static int test_partial_and_lifetime(void)
   fixture_t fixture;
   ftun_buffer_slice_t slice = {0};
   ftun_operation_t *operation = NULL;
-  ftun_stream_write_t *write;
+  ftun_stream_write_token_t write;
   ftun_stream_usage_t usage;
   ftun_buffer_pool_usage_t pool_usage;
   ftun_bytes_t bytes;
@@ -256,7 +266,8 @@ static int test_rejection_and_limits(void)
   accepted = 99u;
   CHECK(ftun_stream_write_ref(fixture.stream, &first, &accepted,
                               &operation) == FTUN_E_STATE_CORRUPT);
-  CHECK(accepted == 0u && operation == NULL && fixture.backend.write == NULL &&
+  CHECK(accepted == 0u && operation == NULL &&
+        fixture.backend.write.stream == NULL &&
         fixture.backend.cancel_calls == 1 && fixture.completion.calls == 0);
   CHECK(ftun_buffer_slice_release(&first) == FTUN_OK);
 
@@ -284,7 +295,7 @@ static int test_cancel_and_stop(void)
   fixture_t fixture;
   ftun_buffer_slice_t slice = {0};
   ftun_operation_t *operation = NULL;
-  ftun_stream_write_t *write;
+  ftun_stream_write_token_t write;
   ftun_bytes_t bytes;
   ftun_error_t success = {FTUN_OK, 0u, 0};
   size_t accepted = 0u;
@@ -295,7 +306,8 @@ static int test_cancel_and_stop(void)
   CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
   fixture.backend.cancel_status = FTUN_E_IO;
   CHECK(ftun_operation_cancel(operation) == FTUN_E_IO);
-  CHECK(fixture.backend.cancel_calls == 1 && fixture.backend.write != NULL);
+  CHECK(fixture.backend.cancel_calls == 1 &&
+        fixture.backend.write.stream != NULL);
   CHECK(ftun_stream_write_data(fixture.backend.write, &bytes) == FTUN_OK &&
         bytes.length == 4u);
   success.status = FTUN_E_AGAIN;
@@ -303,8 +315,12 @@ static int test_cancel_and_stop(void)
   success.status = FTUN_OK;
   write = fixture.backend.write;
   fixture.backend.cancel_status = FTUN_OK;
+  fixture.backend.complete_during_cancel = 1;
   CHECK(ftun_operation_cancel(operation) == FTUN_OK);
-  CHECK(fixture.backend.cancel_calls == 2 && fixture.backend.write == NULL);
+  CHECK(fixture.backend.cancel_calls == 2 &&
+        fixture.backend.write.stream == NULL &&
+        fixture.backend.complete_during_cancel_was_again == 1);
+  fixture.backend.complete_during_cancel = 0;
   CHECK(ftun_stream_write_data(write, &bytes) == FTUN_E_STALE);
   CHECK(ftun_stream_write_complete(write, success) == FTUN_E_STALE);
   CHECK(dispatch_one(&fixture) == 0);
@@ -329,10 +345,49 @@ static int test_cancel_and_stop(void)
                               &operation) == FTUN_OK);
   CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
   CHECK(ftun_operation_queue_stop(fixture.operations) == FTUN_OK);
-  CHECK(fixture.backend.cancel_calls == 3 && fixture.backend.write == NULL);
+  CHECK(fixture.backend.cancel_calls == 3 &&
+        fixture.backend.write.stream == NULL);
   CHECK(dispatch_one(&fixture) == 0);
   CHECK(fixture.completion.calls == 3 &&
         fixture.completion.error.status == FTUN_E_CANCELLED);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_generation_after_slot_reuse(void)
+{
+  fixture_t fixture;
+  ftun_buffer_slice_t slice = {0};
+  ftun_operation_t *operation = NULL;
+  ftun_stream_write_token_t late;
+  ftun_stream_write_token_t current;
+  ftun_bytes_t bytes;
+  ftun_error_t success = {FTUN_OK, 0u, 0};
+  size_t accepted = 0u;
+  CHECK(fixture_start(&fixture, 1u, 16u) == 0);
+  CHECK(make_slice(&fixture, 90u, 0u, 2u, &slice) == 0);
+  CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
+                              &operation) == FTUN_OK);
+  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  late = fixture.backend.write;
+  CHECK(complete_backend(&fixture, success) == 0);
+  CHECK(dispatch_one(&fixture) == 0 && fixture.completion.calls == 1);
+
+  CHECK(make_slice(&fixture, 100u, 0u, 2u, &slice) == 0);
+  CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
+                              &operation) == FTUN_OK);
+  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  current = fixture.backend.write;
+  CHECK(current.stream == late.stream && current.slot == late.slot &&
+        current.generation != late.generation);
+  CHECK(ftun_stream_write_data(late, &bytes) == FTUN_E_STALE);
+  CHECK(ftun_stream_write_complete(late, success) == FTUN_E_STALE);
+  CHECK(fixture.completion.calls == 1);
+  CHECK(ftun_stream_write_data(current, &bytes) == FTUN_OK &&
+        bytes.length == 2u && bytes.data[0] == 100u);
+  CHECK(complete_backend(&fixture, success) == 0);
+  CHECK(ftun_stream_write_complete(current, success) == FTUN_E_STALE);
+  CHECK(dispatch_one(&fixture) == 0 && fixture.completion.calls == 2);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }
@@ -374,8 +429,10 @@ static int test_failure_and_boundaries(void)
         fixture.stream == NULL);
   CHECK(ftun_stream_write_ref(NULL, NULL, &accepted, &operation) == FTUN_E_INVALID);
   CHECK(accepted == 0u && operation == NULL);
-  CHECK(ftun_stream_write_data(NULL, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_stream_write_complete(NULL, failure) == FTUN_E_INVALID);
+  CHECK(ftun_stream_write_data((ftun_stream_write_token_t){0}, NULL) ==
+        FTUN_E_INVALID);
+  CHECK(ftun_stream_write_complete((ftun_stream_write_token_t){0}, failure) ==
+        FTUN_E_INVALID);
   CHECK(ftun_stream_stop(NULL) == FTUN_E_INVALID);
   CHECK(ftun_stream_get_usage(NULL, &usage) == FTUN_E_INVALID &&
         usage.pending_writes == 0u);
@@ -390,6 +447,7 @@ int main(void)
   CHECK(test_partial_and_lifetime() == 0);
   CHECK(test_rejection_and_limits() == 0);
   CHECK(test_cancel_and_stop() == 0);
+  CHECK(test_generation_after_slot_reuse() == 0);
   CHECK(test_failure_and_boundaries() == 0);
   return 0;
 }
