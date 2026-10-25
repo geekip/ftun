@@ -4,6 +4,7 @@
 #include "util/time.h"
 
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -35,7 +36,7 @@ typedef struct {
 typedef struct {
   ftun_core_t *core;
   const char *path;
-  ftun_status_t result;
+  atomic_int result;
   callback_context_t *callbacks;
 } run_context_t;
 
@@ -52,28 +53,48 @@ static int write_text(const char *path, const char *text)
 
 static uint16_t reserve_port(void)
 {
-  struct sockaddr_in address;
-  socklen_t length = sizeof(address);
-  int descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  uint16_t port = 0u;
-  if (descriptor < 0) return 0u;
-  memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (bind(descriptor, (const struct sockaddr *)&address,
-           sizeof(address)) == 0 &&
-      getsockname(descriptor, (struct sockaddr *)&address, &length) == 0) {
-    port = ntohs(address.sin_port);
+  size_t attempt;
+  /* DNS listener 同时绑定 UDP/TCP，不能只选 UDP 空闲端口。 */
+  for (attempt = 0u; attempt < 64u; attempt++) {
+    struct sockaddr_in address;
+    socklen_t length = sizeof(address);
+    int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    int tcp = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    int error;
+    if (udp < 0 || tcp < 0) {
+      if (udp >= 0) (void)close(udp);
+      if (tcp >= 0) (void)close(tcp);
+      return 0u;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(udp, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
+        getsockname(udp, (struct sockaddr *)&address, &length) != 0) {
+      (void)close(tcp);
+      (void)close(udp);
+      return 0u;
+    }
+    if (bind(tcp, (const struct sockaddr *)&address, sizeof(address)) == 0) {
+      uint16_t port = ntohs(address.sin_port);
+      (void)close(tcp);
+      (void)close(udp);
+      return port;
+    }
+    error = errno;
+    (void)close(tcp);
+    (void)close(udp);
+    if (error != EADDRINUSE) return 0u;
   }
-  (void)close(descriptor);
-  return port;
+  return 0u;
 }
 
 static void *run_core(void *user)
 {
   run_context_t *context = (run_context_t *)user;
   context->callbacks->owner = pthread_self();
-  context->result = ftun_core_run(context->core, context->path);
+  atomic_store_explicit(&context->result,
+    ftun_core_run(context->core, context->path), memory_order_release);
   return NULL;
 }
 
@@ -177,10 +198,14 @@ int main(void)
   atomic_init(&callbacks.wrong_owner, 0u);
   run.core = core;
   run.path = config_path;
-  run.result = FTUN_E_STATE_CORRUPT;
+  atomic_init(&run.result, FTUN_E_STATE_CORRUPT);
   run.callbacks = &callbacks;
   CHECK(pthread_create(&thread, NULL, run_core, &run) == 0);
-  CHECK(wait_running(core));
+  if (!wait_running(core)) {
+    fprintf(stderr, "run status while waiting for RUNNING: %d\n",
+      atomic_load_explicit(&run.result, memory_order_acquire));
+    CHECK(0 && "core did not enter RUNNING");
+  }
   CHECK(ftun_core_reload(core, fifo_path, reload_done, &callbacks,
                          &operation) == FTUN_OK && operation != NULL);
   {
@@ -191,7 +216,8 @@ int main(void)
   CHECK(wait_post(&callbacks));
   CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
   CHECK(ftun_core_stop(core, now_ms + 100u) == FTUN_OK);
-  CHECK(pthread_join(thread, NULL) == 0 && run.result == FTUN_E_TIMEOUT);
+  CHECK(pthread_join(thread, NULL) == 0 &&
+        atomic_load_explicit(&run.result, memory_order_acquire) == FTUN_E_TIMEOUT);
   /* 已接纳 reload 在 run 返回前由 owner 取消终结；迟到 Worker 仅清理。 */
   CHECK(atomic_load_explicit(&callbacks.reload_callbacks,
                              memory_order_relaxed) == 1u);
