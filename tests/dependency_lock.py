@@ -4,8 +4,10 @@
 import hashlib
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+import tempfile
 
 
 def fail(message):
@@ -23,9 +25,51 @@ def git(root, *arguments):
     stdout=subprocess.PIPE, stderr=subprocess.PIPE).stdout.strip()
 
 
+def check_notices(root, lock, cmake):
+  # 独立调用生产生成器，覆盖带空格路径、完整告知、无效输入及失败保全。
+  with tempfile.TemporaryDirectory(prefix="ftun notice ") as directory:
+    temporary = Path(directory)
+    source = temporary / "LOCK.json"
+    output = temporary / "THIRD_PARTY_NOTICES.md"
+    command = [cmake, f"-DFTUN_DEPENDENCY_LOCK={source}",
+               f"-DFTUN_NOTICES_OUTPUT={output}",
+               "-P", str(root / "cmake/ThirdPartyNotices.cmake")]
+    source.write_text(json.dumps(lock), encoding="utf-8")
+    generated = subprocess.run(command, capture_output=True, text=True)
+    if generated.returncode:
+      return fail(f"cannot generate notices: {generated.stderr}")
+    notices = output.read_text(encoding="utf-8")
+    for dependency in lock["dependencies"]:
+      for field in ("name", "source", "license", "selected_license",
+                    "license_file", "build_boundary", "notice"):
+        if dependency[field] not in notices:
+          return fail(f"generated notice omits {dependency['name']} {field}")
+      for patch in dependency["local_patches"]:
+        if patch["description"] not in notices:
+          return fail("generated notice omits a patch description")
+    modified = json.loads(json.dumps(lock))
+    modified["dependencies"][0]["notice"] = "Updated attribution; 保留完整文本."
+    source.write_text(json.dumps(modified), encoding="utf-8")
+    updated = subprocess.run(command, capture_output=True, text=True)
+    if updated.returncode or modified["dependencies"][0]["notice"] not in output.read_text(encoding="utf-8"):
+      return fail("notice generation did not preserve changed lock text")
+    expected = output.read_bytes()
+    for field in ("selected_license", "notice"):
+      invalid = json.loads(json.dumps(modified))
+      del invalid["dependencies"][0][field]
+      source.write_text(json.dumps(invalid), encoding="utf-8")
+      rejected = subprocess.run(command, capture_output=True, text=True)
+      if rejected.returncode == 0 or output.read_bytes() != expected:
+        return fail("invalid notice metadata was accepted or replaced the last valid output")
+  return 0
+
+
 def main():
-  if len(sys.argv) != 2:
+  if len(sys.argv) not in (2, 3):
     return fail("source root is required")
+  cmake = sys.argv[2] if len(sys.argv) == 3 else shutil.which("cmake")
+  if not cmake:
+    return fail("cmake is required to verify generated notices")
   root = Path(sys.argv[1]).resolve()
   project_license = (root / "LICENSE").read_text(encoding="utf-8")
   if not project_license.startswith(
@@ -47,9 +91,12 @@ def main():
       return fail(f"{dependency.get('name')} source or license is missing")
     if sha256(license_file) != dependency.get("license_sha256"):
       return fail(f"{dependency.get('name')} retained license differs")
-    if not dependency.get("license") or not dependency.get("build_boundary"):
+    if any(not isinstance(dependency.get(field), str) or not dependency[field].strip()
+           for field in ("license", "selected_license", "build_boundary", "notice")):
       return fail(f"{dependency.get('name')} review metadata is incomplete")
     for patch in dependency.get("local_patches", []):
+      if not isinstance(patch.get("description"), str) or not patch["description"].strip():
+        return fail(f"{dependency.get('name')} patch description is missing")
       patch_path = root / patch.get("path", "")
       if not patch_path.is_file() or sha256(patch_path) != patch.get("sha256"):
         return fail(f"{dependency.get('name')} local patch differs")
@@ -82,9 +129,10 @@ def main():
       return fail("wolfSSL submodule has local modifications")
   except (OSError, subprocess.CalledProcessError) as error:
     return fail(f"cannot inspect wolfSSL submodule: {error}")
-  notices = (root / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-  if any(name not in notices for name in ("libev", "cJSON", "lwIP", "wolfSSL")):
-    return fail("third-party notice does not cover the complete lock")
+  if (root / "THIRD_PARTY_NOTICES.md").exists():
+    return fail("third-party notices must be generated, not maintained in the source tree")
+  if check_notices(root, lock, cmake):
+    return 1
   cmake = (root / "CMakeLists.txt").read_text(encoding="utf-8")
   if "FetchContent" in cmake or "ExternalProject_Add" in cmake:
     return fail("build must not fetch dependencies")

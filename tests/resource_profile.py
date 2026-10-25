@@ -55,6 +55,9 @@ def main():
   template = Path(sys.argv[3]).read_text(encoding="utf-8")
   if not binary.is_file():
     return fail("ftun binary is missing")
+  notices = binary.parent / "THIRD_PARTY_NOTICES.md"
+  if not notices.is_file():
+    return fail("generated third-party notices are missing from the build directory")
   samples = []
   with tempfile.TemporaryDirectory(prefix="ftun-resource-") as directory:
     temporary = Path(directory)
@@ -99,9 +102,9 @@ def main():
         return fail(f"ftun did not stop cleanly: {process.stderr.read()}")
     unstripped_bytes = binary.stat().st_size
     stripped_bytes = stripped.stat().st_size
-    deployment_bytes = stripped_bytes + sum(
+    deployment_bytes = stripped_bytes + notices.stat().st_size + sum(
       (root / name).stat().st_size for name in
-      ("LICENSE", "THIRD_PARTY_NOTICES.md", "third_party/LOCK.json",
+      ("LICENSE", "third_party/LOCK.json",
        "README.md"))
   report = {
     "runs": RUNS,

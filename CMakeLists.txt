@@ -609,7 +609,11 @@ install(FILES third_party/cjson/LICENSE
 install(FILES third_party/wolfssl/COPYING
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES LICENSE README.md THIRD_PARTY_NOTICES.md third_party/LOCK.json
+set(FTUN_DEPENDENCY_LOCK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LOCK.json")
+set(FTUN_NOTICES_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_NOTICES.md")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FTUN_DEPENDENCY_LOCK}")
+include(cmake/ThirdPartyNotices.cmake)
+install(FILES LICENSE README.md "${FTUN_NOTICES_OUTPUT}" third_party/LOCK.json
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 if(TARGET ftun_libev)
   install(FILES third_party/libev/LICENSE
@@ -2111,7 +2115,7 @@ if(BUILD_TESTING)
     add_test(NAME dependency-lock
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/dependency_lock.py
-        ${CMAKE_CURRENT_SOURCE_DIR})
+        ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_COMMAND})
     add_test(NAME cross-build-contract
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/cross_build_contract.py

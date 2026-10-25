@@ -9,7 +9,7 @@ from pathlib import Path
 try:
     from jsonschema import Draft202012Validator, FormatChecker
 except ImportError:
-    print('SKIP: config schema tests require: python3 -m pip install -r tools/requirements-schema.txt')
+    print('SKIP: config schema tests require: python3 -m pip install -r tests/requirements-schema.txt')
     sys.exit(77)  # CTest SKIP_RETURN_CODE; never report missing validator as a pass.
 
 ROOT = Path(__file__).resolve().parents[1]
