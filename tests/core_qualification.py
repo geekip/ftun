@@ -322,8 +322,8 @@ def low_fd_case(binary, directory, tcp_port):
   return result
 
 
-def reload_case(binary, directory, tcp_port, udp_port):
-  daemon = RunningFtun(binary, directory, 16)
+def reload_case(binary, directory, tcp_port, udp_port, capacity=16):
+  daemon = RunningFtun(binary, directory, capacity)
   tcp = []
   udp = []
   result = None
@@ -337,13 +337,13 @@ def reload_case(binary, directory, tcp_port, udp_port):
     for generation in range(2):
       marker = "ftun: reload committed"
       previous = daemon.log_path.read_text(errors="replace").count(marker)
-      write_config(daemon.config, daemon.proxy_port, 16,
+      write_config(daemon.config, daemon.proxy_port, capacity,
                    log_level="error" if generation == 0 else "silent")
       daemon.process.send_signal(signal.SIGHUP)
       wait_log(daemon.process, daemon.log_path, marker, previous)
       tcp_progress(tcp[0], 0, generation + 1)
       udp_progress(udp[0], udp_port, 0, generation + 1)
-      if generation == 0:
+      if generation == 0 and capacity > 1:
         association = udp_associate(daemon.proxy_port)
         udp_progress(association, udp_port, 1, 0)
         udp.append(association)
@@ -747,8 +747,9 @@ def run(mode, binary, report_path=None):
           "low_fd": low_fd_case(binary, directory, tcp_port),
         }
         print("core-qualification " + json.dumps(result, sort_keys=True))
-      elif mode == "reload":
-        result = reload_case(binary, directory, tcp_port, udp_port)
+      elif mode in {"reload", "reload-minimum"}:
+        result = reload_case(binary, directory, tcp_port, udp_port,
+                             capacity=1 if mode == "reload-minimum" else 16)
         print("core-reload " + json.dumps(result, sort_keys=True))
       elif mode == "explore":
         result = {"exploration": [
@@ -772,9 +773,9 @@ def run(mode, binary, report_path=None):
 
 def main():
   if len(sys.argv) not in (3, 4) or sys.argv[1] not in {
-      "formal", "reload", "explore", "soak"}:
+      "formal", "reload", "reload-minimum", "explore", "soak"}:
     return fail(
-      "usage: core_qualification.py formal|reload|explore|soak FTUN [REPORT]")
+      "usage: core_qualification.py formal|reload|reload-minimum|explore|soak FTUN [REPORT]")
   mode = sys.argv[1]
   binary = Path(sys.argv[2]).resolve()
   report = Path(sys.argv[3]).resolve() if len(sys.argv) == 4 else None

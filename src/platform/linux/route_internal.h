@@ -12,12 +12,15 @@ typedef struct {
 } ftun_netlink_message_t;
 
 struct ftun_route_transaction {
+  ftun_budget_t *budget;
+  ftun_reservation_t *reservation;
   uint32_t magic;
   ftun_linux_route_resource_t resources[FTUN_LINUX_ROUTE_MAX_RESOURCES];
   bool active[FTUN_LINUX_ROUTE_MAX_RESOURCES];
   size_t resource_count;
   size_t active_count;
   bool strict_route;
+  bool retiring;
   ftun_linux_route_io_t io;
 };
 
@@ -29,5 +32,6 @@ int ftun_linux_route_plan_valid(const ftun_linux_route_plan_t *plan);
 ftun_status_t ftun_netlink_build(
   ftun_netlink_message_t *message,
   const ftun_linux_route_resource_t *resource, bool add);
+size_t ftun_linux_route_async_allocation_size(void);
 
 #endif

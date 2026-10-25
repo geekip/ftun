@@ -29,7 +29,7 @@ typedef struct {
   ftun_endpoint_t endpoints[MAX_ATTEMPTS];
   ftun_dial_transport_t transports[MAX_ATTEMPTS];
   uint32_t marks[MAX_ATTEMPTS];
-  char devices[MAX_ATTEMPTS][FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char devices[MAX_ATTEMPTS][FTUN_SOCKET_INTERFACE_BYTES];
   size_t open_calls;
   size_t protect_calls;
   size_t connect_calls;
@@ -166,7 +166,7 @@ static ftun_status_t socket_protect(void *user, ftun_native_socket_t socket,
   socket_state_t *state = (socket_state_t *)user;
   size_t index = socket_index(socket);
   if (index >= MAX_ATTEMPTS || policy == NULL ||
-      policy->interface_name.length >= FTUN_LINUX_SOCKET_DEVICE_BYTES) {
+      policy->interface_name.length >= FTUN_SOCKET_INTERFACE_BYTES) {
     return FTUN_E_STATE_CORRUPT;
   }
   state->protect_calls++;

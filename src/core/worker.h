@@ -11,8 +11,8 @@ typedef void (*ftun_worker_completion_fn)(ftun_operation_t *operation,
                                           ftun_error_t error,
                                           ftun_bytes_t result,
                                           void *user);
-typedef void (*ftun_worker_result_cleanup_fn)(ftun_bytes_t result);
-typedef void (*ftun_worker_input_cleanup_fn)(ftun_bytes_t input);
+typedef ftun_status_t (*ftun_worker_result_cleanup_fn)(ftun_bytes_t result);
+typedef ftun_status_t (*ftun_worker_input_cleanup_fn)(ftun_bytes_t input);
 typedef void (*ftun_worker_wakeup_fn)(void *user);
 
 struct ftun_worker_job {
@@ -31,6 +31,7 @@ typedef struct {
   size_t pending;
   size_t running;
   size_t completed;
+  size_t cleanup_pending;
   bool accepting;
   bool stopping;
   bool exited;
@@ -44,6 +45,9 @@ typedef struct {
  * owner 预先保留的不可变快照，必须提供 input_cleanup；它在任务真正结束且
  * 回调完成后执行。输出若携带拥有型对象，必须提供 result_cleanup；回调取走
  * 对象后须清空结果中的所有权字段。
+ * execute 失败也可通过有效的 out_result_size 交还待清理结果；错误回调仍无结果。
+ * 清理返回错误时须把剩余所有权写回对应字节存储。Worker 保留任务及额度，
+ * 下一轮按配额重试；成功阶段不重做，业务回调不重复。结果先于输入清理。
  * deadline 过期只丢弃结果，不声称中断正在执行的阻塞调用。
  * poll/join/destroy 只由 owner loop 调用。
  */

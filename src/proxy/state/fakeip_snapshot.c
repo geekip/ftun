@@ -206,58 +206,50 @@ ftun_status_t ftun_fakeip_snapshot_save(ftun_fakeip_store_t *store,
 }
 
 static ftun_status_t ftun_snapshot_read(const char *path, size_t maximum,
-                                        ftun_budget_t *budget, uint8_t **out,
-                                        size_t *out_length,
-                                        ftun_reservation_t **out_reservation)
+  ftun_budget_t *budget, uint8_t **out, size_t *out_length,
+  ftun_reservation_t **out_reservation)
 {
   struct stat info;
-  ftun_reservation_t *reservation = NULL;
-  uint8_t *data;
+  ftun_reservation_t *reservation = NULL, *fd_reservation = NULL;
+  ftun_budget_resources_t resources = {0u, 1u, 0u};
+  uint8_t *data = NULL;
   size_t offset = 0u;
-  int descriptor;
+  int descriptor = -1;
   ftun_status_t status;
   *out = NULL;
   *out_length = 0u;
   *out_reservation = NULL;
+  status = ftun_budget_reserve_resources(budget, resources, &fd_reservation);
+  if (status != FTUN_OK) return status;
+  status = FTUN_E_STATE_CORRUPT;
   descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
   if (descriptor < 0 || fstat(descriptor, &info) != 0 ||
       !S_ISREG(info.st_mode) || info.st_size < 0 ||
-      (uint64_t)info.st_size > (uint64_t)maximum) {
-    if (descriptor >= 0) (void)close(descriptor);
-    return FTUN_E_STATE_CORRUPT;
-  }
+      (uint64_t)info.st_size > (uint64_t)maximum) goto done;
   status = ftun_budget_reserve(budget, (size_t)info.st_size, &reservation);
-  if (status != FTUN_OK) {
-    (void)close(descriptor);
-    return status;
-  }
+  if (status != FTUN_OK) goto done;
   data = (uint8_t *)malloc((size_t)info.st_size);
-  if (data == NULL) {
-    (void)close(descriptor);
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_LIMIT;
-  }
+  if (data == NULL) { status = FTUN_E_LIMIT; goto done; }
   while (offset < (size_t)info.st_size) {
     ssize_t result = read(descriptor, data + offset,
                           (size_t)info.st_size - offset);
     if (result < 0 && errno == EINTR) continue;
-    if (result <= 0) {
-      free(data);
-      (void)close(descriptor);
-      (void)ftun_reservation_release(&reservation);
-      return FTUN_E_STATE_CORRUPT;
-    }
+    if (result <= 0) { status = FTUN_E_STATE_CORRUPT; goto done; }
     offset += (size_t)result;
   }
-  if (close(descriptor) != 0) {
+  status = FTUN_OK;
+done:
+  if (descriptor >= 0 && close(descriptor) != 0 && status == FTUN_OK) status = FTUN_E_IO;
+  (void)ftun_reservation_release(&fd_reservation);
+  if (status == FTUN_OK) {
+    *out = data;
+    *out_length = offset;
+    *out_reservation = reservation;
+  } else {
     free(data);
     (void)ftun_reservation_release(&reservation);
-    return FTUN_E_IO;
   }
-  *out = data;
-  *out_length = offset;
-  *out_reservation = reservation;
-  return FTUN_OK;
+  return status;
 }
 
 ftun_status_t ftun_fakeip_snapshot_load(ftun_fakeip_store_t *store,

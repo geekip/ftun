@@ -74,12 +74,12 @@ static ftun_status_t backend_write_cancel(void *user,
       state->write.generation != write.generation) {
     return FTUN_E_STATE_CORRUPT;
   }
-  if (state->cancel_status != FTUN_OK) return state->cancel_status;
   if (state->complete_during_cancel) {
     ftun_error_t success = {FTUN_OK, 0u, 0};
     state->complete_during_cancel_was_again +=
       ftun_stream_write_complete(write, success) == FTUN_E_AGAIN;
   }
+  if (state->cancel_status != FTUN_OK) return state->cancel_status;
   memset(&state->write, 0, sizeof(state->write));
   return FTUN_OK;
 }
@@ -290,6 +290,35 @@ static int test_rejection_and_limits(void)
   return 0;
 }
 
+static int test_cancel_failure_then_complete(void)
+{
+  fixture_t fixture;
+  ftun_buffer_slice_t slice = {0};
+  ftun_operation_t *operation = NULL;
+  ftun_bytes_t bytes;
+  const ftun_error_t success = {FTUN_OK, 7u, 9};
+  size_t accepted = 0u;
+  CHECK(fixture_start(&fixture, 1u, 16u) == 0);
+  CHECK(make_slice(&fixture, 61u, 0u, 4u, &slice) == 0);
+  CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
+                              &operation) == FTUN_OK);
+  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  fixture.backend.cancel_status = FTUN_E_IO;
+  fixture.backend.complete_during_cancel = 1;
+  CHECK(ftun_operation_cancel(operation) == FTUN_E_IO);
+  CHECK(fixture.backend.complete_during_cancel_was_again == 1 &&
+        fixture.completion.calls == 0);
+  CHECK(ftun_stream_write_data(fixture.backend.write, &bytes) == FTUN_OK &&
+        bytes.length == 4u && bytes.data[0] == 61u);
+  CHECK(complete_backend(&fixture, success) == 0);
+  CHECK(dispatch_one(&fixture) == 0 && fixture.completion.calls == 1 &&
+        fixture.completion.error.status == FTUN_OK &&
+        fixture.completion.error.stage == 7u &&
+        fixture.completion.error.native_code == 9);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 static int test_cancel_and_stop(void)
 {
   fixture_t fixture;
@@ -447,6 +476,7 @@ int main(void)
   CHECK(test_partial_and_lifetime() == 0);
   CHECK(test_rejection_and_limits() == 0);
   CHECK(test_cancel_and_stop() == 0);
+  CHECK(test_cancel_failure_then_complete() == 0);
   CHECK(test_generation_after_slot_reuse() == 0);
   CHECK(test_failure_and_boundaries() == 0);
   return 0;

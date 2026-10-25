@@ -17,6 +17,9 @@ typedef ftun_status_t (*ftun_file_stage_hook_fn)(ftun_file_stage_t stage,
 /* 锁文件由调用者选择，通常是 FakeIP identity 目录中的固定 lock 路径。
  * 成功后持有非阻塞独占锁，release 消费句柄。 */
 ftun_status_t ftun_file_lock_acquire(const char *path, ftun_file_lock_t **out);
+/* 自有锁对象和1 FD在打开前准入，直到release才归还。 */
+ftun_status_t ftun_file_lock_acquire_budget(ftun_budget_t *budget,
+  const char *path, ftun_file_lock_t **out);
 ftun_status_t ftun_file_lock_release(ftun_file_lock_t **lock);
 
 /* 持久文件替换。
@@ -34,6 +37,12 @@ ftun_status_t ftun_file_write_atomic(const char *destination,
                                      ftun_bytes_t contents,
                                      unsigned int mode);
 ftun_status_t ftun_file_write_atomic_with_hook(
+  const char *destination, ftun_bytes_t contents, unsigned int mode,
+  ftun_file_stage_hook_fn hook, void *hook_user);
+
+/* 显式预算覆盖自有路径和每阶段FD；输入内容由调用方计量。
+ * 旧独立入口以NULL预算调用，生产宿主应传入其长期预算。 */
+ftun_status_t ftun_file_write_atomic_budget(ftun_budget_t *budget,
   const char *destination, ftun_bytes_t contents, unsigned int mode,
   ftun_file_stage_hook_fn hook, void *hook_user);
 

@@ -41,6 +41,8 @@ typedef enum {
 
 /* 配置索引数组与原模型同序；计划拥有所有数组，不拥有 config。 */
 struct ftun_feature_plan {
+  size_t owned_bytes;
+  ftun_reservation_t *reservation;
   uint32_t built_modules;
   uint32_t required_modules;
   uint64_t compiled;

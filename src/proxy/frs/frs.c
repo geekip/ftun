@@ -25,6 +25,8 @@ struct ftun_frs_view {
   ftun_frs_storage_t storage;
   ftun_frs_layout_t layout;
   ftun_reservation_t *reservation;
+  ftun_budget_t *budget;
+  bool releasing;
 };
 
 struct ftun_frs_set {
@@ -32,6 +34,11 @@ struct ftun_frs_set {
   uint32_t set_id;
   ftun_frs_set_kind_t kind;
 };
+
+size_t ftun_frs_set_owned_bytes(void)
+{
+  return sizeof(ftun_frs_set_t);
+}
 
 static int ftun_frs_permanent_accounted(size_t file_bytes,
                                         size_t section_count,
@@ -54,20 +61,44 @@ static int ftun_frs_max_accounted(size_t file_bytes, size_t *out)
     file_bytes, file_bytes / FTUN_FRS_DIRECTORY_ENTRY_BYTES, out);
 }
 
-static ftun_status_t ftun_frs_view_create(const uint8_t *bytes, size_t length,
-                                          uint8_t *owned,
-                                          ftun_frs_storage_t storage,
-                                          ftun_reservation_t *reservation,
-                                          ftun_frs_view_t **out)
+static ftun_status_t ftun_frs_view_layout(const uint8_t *bytes, size_t length,
+  ftun_reservation_t *reservation, ftun_frs_layout_t *out)
 {
   ftun_frs_layout_t layout;
-  ftun_frs_view_t *view;
   ftun_bytes_t file;
   ftun_status_t status;
   memset(&layout, 0, sizeof(layout));
   file.data = bytes;
   file.length = length;
   status = ftun_frs_format_validate(file, &layout);
+  if (status != FTUN_OK) return status;
+  if (reservation != NULL) {
+    ftun_budget_resources_t resources = {0};
+    if (!ftun_frs_permanent_accounted(length, layout.section_count,
+                                      &resources.memory_bytes)) {
+      ftun_frs_layout_clear(&layout);
+      return FTUN_E_LIMIT;
+    }
+    status = ftun_reservation_resize(reservation, resources);
+    if (status != FTUN_OK) {
+      ftun_frs_layout_clear(&layout);
+      return status;
+    }
+  }
+  *out = layout;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_frs_view_create(const uint8_t *bytes, size_t length,
+                                          uint8_t *owned,
+                                          ftun_frs_storage_t storage,
+                                          ftun_budget_t *budget,
+                                          ftun_reservation_t *reservation,
+                                          ftun_frs_view_t **out)
+{
+  ftun_frs_layout_t layout;
+  ftun_frs_view_t *view;
+  ftun_status_t status = ftun_frs_view_layout(bytes, length, reservation, &layout);
   if (status != FTUN_OK) return status;
   view = (ftun_frs_view_t *)calloc(1u, sizeof(*view));
   if (view == NULL) {
@@ -81,6 +112,7 @@ static ftun_status_t ftun_frs_view_create(const uint8_t *bytes, size_t length,
   view->storage = storage;
   view->layout = layout;
   view->reservation = reservation;
+  view->budget = budget;
   *out = view;
   return FTUN_OK;
 }
@@ -100,7 +132,8 @@ static ftun_status_t ftun_frs_open_bytes_internal(
   }
   if (budget != NULL) {
     if (!ftun_frs_max_accounted(file.length, &accounted)) return FTUN_E_LIMIT;
-    /* 格式校验器的最大并发临时集合是 DFS 颜色与栈，小于文件长度。 */
+    /* 校验临时集合含标签索引、DFS颜色与栈；对应记录的文件跨度
+     * 覆盖这些并发工作区，使用文件长度作为保守准入上界。 */
     scratch = file.length;
     status = ftun_budget_reserve(budget, accounted, &reservation);
     if (status == FTUN_OK) {
@@ -119,7 +152,7 @@ static ftun_status_t ftun_frs_open_bytes_internal(
   }
   memcpy(copy, file.data, file.length);
   status = ftun_frs_view_create(copy, file.length, copy,
-                                FTUN_FRS_STORAGE_MEMORY, reservation, out);
+                                FTUN_FRS_STORAGE_MEMORY, budget, reservation, out);
   if (ftun_reservation_release(&scratch_reservation) != FTUN_OK &&
       status == FTUN_OK) status = FTUN_E_STATE_CORRUPT;
   if (status != FTUN_OK) {
@@ -156,13 +189,20 @@ ftun_status_t ftun_frs_view_bind_budget(ftun_frs_view_t *view,
   ftun_reservation_t *reservation = NULL;
   size_t accounted;
   ftun_status_t status;
-  if (view == NULL || budget == NULL || view->reservation != NULL ||
+  if (view == NULL || budget == NULL ||
       !ftun_frs_permanent_accounted(view->file_bytes,
                                     view->layout.section_count,
                                     &accounted)) return FTUN_E_INVALID;
+  if (view->releasing) return FTUN_E_AGAIN;
+  if (view->reservation != NULL) {
+    bool same = false;
+    status = ftun_budget_same_root(view->budget, budget, &same);
+    return status != FTUN_OK ? status : same ? FTUN_OK : FTUN_E_INVALID;
+  }
   status = ftun_budget_reserve(budget, accounted, &reservation);
   if (status != FTUN_OK) return status;
   view->reservation = reservation;
+  view->budget = budget;
   return FTUN_OK;
 }
 
@@ -185,65 +225,76 @@ ftun_status_t ftun_frs_open_mode(ftun_core_t *core, const char *path,
 {
   ftun_budget_t *budget = NULL;
   ftun_reservation_t *reservation = NULL;
+  ftun_frs_view_t *view = NULL;
   struct stat info;
-  const uint8_t *mapped = MAP_FAILED;
-  uint8_t *owned = NULL;
+  void *mapped = MAP_FAILED;
   size_t file_bytes;
   size_t accounted;
-  size_t scratch;
   ftun_reservation_t *scratch_reservation = NULL;
+  ftun_reservation_t *descriptor_reservation = NULL;
+  ftun_budget_resources_t descriptor_resources = {0u, 1u, 0u};
   int descriptor = -1;
-  ftun_frs_storage_t storage;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || path == NULL || path[0] == '\0' || out == NULL ||
       (mode != FTUN_FRS_OPEN_AUTO && mode != FTUN_FRS_OPEN_READ)) {
     return FTUN_E_INVALID;
   }
+  status = ftun_core_context_budget(core, &budget);
+  if (status == FTUN_OK) status = ftun_budget_reserve_resources(
+    budget, descriptor_resources, &descriptor_reservation);
+  if (status != FTUN_OK) return status;
   descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) return errno == ENOENT ? FTUN_E_EOF : FTUN_E_IO;
+  if (descriptor < 0) {
+    status = errno == ENOENT ? FTUN_E_EOF : FTUN_E_IO;
+    goto fail;
+  }
   if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
       info.st_size < (off_t)FTUN_FRS_HEADER_BYTES ||
       (uintmax_t)info.st_size > (uintmax_t)SIZE_MAX) {
-    (void)close(descriptor);
-    return FTUN_E_PROTOCOL;
+    status = FTUN_E_PROTOCOL;
+    goto fail;
   }
   file_bytes = (size_t)info.st_size;
   if (!ftun_frs_max_accounted(file_bytes, &accounted)) {
-    (void)close(descriptor);
-    return FTUN_E_LIMIT;
+    status = FTUN_E_LIMIT;
+    goto fail;
   }
-  scratch = file_bytes;
-  status = ftun_core_context_budget(core, &budget);
-  if (status == FTUN_OK) status = ftun_budget_reserve(budget, accounted,
-                                                      &reservation);
+  status = ftun_budget_reserve(budget, accounted, &reservation);
   if (status == FTUN_OK) status = ftun_budget_reserve(
-    budget, scratch, &scratch_reservation);
-  if (status != FTUN_OK) {
-    (void)close(descriptor);
-    (void)ftun_reservation_release(&reservation);
-    return status;
+    budget, file_bytes, &scratch_reservation);
+  if (status != FTUN_OK) goto fail;
+  /* 在取得映射前分配拥有者，格式校验/后续分配失败也能保留清理句柄。 */
+  view = (ftun_frs_view_t *)calloc(1u, sizeof(*view));
+  if (view == NULL) {
+    status = FTUN_E_LIMIT;
+    goto fail;
   }
+  view->reference_count = 1u;
+  view->reservation = reservation;
+  reservation = NULL;
+  view->budget = budget;
+  view->file_bytes = file_bytes;
   if (mode == FTUN_FRS_OPEN_AUTO) {
-    mapped = (const uint8_t *)mmap(NULL, file_bytes, PROT_READ, MAP_PRIVATE,
-                                   descriptor, 0);
+    mapped = mmap(NULL, file_bytes, PROT_READ, MAP_PRIVATE, descriptor, 0);
   }
   if (mapped != MAP_FAILED) {
-    storage = FTUN_FRS_STORAGE_MMAP;
+    view->file = (const uint8_t *)mapped;
+    view->storage = FTUN_FRS_STORAGE_MMAP;
   } else {
-    owned = (uint8_t *)malloc(file_bytes);
-    if (owned == NULL) {
+    view->storage = FTUN_FRS_STORAGE_READ;
+    view->owned = (uint8_t *)malloc(file_bytes);
+    if (view->owned == NULL) {
       status = FTUN_E_LIMIT;
       goto fail;
     }
+    view->file = view->owned;
     if (lseek(descriptor, 0, SEEK_SET) < 0) {
       status = FTUN_E_IO;
       goto fail;
     }
-    status = ftun_frs_read_all(descriptor, owned, file_bytes);
+    status = ftun_frs_read_all(descriptor, view->owned, file_bytes);
     if (status != FTUN_OK) goto fail;
-    mapped = owned;
-    storage = FTUN_FRS_STORAGE_READ;
   }
   if (close(descriptor) != 0) {
     descriptor = -1;
@@ -251,27 +302,24 @@ ftun_status_t ftun_frs_open_mode(ftun_core_t *core, const char *path,
     goto fail;
   }
   descriptor = -1;
-  status = ftun_frs_view_create(mapped, file_bytes, owned, storage,
-                                reservation, out);
+  status = ftun_reservation_release(&descriptor_reservation);
+  if (status != FTUN_OK) goto fail;
+  status = ftun_frs_view_layout(view->file, file_bytes, view->reservation,
+    &view->layout);
   if (ftun_reservation_release(&scratch_reservation) != FTUN_OK &&
       status == FTUN_OK) status = FTUN_E_STATE_CORRUPT;
-  if (status != FTUN_OK) {
-    if (*out != NULL) {
-      (void)ftun_frs_view_release(out);
-      mapped = MAP_FAILED;
-      owned = NULL;
-      reservation = NULL;
-    }
-    goto fail;
-  }
+  if (status != FTUN_OK) goto fail;
+  *out = view;
   return FTUN_OK;
 
 fail:
   if (descriptor >= 0) (void)close(descriptor);
-  if (mapped != MAP_FAILED && owned == NULL) (void)munmap((void *)mapped, file_bytes);
-  free(owned);
+  (void)ftun_reservation_release(&descriptor_reservation);
   (void)ftun_reservation_release(&scratch_reservation);
   (void)ftun_reservation_release(&reservation);
+  /* 保留首次错误；撤销失败的view仅供调用方继续release。 */
+  (void)ftun_frs_view_release(&view);
+  *out = view;
   return status;
 }
 
@@ -284,6 +332,7 @@ ftun_status_t ftun_frs_open(ftun_core_t *core, const char *path,
 ftun_status_t ftun_frs_view_retain(ftun_frs_view_t *view)
 {
   if (view == NULL) return FTUN_E_INVALID;
+  if (view->releasing) return FTUN_E_AGAIN;
   if (view->reference_count == SIZE_MAX) return FTUN_E_LIMIT;
   view->reference_count++;
   return FTUN_OK;
@@ -292,28 +341,30 @@ ftun_status_t ftun_frs_view_retain(ftun_frs_view_t *view)
 ftun_status_t ftun_frs_view_release(ftun_frs_view_t **view)
 {
   ftun_frs_view_t *owned;
-  ftun_status_t status = FTUN_OK;
   ftun_status_t release_status;
   if (view == NULL) return FTUN_E_INVALID;
   owned = *view;
   if (owned == NULL) return FTUN_OK;
   if (owned->reference_count == 0u) return FTUN_E_STATE_CORRUPT;
-  owned->reference_count--;
-  *view = NULL;
-  if (owned->reference_count != 0u) return FTUN_OK;
-  ftun_frs_layout_clear(&owned->layout);
-  if (owned->storage == FTUN_FRS_STORAGE_MMAP) {
-    if (munmap((void *)owned->file, owned->file_bytes) != 0) {
-      status = FTUN_E_IO;
-    }
-  } else {
-    free(owned->owned);
+  if (owned->reference_count > 1u) {
+    owned->reference_count--;
+    *view = NULL;
+    return FTUN_OK;
+  }
+  owned->releasing = true;
+  /* 映射撤销失败仍保留句柄、布局及额度；已撤销的映射不重复撤销。 */
+  if (owned->storage == FTUN_FRS_STORAGE_MMAP && owned->file != NULL) {
+    if (munmap((void *)owned->file, owned->file_bytes) != 0) return FTUN_E_IO;
+    owned->file = NULL;
   }
   release_status = ftun_reservation_release(&owned->reservation);
-  if (status == FTUN_OK) status = release_status;
+  if (release_status != FTUN_OK) return release_status;
+  ftun_frs_layout_clear(&owned->layout);
+  free(owned->owned);
   memset(owned, 0, sizeof(*owned));
   free(owned);
-  return status;
+  *view = NULL;
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_frs_view_get_info(const ftun_frs_view_t *view,
@@ -322,6 +373,7 @@ ftun_status_t ftun_frs_view_get_info(const ftun_frs_view_t *view,
   const ftun_frs_section_layout_t *sets;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (view == NULL || out == NULL) return FTUN_E_INVALID;
+  if (view->releasing) return FTUN_E_AGAIN;
   sets = ftun_frs_layout_section(&view->layout, FTUN_FRS_SECTION_SETS);
   if (sets == NULL) return FTUN_E_STATE_CORRUPT;
   out->file_bytes = view->file_bytes;
@@ -368,6 +420,7 @@ ftun_status_t ftun_frs_bind(ftun_frs_view_t *view, ftun_frs_set_kind_t kind,
       (kind != FTUN_FRS_SET_IP && kind != FTUN_FRS_SET_DOMAIN)) {
     return FTUN_E_INVALID;
   }
+  if (view->releasing) return FTUN_E_AGAIN;
   sets = ftun_frs_layout_section(&view->layout, FTUN_FRS_SECTION_SETS);
   strings = ftun_frs_layout_section(&view->layout, FTUN_FRS_SECTION_STRINGS);
   if (sets == NULL || strings == NULL) return FTUN_E_STATE_CORRUPT;
@@ -435,6 +488,7 @@ ftun_status_t ftun_frs_set_data(const ftun_frs_set_t *set, ftun_bytes_t *file,
   if (record != NULL) *record = NULL;
   if (set == NULL || set->view == NULL || file == NULL || layout == NULL ||
       record == NULL || set->set_id == 0u) return FTUN_E_INVALID;
+  if (set->view->releasing) return FTUN_E_AGAIN;
   sets = ftun_frs_layout_section(&set->view->layout, FTUN_FRS_SECTION_SETS);
   if (sets == NULL || set->set_id > sets->count) return FTUN_E_STATE_CORRUPT;
   file->data = set->view->file;
@@ -450,6 +504,7 @@ ftun_status_t ftun_frs_view_bytes(const ftun_frs_view_t *view,
 {
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (view == NULL || out == NULL) return FTUN_E_INVALID;
+  if (view->releasing) return FTUN_E_AGAIN;
   out->data = view->file;
   out->length = view->file_bytes;
   return FTUN_OK;

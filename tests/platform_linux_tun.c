@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #include "platform/linux/tun.h"
 #include "platform/linux/uapi.h"
+#include "core/budget.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <net/if.h>
@@ -263,6 +264,41 @@ static int real_smoke(void)
 }
 
 /* TASK-PLATFORM-001 / TEST-PLATFORM-001：权限、MTU、整包 I/O 和关闭。 */
+static int budget_admission(void)
+{
+  ftun_budget_options_t options = {0};
+  ftun_budget_t *budget = NULL;
+  ftun_budget_usage_t usage;
+  ftun_tun_spec_t spec = test_spec("ftun0", 1500u);
+  ftun_packet_port_t *port = NULL;
+  mock_state_t state = {0};
+  ftun_linux_tun_io_t io = mock_io(&state);
+  int stage;
+  options.limit = (ftun_budget_resources_t){65536u, 1u, 1u};
+  CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
+  CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_LIMIT && port == NULL);
+  CHECK(state.open_device_calls == 0 && state.open_control_calls == 0);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  options.limit.descriptors = 2u;
+  CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
+  CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
+    usage.used > 0u && usage.used_resources.descriptors == 1u &&
+    usage.high_watermarks.descriptors == 2u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN);
+  CHECK(ftun_linux_tun_close(&port) == FTUN_OK);
+  for (stage = 1; stage <= 7; stage++) {
+    memset(&state, 0, sizeof(state));
+    state.fail_stage = stage;
+    state.fail_error = EIO;
+    CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_IO && port == NULL);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
+      usage.used == 0u && usage.used_resources.descriptors == 0u);
+  }
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   mock_state_t state;
@@ -278,6 +314,7 @@ int main(int argc, char **argv)
 
   if (argc == 2 && strcmp(argv[1], "--real") == 0) return real_smoke();
   CHECK(argc == 1);
+  CHECK(budget_admission() == 0);
 
   memset(&state, 0, sizeof(state));
   io = mock_io(&state);

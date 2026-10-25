@@ -48,6 +48,10 @@ struct ftun_worker {
   ftun_worker_task_t *pending_tail;
   ftun_worker_task_t *completed_head;
   ftun_worker_task_t *completed_tail;
+  ftun_worker_task_t *cleanup_head;
+  ftun_worker_task_t *cleanup_tail;
+  _Atomic size_t cleanup_pending;
+  ftun_status_t cleanup_status;
   size_t capacity;
   size_t tasks;
   size_t pending;
@@ -93,22 +97,25 @@ static void ftun_worker_complete_list(ftun_worker_t *worker, ftun_worker_task_t 
                                   memory_order_release);
 }
 
-static void ftun_worker_task_dispose(ftun_worker_task_t *task)
+static ftun_status_t ftun_worker_task_dispose(ftun_worker_task_t *task)
 {
   ftun_worker_t *worker = task->worker;
-  ftun_reservation_t *reservation = task->reservation;
-  int release_failed = 0;
+  ftun_status_t status;
 
-  task->reservation = NULL;
   if (task->result_cleanup != NULL && task->worker_done &&
       task->cleanup_result_size != 0u) {
-    task->result_cleanup((ftun_bytes_t){task->result,
-                                        task->cleanup_result_size});
+    status = task->result_cleanup((ftun_bytes_t){task->result,
+                                                 task->cleanup_result_size});
+    if (status != FTUN_OK) return status;
+    task->cleanup_result_size = 0u;
   }
   if (task->input_cleanup != NULL) {
-    task->input_cleanup((ftun_bytes_t){task->input, task->input_size});
+    status = task->input_cleanup((ftun_bytes_t){task->input, task->input_size});
+    if (status != FTUN_OK) return status;
+    task->input_cleanup = NULL;
   }
-  if (ftun_reservation_release(&reservation) != FTUN_OK) release_failed = 1;
+  status = ftun_reservation_release(&task->reservation);
+  if (status != FTUN_OK) return status;
   free(task->result);
   free(task->input);
   task->result = NULL;
@@ -118,8 +125,23 @@ static void ftun_worker_task_dispose(ftun_worker_task_t *task)
   (void)pthread_mutex_lock(&worker->mutex);
   if (worker->tasks == 0u) worker->cleanup_failed = 1;
   else worker->tasks--;
-  if (release_failed) worker->cleanup_failed = 1;
   (void)pthread_mutex_unlock(&worker->mutex);
+  return FTUN_OK;
+}
+
+/* 仅 owner 操作；复用已接纳任务槽，不新增分配或解除原预算。 */
+static void ftun_worker_task_retire(ftun_worker_task_t *task)
+{
+  ftun_worker_t *worker = task->worker;
+  ftun_status_t status = ftun_worker_task_dispose(task);
+  if (status == FTUN_OK) return;
+  if (worker->cleanup_status == FTUN_OK) worker->cleanup_status = status;
+  task->next = NULL;
+  if (worker->cleanup_tail != NULL) worker->cleanup_tail->next = task;
+  else worker->cleanup_head = task;
+  worker->cleanup_tail = task;
+  (void)atomic_fetch_add_explicit(&worker->cleanup_pending, 1u,
+                                  memory_order_relaxed);
 }
 
 static void ftun_worker_operation_done(ftun_operation_t *operation,
@@ -139,7 +161,7 @@ static void ftun_worker_operation_done(ftun_operation_t *operation,
   task->operation = NULL;
   task->callback_done = 1;
   dispose = task->worker_done;
-  if (dispose) ftun_worker_task_dispose(task);
+  if (dispose) ftun_worker_task_retire(task);
 }
 
 static void ftun_worker_run_task(ftun_worker_task_t *task)
@@ -158,10 +180,11 @@ static void ftun_worker_run_task(ftun_worker_task_t *task)
 
   status = task->execute((ftun_bytes_t){task->input, task->input_size},
                          task->result, task->result_capacity, &result_size);
-  if (status == FTUN_OK && result_size > task->result_capacity) {
+  if (result_size > task->result_capacity) {
     status = FTUN_E_STATE_CORRUPT;
+    result_size = 0u;
   }
-  if (status == FTUN_OK) task->cleanup_result_size = result_size;
+  task->cleanup_result_size = result_size;
   if (status == FTUN_OK && ftun_worker_expired(task->deadline_ms, &status)) {
     status = FTUN_E_TIMEOUT;
   }
@@ -237,6 +260,7 @@ ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
   worker->capacity = capacity;
   worker->accepting = 1;
   atomic_init(&worker->completed, 0u);
+  atomic_init(&worker->cleanup_pending, 0u);
   if (pthread_mutex_init(&worker->mutex, NULL) != 0) goto io_error;
   mutex_ready = 1;
   if (pthread_condattr_init(&condition_attributes) != 0) goto io_error;
@@ -388,6 +412,8 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
   ftun_status_t status = FTUN_OK;
   size_t dispatched = 0u;
   size_t completed = 0u;
+  size_t cleanup_count;
+  size_t index;
 
   if (out_callbacks != NULL) *out_callbacks = 0u;
   if (worker == NULL || max_callbacks == 0u || out_callbacks == NULL) {
@@ -396,6 +422,20 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
   if (!ftun_worker_has_ready(worker)) return FTUN_OK;
   if (worker->polling) return FTUN_E_AGAIN;
   worker->polling = 1;
+  worker->cleanup_status = FTUN_OK;
+  /* 只重试入轮时已积压的对象，每对象每轮最多一次；新失败留到下轮。 */
+  cleanup_count = atomic_load_explicit(&worker->cleanup_pending,
+                                       memory_order_relaxed);
+  if (cleanup_count > max_callbacks) cleanup_count = max_callbacks;
+  for (index = 0u; index < cleanup_count; index++) {
+    ftun_worker_task_t *task = worker->cleanup_head;
+    worker->cleanup_head = task->next;
+    if (worker->cleanup_head == NULL) worker->cleanup_tail = NULL;
+    task->next = NULL;
+    (void)atomic_fetch_sub_explicit(&worker->cleanup_pending, 1u,
+                                    memory_order_relaxed);
+    ftun_worker_task_retire(task);
+  }
   while (completed < max_callbacks) {
     ftun_worker_task_t *task;
     int dispose;
@@ -421,7 +461,7 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
       }
     }
     dispose = task->callback_done;
-    if (dispose) ftun_worker_task_dispose(task);
+    if (dispose) ftun_worker_task_retire(task);
   }
   if (status == FTUN_OK) {
     status = ftun_operation_dispatch(worker->operations, max_callbacks, &dispatched);
@@ -429,13 +469,15 @@ ftun_status_t ftun_worker_poll(ftun_worker_t *worker, size_t max_callbacks,
   worker->polling = 0;
   *out_callbacks = dispatched;
   if (status == FTUN_OK && worker->cleanup_failed) return FTUN_E_STATE_CORRUPT;
+  if (status == FTUN_OK) status = worker->cleanup_status;
   return status;
 }
 
 bool ftun_worker_has_ready(const ftun_worker_t *worker)
 {
   return worker != NULL &&
-    (atomic_load_explicit(&worker->completed, memory_order_acquire) != 0u ||
+    (atomic_load_explicit(&worker->cleanup_pending, memory_order_relaxed) != 0u ||
+     atomic_load_explicit(&worker->completed, memory_order_acquire) != 0u ||
      ftun_operation_queue_has_ready(worker->operations));
 }
 
@@ -509,6 +551,8 @@ ftun_status_t ftun_worker_get_usage(ftun_worker_t *worker, ftun_worker_usage_t *
   out->running = worker->running;
   out->completed = atomic_load_explicit(&worker->completed,
                                         memory_order_acquire);
+  out->cleanup_pending = atomic_load_explicit(&worker->cleanup_pending,
+                                              memory_order_relaxed);
   out->accepting = worker->accepting != 0;
   out->stopping = worker->stopping != 0;
   out->exited = worker->exited != 0;

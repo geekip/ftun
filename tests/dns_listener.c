@@ -35,15 +35,26 @@ typedef struct {
   size_t length;
 } reply_t;
 
+static ftun_status_t transport_select(void *user, uint32_t root,
+  ftun_dns_transport_binding_t *out)
+{
+  memset(out, 0, sizeof(*out));
+  out->scope = user;
+  out->root_id = root;
+  out->leaf_id = root;
+  return FTUN_OK;
+}
+
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  void *user, const ftun_dns_transport_binding_t *binding,
+  uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
   void **out_request)
 {
   transport_t *transport = (transport_t *)user;
-  (void)outbound;
+  (void)binding;
   (void)policy_fingerprint;
   (void)server_fingerprint;
   (void)query;
@@ -185,6 +196,7 @@ int main(void)
   server_options.tcp_fallback = true;
   server_options.fakeip = true;
   server_options.max_response_bytes = 1024u;
+  server_options.query_transport.select = transport_select;
   server_options.query_transport.submit = transport_submit;
   server_options.query_transport.cancel = transport_cancel;
   server_options.query_transport.context = &transport;

@@ -12,6 +12,14 @@
 
 #define BACKEND_SENDS 8u
 
+static size_t fail_calloc_after;
+void *__real_calloc(size_t count, size_t size);
+void *__wrap_calloc(size_t count, size_t size)
+{
+  if (fail_calloc_after != 0u && --fail_calloc_after == 0u) return NULL;
+  return __real_calloc(count, size);
+}
+
 typedef struct {
   ftun_datagram_send_token_t sends[BACKEND_SENDS];
   size_t send_count;
@@ -124,12 +132,12 @@ static ftun_status_t backend_send_cancel(void *user,
   backend_state_t *state = (backend_state_t *)user;
   size_t before = state->send_count;
   state->cancel_calls++;
-  if (state->cancel_status != FTUN_OK) return state->cancel_status;
   if (state->complete_in_cancel) {
     ftun_error_t success = {FTUN_OK, 0u, 0};
     state->cancel_complete_was_again +=
       ftun_datagram_send_complete(send, success) == FTUN_E_AGAIN;
   }
+  if (state->cancel_status != FTUN_OK) return state->cancel_status;
   backend_remove(state, send);
   return state->send_count + 1u == before ? FTUN_OK : FTUN_E_STATE_CORRUPT;
 }
@@ -455,6 +463,40 @@ static int test_rejection_limits_and_stop(void)
   return 0;
 }
 
+static int test_cancel_failure_then_complete(void)
+{
+  fixture_t fixture;
+  ftun_packet_t packet = {{0}, 0u};
+  ftun_endpoint_t target = ipv4_endpoint(53u, 1u);
+  const ftun_endpoint_t *view_target = NULL;
+  const ftun_packet_t *view_packet = NULL;
+  ftun_bytes_t bytes;
+  const ftun_error_t success = {FTUN_OK, 7u, 9};
+  CHECK(fixture_start(&fixture, 1u, 8u, 1) == 0);
+  CHECK(make_packet(&fixture, 71u, 3u, 8u, &packet) == 0);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_OK);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  fixture.backend.cancel_status = FTUN_E_IO;
+  fixture.backend.complete_in_cancel = 1;
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_E_IO);
+  CHECK(fixture.backend.cancel_complete_was_again == 1 &&
+        fixture.backend.send_count == 1u && fixture.callback.result_calls == 0);
+  CHECK(ftun_datagram_send_view(fixture.backend.sends[0], &view_target,
+                                &view_packet) == FTUN_OK);
+  CHECK(ftun_packet_view(view_packet, &bytes) == FTUN_OK &&
+        bytes.length == 3u && bytes.data[0] == 71u);
+  CHECK(complete_first(&fixture, success) == 0);
+  CHECK(fixture.callback.result_calls == 1 &&
+        fixture.callback.error.status == FTUN_OK &&
+        fixture.callback.error.stage == 7u &&
+        fixture.callback.error.native_code == 9);
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&fixture.pool) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&fixture.budget) == FTUN_OK);
+  return 0;
+}
+
 static int test_generation_after_slot_reuse(void)
 {
   fixture_t fixture;
@@ -553,13 +595,146 @@ static int test_receive_and_boundaries(void)
   return 0;
 }
 
+static int test_retained_consumer(void)
+{
+  fixture_t fixture;
+  ftun_datagram_t *borrower;
+  ftun_datagram_usage_t usage;
+  ftun_packet_t packet = {0};
+  ftun_endpoint_t endpoint = ipv4_endpoint(53u, 1u);
+  CHECK(fixture_start(&fixture, 1u, 8u, 0) == 0);
+  borrower = fixture.channel;
+  CHECK(ftun_datagram_release(&borrower) == FTUN_E_STATE_CORRUPT &&
+        borrower == fixture.channel);
+  CHECK(ftun_datagram_retain(borrower) == FTUN_OK);
+  CHECK(ftun_datagram_get_usage(borrower, &usage) == FTUN_OK &&
+        usage.reference_count == 2u);
+  CHECK(make_packet(&fixture, 1u, 1u, 1u, &packet) == 0);
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_E_AGAIN &&
+        fixture.backend.destroy_calls == 0 && fixture.channel == borrower);
+  CHECK(ftun_datagram_send(borrower, &endpoint, &packet) == FTUN_E_CANCELLED &&
+        fixture.backend.start_calls == 0);
+  CHECK(ftun_datagram_release(&borrower) == FTUN_OK && borrower == NULL);
+  CHECK(ftun_datagram_release(&borrower) == FTUN_OK);
+  CHECK(ftun_datagram_retain(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_datagram_release(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_queue_budget(void)
+{
+  fixture_t fixture = {0}, other = {0};
+  ftun_budget_t *root = NULL;
+  ftun_budget_options_t limits = {{65536u, 0u, 4u}, {0u, 0u, 1u}, {0}};
+  ftun_budget_options_t child_limits = {{65536u, 0u, 2u}, {0}, {0}};
+  ftun_budget_usage_t baseline, usage;
+  ftun_datagram_options_t options = {0};
+  ftun_datagram_backend_t backend = {0};
+  ftun_datagram_t *borrowed;
+  ftun_reservation_t *pressure = NULL, *cleanup = NULL;
+  ftun_packet_t packet = {0};
+  ftun_endpoint_t target = ipv4_endpoint(1234u, 1u);
+  size_t allocation;
+  CHECK(ftun_budget_create_resources(NULL, &limits, &root) == FTUN_OK);
+  CHECK(ftun_budget_create_resources(root, &child_limits, &fixture.budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create(root, 0u, 0u, &fixture.pool) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &baseline) == FTUN_OK);
+  fixture.callback.backend = &fixture.backend;
+  options.budget = fixture.budget;
+  options.max_pending_packets = 3u;
+  options.max_pending_bytes = 8u;
+  options.result = send_result;
+  options.user = &fixture.callback;
+  backend.send_start = backend_send_start;
+  backend.send_cancel = backend_send_cancel;
+  backend.destroy = backend_destroy;
+  backend.context = &fixture.backend;
+  /* 父预算有余量也不能绕过子预算；失败不接管 backend。 */
+  CHECK(ftun_datagram_create(&options, &backend, &fixture.channel) == FTUN_E_LIMIT);
+  CHECK(fixture.channel == NULL && fixture.backend.destroy_calls == 0);
+  options.max_pending_packets = 2u;
+  CHECK(ftun_budget_reserve_resources(root, (ftun_budget_resources_t){0u, 0u, 2u},
+    &pressure) == FTUN_OK);
+  CHECK(ftun_datagram_create(&options, &backend, &fixture.channel) == FTUN_E_LIMIT);
+  CHECK(fixture.channel == NULL && fixture.backend.destroy_calls == 0);
+  CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+  for (allocation = 1u; allocation <= 2u; allocation++) {
+    fail_calloc_after = allocation;
+    CHECK(ftun_datagram_create(&options, &backend, &fixture.channel) == FTUN_E_LIMIT);
+    CHECK(fail_calloc_after == 0u && fixture.channel == NULL);
+    CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
+      usage.used == baseline.used && usage.used_resources.queue_slots == 0u);
+  }
+  CHECK(ftun_datagram_create(&options, &backend, &fixture.channel) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK &&
+    usage.used_resources.queue_slots == 2u);
+  other.callback.backend = &other.backend;
+  other.backend.complete_in_start = 1;
+  options.budget = root;
+  options.max_pending_packets = 1u;
+  options.user = &other.callback;
+  backend.context = &other.backend;
+  CHECK(ftun_datagram_create(&options, &backend, &other.channel) == FTUN_OK);
+  CHECK(make_packet(&fixture, 1u, 1u, 1u, &packet) == 0);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_OK);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_OK);
+  CHECK(ftun_datagram_send(fixture.channel, &target, &packet) == FTUN_E_LIMIT);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
+    usage.used_resources.queue_slots == 3u);
+  /* 满槽/取消失败时，既有通道及 cleanup 仍能进展。 */
+  fixture.backend.cancel_status = FTUN_E_IO;
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_E_IO);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_E_AGAIN);
+  CHECK(ftun_datagram_send(other.channel, &target, &packet) == FTUN_OK &&
+    other.callback.result_calls == 1);
+  CHECK(ftun_budget_reserve_resources(root, (ftun_budget_resources_t){0u, 0u, 1u},
+    &pressure) == FTUN_E_LIMIT && pressure == NULL);
+  CHECK(ftun_budget_reserve_cleanup_resources(root,
+    (ftun_budget_resources_t){0u, 0u, 1u}, &cleanup) == FTUN_OK);
+  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+  borrowed = fixture.channel;
+  CHECK(ftun_datagram_retain(borrowed) == FTUN_OK);
+  fixture.backend.cancel_status = FTUN_OK;
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_OK && fixture.callback.result_calls == 2);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_E_AGAIN);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
+    usage.used_resources.queue_slots == 3u);
+  CHECK(ftun_datagram_release(&borrowed) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
+    usage.used_resources.queue_slots == 1u);
+  options.budget = fixture.budget;
+  options.max_pending_packets = 2u;
+  options.user = &fixture.callback;
+  backend.context = &fixture.backend;
+  CHECK(ftun_datagram_create(&options, &backend, &fixture.channel) == FTUN_OK);
+  CHECK(ftun_datagram_stop(fixture.channel) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&fixture.channel) == FTUN_OK);
+  CHECK(ftun_datagram_stop(other.channel) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&other.channel) == FTUN_OK);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&fixture.pool) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
+    usage.used == 0u && usage.used_resources.queue_slots == 0u);
+  CHECK(fixture.backend.destroy_calls == 2 && other.backend.destroy_calls == 1);
+  CHECK(ftun_budget_destroy(&fixture.budget) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&root) == FTUN_OK);
+  return 0;
+}
+
 /* TASK-TRANSPORT-003 / TEST-TRANSPORT-003：整包、零长 payload 与来源。 */
 int main(void)
 {
+  CHECK(test_queue_budget() == 0);
+  CHECK(test_retained_consumer() == 0);
   CHECK(test_async_send_and_error() == 0);
   CHECK(test_zero_domain_and_immediate() == 0);
   CHECK(test_zero_boundaries_and_slots() == 0);
   CHECK(test_rejection_limits_and_stop() == 0);
+  CHECK(test_cancel_failure_then_complete() == 0);
   CHECK(test_generation_after_slot_reuse() == 0);
   CHECK(test_receive_and_boundaries() == 0);
   return 0;

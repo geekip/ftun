@@ -2,6 +2,7 @@
 #include "compile.h"
 #include "model.h"
 #include "parser.h"
+#include "core/budget.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -670,6 +671,7 @@ static ftun_status_t ftun_validate_outbounds(const ftun_config_t *config,
                                              ftun_diagnostic_t *out)
 {
   uint8_t *colors;
+  ftun_reservation_t *workspace = NULL;
   size_t index;
   size_t other;
   for (index = 0u; index < config->outbound_count; index++) {
@@ -757,9 +759,15 @@ static ftun_status_t ftun_validate_outbounds(const ftun_config_t *config,
       }
     }
   }
+  if (config->budget != NULL && ftun_budget_reserve(config->budget,
+      config->outbound_count == 0u ? 1u : config->outbound_count, &workspace) != FTUN_OK) {
+    return ftun_config_diagnostic(out, FTUN_E_LIMIT, "/outbounds",
+                                  "cannot reserve outbound graph workspace");
+  }
   colors = (uint8_t *)calloc(config->outbound_count == 0u ? 1u : config->outbound_count,
                              sizeof(*colors));
   if (colors == NULL) {
+    (void)ftun_reservation_release(&workspace);
     return ftun_config_diagnostic(out, FTUN_E_LIMIT, "/outbounds",
                                   "cannot allocate outbound graph workspace");
   }
@@ -767,10 +775,12 @@ static ftun_status_t ftun_validate_outbounds(const ftun_config_t *config,
     ftun_status_t status = ftun_validate_group_visit(config, index, colors, 1u, out);
     if (status != FTUN_OK) {
       free(colors);
+      (void)ftun_reservation_release(&workspace);
       return status;
     }
   }
   free(colors);
+  (void)ftun_reservation_release(&workspace);
   return FTUN_OK;
 }
 

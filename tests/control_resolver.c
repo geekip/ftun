@@ -1,4 +1,5 @@
 #include "proxy/control_resolver.h"
+#include "util/time.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
@@ -40,14 +41,26 @@ static int system_contract(void)
   ftun_config_t config;
   ftun_control_resolver_plan_t plan;
   ftun_endpoint_t endpoint;
+  ftun_control_execution_t execution = {0};
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 128u, &execution.budget) == FTUN_OK);
+  CHECK(ftun_monotonic_now(&execution.deadline_ms) == FTUN_OK);
+  execution.deadline_ms += 5000u;
+  execution.generation = 7u;
+  execution.allow_system_resolver = true;
+  execution.purpose = FTUN_DIAL_PURPOSE_PROBE;
   memset(&config, 0, sizeof(config));
   CHECK(ftun_control_resolver_plan(&config, NULL,
     (ftun_string_t){"ignored-while-disabled", 22u}, UINT32_C(0x4654),
     &plan) == FTUN_OK);
   CHECK(!plan.named && plan.bootstrap_count == 0u);
-  CHECK(ftun_control_resolve(&plan,
+  CHECK(ftun_control_resolve(&execution, &plan,
     (ftun_string_t){"localhost", 9u}, 8080u, &endpoint) == FTUN_OK);
   CHECK(endpoint.kind == FTUN_ADDRESS_IPV4 && endpoint.port == 8080u);
+  execution.deadline_ms = 1u;
+  CHECK(ftun_control_resolve(&execution, &plan,
+    (ftun_string_t){"localhost", 9u}, 8080u, &endpoint) == FTUN_E_TIMEOUT);
+  CHECK(endpoint.port == 0u);
+  CHECK(ftun_budget_destroy(&execution.budget) == FTUN_OK);
   return 0;
 }
 

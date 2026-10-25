@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "dialer.h"
+#include "platform/linux/socket_protect.h"
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -93,7 +94,7 @@ static int ftun_dial_io_valid(const ftun_dial_io_t *io)
 static int ftun_dial_request_valid(const ftun_dial_request_t *request)
 {
   if (request == NULL || request->loop == NULL || request->operations == NULL ||
-      request->budget == NULL || request->completion == NULL ||
+      request->budget == NULL ||
       request->endpoint.kind != FTUN_ADDRESS_IPV4 ||
       request->endpoint.port == 0u ||
       !ftun_dial_transport_valid(request->transport) ||
@@ -136,6 +137,19 @@ static ftun_status_t ftun_dial_select_domain(
     return FTUN_E_REJECTED;
   }
   return FTUN_OK;
+}
+
+ftun_status_t ftun_dial_authorize(const ftun_dial_request_t *request,
+  ftun_network_dial_decision_t *out)
+{
+  ftun_network_dial_decision_t decision;
+  ftun_status_t status;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (out == NULL || !ftun_dial_request_valid(request)) return FTUN_E_INVALID;
+  if (!ftun_dial_endpoint_allowed(request)) return FTUN_E_REJECTED;
+  status = ftun_dial_select_domain(request, &decision);
+  if (status == FTUN_OK) *out = decision;
+  return status;
 }
 
 static ftun_status_t ftun_dial_errno_status(int error_code)
@@ -381,10 +395,9 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
   ftun_status_t status;
   (void)core;
   if (out != NULL) *out = NULL;
-  if (out == NULL || !ftun_dial_request_valid(request) ||
+  if (out == NULL || request == NULL || request->completion == NULL ||
       !ftun_dial_io_valid(io)) return FTUN_E_INVALID;
-  if (!ftun_dial_endpoint_allowed(request)) return FTUN_E_REJECTED;
-  status = ftun_dial_select_domain(request, &decision);
+  status = ftun_dial_authorize(request, &decision);
   if (status != FTUN_OK) return status;
 
   status = ftun_budget_reserve(request->budget, sizeof(*context), &reservation);

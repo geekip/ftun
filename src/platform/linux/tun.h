@@ -47,4 +47,10 @@ ftun_status_t ftun_linux_tun_write(ftun_packet_port_t *port, const void *packet,
                                    size_t length);
 /* close 即使底层报告错误也消费句柄；Linux close 不可安全重试。 */
 ftun_status_t ftun_linux_tun_close(ftun_packet_port_t **port);
+/* 拥有端口对象/设备FD，打开期间另准入一个临时控制FD。 */
+ftun_status_t ftun_linux_tun_open_with_budget(ftun_budget_t *budget,
+  const ftun_tun_spec_t *spec, ftun_packet_port_t **out);
+ftun_status_t ftun_linux_tun_open_with_io_and_budget(ftun_budget_t *budget,
+  const ftun_tun_spec_t *spec, const ftun_linux_tun_io_t *io,
+  ftun_packet_port_t **out);
 #endif

@@ -80,6 +80,10 @@ typedef struct {
 
 struct ftun_config {
   size_t reference_count;
+  /* 分配时记录实际请求容量，不以规范化后的字符串长度反推。 */
+  size_t owned_bytes;
+  ftun_budget_t *budget;
+  ftun_reservation_t *reservation;
   char *source_path;
   char *base_directory;
   ftun_feature_plan_t *plan;
@@ -143,5 +147,11 @@ struct ftun_config {
   size_t outbound_count;
   ftun_config_string_list_t rules;
 };
+
+/* 仅供配置构造：新增存储先准入；free_bytes的大小必须是原请求容量。
+ * budget借用至最后配置引用销毁，NULL用于独立的未绑定解析调用。 */
+ftun_status_t ftun_config_create_owned(ftun_budget_t *budget, ftun_config_t **out);
+void *ftun_config_allocate(ftun_config_t *config, size_t count, size_t size);
+void ftun_config_free_bytes(ftun_config_t *config, void *value, size_t bytes);
 
 #endif

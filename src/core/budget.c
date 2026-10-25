@@ -1,4 +1,5 @@
 #include "budget.h"
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,6 +12,7 @@ enum {
 
 struct ftun_budget {
   ftun_budget_t *parent;
+  struct ftun_budget_root *root;
   size_t limit[FTUN_BUDGET_RESOURCE_COUNT];
   size_t cleanup_reserve[FTUN_BUDGET_RESOURCE_COUNT];
   size_t guarantee[FTUN_BUDGET_RESOURCE_COUNT];
@@ -20,11 +22,19 @@ struct ftun_budget {
   size_t high_watermark[FTUN_BUDGET_RESOURCE_COUNT];
   size_t child_count;
   size_t rejected_reservations;
+  size_t metadata_bytes;
+};
+
+/* 只在根对象中分配同步状态；所有祖先计数由同一把锁保护。 */
+struct ftun_budget_root {
+  ftun_budget_t budget;
+  pthread_mutex_t mutex;
 };
 
 struct ftun_reservation {
   ftun_budget_t *budget;
   size_t resources[FTUN_BUDGET_RESOURCE_COUNT];
+  int cleanup;
 };
 
 /* ftun_budget_reserve implements TASK-CORE-004 / TEST-CORE-004, target
@@ -63,6 +73,38 @@ static int ftun_budget_values_zero(
   return 1;
 }
 
+/* 元数据独立于调用方申请的资源额度，记录本子树的实际结构分配。 */
+static int ftun_budget_metadata_fits(ftun_budget_t *budget, size_t bytes)
+{
+  for (; budget != NULL; budget = budget->parent) {
+    if (budget->metadata_bytes > SIZE_MAX - bytes) return 0;
+  }
+  return 1;
+}
+
+static void ftun_budget_metadata_add(ftun_budget_t *budget, size_t bytes)
+{
+  for (; budget != NULL; budget = budget->parent) budget->metadata_bytes += bytes;
+}
+
+static int ftun_budget_metadata_can_subtract(ftun_budget_t *budget, size_t bytes)
+{
+  for (; budget != NULL; budget = budget->parent) {
+    if (budget->metadata_bytes < bytes) return 0;
+  }
+  return 1;
+}
+
+static void ftun_budget_metadata_subtract(ftun_budget_t *budget, size_t bytes)
+{
+  for (; budget != NULL; budget = budget->parent) budget->metadata_bytes -= bytes;
+}
+
+static void ftun_budget_rejected(ftun_budget_t *budget)
+{
+  if (budget->rejected_reservations != SIZE_MAX) budget->rejected_reservations++;
+}
+
 /* Check every level before changing a counter.  At an ancestor, path_child
  * names the direct child whose guarantee this request may consume. */
 static int ftun_budget_fits(ftun_budget_t *leaf,
@@ -79,6 +121,8 @@ static int ftun_budget_fits(ftun_budget_t *leaf,
       size_t protected_unused = 0u;
       size_t path_unused = 0u;
       size_t available;
+      /* 未申请的维度不消耗其normal额度；其他维度的cleanup占用不能阻塞它。 */
+      if (requested[index] == 0u) continue;
       if (budget->used[index] > budget->limit[index] ||
           budget->cleanup_reserve[index] > budget->limit[index]) return 0;
       ceiling = cleanup ? budget->limit[index]
@@ -176,9 +220,12 @@ ftun_status_t ftun_budget_create_resources(
   ftun_budget_t **out)
 {
   ftun_budget_t *budget;
+  ftun_status_t status = FTUN_OK;
   size_t limit[FTUN_BUDGET_RESOURCE_COUNT];
   size_t cleanup[FTUN_BUDGET_RESOURCE_COUNT];
   size_t guarantee[FTUN_BUDGET_RESOURCE_COUNT];
+  size_t allocation = parent == NULL ? sizeof(struct ftun_budget_root)
+                                    : sizeof(*budget);
   size_t index;
   if (out != NULL) *out = NULL;
   if (options == NULL || out == NULL) return FTUN_E_INVALID;
@@ -189,21 +236,46 @@ ftun_status_t ftun_budget_create_resources(
     return FTUN_E_INVALID;
   }
   for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
+    if (cleanup[index] > limit[index] ||
+        guarantee[index] > limit[index] - cleanup[index] ||
+        (parent != NULL && parent->parent != NULL && guarantee[index] != 0u)) {
+      return FTUN_E_INVALID;
+    }
+  }
+  budget = (ftun_budget_t *)calloc(1u, allocation);
+  if (budget == NULL) return FTUN_E_LIMIT;
+  budget->parent = parent;
+  memcpy(budget->limit, limit, sizeof(limit));
+  memcpy(budget->cleanup_reserve, cleanup, sizeof(cleanup));
+  memcpy(budget->guarantee, guarantee, sizeof(guarantee));
+  if (parent == NULL) {
+    budget->root = (struct ftun_budget_root *)budget;
+    if (pthread_mutex_init(&budget->root->mutex, NULL) != 0) {
+      free(budget);
+      return FTUN_E_IO;
+    }
+    budget->metadata_bytes = allocation;
+    *out = budget;
+    return FTUN_OK;
+  }
+  budget->root = parent->root;
+  (void)pthread_mutex_lock(&budget->root->mutex);
+  if (parent->child_count == SIZE_MAX ||
+      !ftun_budget_metadata_fits(parent, allocation)) {
+    status = FTUN_E_LIMIT;
+    goto done;
+  }
+  for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
     size_t parent_ceiling;
     size_t protected_unused;
-    if (cleanup[index] > limit[index] ||
-        guarantee[index] > limit[index] - cleanup[index]) {
-      return FTUN_E_INVALID;
+    if (parent->cleanup_reserve[index] > parent->limit[index] ||
+        parent->child_guaranteed_used[index] > parent->child_guarantees[index]) {
+      status = FTUN_E_STATE_CORRUPT;
+      goto done;
     }
-    if (parent == NULL) continue;
     if (parent->child_guarantees[index] > SIZE_MAX - guarantee[index]) {
-      return FTUN_E_LIMIT;
-    }
-    /* Guarantees are allocated once, from the global root to modules.
-     * Object budgets hold concrete minimum reservations instead of creating
-     * a second invisible guarantee layer. */
-    if (parent->parent != NULL && guarantee[index] != 0u) {
-      return FTUN_E_INVALID;
+      status = FTUN_E_LIMIT;
+      goto done;
     }
     parent_ceiling = parent->limit[index] - parent->cleanup_reserve[index];
     protected_unused = parent->child_guarantees[index] -
@@ -211,23 +283,21 @@ ftun_status_t ftun_budget_create_resources(
     if (parent->used[index] > parent_ceiling ||
         protected_unused > parent_ceiling - parent->used[index] ||
         guarantee[index] > parent_ceiling - parent->used[index] -
-          protected_unused) return FTUN_E_LIMIT;
-  }
-  if (parent != NULL && parent->child_count == SIZE_MAX) return FTUN_E_LIMIT;
-  budget = (ftun_budget_t *)calloc(1u, sizeof(*budget));
-  if (budget == NULL) return FTUN_E_LIMIT;
-  budget->parent = parent;
-  memcpy(budget->limit, limit, sizeof(limit));
-  memcpy(budget->cleanup_reserve, cleanup, sizeof(cleanup));
-  memcpy(budget->guarantee, guarantee, sizeof(guarantee));
-  if (parent != NULL) {
-    parent->child_count++;
-    for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
-      parent->child_guarantees[index] += guarantee[index];
+          protected_unused) {
+      status = FTUN_E_LIMIT;
+      goto done;
     }
   }
+  parent->child_count++;
+  for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
+    parent->child_guarantees[index] += guarantee[index];
+  }
+  ftun_budget_metadata_add(budget, allocation);
   *out = budget;
-  return FTUN_OK;
+done:
+  (void)pthread_mutex_unlock(&budget->root->mutex);
+  if (status != FTUN_OK) free(budget);
+  return status;
 }
 
 ftun_status_t ftun_budget_create(ftun_budget_t *parent, size_t limit,
@@ -248,25 +318,31 @@ static ftun_status_t ftun_budget_reserve_kind(
 {
   ftun_reservation_t *reservation;
   size_t requested[FTUN_BUDGET_RESOURCE_COUNT];
+  ftun_status_t status = FTUN_OK;
   if (out != NULL) *out = NULL;
   ftun_budget_unpack(resources, requested);
   if (budget == NULL || out == NULL || ftun_budget_values_zero(requested)) {
     return FTUN_E_INVALID;
   }
-  if (!ftun_budget_fits(budget, requested, cleanup)) {
-    budget->rejected_reservations++;
-    return FTUN_E_LIMIT;
-  }
+  /* 分配不持根锁；准入和全祖先记账在随后同一个临界区完成。 */
   reservation = (ftun_reservation_t *)malloc(sizeof(*reservation));
-  if (reservation == NULL) {
-    budget->rejected_reservations++;
-    return FTUN_E_LIMIT;
+  (void)pthread_mutex_lock(&budget->root->mutex);
+  if (reservation == NULL ||
+      !ftun_budget_metadata_fits(budget, sizeof(*reservation)) ||
+      !ftun_budget_fits(budget, requested, cleanup)) {
+    ftun_budget_rejected(budget);
+    status = FTUN_E_LIMIT;
+  } else {
+    reservation->budget = budget;
+    reservation->cleanup = cleanup;
+    memcpy(reservation->resources, requested, sizeof(requested));
+    ftun_budget_add(budget, requested);
+    ftun_budget_metadata_add(budget, sizeof(*reservation));
+    *out = reservation;
   }
-  reservation->budget = budget;
-  memcpy(reservation->resources, requested, sizeof(requested));
-  ftun_budget_add(budget, requested);
-  *out = reservation;
-  return FTUN_OK;
+  (void)pthread_mutex_unlock(&budget->root->mutex);
+  if (status != FTUN_OK) free(reservation);
+  return status;
 }
 
 ftun_status_t ftun_budget_reserve_resources(
@@ -297,15 +373,13 @@ ftun_status_t ftun_budget_reserve_cleanup(ftun_budget_t *budget, size_t bytes,
   return ftun_budget_reserve_cleanup_resources(budget, resources, out);
 }
 
-ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget,
-                                    ftun_budget_usage_t *out)
+static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
+                                                  ftun_budget_usage_t *out)
 {
   size_t normal[FTUN_BUDGET_RESOURCE_COUNT];
   size_t total[FTUN_BUDGET_RESOURCE_COUNT];
   size_t borrowed[FTUN_BUDGET_RESOURCE_COUNT];
   size_t index;
-  if (out != NULL) memset(out, 0, sizeof(*out));
-  if (budget == NULL || out == NULL) return FTUN_E_INVALID;
   for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
     const ftun_budget_t *ancestor;
     const ftun_budget_t *path_child;
@@ -371,7 +445,20 @@ ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget,
   out->total_available = out->total_available_resources.memory_bytes;
   out->child_count = budget->child_count;
   out->rejected_reservations = budget->rejected_reservations;
+  out->metadata_bytes = budget->metadata_bytes;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget,
+                                    ftun_budget_usage_t *out)
+{
+  ftun_status_t status;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (budget == NULL || out == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&budget->root->mutex);
+  status = ftun_budget_get_usage_locked(budget, out);
+  (void)pthread_mutex_unlock(&budget->root->mutex);
+  return status;
 }
 
 ftun_status_t ftun_budget_same_root(const ftun_budget_t *left,
@@ -382,26 +469,70 @@ ftun_status_t ftun_budget_same_root(const ftun_budget_t *left,
   if (left == NULL || right == NULL || out_same == NULL) {
     return FTUN_E_INVALID;
   }
-  while (left->parent != NULL) left = left->parent;
-  while (right->parent != NULL) right = right->parent;
-  *out_same = left == right;
+  *out_same = left->root == right->root;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_reservation_resize(ftun_reservation_t *reservation,
+  ftun_budget_resources_t resources)
+{
+  size_t requested[FTUN_BUDGET_RESOURCE_COUNT];
+  size_t increase[FTUN_BUDGET_RESOURCE_COUNT] = {0};
+  size_t decrease[FTUN_BUDGET_RESOURCE_COUNT] = {0};
+  size_t index;
+  ftun_budget_t *budget;
+  ftun_status_t status = FTUN_OK;
+  ftun_budget_unpack(resources, requested);
+  if (reservation == NULL || ftun_budget_values_zero(requested)) return FTUN_E_INVALID;
+  budget = reservation->budget;
+  if (budget == NULL) return FTUN_E_STATE_CORRUPT;
+  (void)pthread_mutex_lock(&budget->root->mutex);
+  if (ftun_budget_values_zero(reservation->resources) ||
+      !ftun_budget_can_subtract(budget, reservation->resources)) {
+    status = FTUN_E_STATE_CORRUPT;
+    goto done;
+  }
+  for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
+    if (requested[index] >= reservation->resources[index]) {
+      increase[index] = requested[index] - reservation->resources[index];
+    } else {
+      decrease[index] = reservation->resources[index] - requested[index];
+    }
+  }
+  if (!ftun_budget_values_zero(increase) &&
+      !ftun_budget_fits(budget, increase, reservation->cleanup)) {
+    ftun_budget_rejected(budget);
+    status = FTUN_E_LIMIT;
+    goto done;
+  }
+  ftun_budget_add(budget, increase);
+  ftun_budget_subtract(budget, decrease);
+  memcpy(reservation->resources, requested, sizeof(requested));
+done:
+  (void)pthread_mutex_unlock(&budget->root->mutex);
+  return status;
 }
 
 ftun_status_t ftun_reservation_release(ftun_reservation_t **reservation)
 {
   ftun_reservation_t *owned;
+  ftun_budget_t *budget;
   if (reservation == NULL) return FTUN_E_INVALID;
   owned = *reservation;
   if (owned == NULL) return FTUN_OK;
-  if (owned->budget == NULL ||
-      ftun_budget_values_zero(owned->resources) ||
-      !ftun_budget_can_subtract(owned->budget, owned->resources)) {
+  budget = owned->budget;
+  if (budget == NULL || ftun_budget_values_zero(owned->resources)) {
     return FTUN_E_STATE_CORRUPT;
   }
-  ftun_budget_subtract(owned->budget, owned->resources);
-  owned->budget = NULL;
-  memset(owned->resources, 0, sizeof(owned->resources));
+  (void)pthread_mutex_lock(&budget->root->mutex);
+  if (!ftun_budget_can_subtract(budget, owned->resources) ||
+      !ftun_budget_metadata_can_subtract(budget, sizeof(*owned))) {
+    (void)pthread_mutex_unlock(&budget->root->mutex);
+    return FTUN_E_STATE_CORRUPT;
+  }
+  ftun_budget_subtract(budget, owned->resources);
+  ftun_budget_metadata_subtract(budget, sizeof(*owned));
+  (void)pthread_mutex_unlock(&budget->root->mutex);
   free(owned);
   *reservation = NULL;
   return FTUN_OK;
@@ -410,26 +541,46 @@ ftun_status_t ftun_reservation_release(ftun_reservation_t **reservation)
 ftun_status_t ftun_budget_destroy(ftun_budget_t **budget)
 {
   ftun_budget_t *owned;
+  ftun_status_t status = FTUN_OK;
   size_t index;
   if (budget == NULL) return FTUN_E_INVALID;
   owned = *budget;
   if (owned == NULL) return FTUN_OK;
+  (void)pthread_mutex_lock(&owned->root->mutex);
   if (!ftun_budget_values_zero(owned->used) || owned->child_count != 0u) {
-    return FTUN_E_AGAIN;
+    status = FTUN_E_AGAIN;
+    goto done;
   }
   if (!ftun_budget_values_zero(owned->child_guarantees) ||
-      !ftun_budget_values_zero(owned->child_guaranteed_used)) {
-    return FTUN_E_STATE_CORRUPT;
+      !ftun_budget_values_zero(owned->child_guaranteed_used) ||
+      owned->metadata_bytes != (owned->parent == NULL
+        ? sizeof(struct ftun_budget_root) : sizeof(*owned))) {
+    status = FTUN_E_STATE_CORRUPT;
+    goto done;
   }
   if (owned->parent != NULL) {
-    if (owned->parent->child_count == 0u) return FTUN_E_STATE_CORRUPT;
+    if (owned->parent->child_count == 0u ||
+        !ftun_budget_metadata_can_subtract(owned, sizeof(*owned))) {
+      status = FTUN_E_STATE_CORRUPT;
+      goto done;
+    }
     for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
       if (owned->parent->child_guarantees[index] < owned->guarantee[index]) {
-        return FTUN_E_STATE_CORRUPT;
+        status = FTUN_E_STATE_CORRUPT;
+        goto done;
       }
+    }
+    for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
       owned->parent->child_guarantees[index] -= owned->guarantee[index];
     }
     owned->parent->child_count--;
+    ftun_budget_metadata_subtract(owned, sizeof(*owned));
+  }
+done:
+  (void)pthread_mutex_unlock(&owned->root->mutex);
+  if (status != FTUN_OK) return status;
+  if (owned->parent == NULL && pthread_mutex_destroy(&owned->root->mutex) != 0) {
+    return FTUN_E_STATE_CORRUPT;
   }
   free(owned);
   *budget = NULL;

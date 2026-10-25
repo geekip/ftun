@@ -25,15 +25,19 @@
 } while (0)
 
 typedef struct {
+  atomic_uint post_callbacks;
+  atomic_uint reload_callbacks;
+  atomic_uint reload_cancelled;
+  atomic_uint wrong_owner;
+  pthread_t owner;
+} callback_context_t;
+
+typedef struct {
   ftun_core_t *core;
   const char *path;
   ftun_status_t result;
+  callback_context_t *callbacks;
 } run_context_t;
-
-typedef struct {
-  atomic_uint post_callbacks;
-  atomic_uint reload_callbacks;
-} callback_context_t;
 
 static int write_text(const char *path, const char *text)
 {
@@ -68,6 +72,7 @@ static uint16_t reserve_port(void)
 static void *run_core(void *user)
 {
   run_context_t *context = (run_context_t *)user;
+  context->callbacks->owner = pthread_self();
   context->result = ftun_core_run(context->core, context->path);
   return NULL;
 }
@@ -101,7 +106,14 @@ static void reload_done(ftun_operation_t *operation, ftun_error_t error,
 {
   callback_context_t *context = (callback_context_t *)user;
   (void)operation;
-  (void)error;
+  if (error.status == FTUN_E_CANCELLED) {
+    (void)atomic_fetch_add_explicit(&context->reload_cancelled, 1u,
+                                    memory_order_relaxed);
+  }
+  if (!pthread_equal(pthread_self(), context->owner)) {
+    (void)atomic_fetch_add_explicit(&context->wrong_owner, 1u,
+                                    memory_order_relaxed);
+  }
   (void)atomic_fetch_add_explicit(&context->reload_callbacks, 1u,
                                   memory_order_relaxed);
 }
@@ -161,9 +173,12 @@ int main(void)
   CHECK(ftun_core_create(&options, &core) == FTUN_OK && core != NULL);
   atomic_init(&callbacks.post_callbacks, 0u);
   atomic_init(&callbacks.reload_callbacks, 0u);
+  atomic_init(&callbacks.reload_cancelled, 0u);
+  atomic_init(&callbacks.wrong_owner, 0u);
   run.core = core;
   run.path = config_path;
   run.result = FTUN_E_STATE_CORRUPT;
+  run.callbacks = &callbacks;
   CHECK(pthread_create(&thread, NULL, run_core, &run) == 0);
   CHECK(wait_running(core));
   CHECK(ftun_core_reload(core, fifo_path, reload_done, &callbacks,
@@ -177,6 +192,13 @@ int main(void)
   CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
   CHECK(ftun_core_stop(core, now_ms + 100u) == FTUN_OK);
   CHECK(pthread_join(thread, NULL) == 0 && run.result == FTUN_E_TIMEOUT);
+  /* 已接纳 reload 在 run 返回前由 owner 取消终结；迟到 Worker 仅清理。 */
+  CHECK(atomic_load_explicit(&callbacks.reload_callbacks,
+                             memory_order_relaxed) == 1u);
+  CHECK(atomic_load_explicit(&callbacks.reload_cancelled,
+                             memory_order_relaxed) == 1u);
+  CHECK(atomic_load_explicit(&callbacks.wrong_owner,
+                             memory_order_relaxed) == 0u);
   CHECK(ftun_core_get_info(core, &info) == FTUN_OK &&
         info.state == FTUN_CORE_STOPPING && info.generation == 1u);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
@@ -191,7 +213,7 @@ int main(void)
   }
   CHECK(core == NULL);
   CHECK(atomic_load_explicit(&callbacks.reload_callbacks,
-                             memory_order_relaxed) == 0u);
+                             memory_order_relaxed) == 1u);
   CHECK(unlink(fifo_path) == 0 && unlink(config_path) == 0 &&
         rmdir(directory) == 0);
   return 0;

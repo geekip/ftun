@@ -1,13 +1,8 @@
 #ifndef FTUN_PLATFORM_LINUX_SOCKET_PROTECT_H
 #define FTUN_PLATFORM_LINUX_SOCKET_PROTECT_H
-#include "internal/contracts.h"
+#include "network/socket_policy.h"
 
 #define FTUN_LINUX_SOCKET_DEVICE_BYTES 16u
-
-struct ftun_socket_policy {
-  uint32_t mark;
-  ftun_string_t interface_name;
-};
 
 typedef struct {
   ftun_status_t (*get_mark)(void *context, int descriptor, uint32_t *out);

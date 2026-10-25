@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "route.h"
+#include "core/budget.h"
 #include "route_internal.h"
 #include "event/event.h"
 #include "uapi.h"
@@ -46,6 +47,8 @@ struct ftun_linux_route_async {
   bool request_sent;
   bool runnable;
   bool running;
+  bool release_requested;
+  bool retained_add;
   bool system_io;
   int descriptor;
   ftun_event_loop_t *loop;
@@ -56,6 +59,11 @@ struct ftun_linux_route_async {
   bool io_ready;
   bool io_error;
 };
+
+size_t ftun_linux_route_async_allocation_size(void)
+{
+  return sizeof(ftun_linux_route_async_t);
+}
 
 static uint64_t ftun_route_async_add_deadline(uint64_t now_ms,
                                               uint64_t timeout_ms)
@@ -530,7 +538,7 @@ static void ftun_route_async_cleanup_failed(
 static void ftun_route_async_apply_failed(
   ftun_linux_route_async_t *operation, ftun_status_t status)
 {
-  ftun_route_async_begin_cleanup(operation, status, false);
+  ftun_route_async_begin_cleanup(operation, status, operation->release_requested);
 }
 
 static void ftun_route_async_removed(ftun_linux_route_async_t *operation)
@@ -554,6 +562,9 @@ static void ftun_route_async_applied(ftun_linux_route_async_t *operation)
   operation->has_current = false;
   operation->step = FTUN_ROUTE_ASYNC_PREFLIGHT;
   operation->runnable = true;
+  if (operation->release_requested) {
+    ftun_route_async_begin_cleanup(operation, FTUN_E_CANCELLED, true);
+  }
 }
 
 static int ftun_route_async_prepare_current(
@@ -807,6 +818,80 @@ ftun_status_t ftun_linux_route_async_start(
     step_timeout_ms, total_deadline_ms, out);
 }
 
+static ftun_status_t ftun_route_async_adopt_plan(
+  ftun_route_transaction_t **source, ftun_linux_route_async_t **out,
+  ftun_linux_route_plan_t *plan)
+{
+  ftun_linux_route_info_t info;
+  size_t index, active = 0u;
+  if (source == NULL || *source == NULL || out == NULL || *out != NULL) return FTUN_E_INVALID;
+  if (ftun_linux_route_get_info(*source, &info) != FTUN_OK ||
+      info.resource_count == 0u || info.resource_count > FTUN_LINUX_ROUTE_MAX_RESOURCES) {
+    return FTUN_E_INVALID;
+  }
+  for (index = 0u; index < info.resource_count; index++) {
+    if ((*source)->active[index]) active++;
+  }
+  if (active != info.active_count) return FTUN_E_STATE_CORRUPT;
+  memset(plan, 0, sizeof(*plan));
+  plan->resource_count = info.resource_count;
+  memcpy(plan->resources, (*source)->resources, info.resource_count * sizeof(plan->resources[0]));
+  return FTUN_OK;
+}
+
+static void ftun_route_async_adopt_commit(ftun_route_transaction_t **source,
+  ftun_linux_route_async_t *operation, ftun_linux_route_async_t **out)
+{
+  ftun_route_transaction_t *owned = *source;
+  ftun_reservation_t *reservation = owned->reservation;
+  memcpy(operation->active, owned->active, owned->resource_count * sizeof(owned->active[0]));
+  operation->active_count = owned->active_count;
+  operation->runnable = false;
+  if (!owned->retiring && operation->active_count == operation->resource_count) {
+    operation->state = FTUN_LINUX_ROUTE_ASYNC_READY;
+  } else if (operation->active_count == 0u) {
+    operation->state = FTUN_LINUX_ROUTE_ASYNC_RELEASED;
+  } else {
+    operation->state = FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED;
+    operation->result = operation->cleanup_result = FTUN_E_STATE_CORRUPT;
+  }
+  memset(owned, 0, sizeof(*owned));
+  free(owned);
+  (void)ftun_reservation_release(&reservation);
+  *source = NULL;
+  *out = operation;
+}
+
+ftun_status_t ftun_linux_route_async_adopt_with_io(
+  ftun_route_transaction_t **source, const ftun_linux_route_async_io_t *io,
+  uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
+  uint32_t initial_sequence, ftun_linux_route_async_t **out)
+{
+  ftun_linux_route_plan_t plan;
+  ftun_linux_route_async_t *operation = NULL;
+  ftun_status_t status = ftun_route_async_adopt_plan(source, out, &plan);
+  if (status != FTUN_OK) return status;
+  status = ftun_route_async_allocate_plan(&plan, io, now_ms, step_timeout_ms,
+    total_deadline_ms, initial_sequence, &operation);
+  if (status == FTUN_OK) ftun_route_async_adopt_commit(source, operation, out);
+  return status;
+}
+
+ftun_status_t ftun_linux_route_async_adopt(
+  ftun_route_transaction_t **source, ftun_event_loop_t *loop,
+  uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
+  ftun_linux_route_async_t **out)
+{
+  ftun_linux_route_plan_t plan;
+  ftun_linux_route_async_t *operation = NULL;
+  ftun_status_t status = ftun_route_async_adopt_plan(source, out, &plan);
+  if (status != FTUN_OK) return status;
+  status = ftun_route_async_start_system_plan(&plan, loop, now_ms,
+    step_timeout_ms, total_deadline_ms, &operation);
+  if (status == FTUN_OK) ftun_route_async_adopt_commit(source, operation, out);
+  return status;
+}
+
 ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
                                          uint64_t now_ms, size_t max_work,
                                          size_t *out_work)
@@ -818,6 +903,37 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
       max_work == 0u || out_work == NULL) return FTUN_E_INVALID;
   if (operation->running) return FTUN_E_AGAIN;
   operation->running = true;
+  if (now_ms >= operation->total_deadline_ms &&
+      (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING ||
+       operation->state == FTUN_LINUX_ROUTE_ASYNC_COMPENSATING ||
+       operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASING)) {
+    bool releasing = operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASING;
+    /* 总期限优先于迟到回复。保留未决 ADD 的请求身份，新的 release
+     * 先确认 ACK/reconcile，不能把明确拒绝的外部对象当作自己的资源。 */
+    if (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING &&
+        operation->has_current &&
+        (operation->step == FTUN_ROUTE_ASYNC_RECONCILE ||
+         (operation->request_sent && operation->pending_kind == FTUN_LINUX_ROUTE_REQUEST_ADD))) {
+      operation->retained_add = true;
+      if (!operation->active[operation->cursor]) {
+        operation->active[operation->cursor] = true;
+        operation->active_count++;
+      }
+    }
+    operation->timeouts++;
+    if (operation->result == FTUN_OK) operation->result = FTUN_E_TIMEOUT;
+    return_status = operation->retained_add ?
+      ftun_route_async_timer_cancel(operation) : ftun_route_async_pending_clear(operation);
+    if (!operation->retained_add) operation->has_current = false;
+    operation->runnable = false;
+    if (operation->active_count != 0u) {
+      operation->cleanup_result = FTUN_E_TIMEOUT;
+      operation->state = FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED;
+    } else {
+      operation->state = releasing ? FTUN_LINUX_ROUTE_ASYNC_RELEASED : FTUN_LINUX_ROUTE_ASYNC_FAILED;
+    }
+    work++;
+  }
   while (work < max_work) {
     ftun_status_t status;
     if (operation->state == FTUN_LINUX_ROUTE_ASYNC_READY ||
@@ -841,6 +957,8 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
       status = operation->io.submit(operation->io.context, &request);
       if (status == FTUN_E_AGAIN) {
         operation->runnable = false;
+        /* 即使首个报文还未写入，也必须有总期限唤醒。 */
+        return_status = ftun_route_async_timer_start(operation, operation->total_deadline_ms);
         break;
       }
       if (status != FTUN_OK) {
@@ -930,6 +1048,15 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
     }
   }
   operation->running = false;
+  if (operation->system_io &&
+      (operation->state == FTUN_LINUX_ROUTE_ASYNC_READY ||
+       operation->state == FTUN_LINUX_ROUTE_ASYNC_FAILED ||
+       operation->state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED ||
+       operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASED)) {
+    /* 终态只保留资源责任；迟到 ACK 不应在共享 loop 上持续触发 READ。 */
+    ftun_status_t status = ftun_event_source_cancel(&operation->io_source);
+    if (return_status == FTUN_OK) return_status = status;
+  }
   *out_work = work;
   return return_status;
 }
@@ -942,8 +1069,16 @@ ftun_status_t ftun_linux_route_async_next_deadline(
   if (out_present != NULL) *out_present = false;
   if (operation == NULL || operation->magic != FTUN_LINUX_ROUTE_ASYNC_MAGIC ||
       out_deadline == NULL || out_present == NULL) return FTUN_E_INVALID;
+  if (operation->state != FTUN_LINUX_ROUTE_ASYNC_APPLYING &&
+      operation->state != FTUN_LINUX_ROUTE_ASYNC_COMPENSATING &&
+      operation->state != FTUN_LINUX_ROUTE_ASYNC_RELEASING) return FTUN_OK;
   if (operation->request_sent) {
     *out_deadline = operation->pending_deadline_ms;
+    *out_present = true;
+  } else if (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING ||
+             operation->state == FTUN_LINUX_ROUTE_ASYNC_COMPENSATING ||
+             operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASING) {
+    *out_deadline = operation->total_deadline_ms;
     *out_present = true;
   }
   return FTUN_OK;
@@ -978,12 +1113,57 @@ ftun_status_t ftun_linux_route_async_release(
       total_deadline_ms <= now_ms) return FTUN_E_INVALID;
   if (operation->running) return FTUN_E_AGAIN;
   if (operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASED) return FTUN_OK;
+  if (operation->system_io && operation->io_source == NULL) {
+    status = ftun_event_io_start(operation->loop,
+      (ftun_native_socket_t)(unsigned int)operation->descriptor,
+      FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_route_async_io_ready,
+      operation, &operation->io_source);
+    if (status != FTUN_OK) return status;
+  }
   if (operation->state == FTUN_LINUX_ROUTE_ASYNC_COMPENSATING ||
-      operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASING) return FTUN_E_AGAIN;
+      operation->state == FTUN_LINUX_ROUTE_ASYNC_RELEASING ||
+      operation->release_requested) {
+    if (operation->state != FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED) return FTUN_E_AGAIN;
+  }
+  if (operation->retained_add) {
+    uint64_t deadline = ftun_route_async_add_deadline(now_ms, operation->step_timeout_ms);
+    if (deadline > total_deadline_ms) deadline = total_deadline_ms;
+    status = ftun_route_async_timer_start(operation,
+      operation->request_sent ? deadline : total_deadline_ms);
+    if (status != FTUN_OK) return status;
+    /* active 的暂记只阻止销毁，不构成删除授权。恢复原请求后由结果
+     * 决定是否重新取得所有权；失败 ACK 不得进入该资源的撤销路径。 */
+    operation->active[operation->cursor] = false;
+    operation->active_count--;
+    operation->retained_add = false;
+    operation->release_requested = true;
+    operation->cleanup_result = FTUN_OK;
+    operation->total_deadline_ms = total_deadline_ms;
+    if (operation->request_sent) operation->pending_deadline_ms = deadline;
+    operation->state = FTUN_LINUX_ROUTE_ASYNC_APPLYING;
+    operation->runnable = true;
+    return FTUN_OK;
+  }
+  /* ADD 发出后须先消费 ACK 或完成 reconcile。直接清除 pending 会丢失
+   * 已生效资源，盲目删除又可能误删 CREATE|EXCL 拒绝的外部对象。 */
+  if (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING &&
+      operation->has_current &&
+      ((operation->request_sent && operation->pending_kind == FTUN_LINUX_ROUTE_REQUEST_ADD) ||
+       operation->step == FTUN_ROUTE_ASYNC_RECONCILE)) {
+    operation->release_requested = true;
+    operation->result = FTUN_E_CANCELLED;
+    operation->total_deadline_ms = total_deadline_ms;
+    if (operation->request_sent && operation->pending_deadline_ms > total_deadline_ms) {
+      operation->pending_deadline_ms = total_deadline_ms;
+      return ftun_route_async_timer_start(operation, total_deadline_ms);
+    }
+    return FTUN_OK;
+  }
   status = ftun_route_async_pending_clear(operation);
   if (status != FTUN_OK) return status;
   operation->total_deadline_ms = total_deadline_ms;
   operation->cleanup_result = FTUN_OK;
+  operation->release_requested = true;
   if (operation->state == FTUN_LINUX_ROUTE_ASYNC_FAILED &&
       operation->active_count == 0u) {
     operation->state = FTUN_LINUX_ROUTE_ASYNC_RELEASED;

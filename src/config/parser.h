@@ -18,6 +18,8 @@
  * 不调用回调；失败输出清空，所有部分分配均在返回前回滚。
  */
 ftun_status_t ftun_config_parse(ftun_bytes_t json, ftun_config_t **out);
+ftun_status_t ftun_config_parse_budget(ftun_budget_t *budget,
+  ftun_bytes_t json, ftun_config_t **out);
 /* owner-loop 引用；成功后配置须由对应次数 destroy 释放。 */
 ftun_status_t ftun_config_retain(ftun_config_t *config);
 /* 销毁拥有型配置；空句柄幂等成功。 */

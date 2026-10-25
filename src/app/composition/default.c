@@ -1,9 +1,13 @@
 #include "core/core.h"
+#include "app/runtime_support.h"
 #include "core/module_plan.h"
+#include "core/operation.h"
 #include "config/compile.h"
 #include "event/event.h"
 #include "event/libev_adapter.h"
 #include "dns/core_service.h"
+#include "util/time.h"
+#include "transport/socket_path.h"
 #if defined(FTUN_HAVE_MODULE_PROXY)
 #include "proxy/bindings.h"
 #include "proxy/dns/dispatch_adapter.h"
@@ -13,19 +17,61 @@
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
 #include "tun/owner.h"
+#include "platform/linux/interface.h"
 #endif
 
 #include <stdlib.h>
 #include <string.h>
 
 #define FTUN_DEFAULT_TUN_MARK UINT32_C(0x4654)
+#define FTUN_DEFAULT_CLEANUP_QUOTA 32u
+
+#if defined(FTUN_HAVE_MODULE_PROXY)
+extern const ftun_app_runtime_support_t ftun_proxy_runtime_support;
+#endif
+
+const ftun_app_runtime_support_t *ftun_app_runtime_support(void)
+{
+#if defined(FTUN_HAVE_MODULE_PROXY)
+  return &ftun_proxy_runtime_support;
+#else
+  return NULL;
+#endif
+}
+
+ftun_status_t ftun_app_event_source_capacity(const ftun_config_t *config, size_t *out)
+{
+  if (out != NULL) *out = 0u;
+  if (config == NULL || out == NULL) return FTUN_E_INVALID;
+#if defined(FTUN_HAVE_MODULE_PROXY)
+  return ftun_proxy_runtime_event_source_capacity(config, out);
+#else
+  *out = 512u;
+  return FTUN_OK;
+#endif
+}
+
+ftun_status_t ftun_app_datagram_capacity(const ftun_config_t *config, size_t *out)
+{
+  if (out != NULL) *out = 0u;
+  if (config == NULL || out == NULL) return FTUN_E_INVALID;
+#if defined(FTUN_HAVE_MODULE_PROXY)
+  return ftun_proxy_runtime_datagram_capacity(config, out);
+#else
+  return FTUN_OK;
+#endif
+}
 
 typedef struct {
   ftun_core_module_descriptor_t modules[FTUN_CORE_MODULE_LIMIT];
   ftun_core_module_catalog_t catalog;
   ftun_core_module_runtime_t *modules_runtime;
   ftun_core_t *core;
+  ftun_reservation_t *reservation;
   ftun_event_loop_t *loop;
+  ftun_operation_queue_t *operations;
+  ftun_status_t first_error;
+  ftun_status_t cleanup_error;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   ftun_proxy_bindings_t proxy;
   ftun_fakeip_service_t *fakeip;
@@ -50,8 +96,42 @@ static ftun_status_t ftun_default_resolve_start(
   void *context, ftun_core_t *core,
   const ftun_resolver_provider_request_t *request, ftun_operation_t **out)
 {
+  if (request->requested_domain == FTUN_DIAL_DOMAIN_OVERLAY) return FTUN_E_UNSUPPORTED;
+  if (request->source == FTUN_RESOLVER_SYSTEM) {
+    return ftun_system_resolve(core, &request->system, out);
+  }
+#if defined(FTUN_HAVE_MODULE_DNS)
+  {
+    ftun_default_runtime_t *runtime = context;
+    ftun_bootstrap_request_t query = {0};
+    query.loop = request->loop;
+    query.operations = request->operations;
+    query.worker = request->system.worker;
+    query.budget = request->system.budget;
+    query.domain = request->system.domain;
+    query.protection = request->system.protection;
+    query.deadline_ms = request->system.deadline_ms;
+    query.check_system_path = request->system.check_path;
+    query.system_path_user = request->system.path_user;
+    query.completion = request->system.completion;
+    query.user = request->system.user;
+    query.servers = request->servers;
+    query.server_count = request->server_count;
+    query.network_view = request->network_view;
+    query.network_generation = request->network_generation;
+    query.query_id = request->query_id;
+    if (request->source == FTUN_RESOLVER_BOOTSTRAP) {
+      return ftun_bootstrap_resolve(core, &query, out);
+    }
+    if (runtime == NULL || !runtime->dns.accepting) return FTUN_E_AGAIN;
+    if (runtime->dns.generation != request->generation) return FTUN_E_STALE;
+    return ftun_proxy_dns_resolve_named(&runtime->proxy_dns,
+      &query, request->resolver_name, out);
+  }
+#else
   (void)context;
-  return ftun_system_resolve(core, &request->system, out);
+  return FTUN_E_UNSUPPORTED;
+#endif
 }
 
 static ftun_status_t ftun_default_path_start(
@@ -99,16 +179,16 @@ static const ftun_core_module_catalog_t ftun_default_catalog = {
   0u
 };
 
-static ftun_status_t ftun_default_plan_prepare(
+static ftun_status_t ftun_default_plan_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t socket_mark, void **out)
 {
   ftun_core_module_reload_plan_t *plan = NULL;
   ftun_status_t status;
-  if (out != NULL) *out = NULL;
   if (out == NULL) return FTUN_E_INVALID;
-  status = ftun_core_module_reload_plan_prepare(&ftun_default_catalog, config,
+  if (*out != NULL) return FTUN_E_AGAIN;
+  status = ftun_core_module_reload_plan_prepare(&ftun_default_catalog, budget, config,
                                                  socket_mark, &plan, NULL);
-  if (status == FTUN_OK) *out = plan;
+  *out = plan;
   return status;
 }
 
@@ -138,12 +218,16 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy.loop = runtime->loop;
   runtime->proxy.resolver.start = ftun_default_resolve_start;
+  runtime->proxy.resolver_context = runtime;
   runtime->proxy.path.start = ftun_default_path_start;
+  runtime->proxy.path.open = ftun_socket_path_open;
+  runtime->proxy.control_path.open = ftun_socket_path_open;
   runtime->proxy.fakeip_slot = &runtime->fakeip;
 #endif
 #if defined(FTUN_HAVE_MODULE_DNS)
   runtime->dns_binding.loop = runtime->loop;
   runtime->dns_binding.slot = &runtime->dns;
+  runtime->dns_binding.path.open = ftun_socket_path_open;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy_dns.core = runtime->core;
   runtime->proxy_dns.slot = &runtime->dns;
@@ -161,6 +245,7 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
 #if defined(FTUN_HAVE_MODULE_TUN)
   runtime->tun.provider = &runtime->l3;
   runtime->tun.loop = runtime->loop;
+  runtime->tun.network = &ftun_linux_interface_ops;
   runtime->tun.protection_mark = FTUN_DEFAULT_TUN_MARK;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy.l3 =
@@ -214,32 +299,34 @@ static ftun_status_t ftun_default_prepare(
   uint64_t generation, void **out)
 {
   ftun_default_runtime_t *runtime;
+  ftun_reservation_t *reservation = NULL;
   size_t source_capacity = 0u;
   ftun_status_t status;
-  if (out != NULL) *out = NULL;
   if (core == NULL || budget == NULL || operations == NULL || config == NULL ||
       config->plan == NULL || generation == 0u || out == NULL) {
     return FTUN_E_INVALID;
   }
+  if (*out != NULL) return FTUN_E_AGAIN;
   (void)binding;
-#if defined(FTUN_HAVE_MODULE_PROXY)
-  status = ftun_proxy_runtime_event_source_capacity(config, &source_capacity);
-#else
-  /* DNS-only 组合只需要 listener/upstream watcher；保持固定有界额度。 */
-  source_capacity = 512u;
-  status = FTUN_OK;
-#endif
+  status = ftun_app_event_source_capacity(config, &source_capacity);
+  if (status != FTUN_OK) return status;
+  status = ftun_budget_reserve(budget, sizeof(*runtime), &reservation);
   if (status != FTUN_OK) return status;
   runtime = (ftun_default_runtime_t *)calloc(1u, sizeof(*runtime));
-  if (runtime == NULL) return FTUN_E_LIMIT;
+  if (runtime == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  runtime->reservation = reservation;
   runtime->core = core;
+  runtime->operations = operations;
   memcpy(runtime->modules, ftun_default_modules,
          sizeof(ftun_default_modules));
   runtime->catalog.modules = runtime->modules;
   runtime->catalog.module_count = ftun_default_catalog.module_count;
   runtime->catalog.optional_modules = ftun_default_catalog.optional_modules;
-  status = ftun_event_loop_create_with_capacity(
-    core, source_capacity, &runtime->loop);
+  status = ftun_event_loop_create_with_budget(
+    core, budget, source_capacity, &runtime->loop);
   if (status == FTUN_OK) status = ftun_libev_attach(runtime->loop);
   if (status == FTUN_OK) ftun_default_bind_modules(runtime, config);
   if (status == FTUN_OK) {
@@ -247,10 +334,22 @@ static ftun_status_t ftun_default_prepare(
       budget, operations, config, generation, &runtime->modules_runtime, NULL);
   }
   if (status != FTUN_OK) {
-    (void)ftun_core_module_runtime_destroy_until(
-      &runtime->modules_runtime, UINT64_MAX);
-    (void)ftun_default_loop_destroy(runtime);
-    free(runtime);
+    runtime->first_error = status;
+    if (runtime->modules_runtime != NULL) {
+      ftun_core_module_info_t info;
+      if (ftun_core_module_runtime_get_info(runtime->modules_runtime,
+                                             &info) == FTUN_OK) {
+        runtime->cleanup_error = info.cleanup_error;
+      }
+    } else {
+      runtime->cleanup_error = ftun_default_loop_destroy(runtime);
+      if (runtime->cleanup_error == FTUN_OK) {
+        free(runtime);
+        (void)ftun_reservation_release(&reservation);
+        runtime = NULL;
+      }
+    }
+    *out = runtime;
     return status;
   }
   *out = runtime;
@@ -260,8 +359,23 @@ static ftun_status_t ftun_default_prepare(
 static ftun_status_t ftun_default_activate(void *implementation)
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_activate(runtime->modules_runtime, UINT64_MAX);
+  uint64_t now_ms = 0u;
+  ftun_status_t status;
+  if (runtime == NULL) return FTUN_E_INVALID;
+  status = ftun_monotonic_now(&now_ms);
+  if (status == FTUN_OK) {
+    status = ftun_core_module_runtime_activate(runtime->modules_runtime,
+      now_ms == 0u ? 1u : now_ms);
+  }
+  if (status != FTUN_OK && runtime->first_error == FTUN_OK) {
+    ftun_core_module_info_t info;
+    runtime->first_error = status;
+    if (ftun_core_module_runtime_get_info(runtime->modules_runtime,
+                                           &info) == FTUN_OK) {
+      runtime->cleanup_error = info.cleanup_error;
+    }
+  }
+  return status;
 }
 
 static ftun_status_t ftun_default_reload_prepare(
@@ -313,15 +427,17 @@ static ftun_status_t ftun_default_run_once(
 static ftun_status_t ftun_default_wakeup(void *implementation)
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_wakeup(runtime->modules_runtime);
+  if (runtime == NULL) return FTUN_E_INVALID;
+  return runtime->modules_runtime == NULL ? FTUN_OK
+    : ftun_core_module_runtime_wakeup(runtime->modules_runtime);
 }
 
 static ftun_status_t ftun_default_quiesce(void *implementation)
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_quiesce(runtime->modules_runtime);
+  if (runtime == NULL) return FTUN_E_INVALID;
+  return runtime->modules_runtime == NULL ? FTUN_OK
+    : ftun_core_module_runtime_quiesce(runtime->modules_runtime);
 }
 
 static ftun_status_t ftun_default_drain_until(void *implementation,
@@ -329,10 +445,38 @@ static ftun_status_t ftun_default_drain_until(void *implementation,
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
   ftun_status_t status;
+  ftun_event_loop_usage_t events;
+  ftun_operation_queue_usage_t operations;
+  uint64_t now = 0u;
+  size_t callbacks = 0u;
   if (runtime == NULL) return FTUN_E_INVALID;
-  status = ftun_core_module_runtime_drain_until(
-    runtime->modules_runtime, deadline_ms);
-  if (status == FTUN_OK) status = ftun_event_loop_stop(runtime->loop);
+  status = runtime->modules_runtime == NULL ? FTUN_OK :
+    ftun_core_module_runtime_drain_until(runtime->modules_runtime, deadline_ms);
+  if ((status == FTUN_OK || status == FTUN_E_AGAIN ||
+       status == FTUN_E_TIMEOUT) && runtime->loop != NULL) {
+    ftun_status_t polled = ftun_monotonic_now(&now);
+    /* 生产者先 quiesce；只派发已接纳通知，不再等待物理 I/O。即使调用方
+     * 不允许等待，仍按固定配额推进清理；总期限由 App 的清理驱动持有。 */
+    if (polled == FTUN_OK) polled = ftun_event_loop_poll(
+      runtime->loop, now, FTUN_DEFAULT_CLEANUP_QUOTA, &callbacks);
+    if (polled != FTUN_OK) status = polled;
+    if (status == FTUN_OK) {
+      status = ftun_event_loop_get_usage(runtime->loop, &events);
+      if (status == FTUN_OK) status = ftun_operation_queue_get_usage(
+        runtime->operations, &operations);
+      if (status == FTUN_OK) {
+        /* Operation 取消/完成还可能排入 owner task，不能提前清空 ready
+         * 队列或关闭 defer 接纳；App 在相邻清理轮次继续派发 Operation。 */
+        status = events.ready_count != 0u || events.deferred_count != 0u ||
+          operations.inflight != 0u ? FTUN_E_AGAIN :
+          ftun_event_loop_stop(runtime->loop);
+      }
+    }
+  }
+  if (status != FTUN_OK && status != FTUN_E_AGAIN &&
+      status != FTUN_E_TIMEOUT && runtime->cleanup_error == FTUN_OK) {
+    runtime->cleanup_error = status;
+  }
   return status;
 }
 
@@ -347,17 +491,21 @@ static ftun_status_t ftun_default_destroy_until(void **implementation,
 {
   ftun_default_runtime_t *runtime;
   ftun_status_t status;
+  ftun_reservation_t *reservation;
   if (implementation == NULL || deadline_ms == 0u) return FTUN_E_INVALID;
   runtime = (ftun_default_runtime_t *)*implementation;
   if (runtime == NULL) return FTUN_OK;
   status = ftun_core_module_runtime_destroy_until(
     &runtime->modules_runtime, deadline_ms);
-  if (status != FTUN_OK) return status;
-  status = ftun_default_loop_destroy(runtime);
-  if (status != FTUN_OK) return status;
+  if (status == FTUN_OK) status = ftun_default_loop_destroy(runtime);
+  if (status != FTUN_OK) {
+    if (runtime->cleanup_error == FTUN_OK) runtime->cleanup_error = status;
+    return status;
+  }
+  reservation = runtime->reservation;
   free(runtime);
   *implementation = NULL;
-  return FTUN_OK;
+  return ftun_reservation_release(&reservation);
 }
 
 static const ftun_core_service_descriptor_t ftun_default_service = {

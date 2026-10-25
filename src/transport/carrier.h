@@ -81,6 +81,7 @@ typedef struct {
   /* cancel must be bounded and must not re-enter send_complete. */
   ftun_status_t (*send_cancel)(void *context,
                                ftun_carrier_send_token_t send);
+  /* backend 的物理 FD 由其自身计量，Carrier 不假定一个连接等于一个 FD。 */
   void (*destroy)(void *context);
   void *context;
 } ftun_carrier_backend_t;
@@ -104,6 +105,13 @@ typedef struct {
   size_t failed_messages;
   size_t cancelled_messages;
   size_t rejected_messages;
+  size_t last_selection_visits;
+  size_t selection_visits;
+  size_t max_selection_visits;
+  size_t last_work;
+  size_t last_index_visits;
+  size_t last_cleanup_visits;
+  size_t cleanup_visits;
   uint64_t generation;
   ftun_status_t terminal_status;
   bool accepting;
@@ -153,6 +161,10 @@ ftun_status_t ftun_carrier_owner_get_usage(
 ftun_status_t ftun_carrier_flow_open(
   ftun_carrier_owner_token_t owner, const ftun_carrier_flow_options_t *options,
   ftun_carrier_flow_token_t *out);
+/* 同一 Stream flow 按提交顺序向 backend 提供字节；前项末片接纳后，
+ * 后项可利用剩余 credit，无需等待前项完成回调。Datagram 必须整包接纳，
+ * 超过 flow 或 connection 的总 credit 同步返回 LIMIT，零回调；临时
+ * credit 不足则保留在有界队列中。 */
 ftun_status_t ftun_carrier_flow_send(
   ftun_carrier_flow_token_t flow, const ftun_buffer_slice_t *payload,
   ftun_completion_fn completion, void *completion_user,
@@ -162,12 +174,14 @@ ftun_status_t ftun_carrier_flow_close(ftun_carrier_flow_token_t *flow);
 ftun_status_t ftun_carrier_flow_get_usage(
   ftun_carrier_flow_token_t flow, ftun_carrier_flow_usage_t *out);
 
+/* CONTROL 同样保持整帧；超过 control 总 credit 同步返回 LIMIT。 */
 ftun_status_t ftun_carrier_owner_send_control(
   ftun_carrier_owner_token_t owner, const ftun_buffer_slice_t *payload,
   ftun_completion_fn completion, void *completion_user,
   ftun_operation_t **out_operation);
 /* One action is one backend start attempt. Owner and message cursors persist
- * across calls; control and data alternate when both are eligible. */
+ * across calls; control and data alternate when both are eligible.
+ * usage.last_work另计树查询/维护、候选检查和清理，out_work保持backend尝试次数。 */
 ftun_status_t ftun_carrier_process(ftun_carrier_t *carrier, size_t max_work,
                                    size_t *out_work);
 /* Backend view remains borrowed through start and accepted ownership. */

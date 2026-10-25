@@ -1,4 +1,6 @@
 #include "proxy/sniff/tls_sni.h"
+#include "proxy/sniff/sniff.h"
+#include "core/budget.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -76,6 +78,22 @@ int main(void)
   size_t length = client_hello(wire, "WWW.Example.COM", 1);
   input.data = wire;
   input.length = length;
+  {
+    ftun_budget_t *budget = NULL;
+    ftun_reservation_t *hold = NULL;
+    ftun_budget_usage_t usage;
+    ftun_metadata_t metadata = {0};
+    CHECK(ftun_budget_create(NULL, 131072u, 0u, &budget) == FTUN_OK);
+    CHECK(ftun_budget_reserve(budget, 65537u, &hold) == FTUN_OK);
+    CHECK(ftun_sniff_domain_with_budget(budget, &metadata, input, &result) == FTUN_E_LIMIT);
+    CHECK(!result.found && result.domain.data == NULL);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 65537u);
+    CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+    CHECK(ftun_sniff_domain_with_budget(budget, &metadata, input, &result) == FTUN_OK && result.found);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+      usage.high_watermarks.memory_bytes >= 65536u);
+    CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  }
   CHECK(ftun_sniff_tls_sni(input, &result) == FTUN_OK);
   CHECK(result.found && !result.need_more);
   CHECK(result.domain.length == strlen("www.example.com"));

@@ -1,22 +1,81 @@
 #include "parser.h"
 #include "compile.h"
 #include "model.h"
+#include "core/budget.h"
 #include <cJSON.h>
 #include <math.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
 static int ftun_rule_type_equal(const char *rule, size_t length,
                                 const char *type);
+/* 当前cJSON解析入口写进程级错误位置；只串行此调用，不锁模型构造。 */
+static pthread_mutex_t ftun_json_parse_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static char *ftun_config_string_copy(const char *value)
+ftun_status_t ftun_config_create_owned(ftun_budget_t *budget, ftun_config_t **out)
+{
+  ftun_reservation_t *reservation = NULL;
+  ftun_config_t *config;
+  ftun_status_t status;
+  if (out == NULL) return FTUN_E_INVALID;
+  *out = NULL;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, sizeof(*config), &reservation);
+    if (status != FTUN_OK) return status;
+  }
+  config = (ftun_config_t *)calloc(1u, sizeof(*config));
+  if (config == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  config->reference_count = 1u;
+  config->owned_bytes = sizeof(*config);
+  config->budget = budget;
+  config->reservation = reservation;
+  *out = config;
+  return FTUN_OK;
+}
+
+void *ftun_config_allocate(ftun_config_t *config, size_t count, size_t size)
+{
+  ftun_budget_resources_t resources = {0};
+  size_t bytes;
+  void *value;
+  if (config == NULL || count == 0u || size == 0u || count > SIZE_MAX / size) return NULL;
+  bytes = count * size;
+  if (bytes > SIZE_MAX - config->owned_bytes) return NULL;
+  resources.memory_bytes = config->owned_bytes + bytes;
+  if (config->reservation != NULL &&
+      ftun_reservation_resize(config->reservation, resources) != FTUN_OK) return NULL;
+  value = calloc(count, size);
+  if (value == NULL) {
+    resources.memory_bytes = config->owned_bytes;
+    if (config->reservation != NULL) (void)ftun_reservation_resize(config->reservation, resources);
+    return NULL;
+  }
+  config->owned_bytes += bytes;
+  return value;
+}
+
+void ftun_config_free_bytes(ftun_config_t *config, void *value, size_t bytes)
+{
+  ftun_budget_resources_t resources = {0};
+  if (value == NULL) return;
+  free(value);
+  config->owned_bytes -= bytes;
+  resources.memory_bytes = config->owned_bytes;
+  if (config->reservation != NULL) (void)ftun_reservation_resize(config->reservation, resources);
+}
+
+static char *ftun_config_string_copy(ftun_config_t *config, const char *value)
 {
   size_t length;
   char *copy;
   if (value == NULL) return NULL;
   length = strlen(value);
   if (length > FTUN_CONFIG_MAX_STRING_BYTES) return NULL;
-  copy = (char *)malloc(length + 1u);
+  copy = (char *)ftun_config_allocate(config, length + 1u, 1u);
   if (copy == NULL) return NULL;
   memcpy(copy, value, length + 1u);
   return copy;
@@ -142,10 +201,11 @@ static void ftun_trim_rule_names(char *rule)
   }
 }
 
-static ftun_status_t ftun_json_preflight(ftun_bytes_t json)
+static ftun_status_t ftun_json_preflight(ftun_bytes_t json, size_t *scratch_bytes)
 {
   size_t index;
   size_t depth = 0u;
+  size_t nodes = 1u;
   int in_string = 0;
   int escaped = 0;
   if (json.data == NULL || json.length == 0u) return FTUN_E_INVALID;
@@ -200,13 +260,23 @@ static ftun_status_t ftun_json_preflight(ftun_bytes_t json)
     if (byte == '"') {
       in_string = 1;
     } else if (byte == '{' || byte == '[') {
+      size_t next = index + 1u;
       depth++;
       if (depth > FTUN_CONFIG_MAX_DEPTH) return FTUN_E_LIMIT;
+      while (next < json.length && json.data[next] <= 0x20u) next++;
+      /* cJSON为非空容器首项及每个逗号后的项分配节点，键与值共用一项。 */
+      if (next == json.length || json.data[next] != (byte == '{' ? '}' : ']')) nodes++;
+    } else if (byte == ',') {
+      nodes++;
     } else if (byte == '}' || byte == ']') {
       if (depth == 0u) return FTUN_E_INVALID;
       depth--;
     }
+    if (nodes > FTUN_CONFIG_MAX_NODES) return FTUN_E_LIMIT;
   }
+  /* 输入副本、所有字符串及当前数字解析副本的保守同时存活上界。
+   * cJSON节点在分配前已计数，不切换进程全局allocator hooks。 */
+  *scratch_bytes = nodes * sizeof(cJSON) + 3u * (json.length + 1u);
   return in_string || escaped || depth != 0u ? FTUN_E_INVALID : FTUN_OK;
 }
 
@@ -275,15 +345,15 @@ static ftun_status_t ftun_check_fields(const cJSON *object,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_replace_string(char **destination, const cJSON *item,
+static ftun_status_t ftun_replace_string(ftun_config_t *config, char **destination, const cJSON *item,
                                          int required)
 {
   char *copy;
   if (item == NULL) return required ? FTUN_E_INVALID : FTUN_OK;
   if (!cJSON_IsString(item) || item->valuestring == NULL) return FTUN_E_INVALID;
-  copy = ftun_config_string_copy(item->valuestring);
+  copy = ftun_config_string_copy(config, item->valuestring);
   if (copy == NULL) return FTUN_E_LIMIT;
-  free(*destination);
+  if (*destination != NULL) ftun_config_free_bytes(config, *destination, strlen(*destination) + 1u);
   *destination = copy;
   return FTUN_OK;
 }
@@ -313,7 +383,7 @@ static ftun_status_t ftun_optional_uint(const cJSON *object, const char *name,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_parse_string_list(const cJSON *item,
+static ftun_status_t ftun_parse_string_list(ftun_config_t *config, const cJSON *item,
                                             ftun_config_string_list_t *list,
                                             int require_nonempty)
 {
@@ -326,12 +396,12 @@ static ftun_status_t ftun_parse_string_list(const cJSON *item,
     return count == 0u ? FTUN_E_INVALID : FTUN_E_LIMIT;
   }
   if (count == 0u) return FTUN_OK;
-  list->items = (char **)calloc(count, sizeof(*list->items));
+  list->items = (char **)ftun_config_allocate(config, count, sizeof(*list->items));
   if (list->items == NULL) return FTUN_E_LIMIT;
   list->count = count;
   for (child = item->child; child != NULL; child = child->next, index++) {
     if (!cJSON_IsString(child) || child->valuestring == NULL) return FTUN_E_INVALID;
-    list->items[index] = ftun_config_string_copy(child->valuestring);
+    list->items[index] = ftun_config_string_copy(config, child->valuestring);
     if (list->items[index] == NULL) return FTUN_E_LIMIT;
   }
   return FTUN_OK;
@@ -340,7 +410,7 @@ static ftun_status_t ftun_parse_string_list(const cJSON *item,
 static ftun_status_t ftun_config_defaults(ftun_config_t *config)
 {
 #define FTUN_DEFAULT(field, value) do { \
-  (field) = ftun_config_string_copy(value); \
+  (field) = ftun_config_string_copy(config, value); \
   if ((field) == NULL) return FTUN_E_LIMIT; \
 } while (0)
   config->base.state_cache = true;
@@ -376,7 +446,7 @@ static ftun_status_t ftun_parse_base(const cJSON *item, ftun_config_t *config)
   if (status != FTUN_OK) return status;
   status = ftun_optional_bool(item, "ipv6", &config->base.ipv6);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "allow-lan", &config->base.allow_lan);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->base.cache_file,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->base.cache_file,
     cJSON_GetObjectItemCaseSensitive(item, "cache-file"), 0);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "state-cache", &config->base.state_cache);
   capacity = cJSON_GetObjectItemCaseSensitive(item, "capacity");
@@ -404,9 +474,9 @@ static ftun_status_t ftun_parse_log(const cJSON *item, ftun_config_t *config)
   static const char *const fields[] = {"level", "file"};
   ftun_status_t status = ftun_check_fields(item, fields, 2u);
   if (status != FTUN_OK) return status;
-  status = ftun_replace_string(&config->log.level,
+  status = ftun_replace_string(config, &config->log.level,
     cJSON_GetObjectItemCaseSensitive(item, "level"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->log.file,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->log.file,
     cJSON_GetObjectItemCaseSensitive(item, "file"), 0);
   return status;
 }
@@ -417,7 +487,7 @@ static ftun_status_t ftun_parse_fake_ip(const cJSON *item, ftun_config_t *config
   ftun_status_t status = ftun_check_fields(item, fields, 3u);
   if (status != FTUN_OK) return status;
   status = ftun_optional_bool(item, "enable", &config->dns.fake_ip.enable);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->dns.fake_ip.range,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->dns.fake_ip.range,
     cJSON_GetObjectItemCaseSensitive(item, "range"), 0);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "persist",
     &config->dns.fake_ip.persist);
@@ -434,19 +504,19 @@ static ftun_status_t ftun_parse_dns_listeners(const cJSON *array,
   if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
-  config->dns.listeners = (ftun_config_dns_listener_t *)calloc(
+  config->dns.listeners = (ftun_config_dns_listener_t *)ftun_config_allocate(config,
     count, sizeof(*config->dns.listeners));
   if (config->dns.listeners == NULL) return FTUN_E_LIMIT;
   config->dns.listener_count = count;
   for (item = array->child; item != NULL; item = item->next, index++) {
     ftun_status_t status = ftun_check_fields(item, fields, 2u);
     if (status != FTUN_OK) return status;
-    status = ftun_replace_string(&config->dns.listeners[index].listen,
+    status = ftun_replace_string(config, &config->dns.listeners[index].listen,
       cJSON_GetObjectItemCaseSensitive(item, "listen"), 1);
     if (status != FTUN_OK) return status;
-    config->dns.listeners[index].server = ftun_config_string_copy("");
+    config->dns.listeners[index].server = ftun_config_string_copy(config, "");
     if (config->dns.listeners[index].server == NULL) return FTUN_E_LIMIT;
-    status = ftun_replace_string(&config->dns.listeners[index].server,
+    status = ftun_replace_string(config, &config->dns.listeners[index].server,
       cJSON_GetObjectItemCaseSensitive(item, "server"), 0);
     if (status != FTUN_OK) return status;
   }
@@ -465,7 +535,7 @@ static ftun_status_t ftun_parse_dns_servers(const cJSON *array,
   if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
-  config->dns.servers = (ftun_config_dns_server_t *)calloc(
+  config->dns.servers = (ftun_config_dns_server_t *)ftun_config_allocate(config,
     count, sizeof(*config->dns.servers));
   if (config->dns.servers == NULL) return FTUN_E_LIMIT;
   config->dns.server_count = count;
@@ -474,9 +544,9 @@ static ftun_status_t ftun_parse_dns_servers(const cJSON *array,
     const cJSON *addresses;
     ftun_status_t status = ftun_check_fields(item, fields, 5u);
     if (status != FTUN_OK) return status;
-    status = ftun_replace_string(&server->name,
+    status = ftun_replace_string(config, &server->name,
       cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
-    if (status == FTUN_OK) status = ftun_replace_string(&server->type,
+    if (status == FTUN_OK) status = ftun_replace_string(config, &server->type,
       cJSON_GetObjectItemCaseSensitive(item, "type"), 1);
     if (status != FTUN_OK) return status;
     if (strcmp(server->type, "udp") != 0 && strcmp(server->type, "tcp") != 0) {
@@ -484,11 +554,11 @@ static ftun_status_t ftun_parse_dns_servers(const cJSON *array,
     }
     addresses = cJSON_GetObjectItemCaseSensitive(item, "address");
     if (addresses == NULL) return FTUN_E_INVALID;
-    status = ftun_parse_string_list(addresses, &server->addresses, 1);
+    status = ftun_parse_string_list(config, addresses, &server->addresses, 1);
     if (status != FTUN_OK) return status;
-    server->outbound = ftun_config_string_copy("DIRECT");
+    server->outbound = ftun_config_string_copy(config, "DIRECT");
     if (server->outbound == NULL) return FTUN_E_LIMIT;
-    status = ftun_replace_string(&server->outbound,
+    status = ftun_replace_string(config, &server->outbound,
       cJSON_GetObjectItemCaseSensitive(item, "outbound"), 0);
     if (status == FTUN_OK) status = ftun_optional_bool(item, "fake-ip", &server->fake_ip);
     if (status != FTUN_OK) return status;
@@ -509,9 +579,9 @@ static ftun_status_t ftun_parse_dns(const cJSON *item, ftun_config_t *config)
   if (status == FTUN_OK) status = ftun_optional_bool(item, "cache", &config->dns.cache);
   child = cJSON_GetObjectItemCaseSensitive(item, "bootstrap");
   if (status == FTUN_OK && child != NULL) {
-    status = ftun_parse_string_list(child, &config->dns.bootstrap, 0);
+    status = ftun_parse_string_list(config, child, &config->dns.bootstrap, 0);
   }
-  if (status == FTUN_OK) status = ftun_replace_string(&config->dns.default_server,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->dns.default_server,
     cJSON_GetObjectItemCaseSensitive(item, "default-server"), 0);
   child = cJSON_GetObjectItemCaseSensitive(item, "fake-ip");
   if (status == FTUN_OK && child != NULL) status = ftun_parse_fake_ip(child, config);
@@ -531,17 +601,17 @@ static ftun_status_t ftun_parse_frs(const cJSON *item, ftun_config_t *config)
   ftun_status_t status = ftun_check_fields(item, fields, 6u);
   if (status != FTUN_OK) return status;
   config->frs.present = true;
-  status = ftun_replace_string(&config->frs.path,
+  status = ftun_replace_string(config, &config->frs.path,
     cJSON_GetObjectItemCaseSensitive(item, "path"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.url,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->frs.url,
     cJSON_GetObjectItemCaseSensitive(item, "url"), 0);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "auto-update",
     &config->frs.auto_update);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.update_interval,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->frs.update_interval,
     cJSON_GetObjectItemCaseSensitive(item, "update-interval"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.update_outbound,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->frs.update_outbound,
     cJSON_GetObjectItemCaseSensitive(item, "update-outbound"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&config->frs.dns_server,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &config->frs.dns_server,
     cJSON_GetObjectItemCaseSensitive(item, "dns-server"), 0);
   return status;
 }
@@ -593,7 +663,7 @@ static ftun_status_t ftun_parse_sniff(const cJSON *item, ftun_config_t *config)
   return status;
 }
 
-static ftun_status_t ftun_parse_users(const cJSON *item,
+static ftun_status_t ftun_parse_users(ftun_config_t *config, const cJSON *item,
                                       ftun_config_inbound_t *inbound)
 {
   const cJSON *user;
@@ -602,7 +672,7 @@ static ftun_status_t ftun_parse_users(const cJSON *item,
   if (!cJSON_IsObject(item)) return FTUN_E_INVALID;
   for (user = item->child; user != NULL; user = user->next) count++;
   if (count == 0u) return FTUN_OK;
-  inbound->users = (ftun_config_user_t *)calloc(count, sizeof(*inbound->users));
+  inbound->users = (ftun_config_user_t *)ftun_config_allocate(config, count, sizeof(*inbound->users));
   if (inbound->users == NULL) return FTUN_E_LIMIT;
   inbound->user_count = count;
   for (user = item->child; user != NULL; user = user->next, index++) {
@@ -611,8 +681,8 @@ static ftun_status_t ftun_parse_users(const cJSON *item,
         strlen(user->valuestring) == 0u || strlen(user->valuestring) > 255u) {
       return FTUN_E_INVALID;
     }
-    inbound->users[index].name = ftun_config_string_copy(user->string);
-    inbound->users[index].password = ftun_config_string_copy(user->valuestring);
+    inbound->users[index].name = ftun_config_string_copy(config, user->string);
+    inbound->users[index].password = ftun_config_string_copy(config, user->valuestring);
     if (inbound->users[index].name == NULL || inbound->users[index].password == NULL) {
       return FTUN_E_LIMIT;
     }
@@ -634,7 +704,7 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
   }
   status = ftun_check_fields(item, fields, 5u);
   if (status == FTUN_OK) {
-    status = ftun_replace_string(&config->tun.interface_name,
+    status = ftun_replace_string(config, &config->tun.interface_name,
       cJSON_GetObjectItemCaseSensitive(item, "interface"), 1);
   }
   if (status == FTUN_OK) {
@@ -645,7 +715,7 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
   if (status == FTUN_OK && ipv4 == NULL) status = FTUN_E_INVALID;
   if (status == FTUN_OK) status = ftun_check_fields(ipv4, ipv4_fields, 1u);
   if (status == FTUN_OK) {
-    status = ftun_replace_string(&config->tun.ipv4_address,
+    status = ftun_replace_string(config, &config->tun.ipv4_address,
       cJSON_GetObjectItemCaseSensitive(ipv4, "address"), 1);
   }
   if (status == FTUN_OK) {
@@ -660,7 +730,7 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
   return status;
 }
 
-static ftun_status_t ftun_parse_tun_inbound(
+static ftun_status_t ftun_parse_tun_inbound(ftun_config_t *config,
   const cJSON *item, ftun_config_inbound_t *inbound)
 {
   static const char *const fields[] = {
@@ -679,13 +749,13 @@ static ftun_status_t ftun_parse_tun_inbound(
   inbound->udp = true;
   inbound->dns_hijack = true;
   inbound->mtu = 1500u;
-  inbound->stack = ftun_config_string_copy("lwip");
+  inbound->stack = ftun_config_string_copy(config, "lwip");
   if (inbound->stack == NULL) return FTUN_E_LIMIT;
-  status = ftun_replace_string(&inbound->name,
+  status = ftun_replace_string(config, &inbound->name,
     cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->outbound,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &inbound->outbound,
     cJSON_GetObjectItemCaseSensitive(item, "outbound"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->stack,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &inbound->stack,
     cJSON_GetObjectItemCaseSensitive(item, "stack"), 0);
   if (status != FTUN_OK) return status;
   if (strcmp(inbound->stack, "lwip") != 0) return FTUN_E_UNSUPPORTED;
@@ -697,7 +767,7 @@ static ftun_status_t ftun_parse_tun_inbound(
   if (interface_object != NULL) {
     status = ftun_check_fields(interface_object, interface_fields, 2u);
     if (status == FTUN_OK) {
-      status = ftun_replace_string(&inbound->interface_name,
+      status = ftun_replace_string(config, &inbound->interface_name,
         cJSON_GetObjectItemCaseSensitive(interface_object, "name"), 1);
     }
     if (status == FTUN_OK) {
@@ -709,7 +779,7 @@ static ftun_status_t ftun_parse_tun_inbound(
       status = ftun_check_fields(ipv4_object, ipv4_fields, 1u);
     }
     if (status == FTUN_OK) {
-      status = ftun_replace_string(&inbound->ipv4_address,
+      status = ftun_replace_string(config, &inbound->ipv4_address,
         cJSON_GetObjectItemCaseSensitive(ipv4_object, "address"), 1);
     }
   }
@@ -721,7 +791,7 @@ static ftun_status_t ftun_parse_tun_inbound(
   return status;
 }
 
-static ftun_status_t ftun_parse_proxy_inbound(const cJSON *item,
+static ftun_status_t ftun_parse_proxy_inbound(ftun_config_t *config, const cJSON *item,
                                                ftun_config_inbound_t *inbound,
                                                ftun_config_inbound_kind_t kind)
 {
@@ -733,14 +803,14 @@ static ftun_status_t ftun_parse_proxy_inbound(const cJSON *item,
   if (status != FTUN_OK) return status;
   inbound->kind = kind;
   inbound->udp = true;
-  status = ftun_replace_string(&inbound->name,
+  status = ftun_replace_string(config, &inbound->name,
     cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->outbound,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &inbound->outbound,
     cJSON_GetObjectItemCaseSensitive(item, "outbound"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&inbound->listen,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &inbound->listen,
     cJSON_GetObjectItemCaseSensitive(item, "listen"), 1);
   users = cJSON_GetObjectItemCaseSensitive(item, "users");
-  if (status == FTUN_OK && users != NULL) status = ftun_parse_users(users, inbound);
+  if (status == FTUN_OK && users != NULL) status = ftun_parse_users(config, users, inbound);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "udp", &inbound->udp);
   return status;
 }
@@ -753,7 +823,7 @@ static ftun_status_t ftun_parse_inbounds(const cJSON *array, ftun_config_t *conf
   if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
-  config->inbounds = (ftun_config_inbound_t *)calloc(count, sizeof(*config->inbounds));
+  config->inbounds = (ftun_config_inbound_t *)ftun_config_allocate(config, count, sizeof(*config->inbounds));
   if (config->inbounds == NULL) return FTUN_E_LIMIT;
   config->inbound_count = count;
   for (item = array->child; item != NULL; item = item->next, index++) {
@@ -762,16 +832,16 @@ static ftun_status_t ftun_parse_inbounds(const cJSON *array, ftun_config_t *conf
     if (!cJSON_IsObject(item) || !cJSON_IsString(type) || type->valuestring == NULL) {
       return FTUN_E_INVALID;
     }
-    config->inbounds[index].outbound = ftun_config_string_copy("");
+    config->inbounds[index].outbound = ftun_config_string_copy(config, "");
     if (config->inbounds[index].outbound == NULL) return FTUN_E_LIMIT;
     if (strcmp(type->valuestring, "mixed") == 0) {
-      status = ftun_parse_proxy_inbound(item, &config->inbounds[index],
+      status = ftun_parse_proxy_inbound(config, item, &config->inbounds[index],
                                         FTUN_CONFIG_INBOUND_MIXED);
     } else if (strcmp(type->valuestring, "socks5") == 0) {
-      status = ftun_parse_proxy_inbound(item, &config->inbounds[index],
+      status = ftun_parse_proxy_inbound(config, item, &config->inbounds[index],
                                         FTUN_CONFIG_INBOUND_SOCKS5);
     } else if (strcmp(type->valuestring, "tun") == 0) {
-      status = ftun_parse_tun_inbound(item, &config->inbounds[index]);
+      status = ftun_parse_tun_inbound(config, item, &config->inbounds[index]);
     } else {
       return FTUN_E_UNSUPPORTED;
     }
@@ -780,7 +850,7 @@ static ftun_status_t ftun_parse_inbounds(const cJSON *array, ftun_config_t *conf
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_parse_socks_outbound(const cJSON *item,
+static ftun_status_t ftun_parse_socks_outbound(ftun_config_t *config, const cJSON *item,
                                                 ftun_config_outbound_t *outbound)
 {
   static const char *const fields[] = {
@@ -792,22 +862,22 @@ static ftun_status_t ftun_parse_socks_outbound(const cJSON *item,
   if (status != FTUN_OK) return status;
   outbound->kind = FTUN_CONFIG_OUTBOUND_SOCKS5;
   outbound->udp = true;
-  status = ftun_replace_string(&outbound->name,
+  status = ftun_replace_string(config, &outbound->name,
     cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->dns_server,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->dns_server,
     cJSON_GetObjectItemCaseSensitive(item, "dns-server"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->server,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->server,
     cJSON_GetObjectItemCaseSensitive(item, "server"), 1);
   username = cJSON_GetObjectItemCaseSensitive(item, "username");
   password = cJSON_GetObjectItemCaseSensitive(item, "password");
   if (status == FTUN_OK && ((username == NULL) != (password == NULL))) return FTUN_E_INVALID;
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->username, username, 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->password, password, 0);
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->username, username, 0);
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->password, password, 0);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "udp", &outbound->udp);
   return status;
 }
 
-static ftun_status_t ftun_parse_group_outbound(const cJSON *item,
+static ftun_status_t ftun_parse_group_outbound(ftun_config_t *config, const cJSON *item,
                                                 ftun_config_outbound_t *outbound,
                                                 int url_test)
 {
@@ -824,27 +894,27 @@ static ftun_status_t ftun_parse_group_outbound(const cJSON *item,
                                            url_test ? 11u : 5u);
   if (status != FTUN_OK) return status;
   outbound->kind = url_test ? FTUN_CONFIG_OUTBOUND_URL_TEST : FTUN_CONFIG_OUTBOUND_SELECT;
-  status = ftun_replace_string(&outbound->name,
+  status = ftun_replace_string(config, &outbound->name,
     cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->dns_server,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->dns_server,
     cJSON_GetObjectItemCaseSensitive(item, "dns-server"), 0);
   members = cJSON_GetObjectItemCaseSensitive(item, "outbounds");
   if (status == FTUN_OK && members == NULL) status = FTUN_E_INVALID;
-  if (status == FTUN_OK) status = ftun_parse_string_list(members, &outbound->members, 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->default_member,
+  if (status == FTUN_OK) status = ftun_parse_string_list(config, members, &outbound->members, 1);
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->default_member,
     cJSON_GetObjectItemCaseSensitive(item, "default"), 1);
   if (status != FTUN_OK || !url_test) return status;
-  outbound->interval = ftun_config_string_copy("5m");
-  outbound->timeout = ftun_config_string_copy("5s");
+  outbound->interval = ftun_config_string_copy(config, "5m");
+  outbound->timeout = ftun_config_string_copy(config, "5s");
   outbound->tolerance_ms = 50u;
   outbound->lazy = true;
   outbound->expected_status = 204u;
   if (outbound->interval == NULL || outbound->timeout == NULL) return FTUN_E_LIMIT;
-  status = ftun_replace_string(&outbound->url,
+  status = ftun_replace_string(config, &outbound->url,
     cJSON_GetObjectItemCaseSensitive(item, "url"), 1);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->interval,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->interval,
     cJSON_GetObjectItemCaseSensitive(item, "interval"), 0);
-  if (status == FTUN_OK) status = ftun_replace_string(&outbound->timeout,
+  if (status == FTUN_OK) status = ftun_replace_string(config, &outbound->timeout,
     cJSON_GetObjectItemCaseSensitive(item, "timeout"), 0);
   if (status == FTUN_OK) status = ftun_optional_uint(item, "tolerance", 0u,
     UINT32_MAX, &outbound->tolerance_ms);
@@ -863,7 +933,7 @@ static ftun_status_t ftun_parse_outbounds(const cJSON *array, ftun_config_t *con
   if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
-  config->outbounds = (ftun_config_outbound_t *)calloc(count, sizeof(*config->outbounds));
+  config->outbounds = (ftun_config_outbound_t *)ftun_config_allocate(config, count, sizeof(*config->outbounds));
   if (config->outbounds == NULL) return FTUN_E_LIMIT;
   config->outbound_count = count;
   for (item = array->child; item != NULL; item = item->next, index++) {
@@ -872,14 +942,14 @@ static ftun_status_t ftun_parse_outbounds(const cJSON *array, ftun_config_t *con
     if (!cJSON_IsObject(item) || !cJSON_IsString(type) || type->valuestring == NULL) {
       return FTUN_E_INVALID;
     }
-    config->outbounds[index].dns_server = ftun_config_string_copy("");
+    config->outbounds[index].dns_server = ftun_config_string_copy(config, "");
     if (config->outbounds[index].dns_server == NULL) return FTUN_E_LIMIT;
     if (strcmp(type->valuestring, "socks5") == 0) {
-      status = ftun_parse_socks_outbound(item, &config->outbounds[index]);
+      status = ftun_parse_socks_outbound(config, item, &config->outbounds[index]);
     } else if (strcmp(type->valuestring, "select") == 0) {
-      status = ftun_parse_group_outbound(item, &config->outbounds[index], 0);
+      status = ftun_parse_group_outbound(config, item, &config->outbounds[index], 0);
     } else if (strcmp(type->valuestring, "url-test") == 0) {
-      status = ftun_parse_group_outbound(item, &config->outbounds[index], 1);
+      status = ftun_parse_group_outbound(config, item, &config->outbounds[index], 1);
     } else {
       return FTUN_E_UNSUPPORTED;
     }
@@ -943,9 +1013,9 @@ static ftun_status_t ftun_normalize_tun_device(ftun_config_t *config)
   if (!config->tun.present) {
     if (legacy_source == NULL) return FTUN_E_INVALID;
     config->tun.interface_name =
-      ftun_config_string_copy(legacy_source->interface_name);
+      ftun_config_string_copy(config, legacy_source->interface_name);
     config->tun.ipv4_address =
-      ftun_config_string_copy(legacy_source->ipv4_address);
+      ftun_config_string_copy(config, legacy_source->ipv4_address);
     if (config->tun.interface_name == NULL ||
         config->tun.ipv4_address == NULL) return FTUN_E_LIMIT;
     config->tun.mtu = legacy_source->mtu;
@@ -968,9 +1038,9 @@ static ftun_status_t ftun_normalize_tun_device(ftun_config_t *config)
       continue;
     }
     inbound->interface_name =
-      ftun_config_string_copy(config->tun.interface_name);
+      ftun_config_string_copy(config, config->tun.interface_name);
     inbound->ipv4_address =
-      ftun_config_string_copy(config->tun.ipv4_address);
+      ftun_config_string_copy(config, config->tun.ipv4_address);
     if (inbound->interface_name == NULL || inbound->ipv4_address == NULL) {
       return FTUN_E_LIMIT;
     }
@@ -1015,7 +1085,7 @@ static ftun_status_t ftun_parse_root(const cJSON *root, ftun_config_t *config)
   item = cJSON_GetObjectItemCaseSensitive(root, "outbounds");
   if (status == FTUN_OK && item != NULL) status = ftun_parse_outbounds(item, config);
   item = cJSON_GetObjectItemCaseSensitive(root, "rules");
-  if (status == FTUN_OK && item != NULL) status = ftun_parse_string_list(item, &config->rules, 0);
+  if (status == FTUN_OK && item != NULL) status = ftun_parse_string_list(config, item, &config->rules, 0);
   config->frs.active = status == FTUN_OK && ftun_root_has_frs_rule(root);
   item = cJSON_GetObjectItemCaseSensitive(root, "frs");
   if (status == FTUN_OK && config->frs.active && item != NULL) {
@@ -1040,16 +1110,24 @@ ftun_status_t ftun_config_destroy(ftun_config_t **config)
 {
   ftun_config_t *owned;
   size_t index;
+  ftun_status_t status;
   if (config == NULL) return FTUN_E_INVALID;
   owned = *config;
   if (owned == NULL) return FTUN_OK;
   if (owned->reference_count == 0u) return FTUN_E_STATE_CORRUPT;
-  owned->reference_count--;
+  if (owned->reference_count > 1u) {
+    owned->reference_count--;
+    *config = NULL;
+    return FTUN_OK;
+  }
+  status = ftun_feature_plan_destroy(&owned->plan);
+  if (status != FTUN_OK) return status;
+  status = ftun_reservation_release(&owned->reservation);
+  if (status != FTUN_OK) return status;
+  owned->reference_count = 0u;
   *config = NULL;
-  if (owned->reference_count != 0u) return FTUN_OK;
   free(owned->source_path);
   free(owned->base_directory);
-  (void)ftun_feature_plan_destroy(&owned->plan);
   free(owned->base.cache_file);
   free(owned->log.level);
   free(owned->log.file);
@@ -1120,12 +1198,15 @@ ftun_status_t ftun_config_retain(ftun_config_t *config)
 }
 
 /* TASK-CONFIG-002 / TEST-CONFIG-002，目标 0.2.0：有界 JSON 到拥有型配置。 */
-ftun_status_t ftun_config_parse(ftun_bytes_t json, ftun_config_t **out)
+ftun_status_t ftun_config_parse_budget(ftun_budget_t *budget,
+  ftun_bytes_t json, ftun_config_t **out)
 {
   char *input;
   cJSON *root;
   ftun_config_t *config;
   size_t nodes = 0u;
+  size_t scratch_bytes;
+  ftun_reservation_t *scratch = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (out == NULL) return FTUN_E_INVALID;
@@ -1138,36 +1219,57 @@ ftun_status_t ftun_config_parse(ftun_bytes_t json, ftun_config_t **out)
       return FTUN_E_INVALID;
     }
   }
-  status = ftun_json_preflight(json);
+  status = ftun_json_preflight(json, &scratch_bytes);
   if (status != FTUN_OK) return status;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, scratch_bytes, &scratch);
+    if (status != FTUN_OK) return status;
+  }
   input = (char *)malloc(json.length + 1u);
-  if (input == NULL) return FTUN_E_LIMIT;
+  if (input == NULL) {
+    (void)ftun_reservation_release(&scratch);
+    return FTUN_E_LIMIT;
+  }
   memcpy(input, json.data, json.length);
   input[json.length] = '\0';
+  if (pthread_mutex_lock(&ftun_json_parse_mutex) != 0) {
+    free(input);
+    (void)ftun_reservation_release(&scratch);
+    return FTUN_E_STATE_CORRUPT;
+  }
   root = cJSON_ParseWithLengthOpts(input, json.length + 1u, NULL, 1);
+  (void)pthread_mutex_unlock(&ftun_json_parse_mutex);
   free(input);
   if (root == NULL || !cJSON_IsObject(root)) {
     cJSON_Delete(root);
+    (void)ftun_reservation_release(&scratch);
     return FTUN_E_INVALID;
   }
   status = ftun_json_tree_check(root, 1u, &nodes);
   if (status != FTUN_OK) {
     cJSON_Delete(root);
+    (void)ftun_reservation_release(&scratch);
     return status;
   }
-  config = (ftun_config_t *)calloc(1u, sizeof(*config));
-  if (config == NULL) {
+  status = ftun_config_create_owned(budget, &config);
+  if (status != FTUN_OK) {
     cJSON_Delete(root);
-    return FTUN_E_LIMIT;
+    (void)ftun_reservation_release(&scratch);
+    return status;
   }
-  config->reference_count = 1u;
   status = ftun_config_defaults(config);
   if (status == FTUN_OK) status = ftun_parse_root(root, config);
   cJSON_Delete(root);
+  (void)ftun_reservation_release(&scratch);
   if (status != FTUN_OK) {
     (void)ftun_config_destroy(&config);
     return status;
   }
   *out = config;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_config_parse(ftun_bytes_t json, ftun_config_t **out)
+{
+  return ftun_config_parse_budget(NULL, json, out);
 }

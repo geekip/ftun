@@ -37,10 +37,13 @@ struct ftun_datagram {
   size_t pending_bytes;
   size_t completed_packets;
   size_t failed_packets;
+  size_t reference_count;
   size_t callbacks;
+  size_t backend_calls;
   uint64_t next_generation;
   int accepting;
   int stopping;
+  int destroying;
 };
 
 static int ftun_datagram_backend_valid(const ftun_datagram_backend_t *backend)
@@ -229,7 +232,11 @@ ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
   }
   charge = sizeof(*channel) + options->max_pending_packets *
     sizeof(ftun_datagram_send_t);
-  status = ftun_budget_reserve(options->budget, charge, &reservation);
+  /* 每个槽可独立持有一个已接纳报文；backend 保存的 token 是同一请求的
+   * 引用，不再重复计槽。预留覆盖取消失败、回调及额外引用的整个拥有期。 */
+  status = ftun_budget_reserve_resources(options->budget,
+    (ftun_budget_resources_t){charge, 0u, options->max_pending_packets},
+    &reservation);
   if (status != FTUN_OK) return status;
   channel = (ftun_datagram_t *)calloc(1u, sizeof(*channel));
   if (channel != NULL) {
@@ -251,6 +258,7 @@ ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
   channel->max_pending_packets = options->max_pending_packets;
   channel->max_pending_bytes = options->max_pending_bytes;
   channel->accepting = 1;
+  channel->reference_count = 1u;
   for (index = 0u; index < options->max_pending_packets; index++) {
     channel->storage[index].owner = channel;
     channel->storage[index].free_next = channel->free_head;
@@ -296,9 +304,11 @@ ftun_status_t ftun_datagram_send(ftun_datagram_t *channel,
   ftun_datagram_link(channel, send);
   send->starting = 1;
   send->backend_owned = 1;
+  channel->backend_calls++;
   status = channel->backend.send_start(channel->backend.context,
                                        ftun_datagram_send_token(send),
                                        &send->target, &send->packet);
+  channel->backend_calls--;
   send->starting = 0;
   if (status != FTUN_OK) {
     if (send->early_complete) status = FTUN_E_STATE_CORRUPT;
@@ -385,18 +395,43 @@ ftun_status_t ftun_datagram_budget(ftun_datagram_t *channel,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_datagram_retain(ftun_datagram_t *channel)
+{
+  if (channel == NULL) return FTUN_E_INVALID;
+  if (channel->destroying) return FTUN_E_AGAIN;
+  if (channel->reference_count == 0u) return FTUN_E_STATE_CORRUPT;
+  if (channel->reference_count == SIZE_MAX) return FTUN_E_LIMIT;
+  channel->reference_count++;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_datagram_release(ftun_datagram_t **channel)
+{
+  ftun_datagram_t *owned;
+  if (channel == NULL) return FTUN_E_INVALID;
+  owned = *channel;
+  if (owned == NULL) return FTUN_OK;
+  if (owned->reference_count <= 1u) return FTUN_E_STATE_CORRUPT;
+  owned->reference_count--;
+  *channel = NULL;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_datagram_stop(ftun_datagram_t *channel)
 {
   ftun_status_t status;
   if (channel == NULL) return FTUN_E_INVALID;
   channel->accepting = 0;
-  if (channel->stopping) return FTUN_E_AGAIN;
+  if (channel->stopping || channel->callbacks != 0u ||
+      channel->backend_calls != 0u) return FTUN_E_AGAIN;
   channel->stopping = 1;
   while (channel->head != NULL) {
     ftun_datagram_send_t *send = channel->head;
     send->cancelling = 1;
+    channel->backend_calls++;
     status = channel->backend.send_cancel(channel->backend.context,
                                           ftun_datagram_send_token(send));
+    channel->backend_calls--;
     send->cancelling = 0;
     if (status != FTUN_OK) {
       channel->stopping = 0;
@@ -420,8 +455,10 @@ ftun_status_t ftun_datagram_get_usage(const ftun_datagram_t *channel,
   out->pending_bytes = channel->pending_bytes;
   out->completed_packets = channel->completed_packets;
   out->failed_packets = channel->failed_packets;
+  out->reference_count = channel->reference_count;
   out->accepting = channel->accepting != 0;
   out->in_callback = channel->callbacks != 0u;
+  out->in_backend = channel->backend_calls != 0u;
   return FTUN_OK;
 }
 
@@ -433,13 +470,17 @@ ftun_status_t ftun_datagram_destroy(ftun_datagram_t **channel)
   if (channel == NULL) return FTUN_E_INVALID;
   owned = *channel;
   if (owned == NULL) return FTUN_OK;
-  if (owned->accepting || owned->stopping || owned->callbacks != 0u ||
+  if (owned->accepting || owned->stopping || owned->destroying ||
+      owned->reference_count != 1u || owned->callbacks != 0u ||
+      owned->backend_calls != 0u ||
       owned->pending_packets != 0u || owned->pending_bytes != 0u ||
       owned->head != NULL || owned->tail != NULL) return FTUN_E_AGAIN;
   reservation = owned->reservation;
   status = ftun_reservation_release(&reservation);
   if (status != FTUN_OK) return status;
   owned->reservation = NULL;
+  owned->destroying = 1;
+  owned->backend_calls++;
   owned->backend.destroy(owned->backend.context);
   free(owned->storage);
   memset(owned, 0, sizeof(*owned));

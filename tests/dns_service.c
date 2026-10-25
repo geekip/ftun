@@ -1,3 +1,4 @@
+#include "transport/socket_path.h"
 #include "config/parser.h"
 #include "core/budget.h"
 #include "core/context.h"
@@ -6,12 +7,14 @@
 #include "dns/core_service.h"
 #include "event/event.h"
 #include "event/libev_adapter.h"
+#include "util/time.h"
 
 #include <arpa/inet.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <pthread.h>
 
 #define CHECK(expression) do { \
   if (!(expression)) { \
@@ -20,6 +23,73 @@
     return 1; \
   } \
 } while (0)
+
+static pthread_mutex_t clock_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool measure_busy;
+static uint64_t fake_now;
+static pthread_t clock_owner;
+static bool blocked_call;
+
+ftun_status_t __real_ftun_monotonic_now(uint64_t *out);
+ftun_status_t __wrap_ftun_monotonic_now(uint64_t *out)
+{
+  bool controlled;
+  (void)pthread_mutex_lock(&clock_mutex);
+  controlled = measure_busy && pthread_equal(clock_owner, pthread_self());
+  if (controlled) *out = fake_now;
+  (void)pthread_mutex_unlock(&clock_mutex);
+  return controlled ? FTUN_OK : __real_ftun_monotonic_now(out);
+}
+
+static void busy_callback(void *user)
+{
+  (void)user;
+  (void)pthread_mutex_lock(&clock_mutex);
+  fake_now += 7u;
+  (void)pthread_mutex_unlock(&clock_mutex);
+}
+
+ftun_status_t __real_ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
+  size_t maximum, size_t *callbacks);
+ftun_status_t __wrap_ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
+  size_t maximum, size_t *callbacks)
+{
+  bool controlled;
+  (void)pthread_mutex_lock(&clock_mutex);
+  controlled = measure_busy && pthread_equal(clock_owner, pthread_self());
+  if (controlled) {
+    blocked_call = block;
+    fake_now += block ? 1000u : 5u;
+  }
+  (void)pthread_mutex_unlock(&clock_mutex);
+  if (controlled) {
+    ftun_status_t status = ftun_event_defer(loop, busy_callback, NULL);
+    if (status != FTUN_OK) return status;
+    /* 只控制 backend 等待与回调耗时，派发/usage 使用真实 Event 实现。 */
+    block = false;
+  }
+  return __real_ftun_event_loop_run_once(loop, block, maximum, callbacks);
+}
+
+static int busy_accounting(ftun_core_service_t *service)
+{
+  ftun_core_service_run_usage_t usage;
+  (void)pthread_mutex_lock(&clock_mutex);
+  clock_owner = pthread_self();
+  fake_now = 10000u;
+  measure_busy = true;
+  (void)pthread_mutex_unlock(&clock_mutex);
+  CHECK(ftun_core_service_run_once(service, true, &usage) == FTUN_OK);
+  printf("DNS busy: blocking=%u elapsed=%llu busy=%llu work=%zu\n", blocked_call,
+    (unsigned long long)(fake_now - 10000u), (unsigned long long)usage.busy_ms, usage.work);
+  CHECK(blocked_call && fake_now == 11007u && usage.busy_ms == 7u && usage.work >= 1u);
+  CHECK(ftun_core_service_run_once(service, false, &usage) == FTUN_OK);
+  CHECK(!blocked_call && fake_now == 11019u && usage.busy_ms == 12u && usage.work >= 1u);
+  (void)pthread_mutex_lock(&clock_mutex);
+  measure_busy = false;
+  (void)pthread_mutex_unlock(&clock_mutex);
+  return 0;
+}
 
 static uint16_t reserve_port(void)
 {
@@ -95,10 +165,11 @@ int main(void)
 
   binding.loop = loop;
   binding.slot = &slot;
+  binding.path.open = ftun_socket_path_open;
   erased.value = &binding;
   erased.size = sizeof(binding);
   CHECK(ftun_dns_service_binding_valid(&binding));
-  CHECK(ftun_core_service_plan_prepare(&ftun_dns_core_service, initial, 0u,
+  CHECK(ftun_core_service_plan_prepare(&ftun_dns_core_service, budget, initial, 0u,
                                        &plan) == FTUN_OK);
   CHECK(ftun_core_service_prepare(&service, &ftun_dns_core_service, core,
     budget, operations, &erased, initial, 1u) == FTUN_OK);
@@ -107,9 +178,10 @@ int main(void)
   CHECK(ftun_dns_service_slot_get(&slot, &first) == FTUN_OK &&
         first != NULL && slot.generation == 1u && slot.accepting);
   CHECK(ftun_core_service_run_once(&service, false, &usage) == FTUN_OK);
+  CHECK(busy_accounting(&service) == 0);
   CHECK(ftun_core_service_plan_destroy(&plan) == FTUN_OK);
 
-  CHECK(ftun_core_service_plan_prepare(&ftun_dns_core_service, reload, 0u,
+  CHECK(ftun_core_service_plan_prepare(&ftun_dns_core_service, budget, reload, 0u,
                                        &plan) == FTUN_OK);
   CHECK(ftun_core_service_reload_prepare_planned(
     &service, reload, 2u, &plan) == FTUN_OK);

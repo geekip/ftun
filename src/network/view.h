@@ -58,6 +58,7 @@ typedef struct {
   size_t protected_prefix_count;
   size_t overlay_route_count;
   size_t underlay_exception_count;
+  bool revoked;
 } ftun_network_view_info_t;
 
 typedef struct {
@@ -68,12 +69,16 @@ typedef struct {
   bool purpose_exception;
 } ftun_network_dial_decision_t;
 
-/* NetworkView 创建后只读。route 必须完整落在 protected prefix 内；同一
+/* NetworkView 的策略创建后只读；撤销标志只从 false 转为 true。
+ * route 必须完整落在 protected prefix 内；同一
  * prefix/exception 不允许重复，避免发布后的优先级依赖输入顺序。 */
 ftun_status_t ftun_network_view_create(const ftun_network_view_spec_t *spec,
                                        ftun_network_view_t **out);
 ftun_status_t ftun_network_view_retain(ftun_network_view_t *view);
 ftun_status_t ftun_network_view_release(ftun_network_view_t **view);
+/* 阻止后续路径授权，不改写策略/代次。控制方还须通知各 owner 的 Provider
+ * 取消既有通道；原子标志不使 View 引用计数或 Provider 变为跨线程接口。 */
+ftun_status_t ftun_network_view_revoke(ftun_network_view_t *view);
 ftun_status_t ftun_network_view_get_info(const ftun_network_view_t *view,
                                          ftun_network_view_info_t *out);
 ftun_status_t ftun_network_view_get_protected(

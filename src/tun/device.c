@@ -12,6 +12,13 @@ ftun_status_t ftun_packet_port_open(ftun_core_t *core,
   return ftun_linux_tun_open(spec, out);
 }
 
+ftun_status_t ftun_packet_port_open_with_budget(ftun_core_t *core,
+  ftun_budget_t *budget, const ftun_tun_spec_t *spec, ftun_packet_port_t **out)
+{
+  (void)core;
+  return ftun_linux_tun_open_with_budget(budget, spec, out);
+}
+
 ftun_status_t ftun_packet_port_get_info(const ftun_packet_port_t *port,
                                         ftun_packet_port_info_t *out)
 {

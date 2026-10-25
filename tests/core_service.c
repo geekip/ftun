@@ -28,20 +28,33 @@ typedef struct {
 
 static fake_service_t fake;
 static unsigned int fake_plan;
+static ftun_status_t prepare_error;
+static ftun_status_t plan_error;
+static ftun_status_t activate_error;
+static ftun_status_t reload_error;
+static unsigned int destroy_failures = 1u;
+static unsigned int plan_destroy_failures;
+static unsigned int abort_failures;
 
-static ftun_status_t fake_plan_prepare(const ftun_config_t *config,
+static ftun_status_t fake_plan_prepare(ftun_budget_t *budget,
+  const ftun_config_t *config,
                                        uint32_t socket_mark, void **out)
 {
+  (void)budget;
   (void)socket_mark;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   fake_plan++;
   *out = &fake_plan;
-  return FTUN_OK;
+  return plan_error;
 }
 
 static ftun_status_t fake_plan_destroy(void **plan)
 {
   if (plan == NULL || *plan != &fake_plan) return FTUN_E_INVALID;
+  if (plan_destroy_failures != 0u) {
+    plan_destroy_failures--;
+    return FTUN_E_AGAIN;
+  }
   fake_plan--;
   *plan = NULL;
   return FTUN_OK;
@@ -59,14 +72,14 @@ static ftun_status_t fake_prepare(
       generation == 0u || out == NULL) return FTUN_E_INVALID;
   fake.prepared++;
   *out = &fake;
-  return FTUN_OK;
+  return prepare_error;
 }
 
 static ftun_status_t fake_activate(void *implementation)
 {
   if (implementation != &fake) return FTUN_E_INVALID;
   fake.activated++;
-  return FTUN_OK;
+  return activate_error;
 }
 
 static ftun_status_t fake_reload_prepare(
@@ -76,7 +89,7 @@ static ftun_status_t fake_reload_prepare(
     return FTUN_E_INVALID;
   }
   fake.reload_prepared++;
-  return FTUN_OK;
+  return reload_error;
 }
 
 static ftun_status_t fake_reload_prepare_planned(
@@ -86,7 +99,7 @@ static ftun_status_t fake_reload_prepare_planned(
   if (implementation != &fake || config == NULL || generation == 0u ||
       plan != &fake_plan) return FTUN_E_INVALID;
   fake.reload_prepared++;
-  return FTUN_OK;
+  return reload_error;
 }
 
 static ftun_status_t fake_reload_commit(void *implementation,
@@ -101,6 +114,10 @@ static ftun_status_t fake_reload_abort(void *implementation)
 {
   if (implementation != &fake) return FTUN_E_INVALID;
   fake.reload_aborted++;
+  if (abort_failures != 0u) {
+    abort_failures--;
+    return FTUN_E_AGAIN;
+  }
   return FTUN_OK;
 }
 
@@ -153,7 +170,10 @@ static ftun_status_t fake_destroy_until(void **implementation,
   if (implementation == NULL || *implementation != &fake ||
       deadline_ms == 0u) return FTUN_E_INVALID;
   fake.destroy_attempts++;
-  if (fake.destroy_attempts == 1u) return FTUN_E_TIMEOUT;
+  if (destroy_failures != 0u) {
+    destroy_failures--;
+    return FTUN_E_TIMEOUT;
+  }
   *implementation = NULL;
   return FTUN_OK;
 }
@@ -165,6 +185,106 @@ static const ftun_core_service_descriptor_t descriptor = {
   fake_drain_until,
   fake_stop_until, fake_destroy_until
 };
+
+static ftun_status_t empty_plan_prepare(ftun_budget_t *budget,
+  const ftun_config_t *config,
+                                        uint32_t socket_mark, void **out)
+{
+  (void)budget;
+  (void)config;
+  (void)socket_mark;
+  *out = NULL;
+  return FTUN_OK;
+}
+
+static ftun_status_t empty_plan_destroy(void **plan)
+{
+  return plan != NULL && *plan == NULL ? FTUN_OK : FTUN_E_STATE_CORRUPT;
+}
+
+static int failed_lifecycle(void)
+{
+  ftun_core_service_t service = {0};
+  ftun_core_service_plan_t plan = {0};
+  ftun_core_service_run_usage_t usage;
+  ftun_core_service_descriptor_t empty = descriptor;
+  const ftun_config_t *config = (const ftun_config_t *)(uintptr_t)1u;
+  ftun_core_t *core = (ftun_core_t *)(uintptr_t)1u;
+  ftun_budget_t *budget = (ftun_budget_t *)(uintptr_t)1u;
+  ftun_operation_queue_t *operations =
+    (ftun_operation_queue_t *)(uintptr_t)1u;
+  memset(&fake, 0, sizeof(fake));
+  prepare_error = FTUN_E_IO;
+  destroy_failures = 1u;
+  CHECK(ftun_core_service_prepare(&service, &descriptor, core, budget,
+    operations, NULL, config, 1u) == FTUN_E_IO);
+  CHECK(service.implementation == &fake && service.descriptor == &descriptor &&
+        service.cleanup_only && !service.prepared &&
+        service.first_error == FTUN_E_IO && fake.destroy_attempts == 0u);
+  CHECK(ftun_core_service_prepare(&service, &descriptor, core, budget,
+    operations, NULL, config, 1u) == FTUN_E_AGAIN);
+  CHECK(ftun_core_service_activate(&service) == FTUN_E_STALE);
+  CHECK(ftun_core_service_run_once(&service, false, &usage) == FTUN_E_STALE);
+  CHECK(ftun_core_service_quiesce(&service) == FTUN_OK);
+  CHECK(ftun_core_service_stop_until(&service, 1u) == FTUN_OK);
+  CHECK(fake.quiesced == 0u && fake.stopped == 0u);
+  CHECK(ftun_core_service_destroy_until(&service, 1u) == FTUN_E_TIMEOUT);
+  CHECK(service.implementation == &fake &&
+        service.first_error == FTUN_E_IO && service.cleanup_error == FTUN_E_TIMEOUT);
+  CHECK(ftun_core_service_destroy_until(&service, 1u) == FTUN_OK);
+  CHECK(service.implementation == NULL && service.descriptor == NULL);
+  CHECK(ftun_core_service_destroy_until(&service, 1u) == FTUN_OK);
+  CHECK(fake.destroy_attempts == 2u);
+
+  plan_error = FTUN_E_IO;
+  plan_destroy_failures = 1u;
+  CHECK(ftun_core_service_plan_prepare(&descriptor, budget, config, 0u, &plan) ==
+        FTUN_E_IO);
+  CHECK(plan.implementation == &fake_plan && plan.descriptor == &descriptor &&
+        plan.cleanup_only && plan.first_error == FTUN_E_IO && fake_plan == 1u);
+  CHECK(ftun_core_service_plan_prepare(&descriptor, budget, config, 0u, &plan) ==
+        FTUN_E_AGAIN);
+  CHECK(ftun_core_service_plan_destroy(&plan) == FTUN_E_AGAIN);
+  CHECK(plan.implementation == &fake_plan && plan.cleanup_error == FTUN_E_AGAIN);
+  CHECK(ftun_core_service_plan_destroy(&plan) == FTUN_OK && fake_plan == 0u);
+  CHECK(ftun_core_service_plan_destroy(&plan) == FTUN_OK);
+  empty.plan_prepare = empty_plan_prepare;
+  empty.plan_destroy = empty_plan_destroy;
+  CHECK(ftun_core_service_plan_prepare(&empty, budget, config, 0u, &plan) == FTUN_OK);
+  CHECK(plan.implementation == NULL && plan.descriptor == &empty);
+  CHECK(ftun_core_service_plan_prepare(&empty, budget, config, 0u, &plan) == FTUN_E_AGAIN);
+  CHECK(ftun_core_service_plan_destroy(&plan) == FTUN_OK);
+
+  prepare_error = FTUN_OK;
+  activate_error = FTUN_E_IO;
+  CHECK(ftun_core_service_prepare(&service, &descriptor, core, budget,
+    operations, NULL, config, 1u) == FTUN_OK);
+  CHECK(ftun_core_service_activate(&service) == FTUN_E_IO);
+  CHECK(service.cleanup_only && service.prepared);
+  CHECK(ftun_core_service_activate(&service) == FTUN_E_STALE);
+  CHECK(ftun_core_service_quiesce(&service) == FTUN_OK && fake.quiesced == 1u);
+  CHECK(ftun_core_service_destroy_until(&service, 1u) == FTUN_OK);
+
+  activate_error = FTUN_OK;
+  reload_error = FTUN_E_IO;
+  abort_failures = 1u;
+  CHECK(ftun_core_service_prepare(&service, &descriptor, core, budget,
+    operations, NULL, config, 1u) == FTUN_OK);
+  CHECK(ftun_core_service_activate(&service) == FTUN_OK);
+  CHECK(ftun_core_service_reload_prepare(&service, config, 2u) == FTUN_E_IO);
+  CHECK(service.reload_pending && !service.reload_ready);
+  CHECK(ftun_core_service_reload_commit(&service, 2u) == FTUN_E_STALE);
+  CHECK(ftun_core_service_reload_prepare(&service, config, 2u) == FTUN_E_AGAIN);
+  CHECK(ftun_core_service_reload_abort(&service) == FTUN_E_AGAIN);
+  CHECK(service.reload_pending && service.cleanup_error == FTUN_E_AGAIN);
+  CHECK(ftun_core_service_reload_abort(&service) == FTUN_OK);
+  CHECK(!service.reload_pending);
+  reload_error = FTUN_OK;
+  CHECK(ftun_core_service_reload_prepare(&service, config, 2u) == FTUN_OK);
+  CHECK(ftun_core_service_reload_commit(&service, 2u) == FTUN_OK);
+  CHECK(ftun_core_service_destroy_until(&service, 1u) == FTUN_OK);
+  return 0;
+}
 
 int main(void)
 {
@@ -184,7 +304,7 @@ int main(void)
   memset(&wrong, 0, sizeof(wrong));
   memset(&usage, 0, sizeof(usage));
   CHECK(ftun_core_service_descriptor_valid(&descriptor));
-  CHECK(ftun_core_service_plan_prepare(&descriptor, config, 0u, &plan) ==
+  CHECK(ftun_core_service_plan_prepare(&descriptor, budget, config, 0u, &plan) ==
         FTUN_OK);
   CHECK(ftun_core_service_prepare(&service, &descriptor, core, budget,
         operations, NULL, config, 1u) == FTUN_OK);
@@ -214,5 +334,6 @@ int main(void)
         fake.reload_aborted == 1u && fake.ran == 1u && fake.woke == 1u &&
         fake.quiesced == 1u && fake.drained == 1u && fake.stopped == 1u &&
         fake.destroy_attempts == 2u && fake_plan == 0u);
+  CHECK(failed_lifecycle() == 0);
   return 0;
 }

@@ -41,6 +41,8 @@ typedef struct {
  * 日志和空 mappings 快照均已同步，run/open 从不隐式创建这些文件。 */
 ftun_status_t ftun_fakeip_store_initialize(
   const char *directory, const ftun_fakeip_store_identity_t *identity);
+ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
+  const char *directory, const ftun_fakeip_store_identity_t *identity);
 
 /* open 获取 directory/lock 的独占锁并完整校验 identity、连续预留日志及
  * 空/现有快照。worker/budget/completion 均借用且须比 store 长寿。 */

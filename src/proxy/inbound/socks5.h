@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_INBOUND_SOCKS5_H
 #define FTUN_PROXY_INBOUND_SOCKS5_H
-/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_accept，目标 0.4.0。 */
+/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_server_create，目标 0.4.0。 */
 #include "proxy/inbound/inbound.h"
 #include "protocol/socks5.h"
 
@@ -45,10 +45,4 @@ ftun_status_t ftun_socks5_server_requires_auth(
   const ftun_socks5_server_t *server, bool *out);
 ftun_status_t ftun_socks5_server_destroy(ftun_socks5_server_t **server);
 
-/* 为 Stream 建立同一状态机；成功后 server 保留 client，destroy 时释放。 */
-ftun_status_t ftun_socks5_accept(ftun_core_t *core, ftun_stream_t *client,
-                                 const ftun_inbound_spec_t *spec,
-                                 ftun_socks5_server_t **out);
-ftun_status_t ftun_socks5_server_pump(ftun_socks5_server_t *server,
-                                      ftun_socks5_server_event_t *event);
 #endif

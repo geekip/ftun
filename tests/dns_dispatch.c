@@ -28,6 +28,7 @@ typedef struct {
   ftun_dns_transport_t protocol;
   uint32_t outbound;
   unsigned int submits;
+  unsigned int selects;
   int pending;
 } transport_t;
 
@@ -38,8 +39,21 @@ typedef struct {
   size_t length;
 } completion_t;
 
+static ftun_status_t transport_select(void *user, uint32_t root,
+  ftun_dns_transport_binding_t *out)
+{
+  transport_t *transport = (transport_t *)user;
+  transport->selects++;
+  memset(out, 0, sizeof(*out));
+  out->scope = user;
+  out->root_id = root;
+  out->leaf_id = root;
+  return FTUN_OK;
+}
+
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  void *user, const ftun_dns_transport_binding_t *binding,
+  uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
@@ -55,7 +69,7 @@ static ftun_status_t transport_submit(
   transport->user = completion_user;
   transport->upstream = *upstream;
   transport->protocol = protocol;
-  transport->outbound = outbound;
+  transport->outbound = binding->root_id;
   transport->submits++;
   transport->pending = 1;
   *out_request = transport;
@@ -204,6 +218,7 @@ int main(void)
   server_options.transport = FTUN_DNS_TRANSPORT_UDP;
   server_options.tcp_fallback = true;
   server_options.max_response_bytes = 512u;
+  server_options.query_transport.select = transport_select;
   server_options.query_transport.submit = transport_submit;
   server_options.query_transport.cancel = transport_cancel;
   server_options.query_transport.context = &transport;
@@ -215,6 +230,7 @@ int main(void)
     server_views[index] = servers[index];
   }
   dispatcher_options.budget = budget;
+  CHECK(ftun_runtime_active_config(core, &dispatcher_options.config_scope) == FTUN_OK);
   dispatcher_options.operations = operations;
   dispatcher_options.servers = server_views;
   dispatcher_options.server_count = 2u;
@@ -242,7 +258,7 @@ int main(void)
   CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
         &operation) == FTUN_OK);
   CHECK(dispatch_one(operations) && completion.length == 27u &&
-        completion.response[7] == 0u);
+        completion.response[7] == 0u && transport.selects == 0u);
 
   memset(&completion, 0, sizeof(completion));
   query_init(&query, &completion, wire, 1u);
@@ -277,7 +293,40 @@ int main(void)
   CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
         &operation) == FTUN_E_INVALID);
 
+  {
+    unsigned int selects = transport.selects;
+    unsigned int submits = transport.submits;
+    ftun_config_t *replacement;
+    query.real_only = false;
+    wire[13] = (uint8_t)'b';
+    metadata.domain = (ftun_string_t){"b.example", 9u};
+    memset(&completion, 0, sizeof(completion));
+    CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
+                                   &operation) == FTUN_OK);
+    CHECK(dispatch_one(operations) && completion.status == FTUN_OK &&
+          (completion.response[3] & 15u) == 5u);
+    CHECK(transport.selects == selects && transport.submits == submits);
+    config = (ftun_config_t *)dispatcher_options.config_scope;
+    CHECK(ftun_config_retain(config) == FTUN_OK);
+    replacement = make_config();
+    CHECK(replacement != NULL);
+    CHECK(ftun_runtime_prepare(core, replacement, &candidate) == FTUN_OK);
+    CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+    CHECK(ftun_config_destroy(&replacement) == FTUN_OK);
+    wire[13] = (uint8_t)'a';
+    metadata.domain = (ftun_string_t){"a.example", 9u};
+    metadata.generation = 2u;
+    selected_outbound = UINT32_MAX;
+    memset(&completion, 0, sizeof(completion));
+    CHECK(ftun_proxy_dns_dispatch(&dns_adapter, core, dispatcher, &query,
+                                   &operation) == FTUN_E_STALE);
+    CHECK(operation == NULL && completion.calls == 0u &&
+          selected_outbound == UINT32_MAX && transport.selects == selects &&
+          transport.submits == submits);
+  }
+
   CHECK(ftun_dns_dispatcher_destroy(&dispatcher) == FTUN_OK);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(ftun_dns_server_destroy(&servers[1]) == FTUN_OK);
   CHECK(ftun_dns_server_destroy(&servers[0]) == FTUN_OK);
   CHECK(ftun_fakeip_service_destroy(&fakeip) == FTUN_OK);

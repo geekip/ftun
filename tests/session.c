@@ -37,6 +37,7 @@ typedef struct {
   ftun_error_t result;
   int calls;
   int session_completed;
+  bool reply;
 } child_t;
 
 typedef struct {
@@ -192,8 +193,9 @@ static void child_complete(ftun_operation_t *operation,
   child_t *child = (child_t *)user;
   child->calls++;
   child->result = result;
-  child->session_completed += ftun_session_operation_complete(
-    child->session, operation, result) == FTUN_OK;
+  child->session_completed += (child->reply
+    ? ftun_session_operation_complete_for_reply(child->session, operation, result)
+    : ftun_session_operation_complete(child->session, operation, result)) == FTUN_OK;
   child->operation = NULL;
 }
 
@@ -442,8 +444,87 @@ static int test_failure_and_boundaries(void)
   return 0;
 }
 
+static int test_failure_reply(void)
+{
+  fixture_t fixture;
+  ftun_metadata_t metadata;
+  ftun_endpoint_t resolved = ipv4(40u, 443u);
+  ftun_session_t *session = NULL;
+  ftun_session_info_t info;
+  ftun_stream_usage_t usage;
+  child_t child;
+  CHECK(fixture_start(&fixture) == 0);
+  fill_metadata(&metadata, "reply.example", &resolved, 1u);
+  CHECK(ftun_session_submit(fixture.core, &metadata, fixture.stream, &session) == FTUN_OK);
+  CHECK(ftun_session_transition(session, FTUN_SESSION_ROUTING, NULL) == FTUN_OK);
+  CHECK(begin_child(&fixture, session, FTUN_SESSION_RESOLVING, &child) == 0);
+  child.reply = true;
+  CHECK(finish_child(&fixture, &child, FTUN_E_IO) == 0);
+  CHECK(ftun_session_get_info(session, &info) == FTUN_OK &&
+    info.state == FTUN_SESSION_REPLYING && !info.has_pending_operation &&
+    info.terminal_error.status == FTUN_E_IO);
+  CHECK(ftun_stream_get_usage(fixture.stream, &usage) == FTUN_OK && usage.accepting);
+  CHECK(ftun_session_transition(session, FTUN_SESSION_RELAYING, NULL) == FTUN_E_STALE);
+  CHECK(ftun_session_destroy(&session) == FTUN_E_AGAIN && session != NULL);
+  CHECK(ftun_session_cancel(session) == FTUN_OK);
+  CHECK(ftun_session_get_info(session, &info) == FTUN_OK &&
+    info.state == FTUN_SESSION_CLOSED && info.terminal_error.status == FTUN_E_IO);
+  CHECK(ftun_stream_get_usage(fixture.stream, &usage) == FTUN_OK && !usage.accepting);
+  CHECK(ftun_session_destroy(&session) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_stream_budget_ownership(void)
+{
+  fixture_t fixture;
+  ftun_budget_t *data = NULL;
+  ftun_reservation_t *hold = NULL;
+  ftun_stream_t *stream = NULL;
+  ftun_session_t *session = NULL;
+  ftun_stream_options_t options = {0};
+  ftun_stream_backend_t backend = {0};
+  stream_backend_t state = {0};
+  ftun_budget_usage_t before, during, host;
+  ftun_stream_usage_t stream_usage;
+  ftun_metadata_t metadata;
+  ftun_endpoint_t resolved = ipv4(9u, 443u);
+  CHECK(fixture_start(&fixture) == 0);
+  CHECK(ftun_budget_create(fixture.budget, 65536u, 0u, &data) == FTUN_OK);
+  options.budget = data;
+  options.operations = fixture.operations;
+  options.max_pending_writes = 2u;
+  options.max_pending_bytes = 1024u;
+  options.completion = unused_stream_completion;
+  backend.write_start = backend_write_start;
+  backend.write_cancel = backend_write_cancel;
+  backend.destroy = backend_destroy;
+  backend.context = &state;
+  CHECK(ftun_stream_create(&options, &backend, &stream) == FTUN_OK);
+  fill_metadata(&metadata, "budget.example", &resolved, 1u);
+  CHECK(ftun_budget_get_usage(data, &before) == FTUN_OK);
+  CHECK(ftun_budget_reserve(data, before.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(fixture.budget, &host) == FTUN_OK && host.normal_available > 65536u);
+  /* 宿主仍有空间也不能绕过入站子预算，更不能先保留输入Stream。 */
+  CHECK(ftun_session_submit(fixture.core, &metadata, stream, &session) == FTUN_E_LIMIT && session == NULL);
+  CHECK(ftun_stream_get_usage(stream, &stream_usage) == FTUN_OK && stream_usage.reference_count == 1u);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  CHECK(ftun_session_submit(fixture.core, &metadata, stream, &session) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used > before.used);
+  CHECK(ftun_session_cancel(session) == FTUN_OK);
+  CHECK(ftun_session_destroy(&session) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used == before.used);
+  CHECK(ftun_stream_destroy(&stream) == FTUN_OK && state.destroy_calls == 1);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used == 0u);
+  CHECK(ftun_budget_destroy(&data) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_stream_budget_ownership() == 0);
+  CHECK(test_failure_reply() == 0);
   CHECK(test_full_lifecycle_and_reload() == 0);
   CHECK(test_cancel_waits_for_callback() == 0);
   CHECK(test_failure_and_boundaries() == 0);

@@ -1,6 +1,5 @@
-/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_accept，目标 0.4.0。 */
+/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_server_create，目标 0.4.0。 */
 #include "socks5.h"
-#include "transport/stream.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +17,7 @@ typedef enum {
 } ftun_socks5_server_state_t;
 
 struct ftun_socks5_server {
-  ftun_stream_t *client;
+  ftun_reservation_t *reservation;
   ftun_inbound_user_t *users;
   uint8_t *credential_bytes;
   size_t user_count;
@@ -152,6 +151,8 @@ ftun_status_t ftun_socks5_server_create(const ftun_inbound_spec_t *spec,
   size_t bytes = 0u;
   size_t index;
   uint8_t *cursor;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (spec == NULL || out == NULL ||
       (spec->kind != FTUN_INBOUND_SOCKS5 &&
@@ -171,8 +172,18 @@ ftun_status_t ftun_socks5_server_create(const ftun_inbound_spec_t *spec,
     bytes += spec->users[index].username.length +
              spec->users[index].password.length;
   }
+  if (spec->budget != NULL) {
+    status = ftun_budget_reserve(spec->budget,
+      sizeof(*server) + spec->user_count * sizeof(*server->users) + bytes,
+      &reservation);
+    if (status != FTUN_OK) return status;
+  }
   server = (ftun_socks5_server_t *)calloc(1u, sizeof(*server));
-  if (server == NULL) return FTUN_E_LIMIT;
+  if (server == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  server->reservation = reservation;
   if (spec->user_count != 0u) {
     server->users = (ftun_inbound_user_t *)calloc(
       spec->user_count, sizeof(*server->users));
@@ -181,6 +192,7 @@ ftun_status_t ftun_socks5_server_create(const ftun_inbound_spec_t *spec,
       free(server->credential_bytes);
       free(server->users);
       free(server);
+      (void)ftun_reservation_release(&reservation);
       return FTUN_E_LIMIT;
     }
   }
@@ -387,44 +399,6 @@ ftun_status_t ftun_socks5_server_udp(ftun_socks5_server_t *server,
   return ftun_socks5_decode_udp_datagram(packet, out, &consumed);
 }
 
-ftun_status_t ftun_socks5_accept(ftun_core_t *core, ftun_stream_t *client,
-                                 const ftun_inbound_spec_t *spec,
-                                 ftun_socks5_server_t **out)
-{
-  ftun_status_t status;
-  if (core == NULL || client == NULL || out == NULL) return FTUN_E_INVALID;
-  status = ftun_socks5_server_create(spec, out);
-  if (status != FTUN_OK) return status;
-  status = ftun_stream_retain(client);
-  if (status != FTUN_OK) {
-    (void)ftun_socks5_server_destroy(out);
-    return status;
-  }
-  (*out)->client = client;
-  return FTUN_OK;
-}
-
-ftun_status_t ftun_socks5_server_pump(ftun_socks5_server_t *server,
-                                      ftun_socks5_server_event_t *event)
-{
-  uint8_t input[512];
-  ftun_bytes_t bytes;
-  size_t length = 0u;
-  size_t consumed = 0u;
-  ftun_status_t status;
-  if (event != NULL) memset(event, 0, sizeof(*event));
-  if (server == NULL || server->client == NULL || event == NULL) {
-    return FTUN_E_INVALID;
-  }
-  status = ftun_stream_read(server->client, input, sizeof(input), &length);
-  if (status != FTUN_OK) return status;
-  bytes.data = input;
-  bytes.length = length;
-  status = ftun_socks5_server_feed(server, bytes, &consumed, event);
-  if (status == FTUN_E_AGAIN && consumed == length) return FTUN_E_AGAIN;
-  return status;
-}
-
 ftun_status_t ftun_socks5_server_destroy(ftun_socks5_server_t **server)
 {
   ftun_socks5_server_t *owned;
@@ -432,7 +406,8 @@ ftun_status_t ftun_socks5_server_destroy(ftun_socks5_server_t **server)
   if (server == NULL) return FTUN_E_INVALID;
   owned = *server;
   if (owned == NULL) return FTUN_OK;
-  if (owned->client != NULL) status = ftun_stream_release(&owned->client);
+  status = ftun_reservation_release(&owned->reservation);
+  if (status != FTUN_OK) return status;
   free(owned->credential_bytes);
   free(owned->users);
   memset(owned, 0, sizeof(*owned));

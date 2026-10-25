@@ -50,13 +50,16 @@ struct ftun_runtime {
   ftun_runtime_t *next_retained;
   bool retention_reserved;
   bool blocks_active_acquire;
+  bool cleanup_pending;
 };
 
 typedef struct {
   uint32_t runtime_magic;
+  ftun_reservation_t *reservation;
   ftun_runtime_t *active;
   ftun_runtime_t *candidate;
   ftun_runtime_t *retained;
+  ftun_runtime_t *cleanup;
   size_t retained_count;
   size_t retained_limit;
   size_t retained_bytes;

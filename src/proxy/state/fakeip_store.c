@@ -23,6 +23,11 @@
 #define FTUN_FAKEIP_LOG_RECORD_BYTES 32u
 #define FTUN_FAKEIP_SNAPSHOT_HEADER_BYTES 48u
 
+typedef struct {
+  uintptr_t budget;
+  uint32_t path_length;
+} ftun_store_work_t;
+
 struct ftun_fakeip_store {
   char *directory;
   char *reservation_path;
@@ -35,6 +40,8 @@ struct ftun_fakeip_store {
                      void *);
   void *completion_user;
   ftun_reservation_t *reservation;
+  ftun_reservation_t *reservation_path_budget;
+  ftun_reservation_t *mapping_path_budget;
   ftun_fakeip_store_identity_t identity;
   uint64_t sequence;
   uint32_t reserved_end;
@@ -102,20 +109,54 @@ static int ftun_store_identity_valid(const ftun_fakeip_store_identity_t *identit
          identity->first_address < identity->end_address_exclusive;
 }
 
-static ftun_status_t ftun_store_path(const char *directory, const char *name,
-                                     char **out)
+static ftun_status_t ftun_store_open_file(ftun_budget_t *budget,
+  const char *path, int flags, int *out, ftun_reservation_t **reservation)
+{
+  ftun_budget_resources_t resources = {0u, 1u, 0u};
+  ftun_status_t status;
+  *out = -1;
+  *reservation = NULL;
+  if (budget != NULL) {
+    status = ftun_budget_reserve_resources(budget, resources, reservation);
+    if (status != FTUN_OK) return status;
+  }
+  *out = open(path, flags);
+  if (*out >= 0) return FTUN_OK;
+  (void)ftun_reservation_release(reservation);
+  return (flags & O_WRONLY) != 0 ? FTUN_E_IO : FTUN_E_STATE_CORRUPT;
+}
+
+static int ftun_store_close_file(int descriptor, ftun_reservation_t **reservation)
+{
+  int result = close(descriptor);
+  (void)ftun_reservation_release(reservation);
+  return result;
+}
+
+static ftun_status_t ftun_store_path(ftun_budget_t *budget,
+  const char *directory, const char *name, char **out,
+  ftun_reservation_t **out_reservation)
 {
   size_t directory_length;
   size_t name_length;
   char *path;
+  ftun_status_t status;
   if (out != NULL) *out = NULL;
+  *out_reservation = NULL;
   if (directory == NULL || directory[0] == '\0' || name == NULL ||
       out == NULL) return FTUN_E_INVALID;
   directory_length = strlen(directory);
   name_length = strlen(name);
   if (directory_length > SIZE_MAX - name_length - 2u) return FTUN_E_LIMIT;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, directory_length + name_length + 2u, out_reservation);
+    if (status != FTUN_OK) return status;
+  }
   path = (char *)malloc(directory_length + name_length + 2u);
-  if (path == NULL) return FTUN_E_LIMIT;
+  if (path == NULL) {
+    (void)ftun_reservation_release(out_reservation);
+    return FTUN_E_LIMIT;
+  }
   memcpy(path, directory, directory_length);
   path[directory_length] = '/';
   memcpy(path + directory_length + 1u, name, name_length + 1u);
@@ -123,29 +164,31 @@ static ftun_status_t ftun_store_path(const char *directory, const char *name,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_store_read_exact(const char *path, uint8_t *data,
+static ftun_status_t ftun_store_read_exact(ftun_budget_t *budget, const char *path, uint8_t *data,
                                            size_t length)
 {
   int descriptor;
   size_t offset = 0u;
   struct stat status;
-  descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) return FTUN_E_STATE_CORRUPT;
+  ftun_reservation_t *fd_reservation = NULL;
+  ftun_status_t admission = ftun_store_open_file(budget, path,
+    O_RDONLY | O_CLOEXEC | O_NOFOLLOW, &descriptor, &fd_reservation);
+  if (admission != FTUN_OK) return admission;
   if (fstat(descriptor, &status) != 0 || !S_ISREG(status.st_mode) ||
       status.st_size < 0 || (uint64_t)status.st_size != (uint64_t)length) {
-    (void)close(descriptor);
+    (void)ftun_store_close_file(descriptor, &fd_reservation);
     return FTUN_E_STATE_CORRUPT;
   }
   while (offset < length) {
     ssize_t result = read(descriptor, data + offset, length - offset);
     if (result < 0 && errno == EINTR) continue;
     if (result <= 0) {
-      (void)close(descriptor);
+      (void)ftun_store_close_file(descriptor, &fd_reservation);
       return FTUN_E_STATE_CORRUPT;
     }
     offset += (size_t)result;
   }
-  return close(descriptor) == 0 ? FTUN_OK : FTUN_E_IO;
+  return ftun_store_close_file(descriptor, &fd_reservation) == 0 ? FTUN_OK : FTUN_E_IO;
 }
 
 static void ftun_store_identity_encode(
@@ -202,32 +245,34 @@ static void ftun_store_snapshot_empty_encode(
   ftun_store_u64(data + 40u, ftun_store_checksum(data, 40u));
 }
 
-static ftun_status_t ftun_store_sync_parent(const char *path)
+static ftun_status_t ftun_store_sync_parent(ftun_budget_t *budget, const char *path)
 {
   const char *slash = strrchr(path, '/');
-  char *parent;
-  size_t length;
-  int descriptor;
-  ftun_status_t result = FTUN_OK;
-  if (slash == NULL) {
-    parent = (char *)malloc(2u);
-    if (parent == NULL) return FTUN_E_LIMIT;
-    memcpy(parent, ".", 2u);
-  } else {
-    length = slash == path ? 1u : (size_t)(slash - path);
-    parent = (char *)malloc(length + 1u);
-    if (parent == NULL) return FTUN_E_LIMIT;
-    memcpy(parent, path, length);
-    parent[length] = '\0';
+  size_t length = slash == NULL || slash == path ? 1u : (size_t)(slash - path);
+  char *parent = NULL;
+  int descriptor = -1;
+  ftun_reservation_t *memory_reservation = NULL, *fd_reservation = NULL;
+  ftun_status_t status;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, length + 1u, &memory_reservation);
+    if (status != FTUN_OK) return status;
   }
-  descriptor = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0 || fsync(descriptor) != 0) result = FTUN_E_IO;
-  if (descriptor >= 0 && close(descriptor) != 0) result = FTUN_E_IO;
+  parent = (char *)malloc(length + 1u);
+  if (parent == NULL) { status = FTUN_E_LIMIT; goto done; }
+  if (slash == NULL) memcpy(parent, ".", 2u);
+  else { memcpy(parent, path, length); parent[length] = '\0'; }
+  status = ftun_store_open_file(budget, parent,
+    O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW, &descriptor, &fd_reservation);
+  if (status == FTUN_E_STATE_CORRUPT) status = FTUN_E_IO;
+  if (status == FTUN_OK && fsync(descriptor) != 0) status = FTUN_E_IO;
+  if (descriptor >= 0 && ftun_store_close_file(descriptor, &fd_reservation) != 0) status = FTUN_E_IO;
+done:
   free(parent);
-  return result;
+  (void)ftun_reservation_release(&memory_reservation);
+  return status;
 }
 
-ftun_status_t ftun_fakeip_store_initialize(
+ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
   const char *directory, const ftun_fakeip_store_identity_t *identity)
 {
   static const uint8_t empty[1] = {0u};
@@ -235,6 +280,7 @@ ftun_status_t ftun_fakeip_store_initialize(
   char *reservation_path = NULL;
   char *mapping_path = NULL;
   char *lock_path = NULL;
+  ftun_reservation_t *paths[4] = {NULL, NULL, NULL, NULL};
   uint8_t identity_data[FTUN_FAKEIP_IDENTITY_BYTES];
   uint8_t log_data[FTUN_FAKEIP_LOG_HEADER_BYTES];
   uint8_t snapshot_data[FTUN_FAKEIP_SNAPSHOT_HEADER_BYTES];
@@ -244,30 +290,30 @@ ftun_status_t ftun_fakeip_store_initialize(
       !ftun_store_identity_valid(identity)) return FTUN_E_INVALID;
   if (mkdir(directory, 0700) != 0) return errno == EEXIST ? FTUN_E_INVALID : FTUN_E_IO;
   created = 1;
-  status = ftun_store_path(directory, "identity", &identity_path);
+  status = ftun_store_path(budget, directory, "identity", &identity_path, &paths[0]);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(directory, "reservations", &reservation_path);
+  status = ftun_store_path(budget, directory, "reservations", &reservation_path, &paths[1]);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(directory, "mappings", &mapping_path);
+  status = ftun_store_path(budget, directory, "mappings", &mapping_path, &paths[2]);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(directory, "lock", &lock_path);
+  status = ftun_store_path(budget, directory, "lock", &lock_path, &paths[3]);
   if (status != FTUN_OK) goto done;
   ftun_store_identity_encode(identity, identity_data);
   ftun_store_log_header_encode(identity, log_data);
   ftun_store_snapshot_empty_encode(identity, snapshot_data);
-  status = ftun_file_write_atomic(identity_path,
-    (ftun_bytes_t){identity_data, sizeof(identity_data)}, 0600u);
+  status = ftun_file_write_atomic_budget(budget, identity_path,
+    (ftun_bytes_t){identity_data, sizeof(identity_data)}, 0600u, NULL, NULL);
   if (status != FTUN_OK) goto done;
-  status = ftun_file_write_atomic(reservation_path,
-    (ftun_bytes_t){log_data, sizeof(log_data)}, 0600u);
+  status = ftun_file_write_atomic_budget(budget, reservation_path,
+    (ftun_bytes_t){log_data, sizeof(log_data)}, 0600u, NULL, NULL);
   if (status != FTUN_OK) goto done;
-  status = ftun_file_write_atomic(mapping_path,
-    (ftun_bytes_t){snapshot_data, sizeof(snapshot_data)}, 0600u);
+  status = ftun_file_write_atomic_budget(budget, mapping_path,
+    (ftun_bytes_t){snapshot_data, sizeof(snapshot_data)}, 0600u, NULL, NULL);
   if (status != FTUN_OK) goto done;
-  status = ftun_file_write_atomic(lock_path,
-    (ftun_bytes_t){empty, 0u}, 0600u);
+  status = ftun_file_write_atomic_budget(budget, lock_path,
+    (ftun_bytes_t){empty, 0u}, 0600u, NULL, NULL);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_sync_parent(directory);
+  status = ftun_store_sync_parent(budget, directory);
 
 done:
   if (status != FTUN_OK && created) {
@@ -281,19 +327,26 @@ done:
   free(reservation_path);
   free(mapping_path);
   free(lock_path);
+  { size_t i; for (i = 0u; i < 4u; i++) (void)ftun_reservation_release(&paths[i]); }
   return status;
 }
 
+ftun_status_t ftun_fakeip_store_initialize(
+  const char *directory, const ftun_fakeip_store_identity_t *identity)
+{
+  return ftun_fakeip_store_initialize_budget(NULL, directory, identity);
+}
+
 static ftun_status_t ftun_store_read_identity(
-  const char *path, ftun_fakeip_store_identity_t *out)
+  ftun_budget_t *budget, const char *path, ftun_fakeip_store_identity_t *out)
 {
   uint8_t data[FTUN_FAKEIP_IDENTITY_BYTES];
-  ftun_status_t status = ftun_store_read_exact(path, data, sizeof(data));
+  ftun_status_t status = ftun_store_read_exact(budget, path, data, sizeof(data));
   return status == FTUN_OK ? ftun_store_identity_decode(data, out) : status;
 }
 
 static ftun_status_t ftun_store_read_log(
-  const char *path, const ftun_fakeip_store_identity_t *identity,
+  ftun_budget_t *budget, const char *path, const ftun_fakeip_store_identity_t *identity,
   uint64_t *out_sequence, uint32_t *out_end)
 {
   uint8_t header[FTUN_FAKEIP_LOG_HEADER_BYTES];
@@ -303,12 +356,14 @@ static ftun_status_t ftun_store_read_log(
   uint32_t end = identity->first_address;
   int descriptor;
   off_t offset;
-  descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) return FTUN_E_STATE_CORRUPT;
+  ftun_reservation_t *fd_reservation = NULL;
+  ftun_status_t admission = ftun_store_open_file(budget, path,
+    O_RDONLY | O_CLOEXEC | O_NOFOLLOW, &descriptor, &fd_reservation);
+  if (admission != FTUN_OK) return admission;
   if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
       info.st_size < (off_t)sizeof(header) ||
       ((uint64_t)info.st_size - sizeof(header)) % sizeof(record) != 0u) {
-    (void)close(descriptor);
+    (void)ftun_store_close_file(descriptor, &fd_reservation);
     return FTUN_E_STATE_CORRUPT;
   }
   {
@@ -321,7 +376,7 @@ static ftun_status_t ftun_store_read_log(
       read_bytes += (size_t)result;
     }
     if (read_bytes != sizeof(header)) {
-      (void)close(descriptor);
+      (void)ftun_store_close_file(descriptor, &fd_reservation);
       return FTUN_E_STATE_CORRUPT;
     }
   }
@@ -329,7 +384,7 @@ static ftun_status_t ftun_store_read_log(
       memcmp(header, "FTRL", 4u) != 0 || ftun_load_u32(header + 4u) != 1u ||
       memcmp(header + 8u, identity->uuid, FTUN_FAKEIP_UUID_BYTES) != 0 ||
       ftun_load_u64(header + 24u) != ftun_store_checksum(header, 24u)) {
-    (void)close(descriptor);
+    (void)ftun_store_close_file(descriptor, &fd_reservation);
     return FTUN_E_STATE_CORRUPT;
   }
   for (offset = (off_t)sizeof(header); offset < info.st_size;
@@ -349,7 +404,7 @@ static ftun_status_t ftun_store_read_log(
         memcmp(record, "FTRR", 4u) != 0 ||
         ftun_load_u32(record + 4u) != 1u ||
         ftun_load_u64(record + 24u) != ftun_store_checksum(record, 24u)) {
-      (void)close(descriptor);
+      (void)ftun_store_close_file(descriptor, &fd_reservation);
       return FTUN_E_STATE_CORRUPT;
     }
     next_sequence = ftun_load_u64(record + 8u);
@@ -357,13 +412,13 @@ static ftun_status_t ftun_store_read_log(
     next_end = ftun_load_u32(record + 20u);
     if (next_sequence != sequence + 1u || previous != end ||
         next_end <= previous || next_end > identity->end_address_exclusive) {
-      (void)close(descriptor);
+      (void)ftun_store_close_file(descriptor, &fd_reservation);
       return FTUN_E_STATE_CORRUPT;
     }
     sequence = next_sequence;
     end = next_end;
   }
-  if (close(descriptor) != 0) return FTUN_E_IO;
+  if (ftun_store_close_file(descriptor, &fd_reservation) != 0) return FTUN_E_IO;
   *out_sequence = sequence;
   *out_end = end;
   return FTUN_OK;
@@ -426,7 +481,7 @@ static ftun_status_t ftun_store_snapshot_validate(
   uint64_t durable_sequence, uint32_t reserved_end, ftun_budget_t *budget)
 {
   uint8_t *data = NULL;
-  ftun_reservation_t *file_reservation = NULL;
+  ftun_reservation_t *file_reservation = NULL, *fd_reservation = NULL;
   ftun_index_t *domains = NULL;
   ftun_index_t *addresses = NULL;
   struct stat info;
@@ -447,8 +502,10 @@ static ftun_status_t ftun_store_snapshot_validate(
 #endif
   maximum = FTUN_FAKEIP_SNAPSHOT_HEADER_BYTES +
     (size_t)(reserved_end - identity->first_address) * (8u + 253u);
-  descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) return FTUN_E_STATE_CORRUPT;
+  status = ftun_store_open_file(budget, path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW,
+    &descriptor, &fd_reservation);
+  if (status != FTUN_OK) return status;
+  status = FTUN_E_STATE_CORRUPT;
   if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode) ||
       info.st_size < (off_t)FTUN_FAKEIP_SNAPSHOT_HEADER_BYTES ||
       (uint64_t)info.st_size > (uint64_t)maximum) goto done;
@@ -515,7 +572,7 @@ static ftun_status_t ftun_store_snapshot_validate(
 corrupt:
   status = FTUN_E_STATE_CORRUPT;
 done:
-  if (descriptor >= 0 && close(descriptor) != 0 && status == FTUN_OK) {
+  if (descriptor >= 0 && ftun_store_close_file(descriptor, &fd_reservation) != 0 && status == FTUN_OK) {
     status = FTUN_E_IO;
   }
   free(data);
@@ -536,7 +593,7 @@ ftun_status_t ftun_fakeip_store_open(const ftun_fakeip_store_options_t *options,
   ftun_fakeip_store_t *store = NULL;
   char *identity_path = NULL;
   char *lock_path = NULL;
-  ftun_reservation_t *reservation = NULL;
+  ftun_reservation_t *reservation = NULL, *identity_reservation = NULL, *lock_reservation = NULL;
   ftun_status_t status;
   size_t directory_length;
   if (out != NULL) *out = NULL;
@@ -562,20 +619,20 @@ ftun_status_t ftun_fakeip_store_open(const ftun_fakeip_store_options_t *options,
     goto fail;
   }
   memcpy(store->directory, options->directory, directory_length + 1u);
-  status = ftun_store_path(store->directory, "identity", &identity_path);
+  status = ftun_store_path(options->budget, store->directory, "identity", &identity_path, &identity_reservation);
   if (status != FTUN_OK) goto fail;
-  status = ftun_store_path(store->directory, "reservations",
-                           &store->reservation_path);
+  status = ftun_store_path(options->budget, store->directory, "reservations",
+                           &store->reservation_path, &store->reservation_path_budget);
   if (status != FTUN_OK) goto fail;
-  status = ftun_store_path(store->directory, "mappings", &store->mapping_path);
+  status = ftun_store_path(options->budget, store->directory, "mappings", &store->mapping_path, &store->mapping_path_budget);
   if (status != FTUN_OK) goto fail;
-  status = ftun_store_path(store->directory, "lock", &lock_path);
+  status = ftun_store_path(options->budget, store->directory, "lock", &lock_path, &lock_reservation);
   if (status != FTUN_OK) goto fail;
-  status = ftun_file_lock_acquire(lock_path, &store->lock);
+  status = ftun_file_lock_acquire_budget(options->budget, lock_path, &store->lock);
   if (status != FTUN_OK) goto fail;
-  status = ftun_store_read_identity(identity_path, &store->identity);
+  status = ftun_store_read_identity(options->budget, identity_path, &store->identity);
   if (status != FTUN_OK) goto fail;
-  status = ftun_store_read_log(store->reservation_path, &store->identity,
+  status = ftun_store_read_log(options->budget, store->reservation_path, &store->identity,
                                &store->sequence, &store->reserved_end);
   if (status != FTUN_OK) goto fail;
   status = ftun_store_snapshot_validate(store->mapping_path, &store->identity,
@@ -589,6 +646,8 @@ ftun_status_t ftun_fakeip_store_open(const ftun_fakeip_store_options_t *options,
   store->reservation = reservation;
   free(identity_path);
   free(lock_path);
+  (void)ftun_reservation_release(&identity_reservation);
+  (void)ftun_reservation_release(&lock_reservation);
   *out = store;
   return FTUN_OK;
 
@@ -597,9 +656,13 @@ fail:
   free(store->mapping_path);
   free(store->reservation_path);
   free(store->directory);
+  (void)ftun_reservation_release(&store->reservation_path_budget);
+  (void)ftun_reservation_release(&store->mapping_path_budget);
   free(store);
   free(identity_path);
   free(lock_path);
+  (void)ftun_reservation_release(&identity_reservation);
+  (void)ftun_reservation_release(&lock_reservation);
   (void)ftun_reservation_release(&reservation);
   return status;
 }
@@ -630,12 +693,49 @@ static void ftun_store_log_record_encode(uint64_t sequence, uint32_t previous,
   ftun_store_u64(data + 24u, ftun_store_checksum(data, 24u));
 }
 
+/* Worker借用长期Budget；临时输入与Worker自己的复制输入分别计量。 */
+static ftun_status_t ftun_store_work_input(ftun_fakeip_store_t *store,
+  const char *path, ftun_bytes_t body, uint8_t **out, size_t *out_length,
+  ftun_reservation_t **out_reservation)
+{
+  size_t path_length = strlen(path) + 1u;
+  size_t length;
+  uint8_t *input;
+  ftun_store_work_t work;
+  ftun_status_t status;
+  *out = NULL;
+  *out_length = 0u;
+  *out_reservation = NULL;
+  if (path_length > UINT32_MAX || path_length > SIZE_MAX - sizeof(work) ||
+      body.length > SIZE_MAX - sizeof(work) - path_length) return FTUN_E_LIMIT;
+  length = sizeof(work) + path_length + body.length;
+  status = ftun_budget_reserve(store->budget, length, out_reservation);
+  if (status != FTUN_OK) return status;
+  input = (uint8_t *)malloc(length);
+  if (input == NULL) {
+    (void)ftun_reservation_release(out_reservation);
+    return FTUN_E_LIMIT;
+  }
+  memset(&work, 0, sizeof(work));
+  work.budget = (uintptr_t)store->budget;
+  work.path_length = (uint32_t)path_length;
+  memcpy(input, &work, sizeof(work));
+  memcpy(input + sizeof(work), path, path_length);
+  memcpy(input + sizeof(work) + path_length, body.data, body.length);
+  *out = input;
+  *out_length = length;
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_store_append_execute(ftun_bytes_t input,
                                                uint8_t *result,
                                                size_t result_capacity,
                                                size_t *out_result_size)
 {
+  ftun_store_work_t work;
   uint32_t path_length;
+  ftun_reservation_t *fd_reservation = NULL;
+  ftun_status_t status;
   const char *path;
   const uint8_t *record;
   int descriptor;
@@ -643,18 +743,20 @@ static ftun_status_t ftun_store_append_execute(ftun_bytes_t input,
   struct stat info;
   (void)result;
   if (out_result_size != NULL) *out_result_size = 0u;
-  if (input.data == NULL || input.length < 4u + FTUN_FAKEIP_LOG_RECORD_BYTES ||
+  if (input.data == NULL || input.length < sizeof(work) + FTUN_FAKEIP_LOG_RECORD_BYTES ||
       result_capacity != 0u || out_result_size == NULL) return FTUN_E_INVALID;
-  path_length = ftun_load_u32(input.data);
-  if (path_length == 0u || (size_t)path_length > input.length - 4u ||
-      input.length != 4u + (size_t)path_length + FTUN_FAKEIP_LOG_RECORD_BYTES ||
-      input.data[4u + path_length - 1u] != '\0') return FTUN_E_INVALID;
-  path = (const char *)(input.data + 4u);
-  record = input.data + 4u + path_length;
-  descriptor = open(path, O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW);
-  if (descriptor < 0) return FTUN_E_IO;
+  memcpy(&work, input.data, sizeof(work));
+  path_length = work.path_length;
+  if (work.budget == 0u || path_length == 0u || (size_t)path_length > input.length - sizeof(work) ||
+      input.length != sizeof(work) + (size_t)path_length + FTUN_FAKEIP_LOG_RECORD_BYTES ||
+      input.data[sizeof(work) + path_length - 1u] != '\0') return FTUN_E_INVALID;
+  path = (const char *)(input.data + sizeof(work));
+  record = input.data + sizeof(work) + path_length;
+  status = ftun_store_open_file((ftun_budget_t *)work.budget, path,
+    O_WRONLY | O_APPEND | O_CLOEXEC | O_NOFOLLOW, &descriptor, &fd_reservation);
+  if (status != FTUN_OK) return status;
   if (fstat(descriptor, &info) != 0 || !S_ISREG(info.st_mode)) {
-    (void)close(descriptor);
+    (void)ftun_store_close_file(descriptor, &fd_reservation);
     return FTUN_E_STATE_CORRUPT;
   }
   while (offset < FTUN_FAKEIP_LOG_RECORD_BYTES) {
@@ -663,17 +765,17 @@ static ftun_status_t ftun_store_append_execute(ftun_bytes_t input,
     if (written < 0 && errno == EINTR) continue;
     if (written <= 0) {
       int error_code = errno;
-      (void)close(descriptor);
+      (void)ftun_store_close_file(descriptor, &fd_reservation);
       return error_code == ENOSPC || error_code == EDQUOT ?
         FTUN_E_LIMIT : FTUN_E_IO;
     }
     offset += (size_t)written;
   }
   if (fdatasync(descriptor) != 0) {
-    (void)close(descriptor);
+    (void)ftun_store_close_file(descriptor, &fd_reservation);
     return FTUN_E_IO;
   }
-  if (close(descriptor) != 0) return FTUN_E_IO;
+  if (ftun_store_close_file(descriptor, &fd_reservation) != 0) return FTUN_E_IO;
   return FTUN_OK;
 }
 
@@ -708,7 +810,7 @@ ftun_status_t ftun_fakeip_store_reserve(ftun_fakeip_store_t *store,
   ftun_worker_job_t job;
   uint8_t record[FTUN_FAKEIP_LOG_RECORD_BYTES];
   uint8_t *input;
-  size_t path_length;
+  ftun_reservation_t *input_reservation = NULL;
   size_t input_length;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
@@ -720,23 +822,18 @@ ftun_status_t ftun_fakeip_store_reserve(ftun_fakeip_store_t *store,
   if (end_exclusive <= store->reserved_end ||
       end_exclusive > store->identity.end_address_exclusive ||
       store->sequence == UINT64_MAX) return FTUN_E_INVALID;
-  path_length = strlen(store->reservation_path) + 1u;
-  if (path_length > UINT32_MAX ||
-      path_length > SIZE_MAX - 4u - sizeof(record)) return FTUN_E_LIMIT;
-  input_length = 4u + path_length + sizeof(record);
-  input = (uint8_t *)malloc(input_length);
-  if (input == NULL) return FTUN_E_LIMIT;
-  ftun_store_u32(input, (uint32_t)path_length);
-  memcpy(input + 4u, store->reservation_path, path_length);
   ftun_store_log_record_encode(store->sequence + 1u, store->reserved_end,
                                end_exclusive, record);
-  memcpy(input + 4u + path_length, record, sizeof(record));
+  status = ftun_store_work_input(store, store->reservation_path,
+    (ftun_bytes_t){record, sizeof(record)}, &input, &input_length, &input_reservation);
+  if (status != FTUN_OK) return status;
   memset(&job, 0, sizeof(job));
   job.execute = ftun_store_append_execute;
   job.input = (ftun_bytes_t){input, input_length};
   status = ftun_worker_submit(store->worker, &job, ftun_store_reserve_done,
                               store, out);
   free(input);
+  (void)ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) return status;
   store->pending_sequence = store->sequence + 1u;
   store->pending_end = end_exclusive;
@@ -751,20 +848,22 @@ static ftun_status_t ftun_store_replace_execute(ftun_bytes_t input,
                                                 size_t result_capacity,
                                                 size_t *out_result_size)
 {
+  ftun_store_work_t work;
   uint32_t path_length;
   const char *path;
   ftun_bytes_t contents;
   (void)result;
   if (out_result_size != NULL) *out_result_size = 0u;
-  if (input.data == NULL || input.length < 5u || result_capacity != 0u ||
+  if (input.data == NULL || input.length <= sizeof(work) || result_capacity != 0u ||
       out_result_size == NULL) return FTUN_E_INVALID;
-  path_length = ftun_load_u32(input.data);
-  if (path_length == 0u || (size_t)path_length > input.length - 4u ||
-      input.data[4u + path_length - 1u] != '\0') return FTUN_E_INVALID;
-  path = (const char *)(input.data + 4u);
-  contents.data = input.data + 4u + path_length;
-  contents.length = input.length - 4u - path_length;
-  return ftun_file_write_atomic(path, contents, 0600u);
+  memcpy(&work, input.data, sizeof(work));
+  path_length = work.path_length;
+  if (work.budget == 0u || path_length == 0u || (size_t)path_length > input.length - sizeof(work) ||
+      input.data[sizeof(work) + path_length - 1u] != '\0') return FTUN_E_INVALID;
+  path = (const char *)(input.data + sizeof(work));
+  contents.data = input.data + sizeof(work) + path_length;
+  contents.length = input.length - sizeof(work) - path_length;
+  return ftun_file_write_atomic_budget((ftun_budget_t *)work.budget, path, contents, 0600u, NULL, NULL);
 }
 
 static void ftun_store_snapshot_done(ftun_operation_t *operation,
@@ -808,7 +907,7 @@ ftun_status_t ftun_fakeip_store_submit_snapshot(
 {
   ftun_worker_job_t job;
   uint8_t *input;
-  size_t path_length;
+  ftun_reservation_t *input_reservation = NULL;
   size_t input_length;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
@@ -817,22 +916,16 @@ ftun_status_t ftun_fakeip_store_submit_snapshot(
     return FTUN_E_INVALID;
   }
   if (store->pending) return FTUN_E_AGAIN;
-  path_length = strlen(store->mapping_path) + 1u;
-  if (path_length > UINT32_MAX || contents.length > SIZE_MAX - path_length - 4u) {
-    return FTUN_E_LIMIT;
-  }
-  input_length = 4u + path_length + contents.length;
-  input = (uint8_t *)malloc(input_length);
-  if (input == NULL) return FTUN_E_LIMIT;
-  ftun_store_u32(input, (uint32_t)path_length);
-  memcpy(input + 4u, store->mapping_path, path_length);
-  memcpy(input + 4u + path_length, contents.data, contents.length);
+  status = ftun_store_work_input(store, store->mapping_path, contents,
+    &input, &input_length, &input_reservation);
+  if (status != FTUN_OK) return status;
   memset(&job, 0, sizeof(job));
   job.execute = ftun_store_replace_execute;
   job.input = (ftun_bytes_t){input, input_length};
   status = ftun_worker_submit(store->worker, &job, ftun_store_snapshot_done,
                               store, out);
   free(input);
+  (void)ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) return status;
   store->pending_sequence = sequence;
   store->pending_end = store->reserved_end;
@@ -863,6 +956,8 @@ ftun_status_t ftun_fakeip_store_destroy(ftun_fakeip_store_t **store)
   free(owned->mapping_path);
   free(owned->reservation_path);
   free(owned->directory);
+  (void)ftun_reservation_release(&owned->mapping_path_budget);
+  (void)ftun_reservation_release(&owned->reservation_path_budget);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *store = NULL;

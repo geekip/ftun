@@ -223,6 +223,8 @@ static int test_tcp_lifecycle(void)
   ftun_budget_t *budget = NULL;
   ftun_lwip_t *stack = NULL;
   ftun_lwip_t *other = NULL;
+  ftun_budget_t *other_budget = NULL;
+  ftun_lwip_spec_t other_spec;
   ftun_lwip_spec_t spec;
   ftun_lwip_usage_t usage;
   ftun_budget_usage_t budget_usage;
@@ -259,6 +261,13 @@ static int test_tcp_lifecycle(void)
   CHECK(ftun_lwip_next_deadline(stack, &deadline_ms) == FTUN_OK &&
         deadline_ms == 1250u);
   CHECK(ftun_lwip_create(&spec, &other) == FTUN_E_INVALID && other == NULL);
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u,
+                           &other_budget) == FTUN_OK);
+  other_spec = spec;
+  other_spec.budget = other_budget;
+  CHECK(ftun_lwip_create(&other_spec, &other) == FTUN_E_INVALID && other == NULL);
+  CHECK(ftun_budget_get_usage(other_budget, &budget_usage) == FTUN_OK &&
+        budget_usage.used == 0u);
   CHECK(ftun_lwip_tick(stack, 999u) == FTUN_E_INVALID);
   CHECK(ftun_lwip_tick(stack, 2000u) == FTUN_OK);
   CHECK(ftun_lwip_next_deadline(stack, &deadline_ms) == FTUN_OK &&
@@ -342,6 +351,13 @@ static int test_tcp_lifecycle(void)
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK && usage.tcp_flows == 0u &&
         usage.retained_send_bytes == 0u);
   CHECK(ftun_lwip_destroy(&stack) == FTUN_OK && stack == NULL);
+  CHECK(ftun_lwip_create(&other_spec, &other) == FTUN_OK);
+  CHECK(ftun_lwip_next_deadline(other, &deadline_ms) == FTUN_OK &&
+        deadline_ms == 1250u);
+  CHECK(ftun_lwip_destroy(&other) == FTUN_OK && other == NULL);
+  CHECK(ftun_budget_get_usage(other_budget, &budget_usage) == FTUN_OK &&
+        budget_usage.used == 0u);
+  CHECK(ftun_budget_destroy(&other_budget) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;

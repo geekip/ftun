@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "tun.h"
+#include "core/budget.h"
 #include "uapi.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -24,6 +25,7 @@ struct ftun_packet_port {
   uint32_t mtu;
   char name[FTUN_LINUX_TUN_NAME_BYTES];
   ftun_linux_tun_io_t io;
+  ftun_reservation_t *reservation;
 };
 
 static int ftun_system_open_device(void *context, const char *path, int flags,
@@ -183,7 +185,8 @@ static void ftun_linux_ifreq_name(struct ifreq *request, const char *name)
 }
 
 /* TASK-PLATFORM-001 / TEST-PLATFORM-001，目标 0.2.0：独占非阻塞 TUN 及失败回滚。 */
-ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
+ftun_status_t ftun_linux_tun_open_with_io_and_budget(ftun_budget_t *budget,
+                                          const ftun_tun_spec_t *spec,
                                           const ftun_linux_tun_io_t *io,
                                           ftun_packet_port_t **out)
 {
@@ -192,13 +195,29 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
   int error_code = 0;
   int control = -1;
   ftun_status_t status;
+  ftun_reservation_t *reservation = NULL;
+  ftun_reservation_t *control_reservation = NULL;
   if (out != NULL) *out = NULL;
   if (spec == NULL || out == NULL || !ftun_linux_tun_io_valid(io) ||
       !ftun_linux_tun_name_valid(spec->name) ||
       spec->mtu < FTUN_LINUX_TUN_MIN_MTU ||
       spec->mtu > FTUN_LINUX_TUN_MAX_MTU) return FTUN_E_INVALID;
+  if (budget != NULL) {
+    status = ftun_budget_reserve_resources(budget,
+      (ftun_budget_resources_t){sizeof(*port), 1u, 0u}, &reservation);
+    if (status == FTUN_OK) status = ftun_budget_reserve_resources(budget,
+      (ftun_budget_resources_t){0u, 1u, 0u}, &control_reservation);
+    if (status != FTUN_OK) {
+      (void)ftun_reservation_release(&reservation);
+      return status;
+    }
+  }
   port = (ftun_packet_port_t *)calloc(1u, sizeof(*port));
-  if (port == NULL) return FTUN_E_LIMIT;
+  if (port == NULL) {
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
   port->io = *io;
   port->descriptor = ftun_linux_open_device(
     &port->io, FTUN_LINUX_TUN_PATH, O_RDWR | O_NONBLOCK | O_CLOEXEC,
@@ -206,6 +225,8 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
   if (port->descriptor < 0) {
     status = ftun_linux_error_status(error_code);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   memcpy(port->name, spec->name.data, spec->name.length);
@@ -218,6 +239,8 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
     status = ftun_linux_error_status(error_code);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   request.ifr_name[IFNAMSIZ - 1u] = '\0';
@@ -228,6 +251,8 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
     status = ftun_linux_error_status(error_code);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   ftun_linux_ifreq_name(&request, port->name);
@@ -238,6 +263,8 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
     ftun_linux_close_ignored(&port->io, control);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   ftun_linux_ifreq_name(&request, port->name);
@@ -247,6 +274,8 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
     ftun_linux_close_ignored(&port->io, control);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   request.ifr_flags = (short)(request.ifr_flags | (short)IFF_UP);
@@ -256,18 +285,36 @@ ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
     ftun_linux_close_ignored(&port->io, control);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   if (port->io.close_call(port->io.context, control, &error_code) < 0) {
     status = ftun_linux_error_status(error_code);
     ftun_linux_close_ignored(&port->io, port->descriptor);
     free(port);
+    (void)ftun_reservation_release(&control_reservation);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
+  (void)ftun_reservation_release(&control_reservation);
+  port->reservation = reservation;
   port->magic = FTUN_LINUX_TUN_MAGIC;
   port->mtu = spec->mtu;
   *out = port;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_linux_tun_open_with_io(const ftun_tun_spec_t *spec,
+  const ftun_linux_tun_io_t *io, ftun_packet_port_t **out)
+{
+  return ftun_linux_tun_open_with_io_and_budget(NULL, spec, io, out);
+}
+
+ftun_status_t ftun_linux_tun_open_with_budget(ftun_budget_t *budget,
+  const ftun_tun_spec_t *spec, ftun_packet_port_t **out)
+{
+  return ftun_linux_tun_open_with_io_and_budget(budget, spec, &ftun_system_io, out);
 }
 
 ftun_status_t ftun_linux_tun_open(const ftun_tun_spec_t *spec,
@@ -334,6 +381,7 @@ ftun_status_t ftun_linux_tun_write(ftun_packet_port_t *port,
 ftun_status_t ftun_linux_tun_close(ftun_packet_port_t **port)
 {
   ftun_packet_port_t *owned;
+  ftun_reservation_t *reservation;
   int error_code = 0;
   int result;
   if (port == NULL) return FTUN_E_INVALID;
@@ -347,7 +395,9 @@ ftun_status_t ftun_linux_tun_close(ftun_packet_port_t **port)
   owned->magic = 0u;
   owned->descriptor = -1;
   memset(&owned->io, 0, sizeof(owned->io));
+  reservation = owned->reservation;
   free(owned);
+  (void)ftun_reservation_release(&reservation);
   *port = NULL;
   return result < 0 ? ftun_linux_error_status(error_code) : FTUN_OK;
 }

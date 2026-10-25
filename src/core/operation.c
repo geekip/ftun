@@ -8,6 +8,8 @@ typedef enum {
   FTUN_OPERATION_ACCEPTED = 1,
   FTUN_OPERATION_TERMINAL,
   FTUN_OPERATION_CANCELLING,
+  FTUN_OPERATION_CANCELLING_TERMINAL,
+  FTUN_OPERATION_CANCELLING_COMPLETED,
   FTUN_OPERATION_CALLBACK
 } ftun_operation_state_t;
 
@@ -26,7 +28,6 @@ struct ftun_operation {
   size_t slot;
   uint64_t generation;
   ftun_operation_state_t state;
-  int stop_visited;
   int control;
 };
 
@@ -50,6 +51,8 @@ struct ftun_operation_queue {
   uint64_t next_generation;
   int accepting;
   int dispatching;
+  int stop_running;
+  size_t stop_cursor;
   pthread_mutex_t mutex;
 };
 
@@ -240,8 +243,15 @@ ftun_status_t ftun_operation_accept_control(
   return ftun_operation_accept_kind(queue, callback, user, 1, out, completion);
 }
 
-ftun_status_t ftun_operation_complete(ftun_operation_token_t completion,
-                                      ftun_error_t result)
+static int ftun_operation_is_cancelling(ftun_operation_state_t state)
+{
+  return state == FTUN_OPERATION_CANCELLING ||
+    state == FTUN_OPERATION_CANCELLING_TERMINAL ||
+    state == FTUN_OPERATION_CANCELLING_COMPLETED;
+}
+
+static ftun_status_t ftun_operation_complete_kind(
+  ftun_operation_token_t completion, ftun_error_t result, int defer)
 {
   ftun_operation_queue_t *queue = completion.queue;
   ftun_operation_t *operation;
@@ -253,16 +263,43 @@ ftun_status_t ftun_operation_complete(ftun_operation_token_t completion,
   }
   operation = &queue->storage[completion.slot];
   if (operation->queue != queue ||
-      operation->generation != completion.generation ||
-      operation->state != FTUN_OPERATION_ACCEPTED) {
+      operation->generation != completion.generation) {
     (void)pthread_mutex_unlock(&queue->mutex);
     return FTUN_E_STALE;
+  }
+  /* 取消尚未取得终结权；失败后生产者仍须能提交原结果。已终结项在
+   * cancel hook 窗口内仍是重复完成，不能把它误判成可重试的提交。 */
+  if (operation->state != FTUN_OPERATION_ACCEPTED) {
+    if (operation->state == FTUN_OPERATION_CANCELLING && defer) {
+      /* void 完成适配器不能把 AGAIN 交还上游；复用已预留的结果槽，
+       * 取消返回后再仲裁。此 OK 已接纳结果，后续提交全部按重复处理。 */
+      operation->result = result;
+      operation->state = FTUN_OPERATION_CANCELLING_COMPLETED;
+      (void)pthread_mutex_unlock(&queue->mutex);
+      return FTUN_OK;
+    }
+    ftun_status_t status = operation->state == FTUN_OPERATION_CANCELLING
+      ? FTUN_E_AGAIN : FTUN_E_STALE;
+    (void)pthread_mutex_unlock(&queue->mutex);
+    return status;
   }
   operation->result = result;
   operation->state = FTUN_OPERATION_TERMINAL;
   ftun_operation_ready_link(operation);
   (void)pthread_mutex_unlock(&queue->mutex);
   return FTUN_OK;
+}
+
+ftun_status_t ftun_operation_complete(ftun_operation_token_t completion,
+                                      ftun_error_t result)
+{
+  return ftun_operation_complete_kind(completion, result, 0);
+}
+
+ftun_status_t ftun_operation_complete_deferred(
+  ftun_operation_token_t completion, ftun_error_t result)
+{
+  return ftun_operation_complete_kind(completion, result, 1);
 }
 
 ftun_status_t ftun_operation_set_cancel_hook(
@@ -274,7 +311,7 @@ ftun_status_t ftun_operation_set_cancel_hook(
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     return FTUN_E_STALE;
   }
-  if (operation->state == FTUN_OPERATION_CANCELLING) {
+  if (ftun_operation_is_cancelling(operation->state)) {
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     return FTUN_E_AGAIN;
   }
@@ -334,7 +371,7 @@ ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     return FTUN_E_STALE;
   }
-  if (operation->state == FTUN_OPERATION_CANCELLING) {
+  if (ftun_operation_is_cancelling(operation->state)) {
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     return FTUN_E_AGAIN;
   }
@@ -342,16 +379,22 @@ ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
   hook_user = operation->cancel_user;
   previous = operation->state;
   if (hook != NULL) {
-    operation->state = FTUN_OPERATION_CANCELLING;
+    operation->state = previous == FTUN_OPERATION_TERMINAL
+      ? FTUN_OPERATION_CANCELLING_TERMINAL : FTUN_OPERATION_CANCELLING;
     (void)pthread_mutex_unlock(&operation->queue->mutex);
     status = hook(hook_user);
     (void)pthread_mutex_lock(&operation->queue->mutex);
-    if (operation->state != FTUN_OPERATION_CANCELLING) {
+    if (!ftun_operation_is_cancelling(operation->state)) {
       (void)pthread_mutex_unlock(&operation->queue->mutex);
       return FTUN_E_STATE_CORRUPT;
     }
     if (status != FTUN_OK) {
-      operation->state = previous;
+      if (operation->state == FTUN_OPERATION_CANCELLING_COMPLETED) {
+        operation->state = FTUN_OPERATION_TERMINAL;
+        ftun_operation_ready_link(operation);
+      } else {
+        operation->state = previous;
+      }
       (void)pthread_mutex_unlock(&operation->queue->mutex);
       return status;
     }
@@ -438,25 +481,33 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_operation_queue_stop(ftun_operation_queue_t *queue)
+static ftun_status_t ftun_operation_queue_stop_kind(
+  ftun_operation_queue_t *queue, size_t max_slots, int restart,
+  size_t *out_visited, bool *out_more)
 {
-  ftun_operation_t *operation;
   ftun_status_t result = FTUN_OK;
-  if (queue == NULL) return FTUN_E_INVALID;
+  size_t visited = 0u;
+  if (out_visited != NULL) *out_visited = 0u;
+  if (out_more != NULL) *out_more = false;
+  if (queue == NULL || max_slots == 0u || out_visited == NULL ||
+      out_more == NULL) return FTUN_E_INVALID;
   (void)pthread_mutex_lock(&queue->mutex);
   queue->accepting = 0;
-  /* Each stop attempt must revisit hooks that asked to be retried. */
-  for (operation = queue->head; operation != NULL; operation = operation->next) {
-    operation->stop_visited = 0;
+  if (queue->stop_running) {
+    (void)pthread_mutex_unlock(&queue->mutex);
+    return FTUN_E_AGAIN;
   }
-  for (;;) {
+  queue->stop_running = 1;
+  if (restart) queue->stop_cursor = 0u;
+  /* 稳定槽位游标把扫描工作也计入配额。停止后不再接纳新项，允许在
+   * 两次 step 之间 dispatch/recycle；下一轮完整扫描会重试失败 hook。 */
+  while (visited < max_slots && queue->stop_cursor < queue->capacity &&
+         queue->inflight != 0u) {
+    ftun_operation_t *operation = &queue->storage[queue->stop_cursor++];
     ftun_status_t status;
-    for (operation = queue->head; operation != NULL;
-         operation = operation->next) {
-      if (!operation->stop_visited) break;
-    }
-    if (operation == NULL) break;
-    operation->stop_visited = 1;
+    visited++;
+    if (operation->queue != queue ||
+        operation->state == FTUN_OPERATION_CALLBACK) continue;
     (void)pthread_mutex_unlock(&queue->mutex);
     status = ftun_operation_cancel(operation);
     if (status != FTUN_OK && status != FTUN_E_STALE && result == FTUN_OK) {
@@ -464,8 +515,40 @@ ftun_status_t ftun_operation_queue_stop(ftun_operation_queue_t *queue)
     }
     (void)pthread_mutex_lock(&queue->mutex);
   }
+  *out_visited = visited;
+  *out_more = queue->inflight != 0u && queue->stop_cursor < queue->capacity;
+  if (!*out_more) queue->stop_cursor = 0u;
+  queue->stop_running = 0;
   (void)pthread_mutex_unlock(&queue->mutex);
   return result;
+}
+
+ftun_status_t ftun_operation_queue_stop_step(ftun_operation_queue_t *queue,
+  size_t max_slots, size_t *out_visited, bool *out_more)
+{
+  return ftun_operation_queue_stop_kind(queue, max_slots, 0,
+                                         out_visited, out_more);
+}
+
+ftun_status_t ftun_operation_queue_stop(ftun_operation_queue_t *queue)
+{
+  size_t visited;
+  bool more;
+  return ftun_operation_queue_stop_kind(queue, SIZE_MAX, 1, &visited, &more);
+}
+
+ftun_status_t ftun_operation_queue_reopen(ftun_operation_queue_t *queue)
+{
+  if (queue == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&queue->mutex);
+  if (queue->inflight != 0u || queue->dispatching || queue->stop_running) {
+    (void)pthread_mutex_unlock(&queue->mutex);
+    return FTUN_E_AGAIN;
+  }
+  queue->stop_cursor = 0u;
+  queue->accepting = 1;
+  (void)pthread_mutex_unlock(&queue->mutex);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_operation_queue_get_usage(const ftun_operation_queue_t *queue,

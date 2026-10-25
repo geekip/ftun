@@ -11,9 +11,10 @@ typedef struct {
   bool use_proxy;
 } ftun_proxy_dns_blocking_query_t;
 
-/* Proxy 控制路径的 SOCKS5 DNS 封装。DIRECT 请求转交中立 DNS transport；
- * SOCKS5 连接、认证、UDP 包装和 relay 校验全部留在 Proxy 边界。 */
+/* 控制任务借用 execution 的预算和身份；DIRECT 与 SOCKS5 都通过公共
+ * Path 通道交换。认证、UDP 包装和 relay 校验全部留在 Proxy 边界。 */
 ftun_status_t ftun_proxy_dns_query_blocking(
+  const ftun_control_execution_t *execution,
   const ftun_proxy_dns_blocking_query_t *query, ftun_bytes_t wire,
   uint8_t *response, size_t response_capacity, size_t *out_response_size);
 

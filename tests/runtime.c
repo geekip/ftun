@@ -66,9 +66,37 @@ int main(void)
   ftun_runtime_manager_info_t manager_info;
   size_t first_bytes;
   size_t second_bytes;
+  size_t manager_bytes;
+  ftun_budget_usage_t usage;
+  ftun_reservation_t *hold = NULL;
 
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(NULL, 1u, SIZE_MAX) == FTUN_E_INVALID);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 2u, 4096u) == FTUN_E_LIMIT);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 2u, 4096u) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 3u, 8192u) == FTUN_E_STALE);
+  CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
+        manager_info.retained_limit == 2u &&
+        manager_info.retained_bytes_limit == 4096u);
+  CHECK(ftun_runtime_manager_clear(core) == FTUN_OK);
+  CHECK(ftun_core_context_bind(core, &manager_info) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 1u, SIZE_MAX) == FTUN_E_STALE);
+  {
+    void *extension = NULL;
+    CHECK(ftun_core_context_extension(core, &extension) == FTUN_OK &&
+          extension == &manager_info);
+  }
+  CHECK(ftun_core_context_bind(core, NULL) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 1u, SIZE_MAX) == FTUN_OK);
+  CHECK(ftun_runtime_manager_clear(core) == FTUN_OK);
+  CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u);
+  manager_bytes = usage.used;
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
   CHECK(manager_info.generation == 0u && !manager_info.has_active &&
         !manager_info.has_candidate && manager_info.retained_limit == 1u &&
@@ -88,13 +116,13 @@ int main(void)
         runtime_info.reference_count == 1u && runtime_info.accounted_bytes > 0u &&
         runtime_info.prepared_item_count > 0u);
   first_bytes = runtime_info.accounted_bytes;
-  CHECK(check_budget(budget, first_bytes) == 0);
+  CHECK(check_budget(budget, manager_bytes + first_bytes) == 0);
   CHECK(ftun_runtime_prepare(core, second, &duplicate) == FTUN_E_AGAIN &&
         duplicate == NULL);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_E_AGAIN && core != NULL);
   CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && candidate == NULL);
   CHECK(first->reference_count == 1u);
-  CHECK(check_budget(budget, 0u) == 0);
+  CHECK(check_budget(budget, manager_bytes) == 0);
   CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK);
 
   CHECK(ftun_runtime_prepare(core, first, &candidate) == FTUN_OK);
@@ -111,7 +139,7 @@ int main(void)
   CHECK(ftun_runtime_prepare(core, second, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_get_info(candidate, &runtime_info) == FTUN_OK);
   second_bytes = runtime_info.accounted_bytes;
-  CHECK(check_budget(budget, first_bytes + second_bytes) == 0);
+  CHECK(check_budget(budget, manager_bytes + first_bytes + second_bytes) == 0);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK && candidate == NULL);
   CHECK(ftun_config_destroy(&second) == FTUN_OK && second == NULL);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
@@ -123,7 +151,7 @@ int main(void)
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
         manager_info.retained_count == 0u &&
         manager_info.retained_bytes == 0u);
-  CHECK(check_budget(budget, second_bytes) == 0);
+  CHECK(check_budget(budget, manager_bytes + second_bytes) == 0);
 
   /* stage 只固定候选代次，abort 后 active 与 manager generation 不变。 */
   third = make_config(third_text);
@@ -234,15 +262,25 @@ int main(void)
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   CHECK(ftun_budget_create(NULL, 1u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_E_LIMIT && core == NULL);
+  CHECK(check_budget(budget, 0u) == 0);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
+  manager_bytes = usage.used;
+  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
   first = make_config(first_text);
   CHECK(first != NULL);
   candidate = (ftun_runtime_t *)(uintptr_t)1;
   CHECK(ftun_runtime_prepare(core, first, &candidate) == FTUN_E_LIMIT &&
         candidate == NULL && first->reference_count == 1u);
-  CHECK(check_budget(budget, 0u) == 0);
+  CHECK(check_budget(budget, 1024u * 1024u) == 0);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  CHECK(check_budget(budget, manager_bytes) == 0);
   CHECK(ftun_config_destroy(&first) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(check_budget(budget, 0u) == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   CHECK(ftun_budget_create(NULL, 1024u, 0u, &budget) == FTUN_OK);

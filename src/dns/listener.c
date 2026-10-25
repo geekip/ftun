@@ -179,7 +179,7 @@ static ftun_status_t ftun_dns_listener_accept(
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (!listener->accepting) return FTUN_E_CANCELLED;
-  status = ftun_dns_message_parse(wire, &message);
+  status = ftun_dns_message_parse_with_budget(listener->budget, wire, &message);
   if (status != FTUN_OK) return status;
   if ((message->flags & 0x8000u) != 0u) {
     (void)ftun_dns_message_release(&message);
@@ -339,7 +339,7 @@ ftun_status_t ftun_dns_listener_receive_udp(ftun_dns_listener_t *listener,
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (listener == NULL || out == NULL) return FTUN_E_INVALID;
-  status = ftun_dns_message_parse(datagram, &message);
+  status = ftun_dns_message_parse_with_budget(listener->budget, datagram, &message);
   if (status != FTUN_OK) return status;
   for (index = 0u; index < message->record_count; index++) {
     const ftun_dns_record_t *record = &message->records[index];

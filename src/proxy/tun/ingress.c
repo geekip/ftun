@@ -13,6 +13,8 @@ struct ftun_tun_ingress_context {
   ftun_lwip_t *stack;
   ftun_tun_tcp_bridge_t *tcp_streams;
   ftun_tun_udp_bridge_t *udp_channels;
+  ftun_tun_tcp_bridge_t *close_tcp_cursor;
+  ftun_tun_udp_bridge_t *close_udp_cursor;
   uint64_t generation;
   uint32_t inbound_id;
   uint32_t mtu;
@@ -82,6 +84,7 @@ static void ftun_tun_tcp_unlink(ftun_tun_tcp_bridge_t *bridge)
   ftun_tun_tcp_bridge_t **cursor;
   ftun_tun_ingress_context_t *context = bridge->context;
   if (!bridge->linked) return;
+  if (context->close_tcp_cursor == bridge) context->close_tcp_cursor = bridge->next;
   for (cursor = &context->tcp_streams; *cursor != NULL;
        cursor = &(*cursor)->next) {
     if (*cursor == bridge) {
@@ -109,6 +112,7 @@ static ftun_status_t ftun_tun_tcp_read(void *user, void *buffer,
   if (out_length != NULL) *out_length = 0u;
   if (bridge == NULL || bridge->flow == NULL || buffer == NULL ||
       capacity == 0u || out_length == NULL) return FTUN_E_INVALID;
+  if (!bridge->context->accepting) return FTUN_E_CANCELLED;
   status = ftun_lwip_tcp_peek(bridge->flow, &segment, 1u, &count,
                               &available, &peer_finished);
   if (status != FTUN_OK) return status;
@@ -131,6 +135,7 @@ static ftun_status_t ftun_tun_tcp_write_start(
 {
   ftun_tun_tcp_bridge_t *bridge = (ftun_tun_tcp_bridge_t *)user;
   if (bridge == NULL || bridge->flow == NULL) return FTUN_E_INVALID;
+  if (!bridge->context->accepting) return FTUN_E_CANCELLED;
   return ftun_lwip_tcp_write_ref_with_token(
     bridge->flow, slice,
     (ftun_lwip_token_t){write.stream, write.slot, write.generation}, accepted);
@@ -310,6 +315,7 @@ static void ftun_tun_udp_unlink(ftun_tun_udp_bridge_t *bridge)
   ftun_tun_udp_bridge_t **cursor;
   ftun_tun_ingress_context_t *context = bridge->context;
   if (!bridge->linked) return;
+  if (context->close_udp_cursor == bridge) context->close_udp_cursor = bridge->next;
   for (cursor = &context->udp_channels; *cursor != NULL;
        cursor = &(*cursor)->next) {
     if (*cursor == bridge) {
@@ -336,6 +342,7 @@ static ftun_status_t ftun_tun_udp_send_start(
       !ftun_tun_endpoint_equal(target, &bridge->metadata.source)) {
     return FTUN_E_REJECTED;
   }
+  if (!bridge->context->accepting) return FTUN_E_CANCELLED;
   status = ftun_lwip_udp_send(bridge->flow, packet);
   if (status != FTUN_OK) return status;
   memset(&result, 0, sizeof(result));
@@ -457,6 +464,7 @@ static ftun_status_t ftun_tun_output(void *user, ftun_bytes_t packet)
   if (context == NULL || packet.data == NULL || packet.length == 0u) {
     return FTUN_E_INVALID;
   }
+  if (!context->accepting) return FTUN_E_CANCELLED;
   return context->output(context->user, packet);
 }
 
@@ -696,38 +704,50 @@ ftun_status_t ftun_tun_ingress_get_usage(
   return context->corrupt ? FTUN_E_STATE_CORRUPT : FTUN_OK;
 }
 
-ftun_status_t ftun_tun_ingress_close(ftun_tun_ingress_context_t **context)
+ftun_status_t ftun_tun_ingress_quiesce(ftun_tun_ingress_context_t *context)
+{
+  if (context == NULL) return FTUN_E_INVALID;
+  context->accepting = false;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_tun_ingress_close_step(ftun_tun_ingress_context_t **context,
+  size_t quota, size_t *out_work)
 {
   ftun_tun_ingress_context_t *owned;
   ftun_reservation_t *reservation;
+  ftun_status_t result = FTUN_OK;
   ftun_status_t status;
-  if (context == NULL) return FTUN_E_INVALID;
+  size_t work = 0u;
+  if (out_work != NULL) *out_work = 0u;
+  if (context == NULL || out_work == NULL || quota == 0u) return FTUN_E_INVALID;
   owned = *context;
   if (owned == NULL) return FTUN_OK;
   owned->accepting = false;
-  {
-    ftun_tun_tcp_bridge_t *bridge;
-    for (bridge = owned->tcp_streams; bridge != NULL; bridge = bridge->next) {
-      status = ftun_stream_stop(bridge->stream);
-      if (status != FTUN_OK) return status;
-      if (bridge->flow != NULL) {
-        ftun_lwip_tcp_t *flow = bridge->flow;
-        bridge->flow = NULL;
-        status = ftun_lwip_tcp_close(&flow);
-        if (status != FTUN_OK) return status;
-      }
-    }
+  if (owned->close_tcp_cursor == NULL && owned->close_udp_cursor == NULL) {
+    owned->close_tcp_cursor = owned->tcp_streams;
+    owned->close_udp_cursor = owned->udp_channels;
   }
-  if (owned->tcp_streams != NULL) {
-    return FTUN_E_AGAIN;
+  while (work < quota && owned->close_tcp_cursor != NULL) {
+    ftun_tun_tcp_bridge_t *bridge = owned->close_tcp_cursor;
+    owned->close_tcp_cursor = bridge->next;
+    work++;
+    status = ftun_stream_stop(bridge->stream);
+    if (status == FTUN_OK && bridge->flow != NULL) status = ftun_lwip_tcp_close(&bridge->flow);
+    if (status != FTUN_OK && result == FTUN_OK) result = status;
   }
-  while (owned->udp_channels != NULL) {
-    ftun_datagram_t *channel = owned->udp_channels->channel;
+  while (work < quota && owned->close_udp_cursor != NULL) {
+    ftun_tun_udp_bridge_t *bridge = owned->close_udp_cursor;
+    ftun_datagram_t *channel = bridge->channel;
+    owned->close_udp_cursor = bridge->next;
+    work++;
     status = ftun_datagram_stop(channel);
-    if (status != FTUN_OK) return status;
-    status = ftun_datagram_destroy(&channel);
-    if (status != FTUN_OK) return status;
+    if (status == FTUN_OK) status = ftun_datagram_destroy(&channel);
+    if (status != FTUN_OK && result == FTUN_OK) result = status;
   }
+  *out_work = work;
+  if (result != FTUN_OK) return result;
+  if (owned->tcp_streams != NULL || owned->udp_channels != NULL) return FTUN_E_AGAIN;
   status = ftun_lwip_destroy(&owned->stack);
   if (status != FTUN_OK) return status;
   reservation = owned->reservation;
@@ -742,4 +762,10 @@ ftun_status_t ftun_tun_ingress_close(ftun_tun_ingress_context_t **context)
   memset(owned, 0, sizeof(*owned));
   free(owned);
   return status;
+}
+
+ftun_status_t ftun_tun_ingress_close(ftun_tun_ingress_context_t **context)
+{
+  size_t work = 0u;
+  return ftun_tun_ingress_close_step(context, SIZE_MAX, &work);
 }

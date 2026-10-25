@@ -4,6 +4,7 @@
 #include "config/model.h"
 #include "proxy/runtime_state.h"
 #include "dns/bootstrap.h"
+#include "transport/control_channel.h"
 
 #define FTUN_CONTROL_ENDPOINT_TEXT_BYTES 260u
 #define FTUN_CONTROL_CREDENTIAL_BYTES 256u
@@ -11,6 +12,7 @@
 typedef struct {
   ftun_endpoint_t bootstrap[FTUN_BOOTSTRAP_MAX_SERVERS];
   size_t bootstrap_count;
+  char name[256];
   char upstream[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
   char proxy[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
   char proxy_username[FTUN_CONTROL_CREDENTIAL_BYTES];
@@ -31,6 +33,7 @@ ftun_status_t ftun_control_resolver_plan(
 /* Synchronous worker/control-endpoint resolver.  Result is one IPv4 endpoint
  * with caller supplied port; no fallback occurs after a selected source fails. */
 ftun_status_t ftun_control_resolve(
+  const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan, ftun_string_t domain,
   uint16_t port, ftun_endpoint_t *out);
 
@@ -38,6 +41,7 @@ ftun_status_t ftun_control_resolve(
  * ignoring a named resolver.  Proxy and upstream endpoint names use this to
  * avoid resolver recursion. */
 ftun_status_t ftun_control_resolve_bootstrap(
+  const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan, ftun_string_t domain,
   uint16_t port, ftun_endpoint_t *out);
 

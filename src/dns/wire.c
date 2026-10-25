@@ -1,4 +1,5 @@
 #include "wire.h"
+#include "core/budget.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -312,7 +313,7 @@ static ftun_status_t ftun_dns_parse_sections(
 }
 
 /* TASK-DNS-008 / TEST-DNS-008，目标 0.2.0：有界 DNS wire parser。 */
-ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
+ftun_status_t ftun_dns_message_parse_with_budget(ftun_budget_t *budget, ftun_bytes_t wire,
                                      ftun_dns_message_t **out)
 {
   ftun_dns_layout_t layout;
@@ -324,6 +325,7 @@ ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
   size_t checked_name_bytes = 0u;
   size_t records_bytes;
   size_t allocation_size;
+  ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (out == NULL) return FTUN_E_INVALID;
@@ -341,8 +343,16 @@ ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
     return FTUN_E_LIMIT;
   }
   allocation_size = sizeof(*message) + records_bytes + name_bytes + wire.length;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, allocation_size, &reservation);
+    if (status != FTUN_OK) return status;
+  }
   message = (ftun_dns_message_t *)calloc(1u, allocation_size);
-  if (message == NULL) return FTUN_E_LIMIT;
+  if (message == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  message->reservation = reservation;
   records = (ftun_dns_record_t *)(message + 1);
   names = (uint8_t *)records + records_bytes;
   owned_wire = names + name_bytes;
@@ -361,19 +371,27 @@ ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
     names, name_bytes, &checked_name_bytes);
   if (status != FTUN_OK || checked_name_bytes != name_bytes) {
     free(message);
+    (void)ftun_reservation_release(&reservation);
     return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
   }
   *out = message;
   return FTUN_OK;
 }
 
+ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire, ftun_dns_message_t **out)
+{
+  return ftun_dns_message_parse_with_budget(NULL, wire, out);
+}
+
 ftun_status_t ftun_dns_message_release(ftun_dns_message_t **message)
 {
+  ftun_reservation_t *reservation;
   if (message == NULL) return FTUN_E_INVALID;
   if (*message == NULL) return FTUN_OK;
+  reservation = (*message)->reservation;
   free(*message);
   *message = NULL;
-  return FTUN_OK;
+  return ftun_reservation_release(&reservation);
 }
 
 static int ftun_dns_plain_name_valid(ftun_dns_name_t name)

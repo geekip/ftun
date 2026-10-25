@@ -16,6 +16,10 @@ typedef struct {
   size_t maximum_bytes;
   uint64_t deadline_ms;
   uint32_t socket_mark;
+  uint64_t generation;
+  ftun_dial_purpose_t purpose;
+  ftun_control_path_binding_t path;
+  bool allow_system_resolver;
   ftun_control_resolver_plan_t resolver;
   bool use_proxy;
 } ftun_http_fetch_spec_t;
@@ -26,7 +30,9 @@ typedef struct {
   char *etag;
   unsigned int status;
   bool tls_verified;
+  /* 正文与ETag分别拥有实际分配额度，release统一消费。 */
   ftun_reservation_t *reservation;
+  ftun_reservation_t *etag_reservation;
 } ftun_http_fetch_result_t;
 
 ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,

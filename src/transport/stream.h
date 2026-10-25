@@ -51,6 +51,7 @@ typedef struct {
   size_t reference_count;
   bool accepting;
   bool in_completion;
+  bool in_backend;
   bool write_shutdown;
 } ftun_stream_usage_t;
 
@@ -94,6 +95,12 @@ ftun_status_t ftun_stream_write_complete(ftun_stream_write_token_t write,
                                          ftun_error_t error);
 /* stop 只关闭新写接纳；在途写由 operation cancel/queue stop 终结。 */
 ftun_status_t ftun_stream_stop(ftun_stream_t *stream);
+/* 撤销单条流：关闭读写接纳，并检查至多 max_pending_writes 个槽位，逐项
+ * cancel；不停止共享 Operation 队列，不影响其他流。每轮保留首个错误，
+ * 仍尝试后续槽位；失败的写保留数据与完成权供重试。OK 只表示本轮取消
+ * 已接纳，用户完成仍须由 owner dispatch，随后才能 destroy。
+ * 仅 owner 调用；start/cancel/completion 中重入返回 AGAIN，不能递归取消。 */
+ftun_status_t ftun_stream_abort(ftun_stream_t *stream);
 ftun_status_t ftun_stream_get_usage(const ftun_stream_t *stream,
                                     ftun_stream_usage_t *out);
 /* 必须先 stop、只有创建者引用且所有 completion 已 dispatch；成功后调用 backend destroy。 */

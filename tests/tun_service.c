@@ -34,6 +34,7 @@ typedef struct {
   size_t rebuilt;
   size_t quiesced;
   size_t failed;
+  bool stall;
   ftun_status_t failure_status;
   ftun_tun_lease_t expected;
 } consumer_state_t;
@@ -126,6 +127,7 @@ static ftun_status_t consume_packet(void *user, ftun_tun_lease_t lease,
     return FTUN_E_STATE_CORRUPT;
   }
   index = state->packet_count;
+  if (state->stall) return FTUN_E_AGAIN;
   memcpy(state->packets[index], packet.data, packet.length);
   state->lengths[index] = packet.length;
   state->packet_count++;
@@ -268,17 +270,27 @@ static int test_service_lifecycle(void)
   CHECK(ftun_tun_service_run(service, &work) == FTUN_E_IO && work == 0u &&
         state.failed == 1u && state.failure_status == FTUN_E_IO);
 
+  /* 旧设备读取但消费者背压留下的包，不能在重建后继续交付。 */
+  state.stall = true;
+  memcpy(device.reads[3], output_d, sizeof(output_d));
+  device.read_lengths[3] = sizeof(output_d);
+  device.read_count = 4u;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK && usage.queued_inputs == 1u);
   device.fail_open = true;
   CHECK(ftun_tun_service_rebuild(service) == FTUN_E_IO &&
         device.close_count == 1u && device.open_attempts == 2u &&
         state.rebuilt == 0u);
   CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
         usage.device_generation == 1u && usage.queued_packets == 0u &&
-        usage.packets_dropped == 1u && usage.active_leases == 1u);
+        usage.packets_dropped == 2u && usage.active_leases == 1u &&
+        usage.queued_inputs == 0u && !usage.accepting);
   CHECK(ftun_tun_service_write(
           lease, (ftun_bytes_t){output_a, sizeof(output_a)}) ==
         FTUN_E_CANCELLED);
   device.fail_open = false;
+  state.stall = false;
   device.write_status = FTUN_OK;
   CHECK(ftun_tun_service_rebuild(service) == FTUN_OK &&
         device.open_attempts == 3u && state.rebuilt == 1u);
@@ -286,6 +298,7 @@ static int test_service_lifecycle(void)
         usage.device_generation == 2u &&
         usage.lease_generation == lease.generation &&
         usage.active_leases == 1u);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK && state.packet_count == 3u);
 
   stale = lease;
   CHECK(ftun_tun_service_release(&lease) == FTUN_OK && lease.service == NULL);

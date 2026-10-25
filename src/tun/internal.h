@@ -61,6 +61,7 @@ struct ftun_tun_service {
   ftun_event_loop_t *loop;
   ftun_buffer_pool_t *buffers;
   ftun_tun_device_ops_t ops;
+  ftun_tun_network_lifecycle_t network;
   ftun_packet_port_t *port;
   ftun_event_source_t *source;
   ftun_packet_port_info_t info;
@@ -90,9 +91,17 @@ struct ftun_tun_service {
   size_t feedback_sent;
   size_t feedback_suppressed;
   uint64_t device_generation;
+  uint64_t network_generation;
   uint64_t next_lease_generation;
+  size_t callback_depth;
   uint32_t events;
   bool accepting;
+  bool quiesced;
+  bool network_started;
+  bool rebuilding;
+  bool network_paused;
+  bool rebuild_paused;
+  bool rebuild_port_ready;
 };
 
 ftun_tun_service_consumer_t *ftun_tun_service_lease_consumer(

@@ -1,5 +1,9 @@
 #include "platform/linux/route.h"
 #include "platform/linux/uapi.h"
+#include "platform/linux/interface.h"
+#include "core/budget.h"
+#include "core/context.h"
+#include "event/event.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -37,6 +41,9 @@ typedef struct {
   size_t drop_remove_index;
   bool fail_remove_once;
   bool check_reentry;
+  bool block_submit;
+  bool block_receive;
+  bool block_sync_remove;
   ftun_status_t reentrant_run_status;
   ftun_status_t reentrant_release_status;
   ftun_linux_route_async_t *operation;
@@ -117,6 +124,7 @@ static ftun_status_t async_mock_submit(
   size_t index;
   if (mock == NULL || request == NULL || request->sequence == 0u ||
       mock->request_count >= ASYNC_REQUEST_CAPACITY) return FTUN_E_LIMIT;
+  if (mock->block_submit) return FTUN_E_AGAIN;
   if (mock->request_count != 0u &&
       request->sequence == mock->requests[mock->request_count - 1u].sequence) {
     return FTUN_E_STATE_CORRUPT;
@@ -171,7 +179,7 @@ static ftun_status_t async_mock_receive(void *context,
 {
   async_mock_t *mock = (async_mock_t *)context;
   if (mock == NULL || reply == NULL) return FTUN_E_INVALID;
-  if (mock->reply_count == 0u) return FTUN_E_AGAIN;
+  if (mock->block_receive || mock->reply_count == 0u) return FTUN_E_AGAIN;
   *reply = mock->replies[mock->reply_head];
   mock->reply_head = (mock->reply_head + 1u) % ASYNC_REPLY_CAPACITY;
   mock->reply_count--;
@@ -564,8 +572,290 @@ static int test_network_guard_and_overlay_transactions(void)
   return 0;
 }
 
+static int test_cancel_pending_add(void)
+{
+  unsigned int scenario;
+  for (scenario = 0u; scenario < 5u; scenario++) {
+    async_mock_t mock;
+    ftun_linux_route_async_io_t io;
+    ftun_route_policy_t policy = async_policy();
+    ftun_linux_route_async_t *operation = NULL;
+    ftun_linux_route_async_info_t info;
+    uint64_t now_ms = 100u;
+    size_t work = 0u;
+    async_mock_init(&mock);
+    if (scenario == 1u || scenario == 3u || scenario == 4u) mock.drop_add_index = 0u;
+    if (scenario == 4u) mock.add_without_effect_index = 0u;
+    if (scenario == 2u) {
+      mock.fail_add_index = 0u;
+      mock.fail_add_status = FTUN_E_REJECTED;
+    }
+    io = async_mock_io(&mock);
+    CHECK(ftun_linux_route_async_start_with_io(&policy, &io, now_ms, 5u,
+      1000u, 120u, &operation) == FTUN_OK);
+    /* QUERY 提交、QUERY 回复、ADD 提交；故意暂不派发 ADD ACK。 */
+    CHECK(ftun_linux_route_async_run(operation, now_ms, 3u, &work) == FTUN_OK && work == 3u);
+    CHECK(mock.add_calls[0] == 1u);
+    if (scenario == 2u) mock.present[0] = true; /* 竞争者的对象不可删除。 */
+    CHECK(ftun_linux_route_async_release(operation, now_ms,
+      scenario == 3u ? now_ms + 1u : 1000u) == FTUN_OK);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_E_AGAIN);
+    if (scenario == 3u) {
+      CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED, 1u));
+      CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK && info.active_count == 1u);
+      CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+    }
+    CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+    CHECK(mock.add_calls[1] == 0u && async_present_count(&mock) == (scenario == 2u ? 1 : 0));
+    CHECK(mock.remove_calls[0] == (scenario == 2u || scenario == 4u ? 0u : 1u));
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  }
+  return 0;
+}
+
+static ftun_status_t sync_apply(void *context, const ftun_linux_route_resource_t *resource)
+{
+  async_mock_t *mock = context;
+  size_t index = async_mock_resource(mock, resource);
+  if (index == SIZE_MAX) return FTUN_E_LIMIT;
+  if (index == mock->fail_add_index) return FTUN_E_IO;
+  if (mock->present[index]) return FTUN_E_REJECTED;
+  mock->present[index] = true;
+  return FTUN_OK;
+}
+
+static ftun_status_t sync_remove(void *context, const ftun_linux_route_resource_t *resource)
+{
+  async_mock_t *mock = context;
+  size_t index = async_mock_resource(mock, resource);
+  if (index == SIZE_MAX) return FTUN_E_LIMIT;
+  if (mock->block_sync_remove || index == mock->fail_remove_index) return FTUN_E_IO;
+  mock->present[index] = false;
+  return FTUN_OK;
+}
+
+static int test_adopt_owned_resources(void)
+{
+  unsigned int partial;
+  for (partial = 0u; partial < 3u; partial++) {
+    async_mock_t mock;
+    ftun_linux_route_async_io_t io;
+    ftun_linux_route_io_t sync_io = {sync_apply, sync_remove, &mock};
+    ftun_route_policy_t policy = async_policy();
+    ftun_route_transaction_t *source = NULL, *original;
+    ftun_linux_route_async_t *operation = NULL;
+    ftun_linux_route_async_info_t info;
+    uint64_t now_ms = 100u;
+    async_mock_init(&mock);
+    if (partial == 1u) { mock.fail_add_index = 4u; mock.fail_remove_index = 2u; }
+    io = async_mock_io(&mock);
+    ftun_budget_t *budget = NULL;
+    ftun_budget_usage_t budget_usage;
+    CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
+    CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &sync_io, &source) ==
+      (partial == 1u ? FTUN_E_STATE_CORRUPT : FTUN_OK));
+    CHECK(source != NULL);
+    if (partial == 2u) {
+      mock.block_sync_remove = true;
+      CHECK(ftun_linux_route_release(&source) == FTUN_E_IO && source != NULL);
+    }
+    CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used > 0u);
+    original = source;
+    CHECK(ftun_linux_route_async_adopt_with_io(&source, &io, now_ms, 0u,
+      1000u, 1u, &operation) == FTUN_E_INVALID && source == original && operation == NULL);
+    CHECK(ftun_linux_route_async_adopt_with_io(&source, &io, now_ms, 5u,
+      1000u, 1u, &operation) == FTUN_OK && source == NULL);
+    CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used == 0u);
+    CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+    CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+      info.state == (partial ? FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED : FTUN_LINUX_ROUTE_ASYNC_READY));
+    CHECK(info.active_count == (partial == 1u ? 1u : 7u) && mock.request_count == 0u);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_E_AGAIN);
+    CHECK(ftun_linux_route_async_release(operation, now_ms, 1000u) == FTUN_OK);
+    CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+    CHECK(async_present_count(&mock) == 0);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  }
+  return 0;
+}
+
+static int test_submit_backpressure_deadline(void)
+{
+  async_mock_t mock;
+  ftun_linux_route_async_io_t io;
+  ftun_route_policy_t policy = async_policy();
+  ftun_linux_route_async_t *operation = NULL;
+  ftun_linux_route_async_info_t info;
+  uint64_t deadline = 0u;
+  bool present = false;
+  size_t work = 0u;
+  async_mock_init(&mock);
+  mock.block_submit = true;
+  io = async_mock_io(&mock);
+  CHECK(ftun_linux_route_async_start_with_io(&policy, &io, 100u, 5u,
+    110u, 1u, &operation) == FTUN_OK);
+  CHECK(ftun_linux_route_async_run(operation, 100u, 1u, &work) == FTUN_OK && work == 0u);
+  CHECK(ftun_linux_route_async_next_deadline(operation, &deadline, &present) == FTUN_OK &&
+    present && deadline == 110u);
+  CHECK(ftun_linux_route_async_run(operation, 110u, 1u, &work) == FTUN_OK && work == 1u);
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+    info.state == FTUN_LINUX_ROUTE_ASYNC_FAILED && info.result == FTUN_E_TIMEOUT &&
+    info.active_count == 0u && mock.request_count == 0u);
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  return 0;
+}
+
+static int test_total_deadline_before_reply(void)
+{
+  unsigned int scenario;
+  for (scenario = 0u; scenario < 9u; scenario++) {
+    async_mock_t mock;
+    ftun_linux_route_async_io_t io;
+    ftun_route_policy_t policy = async_policy();
+    ftun_linux_route_async_t *operation = NULL;
+    ftun_linux_route_async_info_t info;
+    size_t work = 0u, index = scenario == 8u ? 1u : 0u;
+    size_t requests, replies;
+    uint64_t now_ms = 111u, deadline;
+    bool present;
+    bool rejected = scenario == 1u || scenario == 4u || scenario == 8u;
+    bool absent = scenario == 3u || scenario == 7u;
+    async_mock_init(&mock);
+    if (rejected) {
+      mock.fail_add_index = index;
+      mock.fail_add_status = FTUN_E_REJECTED;
+    }
+    if (scenario == 2u || scenario == 3u || scenario == 6u || scenario == 7u) {
+      mock.drop_add_index = index;
+    }
+    if (absent) mock.add_without_effect_index = index;
+    io = async_mock_io(&mock);
+    CHECK(ftun_linux_route_async_start_with_io(&policy, &io, 100u, 5u,
+      110u, 1u, &operation) == FTUN_OK);
+    /* ADD 已发出；覆盖成功/拒绝 ACK、丢失 ACK 和查询中的到期。 */
+    CHECK(ftun_linux_route_async_run(operation, 100u, index == 0u ? 3u : 7u,
+      &work) == FTUN_OK && work == (index == 0u ? 3u : 7u));
+    CHECK(mock.add_calls[index] == 1u);
+    if (rejected) mock.present[index] = true; /* 竞争者对象。 */
+    if (scenario == 6u || scenario == 7u) {
+      CHECK(ftun_linux_route_async_run(operation, 105u, 2u, &work) == FTUN_OK && work == 2u);
+      CHECK(mock.query_calls[index] == 2u && mock.reply_count == 1u);
+    }
+    requests = mock.request_count;
+    replies = mock.reply_count;
+    CHECK(ftun_linux_route_async_run(operation, 110u, 1u, &work) == FTUN_OK && work == 1u);
+    CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+      info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED && info.active_count == index + 1u &&
+      info.result == FTUN_E_TIMEOUT && info.cleanup_result == FTUN_E_TIMEOUT && !info.runnable);
+    CHECK(mock.request_count == requests && mock.reply_count == replies);
+    CHECK(ftun_linux_route_async_next_deadline(operation, &deadline, &present) == FTUN_OK && !present);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_E_AGAIN);
+    if (scenario == 4u || scenario == 5u) {
+      /* 显式重试也会再次到期，原 ACK 身份须跨多次保留。 */
+      mock.block_receive = true;
+      CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1u) == FTUN_OK);
+      CHECK(ftun_linux_route_async_run(operation, now_ms, 1u, &work) == FTUN_OK && work == 0u);
+      now_ms++;
+      CHECK(ftun_linux_route_async_run(operation, now_ms, 1u, &work) == FTUN_OK && work == 1u);
+      CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED && info.active_count == 1u);
+      CHECK(ftun_linux_route_async_next_deadline(operation, &deadline, &present) == FTUN_OK && !present);
+      CHECK(mock.request_count == requests && mock.reply_count == replies);
+      mock.block_receive = false;
+      now_ms++;
+    }
+    CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_E_AGAIN);
+    CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+    CHECK(mock.add_calls[index + 1u] == 0u && async_present_count(&mock) == (rejected ? 1 : 0));
+    CHECK(mock.remove_calls[index] == (rejected || absent ? 0u : 1u));
+    if (index != 0u) CHECK(mock.remove_calls[0] == 1u);
+    CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  }
+  return 0;
+}
+
+static int interface_drive(const ftun_interface_async_ops_t *ops, void *state,
+  uint64_t *now_ms, ftun_interface_state_t terminal)
+{
+  size_t round;
+  for (round = 0u; round < 256u; round++) {
+    ftun_interface_async_info_t info;
+    size_t work = 0u;
+    if (ops->query(ops->context, state, &info) != FTUN_OK) return 0;
+    if (info.state == terminal) return 1;
+    if (ops->run(ops->context, state, *now_ms, 1u, &work) != FTUN_OK || work > 1u) return 0;
+    if (work == 0u && info.has_deadline) *now_ms = info.next_deadline_ms;
+  }
+  return 0;
+}
+
+static int test_interface_async_adapter(void)
+{
+  async_mock_t mock;
+  ftun_linux_route_async_io_t io;
+  ftun_linux_route_io_t sync_io = {sync_apply, sync_remove, &mock};
+  ftun_interface_ops_t ops = ftun_linux_interface_ops;
+  ftun_interface_spec_t spec = {{"ftun-route0", 11u}, {10u, 77u, 0u, 1u}, 30u, 0x4654u, true, NULL};
+  ftun_interface_async_options_t options = {0};
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_event_loop_t *loop = NULL;
+  ftun_budget_usage_t baseline, usage;
+  ftun_reservation_t *pressure = NULL;
+  ftun_interface_async_info_t info;
+  void *source = NULL, *state = NULL, *original;
+  unsigned int iteration;
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 65536u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_event_loop_create_with_capacity(core, 8u, &loop) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  options = (ftun_interface_async_options_t){budget, loop, 100u, 5u, 1000u};
+  ops.context = &sync_io;
+  ops.async.context = &io;
+  for (iteration = 0u; iteration < 2u; iteration++) {
+    uint64_t now_ms = 100u;
+    async_mock_init(&mock);
+    io = async_mock_io(&mock);
+    if (iteration == 0u) {
+      CHECK(ops.restore(ops.context, &spec, &source) == FTUN_OK);
+      original = source;
+      CHECK(ftun_budget_reserve_cleanup(budget, baseline.total_available, &pressure) == FTUN_OK);
+      CHECK(ops.async.adopt(ops.async.context, &source, &options, &state) == FTUN_E_LIMIT &&
+        source == original && state == NULL);
+      CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+      CHECK(ftun_budget_reserve(budget, baseline.normal_available, &pressure) == FTUN_OK);
+      CHECK(ops.async.adopt(ops.async.context, &source, &options, &state) == FTUN_OK && source == NULL);
+      CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+      CHECK(mock.request_count == 0u);
+    } else {
+      CHECK(ops.async.start(ops.async.context, &spec, &options, &state) == FTUN_OK);
+      CHECK(interface_drive(&ops.async, state, &now_ms, FTUN_INTERFACE_READY));
+    }
+    CHECK(ops.async.query(ops.async.context, state, &info) == FTUN_OK && info.state == FTUN_INTERFACE_READY);
+    CHECK(ops.async.destroy(ops.async.context, &state) == FTUN_E_AGAIN && state != NULL);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > baseline.used);
+    CHECK(ops.async.withdraw(ops.async.context, state, now_ms, now_ms + 1000u) == FTUN_OK);
+    CHECK(interface_drive(&ops.async, state, &now_ms, FTUN_INTERFACE_RELEASED));
+    CHECK(ops.async.destroy(ops.async.context, &state) == FTUN_OK && state == NULL);
+    CHECK(async_present_count(&mock) == 0);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used &&
+      usage.used_resources.descriptors == baseline.used_resources.descriptors);
+  }
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_cancel_pending_add() == 0);
+  CHECK(test_adopt_owned_resources() == 0);
+  CHECK(test_submit_backpressure_deadline() == 0);
+  CHECK(test_total_deadline_before_reply() == 0);
+  CHECK(test_interface_async_adapter() == 0);
   CHECK(test_success_and_serialization() == 0);
   CHECK(test_lost_ack_reconcile() == 0);
   CHECK(test_lost_ack_without_effect() == 0);

@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_INBOUND_MIXED_H
 #define FTUN_PROXY_INBOUND_MIXED_H
-/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_accept，目标 0.4.0。 */
+/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_connection_create，目标 0.4.0。 */
 #include "proxy/inbound/inbound.h"
 #include "proxy/inbound/socks5.h"
 #include "protocol/http.h"
@@ -24,6 +24,9 @@ typedef struct {
   ftun_http_request_t http;
   ftun_socks5_server_event_t socks5;
   ftun_bytes_t wire; /* HTTP header+预读 body、body chunk 或响应。 */
+  /* HTTP REQUEST 已消费但不属于 wire 的字节；CONNECT 为 header 后全部
+   * 数据，FORWARD 为本次 body 之后的尾部。由流式 adapter 显式移交。 */
+  ftun_bytes_t preread;
   uint64_t body_remaining;
 } ftun_mixed_event_t;
 
@@ -51,8 +54,4 @@ ftun_status_t ftun_mixed_socks5_udp(ftun_mixed_connection_t *connection,
                                     ftun_socks5_udp_datagram_t *out);
 ftun_status_t ftun_mixed_connection_destroy(ftun_mixed_connection_t **connection);
 
-/* TASK-INBOUND-002 / TEST-INBOUND-002：从 Stream 增量读取并调用共享 SOCKS5
- * 或 HTTP parser。该入口只完成协议准入；统一协调层随后按解析出的每个 HTTP
- * 请求重新创建 Metadata/Session，不把首个目标固定到 keep-alive 连接。 */
-ftun_status_t ftun_mixed_accept(ftun_core_t *core, ftun_stream_t *client, const ftun_inbound_spec_t *spec);
 #endif

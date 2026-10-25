@@ -140,6 +140,17 @@ ftun_status_t ftun_linux_route_async_start_plan_with_io(
   const ftun_linux_route_plan_t *plan, const ftun_linux_route_async_io_t *io,
   uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
   uint32_t initial_sequence, ftun_linux_route_async_t **out);
+/* 将同步启动事务的资源及撤销责任转交给非阻塞事务，不发任何路由变更。
+ * 成功清空 source；分配、Event 或参数失败时 source 保持原样。部分同步
+ * 清理失败的资源也可以接管，但只能继续 release，不能当作 READY 发布。 */
+ftun_status_t ftun_linux_route_async_adopt(
+  ftun_route_transaction_t **source, ftun_event_loop_t *loop,
+  uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
+  ftun_linux_route_async_t **out);
+ftun_status_t ftun_linux_route_async_adopt_with_io(
+  ftun_route_transaction_t **source, const ftun_linux_route_async_io_t *io,
+  uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
+  uint32_t initial_sequence, ftun_linux_route_async_t **out);
 ftun_status_t ftun_linux_route_guard_plan(
   const ftun_network_view_t *view, uint32_t table, uint32_t first_priority,
   ftun_linux_route_plan_t *out);
@@ -173,6 +184,12 @@ ftun_status_t ftun_linux_route_async_destroy(
  * 冲突返回 rejected；普通失败完成逆序回滚并清空输出。
  * 若回滚本身失败则返回 state-corrupt 并交付 transaction，调用者必须重试 release。
  */
+/* 系统事务持有对象额度，同步调用期间准入一个控制FD。 */
+ftun_status_t ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
+  const ftun_route_policy_t *policy, ftun_route_transaction_t **out);
+ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
+  const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
+  ftun_route_transaction_t **out);
 ftun_status_t ftun_linux_route_prepare(const ftun_route_policy_t *policy, ftun_route_transaction_t **out);
 /* 测试与受控宿主注入；操作表会复制，context 必须比 transaction 长寿。 */
 ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy,

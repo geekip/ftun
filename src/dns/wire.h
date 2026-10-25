@@ -83,6 +83,7 @@ struct ftun_dns_query {
 };
 
 struct ftun_dns_message {
+  ftun_reservation_t *reservation;
   uint16_t id;
   uint16_t flags;
   uint16_t rcode; /* 含 EDNS 扩展 RCODE 高 8 位。 */
@@ -105,6 +106,9 @@ struct ftun_dns_message {
  */
 ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
                                      ftun_dns_message_t **out);
+/* 生产解析按实际拥有字节准入，release 同时归还额度。 */
+ftun_status_t ftun_dns_message_parse_with_budget(ftun_budget_t *budget,
+  ftun_bytes_t wire, ftun_dns_message_t **out);
 ftun_status_t ftun_dns_message_release(ftun_dns_message_t **message);
 
 /* 只在 ID、完整 Question、transport 和实际上游端点均一致时匹配；

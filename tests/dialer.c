@@ -42,7 +42,7 @@ typedef struct {
   int get_error_calls;
   int close_calls;
   uint32_t protected_mark;
-  char protected_device[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char protected_device[FTUN_SOCKET_INTERFACE_BYTES];
   ftun_endpoint_t connected_endpoint;
 } socket_state_t;
 

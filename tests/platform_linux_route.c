@@ -1,6 +1,7 @@
 #include "platform/linux/route.h"
 #include "platform/linux/tun.h"
 #include "platform/linux/uapi.h"
+#include "core/budget.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -158,6 +159,48 @@ static int real_smoke(void)
 }
 
 /* TASK-PLATFORM-002 / TEST-PLATFORM-002：冲突、反序回滚和所有权清理。 */
+static int owned_budget(void)
+{
+  ftun_budget_options_t options = {0};
+  ftun_budget_t *budget = NULL;
+  ftun_reservation_t *hold = NULL;
+  ftun_budget_usage_t usage;
+  ftun_route_transaction_t *transaction = NULL;
+  ftun_route_policy_t policy = route_policy(false, false);
+  route_mock_t mock = {0};
+  ftun_linux_route_io_t io = mock_io(&mock);
+  options.limit = (ftun_budget_resources_t){65536u, 2u, 1u};
+  options.cleanup_reserve.descriptors = 1u;
+  CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
+  CHECK(ftun_budget_reserve_resources(budget,
+    (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
+  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+    &transaction) == FTUN_E_LIMIT && transaction == NULL && mock.apply_calls == 0u);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+    &transaction) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+    usage.used_resources.descriptors == 0u);
+  CHECK(ftun_budget_reserve_resources(budget,
+    (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
+  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+    usage.used_resources.descriptors == 1u && usage.high_watermarks.descriptors == 2u);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  memset(&mock, 0, sizeof(mock));
+  mock.fail_apply_call = 2u;
+  mock.fail_apply_status = FTUN_E_IO;
+  mock.fail_remove_call = 1u;
+  mock.fail_remove_status = FTUN_E_IO;
+  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+    &transaction) == FTUN_E_STATE_CORRUPT && transaction != NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+    usage.used_resources.descriptors == 0u);
+  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   route_mock_t mock;
@@ -170,6 +213,7 @@ int main(int argc, char **argv)
 
   if (argc == 2 && strcmp(argv[1], "--real") == 0) return real_smoke();
   CHECK(argc == 1);
+  CHECK(owned_budget() == 0);
   memset(&mock, 0, sizeof(mock));
   io = mock_io(&mock);
   CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK &&

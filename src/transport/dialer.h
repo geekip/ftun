@@ -5,7 +5,7 @@
 #include "core/operation.h"
 #include "event/event.h"
 #include "network/view.h"
-#include "platform/linux/socket_protect.h"
+#include "network/socket_policy.h"
 
 #define FTUN_INVALID_SOCKET ((ftun_native_socket_t)UINTPTR_MAX)
 
@@ -77,6 +77,10 @@ typedef struct {
  * 同步拒绝清空 out 且零回调；接纳后由 Event/Operation 恰好一次终结。
  */
 ftun_status_t ftun_dial_start(ftun_core_t *core, const ftun_dial_request_t *request, ftun_operation_t **out);
+/* 共同授权门禁，不分配或打开 socket，不要求 completion；输出失败清零。
+ * 非 socket 工厂也须遵守 endpoint/allowed/View/domain/protection 的收窄。 */
+ftun_status_t ftun_dial_authorize(const ftun_dial_request_t *request,
+  ftun_network_dial_decision_t *out);
 /* 测试与受控宿主注入；操作表按值复制。 */
 ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
                                       const ftun_dial_request_t *request,

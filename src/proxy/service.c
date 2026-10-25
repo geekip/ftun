@@ -4,9 +4,10 @@
 
 #include <string.h>
 
-static ftun_status_t ftun_proxy_service_plan_prepare(
+static ftun_status_t ftun_proxy_service_plan_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t socket_mark, void **out)
 {
+  (void)budget;
   if (out != NULL) *out = NULL;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   (void)socket_mark;
@@ -39,7 +40,7 @@ static ftun_status_t ftun_proxy_service_prepare(
   if (!ftun_proxy_bindings_valid(bindings)) return FTUN_E_INVALID;
   status = ftun_proxy_runtime_prepare(core, budget, operations, bindings,
                                       config, generation, &runtime);
-  if (status == FTUN_OK) *out = runtime;
+  *out = runtime;
   return status;
 }
 
@@ -127,7 +128,7 @@ static ftun_status_t ftun_proxy_service_destroy_until(
   if (implementation == NULL) return FTUN_E_INVALID;
   runtime = (ftun_proxy_runtime_t *)*implementation;
   status = ftun_proxy_runtime_destroy_until(&runtime, deadline_ms);
-  if (status == FTUN_OK) *implementation = NULL;
+  *implementation = runtime;
   return status;
 }
 

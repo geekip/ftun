@@ -22,6 +22,7 @@ typedef struct {
   uint64_t generation;
   bool has_active;
   bool has_candidate;
+  bool has_cleanup;
   size_t retained_count;
   size_t retained_limit;
   size_t retained_bytes;
@@ -52,10 +53,18 @@ ftun_status_t ftun_runtime_manager_create(ftun_budget_t *budget,
 ftun_status_t ftun_runtime_manager_create_limits(
   ftun_budget_t *budget, size_t retained_limit, size_t retained_bytes_limit,
   ftun_core_t **out);
+/* 宿主先创建中立 Core，再附着唯一快照扩展；失败不改变已有 Core。
+ * 调用由 owner 串行执行，已有扩展返回 STALE，不覆盖其他模块状态。 */
+ftun_status_t ftun_runtime_manager_attach(ftun_core_t *core,
+  size_t retained_limit, size_t retained_bytes_limit);
 ftun_status_t ftun_runtime_manager_get_info(const ftun_core_t *core,
                                             ftun_runtime_manager_info_t *out);
-/* candidate/retained 或 active 外部引用存在时返回 AGAIN。 */
+/* candidate/retained 或 active 外部引用存在时返回 AGAIN。
+ * 已消费句柄的清理失败对象由 manager 保留；后续 prepare/clear 重试，
+ * 每次最多回收一个积压对象，未排空前拒绝新增候选。 */
 ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core);
+/* 只释放快照扩展，保留通用 Core 供宿主完成其他可重试清理。 */
+ftun_status_t ftun_runtime_manager_clear(ftun_core_t *core);
 /* 编译结果的准备与快照生命周期。
  * 需求 REQ-CONF-001；任务 TASK-CORE-001；目标 0.2.0；验收 TEST-CORE-001。
  * 实现路径：引用配置计划，检查 active/candidate/retained 总预算；准备必需对象；由 loop 提交，旧代按引用回收。
@@ -71,8 +80,10 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
                                             ftun_runtime_t **out);
 #if defined(FTUN_HAVE_MODULE_FRS)
 /* FRS 更新 worker 使用的脱离态候选。prepare 在 worker 内完成规则表和
- * label 绑定，并接管 view；attach 只在 owner loop 中执行预算、快照保留和
- * manager 指针提交。 */
+ * label 绑定，成功时接管 view；配置只借用至 attach 或 release 完成。
+ * 已绑定配置使用其预算在分配前准入；宿主保证预算活到候选回收结束。
+ * attach 在 owner loop 保留配置并提交 manager，复用同根已有额度；
+ * 独立未绑定配置仍在 attach 时准入。清理失败保留候选和额度供重试。 */
 ftun_status_t ftun_runtime_prepare_detached(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
 ftun_status_t ftun_runtime_prepare_detached_frs(
@@ -97,8 +108,10 @@ ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
 ftun_status_t ftun_runtime_stage_commit(ftun_core_t *core,
                                         ftun_runtime_t *candidate,
                                         uint64_t generation);
+/* 合法句柄即被消费；叶清理失败仍由 manager 持有对象和预算。 */
 ftun_status_t ftun_runtime_abort(ftun_core_t *core, ftun_runtime_t **candidate);
-/* acquire/release 表示 Session 等旧代消费者的引用。 */
+/* acquire/release 表示 Session 等旧代消费者的引用。
+ * 最后消费者释放后，即使叶清理失败也消费句柄，由 manager 负责重试。 */
 ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core, ftun_runtime_t **out);
 ftun_status_t ftun_runtime_retain(ftun_runtime_t *runtime);
 ftun_status_t ftun_runtime_release(ftun_runtime_t **runtime);

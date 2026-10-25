@@ -71,6 +71,7 @@ ftun_status_t ftun_tun_service_acquire_routed(
                                    &inner_mtu)) {
     return FTUN_E_INVALID;
   }
+  if (service->callback_depth != 0u) return FTUN_E_AGAIN;
   if (!service->accepting) return FTUN_E_CANCELLED;
   for (index = 0u; index < service->consumer_capacity; index++) {
     ftun_tun_service_consumer_t *consumer = &service->consumers[index];
@@ -83,8 +84,8 @@ ftun_status_t ftun_tun_service_acquire_routed(
     }
   }
   if (available == NULL) return FTUN_E_LIMIT;
+  if (service->next_lease_generation == UINT64_MAX) return FTUN_E_LIMIT;
   service->next_lease_generation++;
-  if (service->next_lease_generation == 0u) service->next_lease_generation++;
   available->consumer = spec->consumer;
   available->route = spec->route;
   available->path = spec->path;
@@ -118,6 +119,65 @@ ftun_status_t ftun_tun_service_acquire_routed(
     return status;
   }
   *out = available->lease;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_tun_service_update_consumer(
+  ftun_tun_lease_t lease, uint64_t expected_path_generation,
+  const ftun_tun_route_t *route, const ftun_tun_path_t *path)
+{
+  ftun_tun_service_t *service = lease.service;
+  ftun_tun_service_consumer_t *consumer =
+    ftun_tun_service_lease_consumer(service, lease);
+  ftun_tun_route_t next_route;
+  ftun_tun_path_t next_path;
+  uint32_t inner_mtu;
+  uint32_t interests = FTUN_EVENT_ERROR | FTUN_EVENT_READ;
+  size_t index;
+  ftun_status_t status;
+  if (consumer == NULL) return FTUN_E_STALE;
+  if (service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (expected_path_generation != consumer->path_generation) return FTUN_E_STALE;
+  if (!ftun_tun_service_route_valid(route) ||
+      !ftun_tun_service_path_valid(service, route, path, &inner_mtu)) {
+    return FTUN_E_INVALID;
+  }
+  if (!service->accepting) return FTUN_E_CANCELLED;
+  if (ftun_tun_service_route_equal(&consumer->route, route) &&
+      ftun_tun_service_path_equal(&consumer->path, path)) return FTUN_OK;
+  if (consumer->path_generation == UINT64_MAX) return FTUN_E_LIMIT;
+  for (index = 0u; index < service->consumer_capacity; index++) {
+    ftun_tun_service_consumer_t *other = &service->consumers[index];
+    if (other != consumer && other->lease.service == service &&
+        ftun_tun_service_route_equal(&other->route, route)) return FTUN_E_REJECTED;
+  }
+  if (service->queued_outputs < consumer->output_count) return FTUN_E_STATE_CORRUPT;
+  if (service->queued_outputs != consumer->output_count) interests |= FTUN_EVENT_WRITE;
+  /* watcher 拒绝发生在清队列及发布之前，失败时原路由仍完整可用。 */
+  status = ftun_event_io_update(service->source, interests);
+  if (status != FTUN_OK) return status;
+  next_route = *route;
+  next_path = *path;
+  status = ftun_tun_service_consumer_clear(service, consumer);
+  if (status != FTUN_OK) {
+    service->accepting = false;
+    (void)ftun_event_source_cancel(&service->source);
+    ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_FAILED, status);
+    return status;
+  }
+  consumer->route = next_route;
+  consumer->path = next_path;
+  consumer->inner_mtu = inner_mtu;
+  consumer->path_generation++;
+  consumer->feedback_tokens = path->carrier_mtu == 0u
+    ? 0u : FTUN_TUN_FEEDBACK_BURST;
+  consumer->feedback_progress = 0u;
+  if (consumer->consumer.event != NULL) {
+    service->callback_depth++;
+    consumer->consumer.event(consumer->consumer.user, lease,
+                              FTUN_TUN_SERVICE_PATH_UPDATED, FTUN_OK);
+    service->callback_depth--;
+  }
   return FTUN_OK;
 }
 

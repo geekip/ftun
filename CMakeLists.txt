@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FTUN VERSION 1.0.2 LANGUAGES C)
+project(FTUN VERSION 1.0.3 LANGUAGES C)
 include(GNUInstallDirs)
 include(CTest)
 find_package(Threads REQUIRED)
@@ -156,6 +156,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   add_library(ftun_libev STATIC third_party/libev/ev.c)
   target_include_directories(ftun_libev PUBLIC third_party/libev)
   target_compile_definitions(ftun_libev PRIVATE
+    FTUN_LIBEV_EPOLL_HOOK=1
     _GNU_SOURCE=1
     EV_STANDALONE=1
     EV_NO_THREADS=0
@@ -171,6 +172,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     EV_USE_SIGNALFD=0
     EV_USE_TIMERFD=0
     EV_USE_INOTIFY=0)
+  target_compile_options(ftun_libev PRIVATE
+    -include "${CMAKE_CURRENT_SOURCE_DIR}/src/event/libev_epoll.h")
   if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
     target_compile_options(ftun_libev PRIVATE -Wall -Wextra -fno-strict-aliasing
       "$<$<CONFIG:Debug>:-O0;-g>" "$<$<NOT:$<CONFIG:Debug>>:${ftun_opt}>")
@@ -243,18 +246,18 @@ set(ftun_core_sources
 )
 
 set(ftun_app_sources
+  src/app/runtime.c
   src/app/composition/default.c
   src/app/cli/dispatch.c
   src/app/cli/run.c
+  src/app/cli/result.c
   src/app/cli/check.c
   src/app/cli/control.c
   src/app/cli/fakeip.c
   src/app/cli/version.c
 )
 if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
-  list(APPEND ftun_app_sources src/app/runtime.c)
-else()
-  list(APPEND ftun_app_sources src/app/service_runtime.c)
+  list(APPEND ftun_app_sources src/app/composition/proxy_runtime.c)
 endif()
 
 set(ftun_proxy_sources)
@@ -278,6 +281,7 @@ if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
   src/proxy/inbound/inbound.c
   src/proxy/inbound/socks5.c
   src/proxy/inbound/mixed.c
+  src/proxy/inbound/adapter.c
   src/proxy/outbound/outbound.c
   src/proxy/outbound/direct.c
   src/proxy/outbound/reject.c
@@ -309,6 +313,7 @@ set(ftun_shared_sources
   src/platform/system_resolver.c
   src/platform/file.c
   src/util/logger.c
+  src/util/event_log.c
   src/util/buffer.c
   src/util/hash.c
   src/util/time.c
@@ -318,6 +323,8 @@ set(ftun_shared_sources
   src/network/resolver.c
   src/transport/dialer.c
   src/transport/path.c
+  src/transport/socket_path.c
+  src/transport/control_channel.c
   src/transport/blocking.c
   src/transport/carrier.c
   src/transport/stream.c
@@ -427,6 +434,7 @@ if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
     src/tun/path.c
     src/tun/owner.c
     src/platform/linux/tun.c
+    src/platform/linux/interface.c
     src/platform/linux/route.c
     src/platform/linux/route_async.c
   )
@@ -620,7 +628,155 @@ if(BUILD_TESTING)
     target_link_options(ftun-contract-test PRIVATE -static)
   endif()
   add_test(NAME skeleton-contract COMMAND ftun-contract-test)
+  # v1.0.2 发行头固定为独立编译输入，调用方 object 不继承当前 public include。
+  set(ftun_abi_v102_include
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/abi-v1.0.2/include")
+  file(SHA256 "${ftun_abi_v102_include}/ftun/ftun.h" ftun_abi_header_hash)
+  file(SHA256 "${ftun_abi_v102_include}/ftun/error.h" ftun_abi_error_hash)
+  if(NOT ftun_abi_header_hash STREQUAL
+      "15ecf2ed55648dc85978f11ad049c2feed93b1715a4d7fc5cef73b148eb8a68d" OR
+     NOT ftun_abi_error_hash STREQUAL
+      "8c63278b9052da9676259dfde70a3b5a1e401cfe2cf863c69ba89fac55a01891")
+    message(FATAL_ERROR "The v1.0.2 public ABI fixture must remain unchanged")
+  endif()
+  foreach(ftun_abi_caller v102 current)
+    add_library(ftun-abi-${ftun_abi_caller}-caller OBJECT tests/c_api_abi.c)
+    if(ftun_abi_caller STREQUAL "v102")
+      target_include_directories(ftun-abi-${ftun_abi_caller}-caller PRIVATE
+        "${ftun_abi_v102_include}")
+    else()
+      target_include_directories(ftun-abi-${ftun_abi_caller}-caller PRIVATE include)
+    endif()
+    target_link_libraries(ftun-abi-${ftun_abi_caller}-caller PRIVATE
+      ftun_options Threads::Threads)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      target_compile_definitions(ftun-abi-${ftun_abi_caller}-caller PRIVATE
+        FTUN_TEST_PROXY=1)
+    endif()
+    add_executable(ftun-abi-${ftun_abi_caller}-test tests/c_api_abi_host.c
+      $<TARGET_OBJECTS:ftun-abi-${ftun_abi_caller}-caller>)
+    target_include_directories(ftun-abi-${ftun_abi_caller}-test PRIVATE src)
+    target_link_libraries(ftun-abi-${ftun_abi_caller}-test PRIVATE
+      ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-abi-${ftun_abi_caller}-test PRIVATE
+      -Wl,--wrap=ftun_operation_queue_get_usage)
+    if(FTUN_STATIC)
+      target_link_options(ftun-abi-${ftun_abi_caller}-test PRIVATE -static)
+    endif()
+    add_test(NAME c-api-abi-${ftun_abi_caller}
+      COMMAND ftun-abi-${ftun_abi_caller}-test)
+  endforeach()
   add_executable(ftun-core-service-test tests/core_service.c)
+  add_executable(ftun-app-cleanup-test tests/app_cleanup.c)
+  target_include_directories(ftun-app-cleanup-test PRIVATE src)
+  target_link_libraries(ftun-app-cleanup-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-app-cleanup-test PRIVATE FTUN_TEST_PROXY=1)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-app-cleanup-test PRIVATE -static)
+  endif()
+  add_test(NAME app-cleanup-contract COMMAND ftun-app-cleanup-test)
+  add_executable(ftun-app-control-test tests/app_control.c)
+  target_include_directories(ftun-app-control-test PRIVATE src)
+  target_link_libraries(ftun-app-control-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-app-control-test PRIVATE -static)
+  endif()
+  add_test(NAME app-control-contract COMMAND ftun-app-control-test)
+  set_tests_properties(app-control-contract PROPERTIES TIMEOUT 15)
+  add_executable(ftun-app-host-test tests/app_host.c)
+  target_include_directories(ftun-app-host-test PRIVATE src)
+  target_link_libraries(ftun-app-host-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-app-host-test PRIVATE -static)
+  endif()
+  add_test(NAME app-host-contract COMMAND ftun-app-host-test)
+  set_tests_properties(app-host-contract PROPERTIES TIMEOUT 15)
+  add_executable(ftun-app-composition-test tests/app_composition.c)
+  add_executable(ftun-app-event-cleanup-test tests/app_composition.c tests/app_event_cleanup.c)
+  target_compile_definitions(ftun-app-event-cleanup-test PRIVATE FTUN_TEST_EVENT_CLEANUP=1)
+  foreach(operation ftun_libev_attach ftun_core_module_runtime_prepare ftun_core_module_runtime_drain_until)
+    target_link_options(ftun-app-event-cleanup-test PRIVATE "-Wl,--wrap=${operation}")
+  endforeach()
+  set(ftun_composition_test_targets ftun-app-composition-test ftun-app-event-cleanup-test)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN" AND FTUN_MODULE_TUN STREQUAL "BUILTIN"
+      AND FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    add_executable(ftun-runtime-tun-admission-test tests/app_composition.c tests/runtime_tun_admission.c)
+    target_compile_definitions(ftun-runtime-tun-admission-test PRIVATE FTUN_TEST_TUN_ADMISSION=1)
+    foreach(operation ftun_proxy_runtime_prepare ftun_tun_ingress_bind ftun_socket_path_open
+        ftun_proxy_dns_has_hijack ftun_proxy_dns_hijack_tcp ftun_stream_create
+        ftun_session_transition ftun_relay_start_with_pool_options socketpair close)
+      target_link_options(ftun-runtime-tun-admission-test PRIVATE "-Wl,--wrap=${operation}")
+    endforeach()
+    list(APPEND ftun_composition_test_targets ftun-runtime-tun-admission-test)
+    add_test(NAME runtime-tun-admission-contract COMMAND ftun-runtime-tun-admission-test)
+    set_tests_properties(runtime-tun-admission-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-runtime-tun-recovery-test tests/app_composition.c tests/runtime_tun_admission.c)
+    target_compile_definitions(ftun-runtime-tun-recovery-test PRIVATE FTUN_TEST_TUN_ADMISSION=1 FTUN_TEST_TUN_RECOVERY=1)
+    foreach(operation ftun_proxy_runtime_prepare ftun_tun_ingress_bind ftun_socket_path_open
+        ftun_proxy_dns_has_hijack ftun_proxy_dns_hijack_tcp ftun_stream_create
+        ftun_session_transition ftun_relay_start_with_pool_options socketpair close ftun_l3_provider_acquire)
+      target_link_options(ftun-runtime-tun-recovery-test PRIVATE "-Wl,--wrap=${operation}")
+    endforeach()
+    target_link_options(ftun-runtime-tun-recovery-test PRIVATE -Wl,--wrap=ftun_proxy_runtime_reload_commit)
+    list(APPEND ftun_composition_test_targets ftun-runtime-tun-recovery-test)
+    add_test(NAME runtime-tun-recovery-contract COMMAND ftun-runtime-tun-recovery-test)
+    set_tests_properties(runtime-tun-recovery-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-runtime-tun-async-test tests/app_composition.c tests/runtime_tun_async.c)
+    target_compile_definitions(ftun-runtime-tun-async-test PRIVATE FTUN_TEST_TUN_ADMISSION=1 FTUN_TEST_TUN_ASYNC=1)
+    foreach(operation ftun_tun_ingress_bind ftun_l3_provider_acquire
+        ftun_linux_route_prepare ftun_linux_route_prepare_with_budget ftun_linux_route_async_start ftun_linux_route_async_adopt)
+      target_link_options(ftun-runtime-tun-async-test PRIVATE "-Wl,--wrap=${operation}")
+    endforeach()
+    list(APPEND ftun_composition_test_targets ftun-runtime-tun-async-test)
+    add_test(NAME runtime-tun-async-contract COMMAND ftun-runtime-tun-async-test)
+    set_tests_properties(runtime-tun-async-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-runtime-udp-retention-test tests/app_composition.c tests/runtime_udp_retention.c)
+    target_compile_definitions(ftun-runtime-udp-retention-test PRIVATE FTUN_TEST_TUN_ADMISSION=1)
+    foreach(operation ftun_tun_ingress_bind ftun_proxy_dns_resolve_with_provider ftun_socket_path_open)
+      target_link_options(ftun-runtime-udp-retention-test PRIVATE "-Wl,--wrap=${operation}")
+    endforeach()
+    list(APPEND ftun_composition_test_targets ftun-runtime-udp-retention-test)
+    add_test(NAME runtime-udp-retention-contract COMMAND ftun-runtime-udp-retention-test)
+    set_tests_properties(runtime-udp-retention-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-runtime-tun-udp-recovery-test tests/app_composition.c tests/runtime_udp_retention.c)
+    target_compile_definitions(ftun-runtime-tun-udp-recovery-test PRIVATE FTUN_TEST_TUN_ADMISSION=1 FTUN_TEST_TUN_UDP_RECOVERY=1)
+    foreach(operation ftun_tun_ingress_bind ftun_proxy_dns_resolve_with_provider ftun_socket_path_open ftun_l3_provider_acquire)
+      target_link_options(ftun-runtime-tun-udp-recovery-test PRIVATE "-Wl,--wrap=${operation}")
+    endforeach()
+    list(APPEND ftun_composition_test_targets ftun-runtime-tun-udp-recovery-test)
+    add_test(NAME runtime-tun-udp-recovery-contract COMMAND ftun-runtime-tun-udp-recovery-test)
+    set_tests_properties(runtime-tun-udp-recovery-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-app-control-policy-test tests/app_composition.c tests/app_control_policy.c)
+    target_compile_definitions(ftun-app-control-policy-test PRIVATE FTUN_TEST_CONTROL_POLICY=1)
+    target_link_options(ftun-app-control-policy-test PRIVATE
+      -Wl,--wrap=ftun_app_runtime_support -Wl,--wrap=ftun_linux_route_prepare
+      -Wl,--wrap=ftun_linux_route_prepare_with_budget
+      -Wl,--wrap=ftun_linux_route_async_adopt)
+    list(APPEND ftun_composition_test_targets ftun-app-control-policy-test)
+    foreach(route true false)
+      add_test(NAME app-control-policy-${route} COMMAND ftun-app-control-policy-test)
+      set_tests_properties(app-control-policy-${route} PROPERTIES TIMEOUT 15
+        ENVIRONMENT "FTUN_TEST_CONTROL_AUTO_ROUTE=${route}")
+    endforeach()
+  endif()
+  foreach(target IN LISTS ftun_composition_test_targets)
+    target_include_directories(${target} PRIVATE src)
+    target_link_libraries(${target} PRIVATE ftun_runtime ftun_options Threads::Threads)
+    if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
+      target_compile_definitions(${target} PRIVATE FTUN_TEST_TUN=1)
+      foreach(operation open open_with_budget get_info read write close)
+        target_link_options(${target} PRIVATE "-Wl,--wrap=ftun_packet_port_${operation}")
+      endforeach()
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(${target} PRIVATE -static)
+    endif()
+  endforeach()
+  add_test(NAME app-composition-contract COMMAND ftun-app-composition-test)
+  add_test(NAME app-event-cleanup-contract COMMAND ftun-app-event-cleanup-test)
+  set_tests_properties(app-event-cleanup-contract PROPERTIES TIMEOUT 15)
   target_include_directories(ftun-core-service-test PRIVATE src)
   target_link_libraries(ftun-core-service-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
@@ -643,11 +799,37 @@ if(BUILD_TESTING)
   target_include_directories(ftun-core-module-plan-test PRIVATE src)
   target_link_libraries(ftun-core-module-plan-test PRIVATE
     ftun_runtime ftun_options)
+  target_link_options(ftun-core-module-plan-test PRIVATE -Wl,--wrap=calloc)
   if(FTUN_STATIC)
     target_link_options(ftun-core-module-plan-test PRIVATE -static)
   endif()
   add_test(NAME core-module-plan-contract COMMAND ftun-core-module-plan-test)
   if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-proxy-resources-test tests/proxy_resources.c)
+    target_include_directories(ftun-proxy-resources-test PRIVATE src)
+    target_link_libraries(ftun-proxy-resources-test PRIVATE ftun_runtime ftun_options)
+    target_link_options(ftun-proxy-resources-test PRIVATE
+      -Wl,--wrap=socket -Wl,--wrap=ftun_event_source_backend_data)
+    if(FTUN_STATIC)
+      target_link_options(ftun-proxy-resources-test PRIVATE -static)
+    endif()
+    add_test(NAME proxy-resources-contract COMMAND ftun-proxy-resources-test)
+    set_tests_properties(proxy-resources-contract PROPERTIES TIMEOUT 30)
+    add_executable(ftun-proxy-owned-memory-test tests/proxy_owned_memory.c)
+    target_include_directories(ftun-proxy-owned-memory-test PRIVATE src)
+    target_link_libraries(ftun-proxy-owned-memory-test PRIVATE ftun_runtime ftun_options)
+    foreach(module DNS FAKEIP TUN FRS)
+      if(FTUN_MODULE_${module} STREQUAL "BUILTIN")
+        target_compile_definitions(ftun-proxy-owned-memory-test PRIVATE FTUN_HAVE_MODULE_${module}=1)
+      endif()
+    endforeach()
+    target_link_options(ftun-proxy-owned-memory-test PRIVATE
+      -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=ftun_worker_submit)
+    if(FTUN_STATIC)
+      target_link_options(ftun-proxy-owned-memory-test PRIVATE -static)
+    endif()
+    add_test(NAME proxy-owned-memory-contract COMMAND ftun-proxy-owned-memory-test)
+    set_tests_properties(proxy-owned-memory-contract PROPERTIES TIMEOUT 30)
     add_executable(ftun-proxy-slot-pool-test tests/proxy_slot_pool.c)
     target_include_directories(ftun-proxy-slot-pool-test PRIVATE src)
     target_link_libraries(ftun-proxy-slot-pool-test PRIVATE
@@ -686,7 +868,62 @@ if(BUILD_TESTING)
     target_link_options(ftun-budget-test PRIVATE -static)
   endif()
   add_test(NAME budget-contract COMMAND ftun-budget-test)
+  add_executable(ftun-core-resources-test tests/core_resources.c)
+  target_include_directories(ftun-core-resources-test PRIVATE src)
+  target_link_libraries(ftun-core-resources-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-core-resources-test PRIVATE -static)
+  endif()
+  add_test(NAME core-resources-contract COMMAND ftun-core-resources-test)
+  add_executable(ftun-app-owned-memory-test tests/app_owned_memory.c)
+  target_include_directories(ftun-app-owned-memory-test PRIVATE src)
+  target_link_libraries(ftun-app-owned-memory-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+  # 故障注入依赖分配函数调用，不能让内建优化绕过链接器wrap。
+  target_compile_options(ftun-app-owned-memory-test PRIVATE
+    -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-free)
+  target_link_options(ftun-app-owned-memory-test PRIVATE
+    -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=ftun_core_service_plan_destroy
+    -Wl,--wrap=ftun_core_service_reload_commit -Wl,--wrap=ftun_worker_submit)
+  if(FTUN_STATIC)
+    target_link_options(ftun-app-owned-memory-test PRIVATE -static)
+  endif()
+  add_test(NAME app-owned-memory-contract COMMAND ftun-app-owned-memory-test)
+  set_tests_properties(app-owned-memory-contract PROPERTIES TIMEOUT 15)
+  add_executable(ftun-budget-faults-test tests/budget_faults.c)
+  target_include_directories(ftun-budget-faults-test PRIVATE include src)
+  target_link_libraries(ftun-budget-faults-test PRIVATE ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-budget-faults-test PRIVATE -static)
+  endif()
+  add_test(NAME budget-faults-contract COMMAND ftun-budget-faults-test)
+  add_executable(ftun-budget-consumers-test tests/budget_consumers.c)
+  target_include_directories(ftun-budget-consumers-test PRIVATE src)
+  target_link_libraries(ftun-budget-consumers-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-budget-consumers-test PRIVATE -static)
+  endif()
+  add_test(NAME budget-consumers-contract COMMAND ftun-budget-consumers-test)
   if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    add_executable(ftun-app-proxy-memory-test tests/app_proxy_memory.c)
+    target_include_directories(ftun-app-proxy-memory-test PRIVATE src tests)
+    target_link_libraries(ftun-app-proxy-memory-test PRIVATE ftun_runtime ftun_options)
+    target_compile_options(ftun-app-proxy-memory-test PRIVATE
+      -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-free)
+    target_link_options(ftun-app-proxy-memory-test PRIVATE
+      -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=open
+      -Wl,--wrap=ftun_route_table_destroy -Wl,--wrap=read
+      -Wl,--wrap=close -Wl,--wrap=mkstemp)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      target_sources(ftun-app-proxy-memory-test PRIVATE tests/frs_fixture.c)
+      target_compile_definitions(ftun-app-proxy-memory-test PRIVATE FTUN_HAVE_MODULE_FRS=1)
+      target_link_options(ftun-app-proxy-memory-test PRIVATE -Wl,--wrap=ftun_http_fetch)
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(ftun-app-proxy-memory-test PRIVATE -static)
+    endif()
+    add_test(NAME app-proxy-memory-contract COMMAND ftun-app-proxy-memory-test)
+    set_tests_properties(app-proxy-memory-contract PROPERTIES TIMEOUT 15)
     add_executable(ftun-runtime-test tests/runtime.c)
     target_include_directories(ftun-runtime-test PRIVATE src)
     target_link_libraries(ftun-runtime-test PRIVATE ftun_runtime ftun_options)
@@ -694,6 +931,34 @@ if(BUILD_TESTING)
       target_link_options(ftun-runtime-test PRIVATE -static)
     endif()
     add_test(NAME runtime-contract COMMAND ftun-runtime-test)
+    add_executable(ftun-runtime-cleanup-test tests/runtime_cleanup.c)
+    target_include_directories(ftun-runtime-cleanup-test PRIVATE src)
+    target_link_libraries(ftun-runtime-cleanup-test PRIVATE ftun_runtime ftun_options)
+    target_link_options(ftun-runtime-cleanup-test PRIVATE -Wl,--wrap=ftun_route_table_destroy)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      target_sources(ftun-runtime-cleanup-test PRIVATE tests/frs_fixture.c)
+      target_compile_definitions(ftun-runtime-cleanup-test PRIVATE FTUN_HAVE_MODULE_FRS=1)
+      target_link_options(ftun-runtime-cleanup-test PRIVATE -Wl,--wrap=munmap -Wl,--wrap=calloc)
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(ftun-runtime-cleanup-test PRIVATE -static)
+    endif()
+    add_test(NAME runtime-cleanup-contract COMMAND ftun-runtime-cleanup-test)
+    set_tests_properties(runtime-cleanup-contract PROPERTIES TIMEOUT 15)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      add_executable(ftun-runtime-detached-test tests/runtime_detached.c tests/frs_fixture.c)
+      target_include_directories(ftun-runtime-detached-test PRIVATE src)
+      target_compile_definitions(ftun-runtime-detached-test PRIVATE FTUN_HAVE_MODULE_FRS=1)
+      target_link_libraries(ftun-runtime-detached-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-runtime-detached-test PRIVATE
+        -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free
+        -Wl,--wrap=ftun_route_table_destroy)
+      if(FTUN_STATIC)
+        target_link_options(ftun-runtime-detached-test PRIVATE -static)
+      endif()
+      add_test(NAME runtime-detached-contract COMMAND ftun-runtime-detached-test)
+      set_tests_properties(runtime-detached-contract PROPERTIES TIMEOUT 15)
+    endif()
     add_executable(ftun-session-test tests/session.c)
     target_include_directories(ftun-session-test PRIVATE src)
     target_link_libraries(ftun-session-test PRIVATE ftun_runtime ftun_options)
@@ -705,6 +970,7 @@ if(BUILD_TESTING)
   add_executable(ftun-buffer-test tests/buffer.c)
   target_include_directories(ftun-buffer-test PRIVATE src)
   target_link_libraries(ftun-buffer-test PRIVATE ftun_runtime ftun_options)
+  target_link_options(ftun-buffer-test PRIVATE -Wl,--wrap=calloc)
   if(FTUN_STATIC)
     target_link_options(ftun-buffer-test PRIVATE -static)
   endif()
@@ -716,9 +982,75 @@ if(BUILD_TESTING)
     target_link_options(ftun-hash-test PRIVATE -static)
   endif()
   add_test(NAME hash-contract COMMAND ftun-hash-test)
+  add_executable(ftun-logger-test tests/logger.c)
+  target_include_directories(ftun-logger-test PRIVATE src)
+  target_link_libraries(ftun-logger-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-logger-test PRIVATE -static)
+  endif()
+  add_test(NAME logger-contract COMMAND ftun-logger-test)
+  add_executable(ftun-log-ledger-test tests/log_ledger.c)
+  target_include_directories(ftun-log-ledger-test PRIVATE src)
+  target_link_libraries(ftun-log-ledger-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  target_link_options(ftun-log-ledger-test PRIVATE -Wl,--wrap=close)
+  if(FTUN_STATIC)
+    target_link_options(ftun-log-ledger-test PRIVATE -static)
+  endif()
+  add_test(NAME log-ledger-contract COMMAND ftun-log-ledger-test)
+  set_tests_properties(log-ledger-contract PROPERTIES TIMEOUT 30)
+  add_executable(ftun-app-logging-test tests/app_logging.c)
+  target_include_directories(ftun-app-logging-test PRIVATE src)
+  target_link_libraries(ftun-app-logging-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  target_link_options(ftun-app-logging-test PRIVATE
+    -Wl,--wrap=ftun_logger_create -Wl,--wrap=ftun_worker_poll)
+  if(FTUN_STATIC)
+    target_link_options(ftun-app-logging-test PRIVATE -static)
+  endif()
+  add_test(NAME app-logging-contract COMMAND ftun-app-logging-test)
+  set_tests_properties(app-logging-contract PROPERTIES TIMEOUT 30)
+  add_executable(ftun-event-log-test tests/event_log.c)
+  target_include_directories(ftun-event-log-test PRIVATE src)
+  target_link_libraries(ftun-event-log-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  if(FTUN_STATIC)
+    target_link_options(ftun-event-log-test PRIVATE -static)
+  endif()
+  add_test(NAME event-log-contract COMMAND ftun-event-log-test)
+  add_executable(ftun-cli-result-test tests/cli_result.c)
+  target_include_directories(ftun-cli-result-test PRIVATE src)
+  target_link_libraries(ftun-cli-result-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  target_link_options(ftun-cli-result-test PRIVATE -Wl,--wrap=write
+    -Wl,--wrap=ftun_budget_reserve_resources -Wl,--wrap=ftun_budget_destroy)
+  if(FTUN_STATIC)
+    target_link_options(ftun-cli-result-test PRIVATE -static)
+  endif()
+  add_test(NAME cli-result-contract COMMAND ftun-cli-result-test)
+  set_tests_properties(cli-result-contract PROPERTIES TIMEOUT 30)
+  add_executable(ftun-cli-preflight-test tests/cli_preflight.c)
+  target_include_directories(ftun-cli-preflight-test PRIVATE src)
+  target_link_libraries(ftun-cli-preflight-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
+  target_link_options(ftun-cli-preflight-test PRIVATE
+    -Wl,--wrap=ftun_config_load_budget_traced
+    -Wl,--wrap=ftun_config_destroy -Wl,--wrap=ftun_core_destroy)
+  if(FTUN_MODULE_FAKEIP STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-cli-preflight-test PRIVATE FTUN_HAVE_MODULE_FAKEIP=1)
+    target_link_options(ftun-cli-preflight-test PRIVATE
+      -Wl,--wrap=getrandom -Wl,--wrap=open -Wl,--wrap=close)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-cli-preflight-test PRIVATE -static)
+  endif()
+  add_test(NAME cli-preflight-contract COMMAND ftun-cli-preflight-test)
+  set_tests_properties(cli-preflight-contract PROPERTIES TIMEOUT 30)
   add_executable(ftun-operation-test tests/operation.c)
   target_include_directories(ftun-operation-test PRIVATE src)
-  target_link_libraries(ftun-operation-test PRIVATE ftun_runtime ftun_options)
+  target_link_libraries(ftun-operation-test PRIVATE
+    ftun_runtime ftun_options Threads::Threads)
   if(FTUN_STATIC)
     target_link_options(ftun-operation-test PRIVATE -static)
   endif()
@@ -759,10 +1091,48 @@ if(BUILD_TESTING)
     target_compile_definitions(ftun-provider-bindings-test PRIVATE
       FTUN_EXPECT_PROXY=1)
   endif()
+  if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-provider-bindings-test PRIVATE
+      FTUN_EXPECT_DNS=1)
+  endif()
   if(FTUN_STATIC)
     target_link_options(ftun-provider-bindings-test PRIVATE -static)
   endif()
   add_test(NAME provider-bindings-contract COMMAND ftun-provider-bindings-test)
+  add_executable(ftun-resolver-provider-test tests/resolver_provider.c)
+  target_include_directories(ftun-resolver-provider-test PRIVATE src)
+  target_link_libraries(ftun-resolver-provider-test PRIVATE ftun_runtime ftun_options)
+  add_test(NAME resolver-provider-contract COMMAND ftun-resolver-provider-test)
+  add_executable(ftun-path-test tests/path.c)
+  target_include_directories(ftun-path-test PRIVATE src)
+  target_link_libraries(ftun-path-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-path-test PRIVATE -static)
+  endif()
+  add_test(NAME path-contract COMMAND ftun-path-test)
+  add_executable(ftun-path-result-test tests/path_result.c)
+  target_include_directories(ftun-path-result-test PRIVATE src)
+  target_link_libraries(ftun-path-result-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-path-result-test PRIVATE -static)
+  endif()
+  add_test(NAME path-result-contract COMMAND ftun-path-result-test)
+  add_executable(ftun-path-provider-test tests/path_provider.c)
+  target_include_directories(ftun-path-provider-test PRIVATE src)
+  target_link_libraries(ftun-path-provider-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-path-provider-test PRIVATE -static)
+  endif()
+  add_test(NAME path-provider-contract COMMAND ftun-path-provider-test)
+
+  add_executable(ftun-socket-path-test tests/socket_path.c)
+  target_include_directories(ftun-socket-path-test PRIVATE src)
+  target_link_libraries(ftun-socket-path-test PRIVATE ftun_runtime ftun_options)
+  target_link_options(ftun-socket-path-test PRIVATE -Wl,--wrap=send)
+  if(FTUN_STATIC)
+    target_link_options(ftun-socket-path-test PRIVATE -static)
+  endif()
+  add_test(NAME socket-path-contract COMMAND ftun-socket-path-test)
   add_executable(ftun-stream-test tests/stream.c)
   target_include_directories(ftun-stream-test PRIVATE src)
   target_link_libraries(ftun-stream-test PRIVATE ftun_runtime ftun_options)
@@ -770,9 +1140,17 @@ if(BUILD_TESTING)
     target_link_options(ftun-stream-test PRIVATE -static)
   endif()
   add_test(NAME stream-contract COMMAND ftun-stream-test)
+  add_executable(ftun-stream-abort-test tests/stream_abort.c)
+  target_include_directories(ftun-stream-abort-test PRIVATE src)
+  target_link_libraries(ftun-stream-abort-test PRIVATE ftun_runtime ftun_options)
+  if(FTUN_STATIC)
+    target_link_options(ftun-stream-abort-test PRIVATE -static)
+  endif()
+  add_test(NAME stream-abort-contract COMMAND ftun-stream-abort-test)
   add_executable(ftun-datagram-test tests/datagram.c)
   target_include_directories(ftun-datagram-test PRIVATE src)
   target_link_libraries(ftun-datagram-test PRIVATE ftun_runtime ftun_options)
+  target_link_options(ftun-datagram-test PRIVATE -Wl,--wrap=calloc)
   if(FTUN_STATIC)
     target_link_options(ftun-datagram-test PRIVATE -static)
   endif()
@@ -812,6 +1190,65 @@ if(BUILD_TESTING)
     target_link_libraries(ftun-inbound-mixed-test PRIVATE
       ftun_runtime ftun_options)
     add_test(NAME inbound-mixed-contract COMMAND ftun-inbound-mixed-test)
+    add_executable(ftun-inbound-adapter-test tests/inbound_adapter.c)
+    target_include_directories(ftun-inbound-adapter-test PRIVATE src)
+    target_link_libraries(ftun-inbound-adapter-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME inbound-adapter-contract COMMAND ftun-inbound-adapter-test)
+    add_executable(ftun-outbound-path-test tests/outbound_path.c tests/memory_path_factory.c)
+    target_include_directories(ftun-outbound-path-test PRIVATE src)
+    target_link_libraries(ftun-outbound-path-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME outbound-path-contract COMMAND ftun-outbound-path-test)
+    add_executable(ftun-socks-path-test tests/socks_path.c tests/memory_path_factory.c)
+    target_include_directories(ftun-socks-path-test PRIVATE src)
+    target_link_libraries(ftun-socks-path-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME socks-path-contract COMMAND ftun-socks-path-test)
+    add_executable(ftun-socks-datagram-test tests/socks_datagram.c tests/memory_path_factory.c)
+    target_include_directories(ftun-socks-datagram-test PRIVATE src)
+    target_link_libraries(ftun-socks-datagram-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME socks-datagram-contract COMMAND ftun-socks-datagram-test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_executable(ftun-memory-path-test src/app/main.c tests/memory_path_factory.c)
+      target_include_directories(ftun-memory-path-test PRIVATE src)
+      target_link_libraries(ftun-memory-path-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-memory-path-test PRIVATE -Wl,--wrap=ftun_socket_path_open)
+      if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+        add_executable(ftun-resolver-production-test src/app/main.c tests/resolver_factory_probe.c)
+        target_include_directories(ftun-resolver-production-test PRIVATE src)
+        target_link_libraries(ftun-resolver-production-test PRIVATE ftun_runtime ftun_options)
+        target_link_options(ftun-resolver-production-test PRIVATE -Wl,--wrap=ftun_resolver_scope_start)
+      endif()
+    endif()
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_executable(ftun-control-channel-test tests/control_channel.c)
+      target_include_directories(ftun-control-channel-test PRIVATE src)
+      target_link_libraries(ftun-control-channel-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-control-channel-test PRIVATE -Wl,--wrap=ftun_socket_path_open)
+      add_test(NAME control-channel-contract COMMAND ftun-control-channel-test)
+      add_executable(ftun-control-resolution-test tests/control_resolution.c)
+      target_include_directories(ftun-control-resolution-test PRIVATE src)
+      target_link_libraries(ftun-control-resolution-test PRIVATE ftun_runtime ftun_options)
+      add_test(NAME control-resolution-contract COMMAND ftun-control-resolution-test)
+      add_executable(ftun-control-system-worker-test tests/control_system_worker.c)
+      target_include_directories(ftun-control-system-worker-test PRIVATE src)
+      target_link_libraries(ftun-control-system-worker-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+      target_link_options(ftun-control-system-worker-test PRIVATE -Wl,--wrap=getaddrinfo)
+      add_test(NAME control-system-worker-contract COMMAND ftun-control-system-worker-test)
+      add_executable(ftun-control-datagram-test tests/control_datagram.c)
+      target_include_directories(ftun-control-datagram-test PRIVATE src)
+      target_link_libraries(ftun-control-datagram-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-control-datagram-test PRIVATE -Wl,--wrap=ftun_socket_path_open)
+      add_test(NAME control-datagram-contract COMMAND ftun-control-datagram-test)
+      add_executable(ftun-http-fetch-test tests/http_fetch.c)
+      target_include_directories(ftun-http-fetch-test PRIVATE src)
+      target_link_libraries(ftun-http-fetch-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-http-fetch-test PRIVATE -Wl,--wrap=ftun_tls_client_open)
+      if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+        add_executable(ftun-control-dns-test tests/control_dns.c)
+        target_include_directories(ftun-control-dns-test PRIVATE src)
+        target_link_libraries(ftun-control-dns-test PRIVATE ftun_runtime ftun_options)
+        target_link_options(ftun-control-dns-test PRIVATE -Wl,--wrap=ftun_resolver_provider_start -Wl,--wrap=getaddrinfo)
+      endif()
+    endif()
     add_executable(ftun-v04-group-test tests/group.c)
     target_include_directories(ftun-v04-group-test PRIVATE src)
     target_link_libraries(ftun-v04-group-test PRIVATE ftun_runtime ftun_options)
@@ -858,11 +1295,6 @@ if(BUILD_TESTING)
     target_include_directories(ftun-core-state-test PRIVATE src)
     target_link_libraries(ftun-core-state-test PRIVATE ftun_runtime ftun_options)
     add_test(NAME core-state-contract COMMAND ftun-core-state-test)
-    add_executable(ftun-logger-test tests/logger.c)
-    target_include_directories(ftun-logger-test PRIVATE src)
-    target_link_libraries(ftun-logger-test PRIVATE
-      ftun_runtime ftun_options Threads::Threads)
-    add_test(NAME logger-contract COMMAND ftun-logger-test)
     add_executable(ftun-v05-integration-test tests/integration_v05.c)
     target_include_directories(ftun-v05-integration-test PRIVATE src)
     target_link_libraries(ftun-v05-integration-test PRIVATE
@@ -876,6 +1308,12 @@ if(BUILD_TESTING)
       target_link_options(ftun-control-resolver-test PRIVATE -static)
     endif()
     add_test(NAME control-resolver-contract COMMAND ftun-control-resolver-test)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN" AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_executable(ftun-control-memory-test src/app/main.c tests/control_memory_factory.c tests/frs_fixture.c)
+      target_include_directories(ftun-control-memory-test PRIVATE src tests)
+      target_link_libraries(ftun-control-memory-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-control-memory-test PRIVATE -Wl,--wrap=ftun_socket_path_open -Wl,--wrap=ftun_resolver_provider_start)
+    endif()
     if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
       add_executable(ftun-v04-frs-test tests/frs.c tests/frs_fixture.c)
       target_include_directories(ftun-v04-frs-test PRIVATE src tests)
@@ -887,6 +1325,27 @@ if(BUILD_TESTING)
       target_link_libraries(ftun-v04-frs-update-test PRIVATE
         ftun_runtime ftun_options)
       add_test(NAME frs-update-contract COMMAND ftun-v04-frs-update-test)
+      add_executable(ftun-app-frs-test tests/app_frs.c tests/frs_fixture.c)
+      target_include_directories(ftun-app-frs-test PRIVATE src tests)
+      target_link_libraries(ftun-app-frs-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+      target_link_options(ftun-app-frs-test PRIVATE
+        -Wl,--wrap=ftun_http_fetch -Wl,--wrap=ftun_file_write_atomic_budget)
+      if(FTUN_STATIC)
+        target_link_options(ftun-app-frs-test PRIVATE -static)
+      endif()
+      add_test(NAME app-frs-contract COMMAND ftun-app-frs-test)
+      add_executable(ftun-runtime-worker-cleanup-test
+        tests/runtime_worker_cleanup.c tests/frs_fixture.c)
+      target_include_directories(ftun-runtime-worker-cleanup-test PRIVATE src tests)
+      target_link_libraries(ftun-runtime-worker-cleanup-test PRIVATE
+        ftun_runtime ftun_options Threads::Threads)
+      target_link_options(ftun-runtime-worker-cleanup-test PRIVATE
+        -Wl,--wrap=ftun_http_fetch -Wl,--wrap=ftun_runtime_prepared_release)
+      if(FTUN_STATIC)
+        target_link_options(ftun-runtime-worker-cleanup-test PRIVATE -static)
+      endif()
+      add_test(NAME runtime-worker-cleanup-contract COMMAND ftun-runtime-worker-cleanup-test)
+      set_tests_properties(runtime-worker-cleanup-contract PROPERTIES TIMEOUT 20)
     endif()
   endif()
   add_executable(ftun-v04-tls-test tests/tls.c)
@@ -896,6 +1355,26 @@ if(BUILD_TESTING)
   target_link_libraries(ftun-v04-tls-test PRIVATE
     ftun_runtime ftun_options wolfssl::wolfssl)
   add_test(NAME tls-wolfssl-contract COMMAND ftun-v04-tls-test)
+  add_executable(ftun-tls-resources-test tests/tls_resources.c)
+  target_include_directories(ftun-tls-resources-test PRIVATE src)
+  target_compile_definitions(ftun-tls-resources-test PRIVATE
+    "FTUN_TEST_CERT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/third_party/wolfssl/certs")
+  target_link_libraries(ftun-tls-resources-test PRIVATE
+    ftun_runtime ftun_options wolfssl::wolfssl)
+  target_link_options(ftun-tls-resources-test PRIVATE
+    -Wl,--wrap=wolfSSL_Init -Wl,--wrap=wolfSSL_CTX_new
+    -Wl,--wrap=wolfSSL_new -Wl,--wrap=wolfSSL_UseSNI)
+  add_test(NAME tls-resources-contract COMMAND ftun-tls-resources-test)
+  add_executable(ftun-tls-global-test tests/tls_global.c)
+  target_include_directories(ftun-tls-global-test PRIVATE src)
+  target_compile_definitions(ftun-tls-global-test PRIVATE
+    "FTUN_TEST_CERT_DIR=${CMAKE_CURRENT_SOURCE_DIR}/third_party/wolfssl/certs")
+  target_link_libraries(ftun-tls-global-test PRIVATE
+    ftun_runtime ftun_options wolfssl::wolfssl Threads::Threads)
+  target_link_options(ftun-tls-global-test PRIVATE
+    -Wl,--wrap=wolfSSL_Init -Wl,--wrap=wolfSSL_Cleanup -Wl,--wrap=atexit)
+  add_test(NAME tls-global-contract COMMAND ftun-tls-global-test)
+  set_tests_properties(tls-global-contract PROPERTIES TIMEOUT 30)
   if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
     add_executable(ftun-v04-integration-test
       tests/integration_v04.c tests/frs_fixture.c)
@@ -926,6 +1405,21 @@ if(BUILD_TESTING)
       target_link_options(ftun-route-router-test PRIVATE -static)
     endif()
     add_test(NAME route-router-contract COMMAND ftun-route-router-test)
+    add_executable(ftun-route-memory-test tests/route_memory.c)
+    target_include_directories(ftun-route-memory-test PRIVATE src)
+    target_link_libraries(ftun-route-memory-test PRIVATE ftun_runtime ftun_options)
+    target_link_options(ftun-route-memory-test PRIVATE
+      -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free)
+    if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
+      target_sources(ftun-route-memory-test PRIVATE tests/frs_fixture.c)
+      target_compile_definitions(ftun-route-memory-test PRIVATE FTUN_HAVE_MODULE_FRS=1)
+      target_link_options(ftun-route-memory-test PRIVATE -Wl,--wrap=open -Wl,--wrap=read)
+    endif()
+    if(FTUN_STATIC)
+      target_link_options(ftun-route-memory-test PRIVATE -static)
+    endif()
+    add_test(NAME route-memory-contract COMMAND ftun-route-memory-test)
+    set_tests_properties(route-memory-contract PROPERTIES TIMEOUT 30)
     add_executable(ftun-outbound-reject-test tests/outbound_reject.c)
     target_include_directories(ftun-outbound-reject-test PRIVATE src)
     target_link_libraries(ftun-outbound-reject-test PRIVATE ftun_runtime ftun_options)
@@ -959,10 +1453,24 @@ if(BUILD_TESTING)
     add_executable(ftun-libev-test tests/libev_adapter.c)
     target_include_directories(ftun-libev-test PRIVATE src)
     target_link_libraries(ftun-libev-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-libev-test PRIVATE
+      -Wl,--wrap=ftun_event_io_ready -Wl,--wrap=epoll_wait -Wl,--wrap=epoll_ctl
+      -Wl,--wrap=read -Wl,--wrap=write)
     if(FTUN_STATIC)
       target_link_options(ftun-libev-test PRIVATE -static)
     endif()
     add_test(NAME libev-adapter COMMAND ftun-libev-test)
+    set_tests_properties(libev-adapter PROPERTIES TIMEOUT 20)
+    add_executable(ftun-event-resources-test tests/event_resources.c)
+    target_include_directories(ftun-event-resources-test PRIVATE src)
+    target_link_libraries(ftun-event-resources-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-event-resources-test PRIVATE
+      -Wl,--wrap=eventfd -Wl,--wrap=pipe -Wl,--wrap=ftun_event_source_backend_data)
+    if(FTUN_STATIC)
+      target_link_options(ftun-event-resources-test PRIVATE -static)
+    endif()
+    add_test(NAME event-resources-contract COMMAND ftun-event-resources-test)
+    set_tests_properties(event-resources-contract PROPERTIES TIMEOUT 20)
     add_executable(ftun-libev-runtime-test tests/libev_runtime.c)
     target_compile_definitions(ftun-libev-runtime-test PRIVATE
       "EV_ATOMIC_T=_Atomic sig_atomic_t")
@@ -973,6 +1481,20 @@ if(BUILD_TESTING)
     add_test(NAME libev-signal-exit COMMAND ftun-libev-runtime-test)
   endif()
   add_executable(ftun-config-parser-test tests/config_parser.c)
+  add_executable(ftun-config-memory-test tests/config_memory.c)
+  target_include_directories(ftun-config-memory-test PRIVATE src)
+  target_link_libraries(ftun-config-memory-test PRIVATE ftun_runtime ftun_options Threads::Threads)
+  target_link_options(ftun-config-memory-test PRIVATE
+    -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=realloc -Wl,--wrap=free
+    -Wl,--wrap=fstat -Wl,--wrap=getpwuid_r)
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-config-memory-test PRIVATE FTUN_HAVE_MODULE_PROXY=1)
+  endif()
+  if(FTUN_STATIC)
+    target_link_options(ftun-config-memory-test PRIVATE -static)
+  endif()
+  add_test(NAME config-memory-contract COMMAND ftun-config-memory-test)
+  set_tests_properties(config-memory-contract PROPERTIES TIMEOUT 30)
   target_include_directories(ftun-config-parser-test PRIVATE src)
   target_link_libraries(ftun-config-parser-test PRIVATE ftun_runtime ftun_options)
   if(FTUN_STATIC)
@@ -1044,6 +1566,8 @@ if(BUILD_TESTING)
     target_include_directories(ftun-fakeip-store-test PRIVATE src)
     target_link_libraries(ftun-fakeip-store-test PRIVATE
       ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-fakeip-store-test PRIVATE
+      -Wl,--wrap=open -Wl,--wrap=close -Wl,--wrap=mkstemp)
     if(FTUN_STATIC)
       target_link_options(ftun-fakeip-store-test PRIVATE -static)
     endif()
@@ -1066,12 +1590,30 @@ if(BUILD_TESTING)
     add_test(NAME fakeip-contract COMMAND ftun-fakeip-test)
   endif()
   if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    add_executable(ftun-dns-dependencies-test tests/dns_dependencies.c)
+    target_include_directories(ftun-dns-dependencies-test PRIVATE src)
+    target_compile_definitions(ftun-dns-dependencies-test PRIVATE
+      FTUN_HAVE_MODULE_DNS=1)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      target_compile_definitions(ftun-dns-dependencies-test PRIVATE FTUN_TEST_PROXY=1)
+    endif()
+    target_link_libraries(ftun-dns-dependencies-test PRIVATE
+      ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-dns-dependencies-test PRIVATE
+      -Wl,--wrap=calloc -Wl,--wrap=ftun_config_destroy)
+    if(FTUN_STATIC)
+      target_link_options(ftun-dns-dependencies-test PRIVATE -static)
+    endif()
+    add_test(NAME dns-dependencies-contract COMMAND ftun-dns-dependencies-test)
+    set_tests_properties(dns-dependencies-contract PROPERTIES TIMEOUT 30)
     add_executable(ftun-dns-service-test
       tests/dns_service.c
       $<TARGET_OBJECTS:ftun_core>
       $<TARGET_OBJECTS:ftun_shared_services>
       $<TARGET_OBJECTS:ftun_module_dns>)
     target_include_directories(ftun-dns-service-test PRIVATE include src)
+    target_link_options(ftun-dns-service-test PRIVATE
+      -Wl,--wrap=ftun_monotonic_now -Wl,--wrap=ftun_event_loop_run_once)
     target_compile_definitions(ftun-dns-service-test PRIVATE
       FTUN_HAVE_MODULE_DNS=1)
     target_link_libraries(ftun-dns-service-test PRIVATE
@@ -1084,6 +1626,51 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME dns-service-independent-contract
       COMMAND ftun-dns-service-test)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+      add_executable(ftun-dns-memory-path-test src/app/main.c tests/memory_path_factory.c)
+      target_include_directories(ftun-dns-memory-path-test PRIVATE src)
+      target_link_libraries(ftun-dns-memory-path-test PRIVATE ftun_runtime ftun_options)
+      target_link_options(ftun-dns-memory-path-test PRIVATE -Wl,--wrap=ftun_socket_path_open)
+    endif()
+    add_executable(ftun-dns-service-failures-test tests/dns_service_failures.c)
+    target_include_directories(ftun-dns-service-failures-test PRIVATE src)
+    target_compile_definitions(ftun-dns-service-failures-test PRIVATE
+      FTUN_HAVE_MODULE_DNS=1)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      target_compile_definitions(ftun-dns-service-failures-test PRIVATE
+        FTUN_TEST_PROXY=1)
+    endif()
+    target_link_libraries(ftun-dns-service-failures-test PRIVATE
+      ftun_runtime ftun_options Threads::Threads)
+    target_link_options(ftun-dns-service-failures-test PRIVATE
+      -Wl,--wrap=send -Wl,--wrap=recv -Wl,--wrap=close -Wl,--wrap=socket
+      -Wl,--wrap=calloc -Wl,--wrap=ftun_event_source_cancel
+      -Wl,--wrap=ftun_event_io_start -Wl,--wrap=ftun_dns_cache_create)
+    if(FTUN_STATIC)
+      target_link_options(ftun-dns-service-failures-test PRIVATE -static)
+    endif()
+    add_test(NAME dns-service-failures-contract
+      COMMAND ftun-dns-service-failures-test)
+    add_executable(ftun-dns-path-lifecycle-test tests/dns_path_lifecycle.c)
+    target_include_directories(ftun-dns-path-lifecycle-test PRIVATE src)
+    target_compile_definitions(ftun-dns-path-lifecycle-test PRIVATE FTUN_HAVE_MODULE_DNS=1)
+    target_link_libraries(ftun-dns-path-lifecycle-test PRIVATE ftun_runtime ftun_options)
+    add_test(NAME dns-path-lifecycle-contract COMMAND ftun-dns-path-lifecycle-test)
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+      add_executable(ftun-service-leaf-cleanup-test tests/service_leaf_cleanup.c)
+      target_include_directories(ftun-service-leaf-cleanup-test PRIVATE src)
+      target_link_libraries(ftun-service-leaf-cleanup-test PRIVATE
+        ftun_runtime ftun_options Threads::Threads)
+      target_link_options(ftun-service-leaf-cleanup-test PRIVATE
+        -Wl,--wrap=ftun_proxy_slot_pool_create
+        -Wl,--wrap=ftun_worker_set_wakeup
+        -Wl,--wrap=ftun_dns_dispatcher_destroy -Wl,--wrap=socket -Wl,--wrap=close)
+      if(FTUN_STATIC)
+        target_link_options(ftun-service-leaf-cleanup-test PRIVATE -static)
+      endif()
+      add_test(NAME service-leaf-cleanup-contract
+        COMMAND ftun-service-leaf-cleanup-test)
+    endif()
     add_executable(ftun-dns-cache-test tests/dns_cache.c)
     target_include_directories(ftun-dns-cache-test PRIVATE src)
     target_link_libraries(ftun-dns-cache-test PRIVATE ftun_runtime ftun_options)
@@ -1099,6 +1686,16 @@ if(BUILD_TESTING)
         target_link_options(ftun-dns-server-test PRIVATE -static)
       endif()
       add_test(NAME dns-server-contract COMMAND ftun-dns-server-test)
+      add_executable(ftun-dns-query-binding-test tests/dns_query_binding.c)
+      target_include_directories(ftun-dns-query-binding-test PRIVATE src)
+      target_compile_definitions(ftun-dns-query-binding-test PRIVATE
+        FTUN_HAVE_MODULE_DNS=1)
+      target_link_libraries(ftun-dns-query-binding-test PRIVATE
+        ftun_runtime ftun_options Threads::Threads)
+      if(FTUN_STATIC)
+        target_link_options(ftun-dns-query-binding-test PRIVATE -static)
+      endif()
+      add_test(NAME dns-query-binding-contract COMMAND ftun-dns-query-binding-test)
       add_executable(ftun-dns-dispatch-test tests/dns_dispatch.c)
       target_include_directories(ftun-dns-dispatch-test PRIVATE src)
       target_link_libraries(ftun-dns-dispatch-test PRIVATE ftun_runtime ftun_options)
@@ -1197,7 +1794,8 @@ if(BUILD_TESTING)
     add_test(NAME tun-service-contract COMMAND ftun-tun-service-test)
     add_executable(ftun-tun-owner-test tests/tun_owner.c)
     target_include_directories(ftun-tun-owner-test PRIVATE src)
-    target_link_libraries(ftun-tun-owner-test PRIVATE ftun_runtime ftun_options)
+  target_link_libraries(ftun-tun-owner-test PRIVATE ftun_runtime ftun_options)
+  target_link_options(ftun-tun-owner-test PRIVATE -Wl,--wrap=calloc)
     if(FTUN_STATIC)
       target_link_options(ftun-tun-owner-test PRIVATE -static)
     endif()
@@ -1391,6 +1989,94 @@ if(BUILD_TESTING)
   endif()
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    if(TARGET ftun-control-dns-test)
+      add_test(NAME control-dns-production COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/control_dns_production.py $<TARGET_FILE:ftun-control-dns-test>)
+      set_tests_properties(control-dns-production PROPERTIES TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(TARGET ftun-control-datagram-test)
+      add_test(NAME control-datagram-socket COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/control_datagram_socket.py $<TARGET_FILE:ftun-control-datagram-test>)
+      set_tests_properties(control-datagram-socket PROPERTIES TIMEOUT 15 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(TARGET ftun-control-memory-test)
+      add_test(NAME control-memory-production COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/control_memory_production.py $<TARGET_FILE:ftun-control-memory-test>)
+      set_tests_properties(control-memory-production PROPERTIES TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(TARGET ftun-http-fetch-test)
+      add_test(NAME http-fetch-production COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/tests/http_fetch_production.py $<TARGET_FILE:ftun-http-fetch-test>)
+      set_tests_properties(http-fetch-production PROPERTIES TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(TARGET ftun-resolver-production-test)
+      add_test(NAME resolver-production
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/resolver_production.py
+          $<TARGET_FILE:ftun-resolver-production-test>)
+      set_tests_properties(resolver-production PROPERTIES TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(TARGET ftun-dns-memory-path-test)
+      add_test(NAME dns-memory-path-production
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/dns_memory_path.py
+          $<TARGET_FILE:ftun-dns-memory-path-test>)
+      set_tests_properties(dns-memory-path-production PROPERTIES TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+      if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+        add_test(NAME dns-memory-socks-path-production
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/dns_memory_path.py
+            $<TARGET_FILE:ftun-dns-memory-path-test> --proxy)
+        set_tests_properties(dns-memory-socks-path-production PROPERTIES TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+      endif()
+    endif()
+    if(FTUN_MODULE_PROXY STREQUAL "BUILTIN" AND UNIX)
+      if(TARGET ftun-memory-path-test)
+        add_test(NAME runtime-memory-path-production
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_memory_path.py
+            $<TARGET_FILE:ftun-memory-path-test>)
+        set_tests_properties(runtime-memory-path-production PROPERTIES
+          TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+        foreach(ftun_socks_mode noauth auth)
+          add_test(NAME runtime-memory-socks-${ftun_socks_mode}-production
+            COMMAND ${Python3_EXECUTABLE}
+              ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_memory_path.py
+              $<TARGET_FILE:ftun-memory-path-test> --socks5 ${ftun_socks_mode})
+          set_tests_properties(runtime-memory-socks-${ftun_socks_mode}-production PROPERTIES
+            TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+        endforeach()
+        add_test(NAME runtime-memory-datagram-production
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_memory_datagram.py
+            $<TARGET_FILE:ftun-memory-path-test>)
+        add_test(NAME runtime-memory-socks-datagram-production
+          COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/runtime_memory_datagram.py
+            $<TARGET_FILE:ftun-memory-path-test> --socks5)
+        set_tests_properties(runtime-memory-datagram-production runtime-memory-socks-datagram-production PROPERTIES
+          TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+      endif()
+      add_test(NAME inbound-adapter-production
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/inbound_adapter_product.py
+          $<TARGET_FILE:ftun>)
+      set_tests_properties(inbound-adapter-production PROPERTIES
+        TIMEOUT 30 RESOURCE_LOCK ftun_host_socket)
+    endif()
+    if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
+      set(ftun_cli_result_proxy_argument)
+      if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+        set(ftun_cli_result_proxy_argument --proxy)
+      endif()
+      add_test(NAME cli-results-product
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/cli_results_product.py
+          $<TARGET_FILE:ftun> ${ftun_cli_result_proxy_argument})
+      set_tests_properties(cli-results-product PROPERTIES
+        TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
+      add_test(NAME lifecycle-events-product
+        COMMAND ${Python3_EXECUTABLE}
+          ${CMAKE_CURRENT_SOURCE_DIR}/tests/lifecycle_events.py
+          --ftun $<TARGET_FILE:ftun> ${ftun_cli_result_proxy_argument})
+      set_tests_properties(lifecycle-events-product PROPERTIES
+        TIMEOUT 60 RESOURCE_LOCK ftun_host_socket)
+    endif()
     add_test(NAME core-proxy-boundary
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_proxy_boundary.py
@@ -1464,6 +2150,13 @@ if(BUILD_TESTING)
           COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_qualification.py reload
             $<TARGET_FILE:ftun>)
+        add_test(NAME proxy-reload-minimum-flows
+          COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tests/core_qualification.py reload-minimum
+            $<TARGET_FILE:ftun>)
+        set_tests_properties(proxy-reload-minimum-flows PROPERTIES
+          RESOURCE_LOCK "ftun_capacity;ftun_host_socket"
+          SKIP_RETURN_CODE 77 TIMEOUT 60)
         set_tests_properties(proxy-reload-established-flows PROPERTIES
           RESOURCE_LOCK "ftun_host_socket;ftun_capacity"
           SKIP_RETURN_CODE 77 TIMEOUT 60)

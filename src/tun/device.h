@@ -30,4 +30,6 @@ ftun_status_t ftun_packet_port_read(ftun_packet_port_t *port, void *buffer,
 ftun_status_t ftun_packet_port_write(ftun_packet_port_t *port,
                                      const void *packet, size_t length);
 ftun_status_t ftun_packet_port_close(ftun_packet_port_t **port);
+ftun_status_t ftun_packet_port_open_with_budget(ftun_core_t *core,
+  ftun_budget_t *budget, const ftun_tun_spec_t *spec, ftun_packet_port_t **out);
 #endif

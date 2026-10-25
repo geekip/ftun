@@ -1,15 +1,16 @@
 #include "event.h"
+#include "core/context.h"
 #include "util/time.h"
 #include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define FTUN_EVENT_DEFERRED_CAPACITY 256u
 #define FTUN_EVENT_SOURCE_CAPACITY 1024u
 
 typedef enum {
   FTUN_EVENT_SOURCE_IO = 1,
-  FTUN_EVENT_SOURCE_TIMER
+  FTUN_EVENT_SOURCE_TIMER,
+  FTUN_EVENT_SOURCE_TASK
 } ftun_event_source_kind_t;
 
 typedef struct {
@@ -19,6 +20,7 @@ typedef struct {
 
 struct ftun_event_source {
   ftun_event_loop_t *loop;
+  ftun_reservation_t *reservation;
   ftun_event_source_t *previous;
   ftun_event_source_t *next;
   ftun_event_source_t *ready_previous;
@@ -29,6 +31,7 @@ struct ftun_event_source {
   ftun_event_source_kind_t kind;
   ftun_native_socket_t socket;
   uint64_t deadline_ms;
+  size_t timer_index;
   uint32_t interests;
   uint32_t pending;
   int active;
@@ -37,6 +40,8 @@ struct ftun_event_source {
 
 struct ftun_event_loop {
   ftun_core_t *core;
+  ftun_budget_t *budget;
+  ftun_reservation_t *reservation;
   ftun_event_source_t *sources;
   ftun_event_source_t *ready_head;
   ftun_event_source_t *ready_tail;
@@ -64,6 +69,13 @@ struct ftun_event_loop {
   int accepting;
   int dispatching;
   int stopped;
+  size_t timer_count;
+  size_t last_work;
+  size_t last_backend_work;
+  size_t last_timer_work;
+  uint64_t last_wait_ms;
+  bool backend_quota_exhausted;
+  ftun_event_source_t *timer_heap[];
 };
 
 /* TASK-EVENT-001 / TEST-EVENT-001，目标 0.2.0：后端无关的有界事件前端。 */
@@ -76,20 +88,64 @@ ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out)
 ftun_status_t ftun_event_loop_create_with_capacity(
   ftun_core_t *core, size_t source_capacity, ftun_event_loop_t **out)
 {
+  ftun_budget_t *budget = NULL;
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (core != NULL) {
+    status = ftun_core_context_budget(core, &budget);
+    if (status != FTUN_OK) return status;
+  }
+  return ftun_event_loop_create_with_budget(core, budget, source_capacity, out);
+}
+
+ftun_status_t ftun_event_loop_create_with_budget(
+  ftun_core_t *core, ftun_budget_t *budget, size_t source_capacity, ftun_event_loop_t **out)
+{
   ftun_event_loop_t *loop;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
+  size_t allocation_size;
   if (out != NULL) *out = NULL;
   if (out == NULL || source_capacity == 0u) return FTUN_E_INVALID;
-  loop = (ftun_event_loop_t *)calloc(1u, sizeof(*loop));
-  if (loop == NULL) return FTUN_E_LIMIT;
+  if (source_capacity > (SIZE_MAX - sizeof(*loop)) / sizeof(*loop->timer_heap)) return FTUN_E_LIMIT;
+  allocation_size = sizeof(*loop) + source_capacity * sizeof(*loop->timer_heap);
+  if (core != NULL) {
+    ftun_budget_t *context_budget = NULL;
+    bool same = false;
+    status = ftun_core_context_budget(core, &context_budget);
+    if (status == FTUN_OK) status = ftun_budget_same_root(context_budget, budget, &same);
+    if (status != FTUN_OK || !same) return FTUN_E_INVALID;
+  }
+  if (budget != NULL) {
+    const ftun_budget_resources_t charge = {allocation_size, 0u, FTUN_EVENT_DEFERRED_CAPACITY};
+    status = ftun_budget_reserve_resources(budget, charge, &reservation);
+    if (status != FTUN_OK) return status;
+  }
+  loop = (ftun_event_loop_t *)calloc(1u, allocation_size);
+  if (loop == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
   if (pthread_mutex_init(&loop->mutex, NULL) != 0) {
     free(loop);
+    (void)ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   loop->core = core;
+  loop->budget = budget;
+  loop->reservation = reservation;
   loop->source_capacity = source_capacity;
   loop->accepting = 1;
   loop->prefer_deferred = 1;
   *out = loop;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_event_loop_budget(ftun_event_loop_t *loop, ftun_budget_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (loop == NULL || out == NULL) return FTUN_E_INVALID;
+  *out = loop->budget;
   return FTUN_OK;
 }
 
@@ -193,23 +249,42 @@ static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
                                            ftun_event_source_t **out)
 {
   ftun_event_source_t *source;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (loop == NULL || callback == NULL || out == NULL) return FTUN_E_INVALID;
   if (!loop->accepting) return FTUN_E_CANCELLED;
   if (loop->source_count >= loop->source_capacity) return FTUN_E_LIMIT;
+  if (loop->budget != NULL) {
+    const ftun_budget_resources_t charge = {sizeof(*source), 0u, 1u};
+    status = ftun_budget_reserve_resources(loop->budget, charge, &reservation);
+    if (status != FTUN_OK) return status;
+  }
   source = (ftun_event_source_t *)calloc(1u, sizeof(*source));
-  if (source == NULL) return FTUN_E_LIMIT;
+  if (source == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  source->reservation = reservation;
   source->loop = loop;
   source->kind = kind;
   source->callback = callback;
   source->user = user;
   source->active = 1;
+  source->timer_index = SIZE_MAX;
   source->next = loop->sources;
   if (loop->sources != NULL) loop->sources->previous = source;
   loop->sources = source;
   loop->source_count++;
   *out = source;
   return FTUN_OK;
+}
+
+static void ftun_event_source_free(ftun_event_source_t *source)
+{
+  ftun_reservation_t *reservation = source->reservation;
+  free(source);
+  (void)ftun_reservation_release(&reservation);
 }
 
 static void ftun_event_source_unlink(ftun_event_source_t *source)
@@ -278,13 +353,31 @@ ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t 
     status = loop->backend->io_start(loop->backend_context, source, socket, interests);
     if (status != FTUN_OK) {
       ftun_event_source_unlink(source);
-      free(source);
+      ftun_event_source_free(source);
       return status;
     }
   }
   *out = source;
   return FTUN_OK;
 }
+
+ftun_status_t ftun_event_task_start(ftun_event_loop_t *loop,
+  ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
+{
+  return ftun_event_source_add(loop, FTUN_EVENT_SOURCE_TASK, callback, user, out);
+}
+
+ftun_status_t ftun_event_task_ready(ftun_event_source_t *source)
+{
+  if (source == NULL || source->loop == NULL || source->kind != FTUN_EVENT_SOURCE_TASK) return FTUN_E_INVALID;
+  if (!source->active) return FTUN_E_STALE;
+  source->pending = FTUN_EVENT_TASK;
+  ftun_event_ready_enqueue(source);
+  return FTUN_OK;
+}
+
+static void ftun_event_timer_insert(ftun_event_source_t *source);
+static void ftun_event_timer_remove(ftun_event_source_t *source);
 
 ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
                                      ftun_event_callback_fn callback, void *user,
@@ -302,10 +395,11 @@ ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_
     status = loop->backend->timer_start(loop->backend_context, source, deadline_ms);
     if (status != FTUN_OK) {
       ftun_event_source_unlink(source);
-      free(source);
+      ftun_event_source_free(source);
       return status;
     }
   }
+  if (source->pending == 0u) ftun_event_timer_insert(source);
   *out = source;
   return FTUN_OK;
 }
@@ -370,6 +464,7 @@ ftun_status_t ftun_event_timer_ready(ftun_event_source_t *source)
   if (source == NULL || source->loop == NULL ||
       source->kind != FTUN_EVENT_SOURCE_TIMER) return FTUN_E_INVALID;
   if (!source->active) return FTUN_E_STALE;
+  ftun_event_timer_remove(source);
   source->pending = FTUN_EVENT_TIMER;
   ftun_event_ready_enqueue(source);
   return FTUN_OK;
@@ -441,16 +536,90 @@ static int ftun_event_pop_deferred(ftun_event_loop_t *loop,
   return found;
 }
 
-static void ftun_event_queue_expired_timers(ftun_event_loop_t *loop,
-                                             uint64_t now_ms)
+/* 固定容量二叉堆；插入/取消 O(log capacity)，取最早期限 O(1)。
+ * heap 槽与 loop 一次准入，逐 source 的 index 包含在 source 实际额度内。 */
+static void ftun_event_timer_set(ftun_event_loop_t *loop, size_t index,
+  ftun_event_source_t *source)
 {
-  ftun_event_source_t *source;
-  for (source = loop->sources; source != NULL; source = source->next) {
-    if (source->active && source->kind == FTUN_EVENT_SOURCE_TIMER &&
-        now_ms >= source->deadline_ms) {
-      source->pending = FTUN_EVENT_TIMER;
-      ftun_event_ready_enqueue(source);
+  loop->timer_heap[index] = source;
+  source->timer_index = index;
+}
+
+static void ftun_event_timer_insert(ftun_event_source_t *source)
+{
+  ftun_event_loop_t *loop = source->loop;
+  size_t index = loop->timer_count++;
+  while (index != 0u) {
+    size_t parent = (index - 1u) / 2u;
+    if (loop->timer_heap[parent]->deadline_ms <= source->deadline_ms) break;
+    ftun_event_timer_set(loop, index, loop->timer_heap[parent]);
+    index = parent;
+  }
+  ftun_event_timer_set(loop, index, source);
+}
+
+static void ftun_event_timer_remove(ftun_event_source_t *source)
+{
+  ftun_event_loop_t *loop = source->loop;
+  ftun_event_source_t *last;
+  size_t index = source->timer_index;
+  if (index == SIZE_MAX) return;
+  last = loop->timer_heap[--loop->timer_count];
+  loop->timer_heap[loop->timer_count] = NULL;
+  source->timer_index = SIZE_MAX;
+  if (index == loop->timer_count) return;
+  if (index != 0u && last->deadline_ms < loop->timer_heap[(index - 1u) / 2u]->deadline_ms) {
+    do {
+      size_t parent = (index - 1u) / 2u;
+      if (loop->timer_heap[parent]->deadline_ms <= last->deadline_ms) break;
+      ftun_event_timer_set(loop, index, loop->timer_heap[parent]);
+      index = parent;
+    } while (index != 0u);
+  } else {
+    while (index < loop->timer_count / 2u) {
+      size_t child = index * 2u + 1u;
+      if (child + 1u < loop->timer_count &&
+          loop->timer_heap[child + 1u]->deadline_ms < loop->timer_heap[child]->deadline_ms) child++;
+      if (last->deadline_ms <= loop->timer_heap[child]->deadline_ms) break;
+      ftun_event_timer_set(loop, index, loop->timer_heap[child]);
+      index = child;
     }
+  }
+  ftun_event_timer_set(loop, index, last);
+}
+
+ftun_status_t ftun_event_loop_next_deadline(ftun_event_loop_t *loop,
+  uint64_t *out_deadline, bool *out_present)
+{
+  if (out_deadline != NULL) *out_deadline = 0u;
+  if (out_present != NULL) *out_present = false;
+  if (loop == NULL || out_deadline == NULL || out_present == NULL) return FTUN_E_INVALID;
+  if (loop->timer_count != 0u) {
+    *out_deadline = loop->timer_heap[0]->deadline_ms;
+    *out_present = true;
+  }
+  return FTUN_OK;
+}
+
+void ftun_event_loop_backend_report(ftun_event_loop_t *loop,
+  uint64_t wait_ms, size_t work, bool quota_exhausted)
+{
+  if (loop == NULL) return;
+  loop->last_wait_ms = wait_ms;
+  loop->last_backend_work = work;
+  loop->backend_quota_exhausted = quota_exhausted;
+}
+
+static void ftun_event_queue_expired_timers(ftun_event_loop_t *loop,
+  uint64_t now_ms, size_t quota)
+{
+  while (loop->last_timer_work < quota && loop->timer_count != 0u &&
+      now_ms >= loop->timer_heap[0]->deadline_ms) {
+    ftun_event_source_t *source = loop->timer_heap[0];
+    ftun_event_timer_remove(source);
+    source->pending = FTUN_EVENT_TIMER;
+    ftun_event_ready_enqueue(source);
+    loop->last_timer_work++;
   }
 }
 
@@ -479,11 +648,12 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
   if (loop->dispatching) return FTUN_E_AGAIN;
   loop->dispatching = 1;
   (void)ftun_monotonic_now(&started_ms);
-  /* A direct poll without a backend still owns timer expiry and therefore
-   * performs one bounded scan.  Production backends enqueue timer readiness
-   * themselves, so the hot dispatch path only performs O(1) ready pops. */
+  loop->last_work = loop->last_backend_work = loop->last_timer_work = 0u;
+  loop->last_wait_ms = 0u;
+  loop->backend_quota_exhausted = false;
+  /* 到期入队与业务派发分别限额，源总数不增加空闲轮次成本。 */
   if (loop->backend == NULL || !loop->backend->native_timers) {
-    ftun_event_queue_expired_timers(loop, now_ms);
+    ftun_event_queue_expired_timers(loop, now_ms, max_callbacks);
   }
   while (callbacks < max_callbacks) {
     ftun_event_deferred_t deferred;
@@ -514,15 +684,13 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
     callbacks++;
   }
   loop->dispatching = 0;
+  loop->last_work = callbacks > SIZE_MAX - loop->last_timer_work
+    ? SIZE_MAX : callbacks + loop->last_timer_work;
   loop->polls++;
   if (UINT64_MAX - loop->callbacks < callbacks) loop->callbacks = UINT64_MAX;
   else loop->callbacks += callbacks;
   if (callbacks > loop->max_callbacks_per_poll) {
     loop->max_callbacks_per_poll = callbacks;
-  }
-  if (callbacks == max_callbacks &&
-      (loop->ready_count != 0u || loop->deferred_count != 0u)) {
-    if (loop->quota_exhaustions != UINT64_MAX) loop->quota_exhaustions++;
   }
   if (ftun_monotonic_now(&finished_ms) == FTUN_OK &&
       finished_ms >= started_ms) {
@@ -532,6 +700,11 @@ ftun_status_t ftun_event_loop_poll(ftun_event_loop_t *loop, uint64_t now_ms,
     }
   }
   (void)pthread_mutex_lock(&loop->mutex);
+  if (callbacks == max_callbacks &&
+      (loop->ready_count != 0u || loop->deferred_count != 0u ||
+       (loop->timer_count != 0u && loop->timer_heap[0]->deadline_ms <= now_ms))) {
+    if (loop->quota_exhaustions != UINT64_MAX) loop->quota_exhaustions++;
+  }
   if (loop->deferred_count != 0u && loop->backend != NULL) {
     loop->wakeups++;
     loop->backend->wakeup(loop->backend_context);
@@ -549,10 +722,15 @@ ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
 {
   ftun_status_t status;
   uint64_t now_ms = 0u;
+  uint64_t backend_started_ms = 0u, backend_finished_ms = 0u, wait_ms;
+  size_t backend_work;
+  uint64_t quota_before;
+  bool backend_limited;
   if (out_callbacks != NULL) *out_callbacks = 0u;
   if (loop == NULL || max_callbacks == 0u || out_callbacks == NULL) {
     return FTUN_E_INVALID;
   }
+  if (loop->dispatching) return FTUN_E_AGAIN;
   if (loop->backend == NULL) return FTUN_E_UNSUPPORTED;
   if (loop->stopped) return FTUN_E_CANCELLED;
   /* A retained ready/deferred item already is a wakeup source.  Never enter
@@ -561,11 +739,34 @@ ftun_status_t ftun_event_loop_run_once(ftun_event_loop_t *loop, bool block,
   if (loop->deferred_count != 0u) block = false;
   (void)pthread_mutex_unlock(&loop->mutex);
   if (loop->ready_count != 0u) block = false;
+  loop->last_wait_ms = 0u;
+  loop->last_backend_work = 0u;
+  loop->backend_quota_exhausted = false;
+  status = ftun_monotonic_now(&backend_started_ms);
+  if (status != FTUN_OK) return status;
   status = loop->backend->run_once(loop->backend_context, block);
   if (status != FTUN_OK) return status;
   status = ftun_monotonic_now(&now_ms);
   if (status != FTUN_OK) return status;
-  return ftun_event_loop_poll(loop, now_ms, max_callbacks, out_callbacks);
+  backend_finished_ms = now_ms;
+  wait_ms = loop->last_wait_ms;
+  backend_work = loop->last_backend_work;
+  backend_limited = loop->backend_quota_exhausted;
+  quota_before = loop->quota_exhaustions;
+  status = ftun_event_loop_poll(loop, now_ms, max_callbacks, out_callbacks);
+  if (status != FTUN_OK) return status;
+  loop->last_backend_work = backend_work;
+  loop->backend_quota_exhausted = backend_limited;
+  if (backend_limited && loop->quota_exhaustions == quota_before &&
+      loop->quota_exhaustions != UINT64_MAX) loop->quota_exhaustions++;
+  loop->last_work = backend_work > SIZE_MAX - loop->last_work
+    ? SIZE_MAX : loop->last_work + backend_work;
+  if (backend_finished_ms >= backend_started_ms &&
+      backend_finished_ms - backend_started_ms >= wait_ms) {
+    loop->last_dispatch_ms += backend_finished_ms - backend_started_ms - wait_ms;
+    if (loop->last_dispatch_ms > loop->max_dispatch_ms) loop->max_dispatch_ms = loop->last_dispatch_ms;
+  }
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source)
@@ -578,16 +779,17 @@ ftun_status_t ftun_event_source_cancel(ftun_event_source_t **source)
   if (owned == NULL) return FTUN_OK;
   loop = owned->loop;
   if (loop == NULL || loop->source_count == 0u) return FTUN_E_STATE_CORRUPT;
-  if (loop->backend != NULL) {
+  if (loop->backend != NULL && owned->kind != FTUN_EVENT_SOURCE_TASK) {
     status = loop->backend->source_cancel(loop->backend_context, owned);
     if (status != FTUN_OK) return status;
   }
+  ftun_event_timer_remove(owned);
   ftun_event_ready_unlink(owned);
   ftun_event_source_unlink(owned);
   owned->backend_data = NULL;
   owned->callback = NULL;
   owned->user = NULL;
-  free(owned);
+  ftun_event_source_free(owned);
   *source = NULL;
   return FTUN_OK;
 }
@@ -609,6 +811,7 @@ ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop)
   (void)pthread_mutex_unlock(&loop->mutex);
   for (source = loop->sources; source != NULL; source = source->next) {
     source->active = 0;
+    source->timer_index = SIZE_MAX;
     source->pending = 0u;
     source->ready_previous = NULL;
     source->ready_next = NULL;
@@ -617,6 +820,8 @@ ftun_status_t ftun_event_loop_stop(ftun_event_loop_t *loop)
   loop->ready_head = NULL;
   loop->ready_tail = NULL;
   loop->ready_count = 0u;
+  memset(loop->timer_heap, 0, loop->timer_count * sizeof(*loop->timer_heap));
+  loop->timer_count = 0u;
   return FTUN_OK;
 }
 
@@ -639,6 +844,10 @@ ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
   out->max_dispatch_ms = loop->max_dispatch_ms;
   out->max_timer_lateness_ms = loop->max_timer_lateness_ms;
   out->max_callbacks_per_poll = loop->max_callbacks_per_poll;
+  out->last_work = loop->last_work;
+  out->last_backend_work = loop->last_backend_work;
+  out->last_timer_work = loop->last_timer_work;
+  out->backend_quota_exhausted = loop->backend_quota_exhausted;
   out->accepting = loop->accepting != 0;
   out->dispatching = loop->dispatching != 0;
   out->stopped = loop->stopped != 0;
@@ -650,6 +859,7 @@ ftun_status_t ftun_event_loop_get_usage(ftun_event_loop_t *loop,
 ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop)
 {
   ftun_event_loop_t *owned;
+  ftun_reservation_t *reservation;
   if (loop == NULL) return FTUN_E_INVALID;
   owned = *loop;
   if (owned == NULL) return FTUN_OK;
@@ -665,7 +875,9 @@ ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop)
       owned->ready_count != 0u) return FTUN_E_STATE_CORRUPT;
   if (pthread_mutex_destroy(&owned->mutex) != 0) return FTUN_E_STATE_CORRUPT;
   owned->core = NULL;
+  reservation = owned->reservation;
   free(owned);
+  (void)ftun_reservation_release(&reservation);
   *loop = NULL;
   return FTUN_OK;
 }

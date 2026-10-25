@@ -327,6 +327,55 @@ static ftun_status_t ftun_rule_resolve_outbound(
   return resolver(name, out, resolver_user);
 }
 
+static ftun_rule_kind_t ftun_rule_kind(ftun_string_t type)
+{
+  static const struct { const char *name; ftun_rule_kind_t kind; } types[] = {
+    {"SRC-IP-CIDR", FTUN_RULE_SRC_IP_CIDR}, {"IP-CIDR", FTUN_RULE_IP_CIDR},
+    {"DOMAIN", FTUN_RULE_DOMAIN}, {"DOMAIN-SUFFIX", FTUN_RULE_DOMAIN_SUFFIX},
+    {"DOMAIN-KEYWORD", FTUN_RULE_DOMAIN_KEYWORD}, {"FRS-IP", FTUN_RULE_FRS_IP},
+    {"FRS-DOMAIN", FTUN_RULE_FRS_DOMAIN}, {"DST-PORT", FTUN_RULE_DST_PORT},
+    {"NETWORK", FTUN_RULE_NETWORK}, {"MATCH", FTUN_RULE_MATCH}
+  };
+  size_t i;
+  for (i = 0u; i < sizeof(types) / sizeof(types[0]); i++) {
+    if (ftun_rule_type_equal(type, types[i].name)) return types[i].kind;
+  }
+  return 0;
+}
+
+ftun_status_t ftun_rule_accounted_bytes(const char *text, size_t *out)
+{
+  const char *first, *second;
+  ftun_rule_kind_t kind;
+  size_t extra = 0u;
+  if (out != NULL) *out = 0u;
+  if (text == NULL || out == NULL || (first = strchr(text, ',')) == NULL) {
+    return FTUN_E_INVALID;
+  }
+  kind = ftun_rule_kind((ftun_string_t){text, (size_t)(first - text)});
+  if (kind == 0) return FTUN_E_UNSUPPORTED;
+  second = strchr(first + 1u, ',');
+  if (kind == FTUN_RULE_MATCH) {
+    if (second != NULL || first[1] == '\0') return FTUN_E_INVALID;
+  } else {
+    if (second == NULL || second == first + 1u || second[1] == '\0' ||
+        strchr(second + 1u, ',') != NULL) return FTUN_E_INVALID;
+    if (kind == FTUN_RULE_DOMAIN || kind == FTUN_RULE_DOMAIN_SUFFIX ||
+        kind == FTUN_RULE_DOMAIN_KEYWORD) {
+      extra = (size_t)(second - first);
+    } else if (kind == FTUN_RULE_FRS_IP || kind == FTUN_RULE_FRS_DOMAIN) {
+#if defined(FTUN_HAVE_MODULE_FRS)
+      extra = ftun_frs_set_owned_bytes();
+#else
+      return FTUN_E_UNSUPPORTED;
+#endif
+    }
+  }
+  if (extra > SIZE_MAX - sizeof(ftun_rule_t)) return FTUN_E_LIMIT;
+  *out = sizeof(ftun_rule_t) + extra;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_rule_compile_with_frs(
   const char *text, ftun_rule_outbound_resolver_fn resolver,
   void *resolver_user, ftun_rule_frs_bind_fn frs_bind, void *frs_user,
@@ -359,27 +408,8 @@ ftun_status_t ftun_rule_compile_with_frs(
   if (outbound.length == 0u) return FTUN_E_INVALID;
   rule = (ftun_rule_t *)calloc(1u, sizeof(*rule));
   if (rule == NULL) return FTUN_E_LIMIT;
-  if (ftun_rule_type_equal(type, "SRC-IP-CIDR")) {
-    rule->kind = FTUN_RULE_SRC_IP_CIDR;
-  } else if (ftun_rule_type_equal(type, "IP-CIDR")) {
-    rule->kind = FTUN_RULE_IP_CIDR;
-  } else if (ftun_rule_type_equal(type, "DOMAIN")) {
-    rule->kind = FTUN_RULE_DOMAIN;
-  } else if (ftun_rule_type_equal(type, "DOMAIN-SUFFIX")) {
-    rule->kind = FTUN_RULE_DOMAIN_SUFFIX;
-  } else if (ftun_rule_type_equal(type, "DOMAIN-KEYWORD")) {
-    rule->kind = FTUN_RULE_DOMAIN_KEYWORD;
-  } else if (ftun_rule_type_equal(type, "FRS-IP")) {
-    rule->kind = FTUN_RULE_FRS_IP;
-  } else if (ftun_rule_type_equal(type, "FRS-DOMAIN")) {
-    rule->kind = FTUN_RULE_FRS_DOMAIN;
-  } else if (ftun_rule_type_equal(type, "DST-PORT")) {
-    rule->kind = FTUN_RULE_DST_PORT;
-  } else if (ftun_rule_type_equal(type, "NETWORK")) {
-    rule->kind = FTUN_RULE_NETWORK;
-  } else if (ftun_rule_type_equal(type, "MATCH")) {
-    rule->kind = FTUN_RULE_MATCH;
-  } else {
+  rule->kind = ftun_rule_kind(type);
+  if (rule->kind == 0) {
     status = FTUN_E_UNSUPPORTED;
     goto fail;
   }

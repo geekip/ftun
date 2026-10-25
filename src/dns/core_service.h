@@ -17,6 +17,8 @@ typedef struct {
   ftun_dns_service_slot_t *slot;
   ftun_dns_runtime_adapter_t adapter;
   uint32_t socket_mark;
+  ftun_path_provider_ops_t path;
+  void *path_context;
 } ftun_dns_service_binding_t;
 
 bool ftun_dns_service_binding_valid(const ftun_dns_service_binding_t *binding);

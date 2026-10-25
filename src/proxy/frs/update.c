@@ -193,7 +193,7 @@ ftun_status_t ftun_frs_update(ftun_core_t *core,
       }
     }
     if (status == FTUN_OK) {
-      status = ftun_file_write_atomic_with_hook(
+      status = ftun_file_write_atomic_budget(budget,
         request->destination,
         (ftun_bytes_t){download.data, download.length}, 0644u,
         ftun_frs_publish_hook, &publish);

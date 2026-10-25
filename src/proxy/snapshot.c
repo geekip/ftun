@@ -30,100 +30,36 @@ static int ftun_size_array(size_t *total, size_t count, size_t item_size)
   return ftun_size_add(total, count * item_size);
 }
 
-static int ftun_size_string(size_t *total, const char *value)
-{
-  return value == NULL || ftun_size_add(total, strlen(value) + 1u);
-}
-
-static int ftun_size_string_list(size_t *total,
-                                 const ftun_config_string_list_t *list)
-{
-  size_t index;
-  if (!ftun_size_array(total, list->count, sizeof(*list->items))) return 0;
-  for (index = 0u; index < list->count; index++) {
-    if (!ftun_size_string(total, list->items[index])) return 0;
-  }
-  return 1;
-}
-
+/* 保留限额包含配置和计划；实际预算预留另行扣除已有独立拥有额度。 */
 static int ftun_config_accounted_bytes(const ftun_config_t *config, size_t *out)
 {
-  size_t total = sizeof(*config);
-  size_t index;
-  if (config == NULL || out == NULL) return 0;
-  if (!ftun_size_string(&total, config->source_path) ||
-      !ftun_size_string(&total, config->base_directory) ||
-      !ftun_size_string(&total, config->base.cache_file) ||
-      !ftun_size_string(&total, config->log.level) ||
-      !ftun_size_string(&total, config->log.file) ||
-      !ftun_size_string_list(&total, &config->dns.bootstrap) ||
-      !ftun_size_string(&total, config->dns.default_server) ||
-      !ftun_size_string(&total, config->dns.fake_ip.range) ||
-      !ftun_size_array(&total, config->dns.listener_count,
-                       sizeof(*config->dns.listeners))) return 0;
-  for (index = 0u; index < config->dns.listener_count; index++) {
-    if (!ftun_size_string(&total, config->dns.listeners[index].listen) ||
-        !ftun_size_string(&total, config->dns.listeners[index].server)) return 0;
-  }
-  if (!ftun_size_array(&total, config->dns.server_count,
-                       sizeof(*config->dns.servers))) return 0;
-  for (index = 0u; index < config->dns.server_count; index++) {
-    const ftun_config_dns_server_t *server = &config->dns.servers[index];
-    if (!ftun_size_string(&total, server->name) ||
-        !ftun_size_string(&total, server->type) ||
-        !ftun_size_string_list(&total, &server->addresses) ||
-        !ftun_size_string(&total, server->outbound)) return 0;
-  }
-  if (!ftun_size_string(&total, config->frs.path) ||
-      !ftun_size_string(&total, config->frs.url) ||
-      !ftun_size_string(&total, config->frs.update_interval) ||
-      !ftun_size_string(&total, config->frs.update_outbound) ||
-      !ftun_size_string(&total, config->frs.dns_server) ||
-      !ftun_size_array(&total, config->inbound_count,
-                       sizeof(*config->inbounds))) return 0;
-  for (index = 0u; index < config->inbound_count; index++) {
-    const ftun_config_inbound_t *inbound = &config->inbounds[index];
-    size_t user_index;
-    if (!ftun_size_string(&total, inbound->name) ||
-        !ftun_size_string(&total, inbound->outbound) ||
-        !ftun_size_string(&total, inbound->listen) ||
-        !ftun_size_string(&total, inbound->interface_name) ||
-        !ftun_size_string(&total, inbound->stack) ||
-        !ftun_size_string(&total, inbound->ipv4_address) ||
-        !ftun_size_array(&total, inbound->user_count,
-                         sizeof(*inbound->users))) return 0;
-    for (user_index = 0u; user_index < inbound->user_count; user_index++) {
-      if (!ftun_size_string(&total, inbound->users[user_index].name) ||
-          !ftun_size_string(&total, inbound->users[user_index].password)) return 0;
-    }
-  }
-  if (!ftun_size_array(&total, config->outbound_count,
-                       sizeof(*config->outbounds))) return 0;
-  for (index = 0u; index < config->outbound_count; index++) {
-    const ftun_config_outbound_t *outbound = &config->outbounds[index];
-    if (!ftun_size_string(&total, outbound->name) ||
-        !ftun_size_string(&total, outbound->dns_server) ||
-        !ftun_size_string(&total, outbound->server) ||
-        !ftun_size_string(&total, outbound->username) ||
-        !ftun_size_string(&total, outbound->password) ||
-        !ftun_size_string_list(&total, &outbound->members) ||
-        !ftun_size_string(&total, outbound->default_member) ||
-        !ftun_size_string(&total, outbound->url) ||
-        !ftun_size_string(&total, outbound->interval) ||
-        !ftun_size_string(&total, outbound->timeout)) return 0;
-  }
-  if (!ftun_size_string_list(&total, &config->rules)) return 0;
-  if (config->plan != NULL) {
-    if (!ftun_size_add(&total, sizeof(*config->plan)) ||
-        !ftun_size_array(&total, config->plan->outbound_count,
-                         sizeof(*config->plan->outbound_states)) ||
-        !ftun_size_array(&total, config->plan->dns_server_count,
-                         sizeof(*config->plan->dns_server_states)) ||
-        !ftun_size_array(&total, config->plan->rule_count,
-                         sizeof(*config->plan->rule_order))) return 0;
-  }
-  *out = total;
+  size_t bytes;
+  if (config == NULL || out == NULL || config->owned_bytes < sizeof(*config)) return 0;
+  bytes = config->owned_bytes;
+  if (config->plan != NULL &&
+      !ftun_size_add(&bytes, config->plan->owned_bytes)) return 0;
+  *out = bytes;
   return 1;
+}
+
+static size_t ftun_runtime_reservation_bytes(const ftun_config_t *config,
+  size_t accounted_bytes)
+{
+  if (config->reservation != NULL) accounted_bytes -= config->owned_bytes;
+  if (config->plan != NULL && config->plan->reservation != NULL) {
+    accounted_bytes -= config->plan->owned_bytes;
+  }
+  return accounted_bytes;
+}
+
+static ftun_status_t ftun_runtime_config_budget(ftun_core_t *core,
+  const ftun_config_t *config)
+{
+  bool same = false;
+  ftun_status_t status;
+  if (config->budget == NULL) return FTUN_OK;
+  status = ftun_budget_same_root(core->budget, config->budget, &same);
+  return status != FTUN_OK ? status : same ? FTUN_OK : FTUN_E_INVALID;
 }
 
 static size_t ftun_feature_count(uint64_t features)
@@ -245,15 +181,17 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
   ftun_config_t *config;
   ftun_status_t status;
   if (runtime == NULL || runtime->reference_count != 1u) return FTUN_E_STATE_CORRUPT;
-  config = (ftun_config_t *)runtime->snapshot.config;
-  status = ftun_config_destroy(&config);
-  if (status != FTUN_OK) return status;
+  runtime->cleanup_pending = true;
   status = ftun_route_table_destroy(&runtime->snapshot.routes);
   if (status != FTUN_OK) return status;
 #if defined(FTUN_HAVE_MODULE_FRS)
   status = ftun_frs_view_release(&runtime->snapshot.frs_view);
   if (status != FTUN_OK) return status;
 #endif
+  config = (ftun_config_t *)runtime->snapshot.config;
+  status = ftun_config_destroy(&config);
+  runtime->snapshot.config = config;
+  if (status != FTUN_OK) return status;
   free(runtime->snapshot.prepared_items);
   runtime->snapshot.prepared_items = NULL;
   free(runtime->owner_state.group_choices);
@@ -265,6 +203,31 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
   runtime->reference_count = 0u;
   free(runtime);
   return FTUN_OK;
+}
+
+/* 对外句柄已消费，失败对象仍挂在 manager；不分配额外回收节点。 */
+static ftun_status_t ftun_runtime_retire(ftun_core_t *core,
+  ftun_runtime_t *runtime)
+{
+  ftun_status_t status = ftun_runtime_finalize(runtime);
+  if (status != FTUN_OK) {
+    runtime->next_retained = FTUN_MANAGER(core)->cleanup;
+    FTUN_MANAGER(core)->cleanup = runtime;
+  }
+  return status;
+}
+
+static ftun_status_t ftun_runtime_collect(ftun_core_t *core)
+{
+  ftun_runtime_t *runtime = FTUN_MANAGER(core)->cleanup;
+  ftun_runtime_t *next;
+  ftun_status_t status;
+  if (runtime == NULL) return FTUN_OK;
+  next = runtime->next_retained;
+  status = ftun_runtime_finalize(runtime);
+  if (status != FTUN_OK) return status;
+  FTUN_MANAGER(core)->cleanup = next;
+  return next == NULL ? FTUN_OK : FTUN_E_AGAIN;
 }
 
 ftun_status_t ftun_runtime_resolve_outbound(ftun_string_t name,
@@ -343,28 +306,47 @@ ftun_status_t ftun_runtime_manager_create_limits(
   ftun_budget_t *budget, size_t retained_limit, size_t retained_bytes_limit,
   ftun_core_t **out)
 {
-  ftun_core_t *core;
-  ftun_snapshot_manager_t *manager;
+  ftun_core_t *core = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (budget == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_core_context_create(budget, &core);
   if (status != FTUN_OK) return status;
+  status = ftun_runtime_manager_attach(core, retained_limit,
+                                       retained_bytes_limit);
+  if (status != FTUN_OK) {
+    (void)ftun_core_context_destroy(&core);
+    return status;
+  }
+  *out = core;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_manager_attach(ftun_core_t *core,
+  size_t retained_limit, size_t retained_bytes_limit)
+{
+  ftun_snapshot_manager_t *manager;
+  ftun_reservation_t *reservation = NULL;
+  ftun_status_t status;
+  if (!ftun_core_context_valid(core)) return FTUN_E_INVALID;
+  if (core->extension != NULL) return FTUN_E_STALE;
+  status = ftun_budget_reserve(core->budget, sizeof(*manager), &reservation);
+  if (status != FTUN_OK) return status;
   manager = (ftun_snapshot_manager_t *)calloc(1u, sizeof(*manager));
   if (manager == NULL) {
-    (void)ftun_core_context_destroy(&core);
+    (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
+  manager->reservation = reservation;
   manager->runtime_magic = FTUN_RUNTIME_MANAGER_MAGIC;
   manager->retained_limit = retained_limit;
   manager->retained_bytes_limit = retained_bytes_limit;
   status = ftun_core_context_bind(core, manager);
   if (status != FTUN_OK) {
     free(manager);
-    (void)ftun_core_context_destroy(&core);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
-  *out = core;
   return FTUN_OK;
 }
 
@@ -376,6 +358,7 @@ ftun_status_t ftun_runtime_manager_get_info(const ftun_core_t *core,
   out->generation = core->generation;
   out->has_active = FTUN_MANAGER(core)->active != NULL;
   out->has_candidate = FTUN_MANAGER(core)->candidate != NULL;
+  out->has_cleanup = FTUN_MANAGER(core)->cleanup != NULL;
   out->retained_count = FTUN_MANAGER(core)->retained_count;
   out->retained_limit = FTUN_MANAGER(core)->retained_limit;
   out->retained_bytes = FTUN_MANAGER(core)->retained_bytes;
@@ -383,30 +366,42 @@ ftun_status_t ftun_runtime_manager_get_info(const ftun_core_t *core,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
+ftun_status_t ftun_runtime_manager_clear(ftun_core_t *owned)
 {
-  ftun_core_t *owned;
   ftun_snapshot_manager_t *manager;
+  ftun_reservation_t *reservation;
   ftun_status_t status;
-  if (core == NULL) return FTUN_E_INVALID;
-  owned = *core;
-  if (owned == NULL) return FTUN_OK;
+  if (!ftun_core_context_valid(owned)) return FTUN_E_INVALID;
+  if (owned->extension == NULL) return FTUN_OK;
   if (!ftun_runtime_core_valid(owned)) return FTUN_E_INVALID;
   manager = FTUN_MANAGER(owned);
+  status = ftun_runtime_collect(owned);
+  if (status != FTUN_OK) return status;
   if (manager->candidate != NULL || manager->retained != NULL ||
       (manager->active != NULL && manager->active->reference_count != 1u)) {
     return FTUN_E_AGAIN;
   }
   if (manager->active != NULL) {
-    status = ftun_runtime_finalize(manager->active);
-    if (status != FTUN_OK) return status;
+    ftun_runtime_t *active = manager->active;
     manager->active = NULL;
+    status = ftun_runtime_retire(owned, active);
+    if (status != FTUN_OK) return status;
   }
-  manager->runtime_magic = 0u;
-  free(manager);
   status = ftun_core_context_bind(owned, NULL);
   if (status != FTUN_OK) return status;
-  return ftun_core_context_destroy(core);
+  reservation = manager->reservation;
+  manager->runtime_magic = 0u;
+  free(manager);
+  return ftun_reservation_release(&reservation);
+}
+
+ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core)
+{
+  ftun_status_t status;
+  if (core == NULL) return FTUN_E_INVALID;
+  if (*core == NULL) return FTUN_OK;
+  status = ftun_runtime_manager_clear(*core);
+  return status == FTUN_OK ? ftun_core_context_destroy(core) : status;
 }
 
 static ftun_status_t ftun_runtime_frs_bind(uint16_t kind, ftun_string_t label,
@@ -429,7 +424,6 @@ static ftun_status_t ftun_runtime_prepare_internal(
   ftun_runtime_t **out)
 {
   ftun_runtime_t *runtime;
-  ftun_frs_view_t *frs_view = NULL;
   ftun_reservation_t *reservation = NULL;
   size_t item_count;
   size_t accounted_bytes;
@@ -437,122 +431,87 @@ static ftun_status_t ftun_runtime_prepare_internal(
   if (out != NULL) *out = NULL;
   if (!ftun_runtime_core_valid(core) || config == NULL || out == NULL ||
       config->plan == NULL) return FTUN_E_INVALID;
+  status = ftun_runtime_config_budget(core, config);
+  if (status != FTUN_OK) return status;
   if (FTUN_MANAGER(core)->candidate != NULL) return FTUN_E_AGAIN;
+  status = ftun_runtime_collect(core);
+  if (status != FTUN_OK) return status;
   if (core->generation == UINT64_MAX ||
       !ftun_runtime_can_retain_active(core)) return FTUN_E_LIMIT;
   if (!ftun_runtime_layout(config, &item_count, &accounted_bytes)) return FTUN_E_LIMIT;
-  status = ftun_budget_reserve(core->budget, accounted_bytes, &reservation);
+  status = ftun_budget_reserve(core->budget,
+    ftun_runtime_reservation_bytes(config, accounted_bytes), &reservation);
   if (status != FTUN_OK) return status;
   runtime = (ftun_runtime_t *)calloc(1u, sizeof(*runtime));
   if (runtime == NULL) {
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
+  /* 先建立回收所需的拥有链，构造错误也可由 manager 保留并重试。 */
+  runtime->owner = core;
+  runtime->reservation = reservation;
+  runtime->reference_count = 1u;
+  runtime->state = FTUN_RUNTIME_CANDIDATE;
+  status = ftun_config_retain((ftun_config_t *)config);
+  if (status != FTUN_OK) goto fail;
+  runtime->snapshot.config = config;
   if (item_count != 0u) {
     runtime->snapshot.prepared_items = (ftun_runtime_prepared_item_t *)calloc(
       item_count, sizeof(*runtime->snapshot.prepared_items));
     if (runtime->snapshot.prepared_items == NULL) {
-      free(runtime);
-      (void)ftun_reservation_release(&reservation);
-      return FTUN_E_LIMIT;
+      status = FTUN_E_LIMIT;
+      goto fail;
     }
   }
   if (config->outbound_count != 0u) {
     runtime->owner_state.group_choices = (ftun_runtime_group_choice_state_t *)calloc(
       config->outbound_count, sizeof(*runtime->owner_state.group_choices));
     if (runtime->owner_state.group_choices == NULL) {
-      free(runtime->snapshot.prepared_items);
-      free(runtime);
-      (void)ftun_reservation_release(&reservation);
-      return FTUN_E_LIMIT;
+      status = FTUN_E_LIMIT;
+      goto fail;
     }
   }
 #if defined(FTUN_HAVE_MODULE_FRS)
   if ((config->plan->prepare & FTUN_PLAN_FRS) != 0u) {
     if (provided_frs != NULL) {
       status = ftun_frs_view_retain(provided_frs);
-      if (status == FTUN_OK) frs_view = provided_frs;
+      if (status == FTUN_OK) runtime->snapshot.frs_view = provided_frs;
     } else if (config->frs.path == NULL || config->frs.path[0] == '\0') {
       status = FTUN_E_INVALID;
     } else {
-      status = ftun_frs_open(core, config->frs.path, &frs_view);
+      status = ftun_frs_open(core, config->frs.path, &runtime->snapshot.frs_view);
     }
-    if (status != FTUN_OK) {
-      free(runtime->owner_state.group_choices);
-      free(runtime->snapshot.prepared_items);
-      free(runtime);
-      (void)ftun_reservation_release(&reservation);
-      return status;
-    }
+    if (status != FTUN_OK) goto fail;
   } else if (provided_frs != NULL) {
-    free(runtime->owner_state.group_choices);
-    free(runtime->snapshot.prepared_items);
-    free(runtime);
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_INVALID;
+    status = FTUN_E_INVALID;
+    goto fail;
   }
 #else
   if (provided_frs != NULL || (config->plan->prepare & FTUN_PLAN_FRS) != 0u) {
-    free(runtime->owner_state.group_choices);
-    free(runtime->snapshot.prepared_items);
-    free(runtime);
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_UNSUPPORTED;
+    status = FTUN_E_UNSUPPORTED;
+    goto fail;
   }
 #endif
   status = ftun_route_table_create_with_frs(
     0u, (const char *const *)config->rules.items, config->rules.count,
     ftun_runtime_resolve_outbound, (void *)config,
-    frs_view == NULL ? NULL : ftun_runtime_frs_bind, frs_view,
-    &runtime->snapshot.routes);
-  if (status != FTUN_OK) {
-#if defined(FTUN_HAVE_MODULE_FRS)
-    (void)ftun_frs_view_release(&frs_view);
-#endif
-    free(runtime->owner_state.group_choices);
-    free(runtime->snapshot.prepared_items);
-    free(runtime);
-    (void)ftun_reservation_release(&reservation);
-    return status;
-  }
-  status = ftun_config_retain((ftun_config_t *)config);
-  if (status != FTUN_OK) {
-    (void)ftun_route_table_destroy(&runtime->snapshot.routes);
-#if defined(FTUN_HAVE_MODULE_FRS)
-    (void)ftun_frs_view_release(&frs_view);
-#endif
-    free(runtime->owner_state.group_choices);
-    free(runtime->snapshot.prepared_items);
-    free(runtime);
-    (void)ftun_reservation_release(&reservation);
-    return status;
-  }
-  runtime->owner = core;
-  runtime->snapshot.config = config;
-  runtime->reservation = reservation;
-  runtime->snapshot.frs_view = frs_view;
+    runtime->snapshot.frs_view == NULL ? NULL : ftun_runtime_frs_bind,
+    runtime->snapshot.frs_view, &runtime->snapshot.routes);
+  if (status != FTUN_OK) goto fail;
   runtime->snapshot.prepared_item_count = item_count;
   runtime->snapshot.accounted_bytes = accounted_bytes;
   runtime->owner_state.group_choice_count = config->outbound_count;
-  runtime->reference_count = 1u;
-  runtime->state = FTUN_RUNTIME_CANDIDATE;
   status = ftun_runtime_fill_group_defaults(runtime, config);
-  if (status != FTUN_OK) {
-    (void)ftun_config_destroy((ftun_config_t **)&runtime->snapshot.config);
-    (void)ftun_route_table_destroy(&runtime->snapshot.routes);
-#if defined(FTUN_HAVE_MODULE_FRS)
-    (void)ftun_frs_view_release(&runtime->snapshot.frs_view);
-#endif
-    free(runtime->owner_state.group_choices);
-    free(runtime->snapshot.prepared_items);
-    free(runtime);
-    (void)ftun_reservation_release(&reservation);
-    return status;
-  }
+  if (status != FTUN_OK) goto fail;
   ftun_runtime_fill_items(runtime, config->plan);
   FTUN_MANAGER(core)->candidate = runtime;
   *out = runtime;
   return FTUN_OK;
+
+fail:
+  /* 首次返回构造错误；清理错误由后续 collect/clear 暴露，不能丢掉资源。 */
+  (void)ftun_runtime_retire(core, runtime);
+  return status;
 }
 
 /* TASK-CORE-001 / TEST-CORE-001，目标 0.2.0：候选准备和快照生命周期。 */
@@ -580,6 +539,7 @@ ftun_status_t ftun_runtime_prepare_detached(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out)
 {
   ftun_runtime_t *runtime;
+  ftun_reservation_t *reservation = NULL;
   size_t item_count;
   size_t accounted_bytes;
   ftun_status_t status;
@@ -589,8 +549,18 @@ ftun_status_t ftun_runtime_prepare_detached(
       !ftun_runtime_layout(config, &item_count, &accounted_bytes)) {
     return FTUN_E_INVALID;
   }
+  /* 配置绑定的预算由宿主持有，Worker 只借用；构造期即可准入，
+   * 不再等待 owner attach。独立未绑定调用仍在 attach 时准入。 */
+  if (config->budget != NULL) {
+    status = ftun_budget_reserve(config->budget,
+      ftun_runtime_reservation_bytes(config, accounted_bytes), &reservation);
+    if (status != FTUN_OK) return status;
+  }
   runtime = (ftun_runtime_t *)calloc(1u, sizeof(*runtime));
-  if (runtime == NULL) return FTUN_E_LIMIT;
+  if (runtime == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
   if (item_count != 0u) {
     runtime->snapshot.prepared_items = (ftun_runtime_prepared_item_t *)calloc(
       item_count, sizeof(*runtime->snapshot.prepared_items));
@@ -607,6 +577,7 @@ ftun_status_t ftun_runtime_prepare_detached(
     view == NULL ? NULL : ftun_runtime_frs_bind, view, &runtime->snapshot.routes);
   if (status != FTUN_OK) goto status_error;
   runtime->snapshot.config = config;
+  runtime->reservation = reservation;
   runtime->snapshot.frs_view = view;
   runtime->snapshot.prepared_item_count = item_count;
   runtime->snapshot.accounted_bytes = accounted_bytes;
@@ -625,12 +596,14 @@ status_error:
   free(runtime->owner_state.group_choices);
   free(runtime->snapshot.prepared_items);
   free(runtime);
+  (void)ftun_reservation_release(&reservation);
   return status;
 
 allocation_error:
   free(runtime->owner_state.group_choices);
   free(runtime->snapshot.prepared_items);
   free(runtime);
+  (void)ftun_reservation_release(&reservation);
   return FTUN_E_LIMIT;
 }
 
@@ -647,24 +620,26 @@ ftun_status_t ftun_runtime_prepare_detached_frs(
 ftun_status_t ftun_runtime_prepared_release(ftun_runtime_t **prepared)
 {
   ftun_runtime_t *runtime;
-  ftun_status_t status = FTUN_OK;
-  ftun_status_t step;
+  ftun_status_t status;
   if (prepared == NULL) return FTUN_E_INVALID;
   runtime = *prepared;
   if (runtime == NULL) return FTUN_OK;
-  if (runtime->owner != NULL || runtime->reservation != NULL ||
+  if (runtime->owner != NULL ||
       runtime->state != FTUN_RUNTIME_CANDIDATE ||
       runtime->reference_count != 1u) return FTUN_E_STATE_CORRUPT;
-  step = ftun_route_table_destroy(&runtime->snapshot.routes);
-  if (step != FTUN_OK) status = step;
-  step = ftun_frs_view_release(&runtime->snapshot.frs_view);
-  if (status == FTUN_OK) status = step;
+  runtime->cleanup_pending = true;
+  status = ftun_route_table_destroy(&runtime->snapshot.routes);
+  if (status != FTUN_OK) return status;
+  status = ftun_frs_view_release(&runtime->snapshot.frs_view);
+  if (status != FTUN_OK) return status;
+  status = ftun_reservation_release(&runtime->reservation);
+  if (status != FTUN_OK) return status;
   free(runtime->owner_state.group_choices);
   free(runtime->snapshot.prepared_items);
   memset(runtime, 0, sizeof(*runtime));
   free(runtime);
   *prepared = NULL;
-  return status;
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
@@ -679,20 +654,29 @@ ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
     return FTUN_E_INVALID;
   }
   runtime = *prepared;
-  if (runtime == NULL || runtime->owner != NULL ||
-      runtime->reservation != NULL || runtime->snapshot.config == NULL ||
+  if (runtime == NULL || runtime->cleanup_pending || runtime->owner != NULL ||
+      runtime->snapshot.config == NULL ||
       runtime->snapshot.routes == NULL ||
       ((((runtime->snapshot.config->plan->prepare & FTUN_PLAN_FRS) != 0u) !=
         (runtime->snapshot.frs_view != NULL))) ||
       runtime->state != FTUN_RUNTIME_CANDIDATE ||
       runtime->reference_count != 1u) return FTUN_E_INVALID;
+  status = ftun_runtime_config_budget(core, runtime->snapshot.config);
+  if (status != FTUN_OK) return status;
   if (FTUN_MANAGER(core)->candidate != NULL) return FTUN_E_AGAIN;
+  status = ftun_runtime_collect(core);
+  if (status != FTUN_OK) return status;
   if (core->generation == UINT64_MAX ||
       !ftun_runtime_can_retain_active(core)) return FTUN_E_LIMIT;
   status = ftun_config_retain((ftun_config_t *)runtime->snapshot.config);
   if (status != FTUN_OK) return status;
-  status = ftun_budget_reserve(core->budget, runtime->snapshot.accounted_bytes,
-                               &reservation);
+  /* 已绑定配置的候选持有同根额度，附着只转移拥有者，不重复准入。
+   * 未绑定的独立候选在此获得额度；失败只归还本次新增 reservation。 */
+  if (runtime->reservation == NULL) {
+    status = ftun_budget_reserve(core->budget,
+      ftun_runtime_reservation_bytes(runtime->snapshot.config, runtime->snapshot.accounted_bytes),
+      &reservation);
+  }
   if (status == FTUN_OK && runtime->snapshot.frs_view != NULL) {
     status = ftun_frs_view_bind_budget(runtime->snapshot.frs_view, core->budget);
   }
@@ -703,7 +687,7 @@ ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
     return status;
   }
   runtime->owner = core;
-  runtime->reservation = reservation;
+  if (runtime->reservation == NULL) runtime->reservation = reservation;
   FTUN_MANAGER(core)->candidate = runtime;
   *prepared = NULL;
   *out = runtime;
@@ -717,7 +701,7 @@ ftun_status_t ftun_runtime_prepared_frs_bytes(
     out->data = NULL;
     out->length = 0u;
   }
-  if (prepared == NULL || out == NULL || prepared->snapshot.frs_view == NULL ||
+  if (prepared == NULL || prepared->cleanup_pending || out == NULL || prepared->snapshot.frs_view == NULL ||
       prepared->state != FTUN_RUNTIME_CANDIDATE) return FTUN_E_INVALID;
   return ftun_frs_view_bytes(prepared->snapshot.frs_view, out);
 }
@@ -730,6 +714,7 @@ ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
   if (!ftun_runtime_core_valid(core) || candidate == NULL) {
     return FTUN_E_INVALID;
   }
+  if (FTUN_MANAGER(core)->cleanup != NULL) return FTUN_E_AGAIN;
   if (candidate != FTUN_MANAGER(core)->candidate || candidate->owner != core ||
       candidate->state != FTUN_RUNTIME_CANDIDATE ||
       candidate->reference_count != 1u) return FTUN_E_STALE;
@@ -797,7 +782,7 @@ ftun_status_t ftun_runtime_commit(ftun_core_t *core,
   *candidate = NULL;
   if (previous != NULL) {
     if (previous->reference_count == 1u) {
-      (void)ftun_runtime_finalize(previous);
+      (void)ftun_runtime_retire(core, previous);
     } else {
       previous->state = FTUN_RUNTIME_RETAINED;
       previous->next_retained = FTUN_MANAGER(core)->retained;
@@ -820,7 +805,7 @@ ftun_status_t ftun_runtime_abort(ftun_core_t *core,
       runtime->state != FTUN_RUNTIME_CANDIDATE) return FTUN_E_STALE;
   FTUN_MANAGER(core)->candidate = NULL;
   *candidate = NULL;
-  return ftun_runtime_finalize(runtime);
+  return ftun_runtime_retire(core, runtime);
 }
 
 ftun_status_t ftun_runtime_active_acquire(ftun_core_t *core,
@@ -865,9 +850,7 @@ ftun_status_t ftun_runtime_release(ftun_runtime_t **runtime)
   core = owned->owner;
   if (!ftun_runtime_core_valid(core) || owned->reference_count <= 1u ||
       owned->state == FTUN_RUNTIME_CANDIDATE) return FTUN_E_STATE_CORRUPT;
-  owned->reference_count--;
-  *runtime = NULL;
-  if (owned->state == FTUN_RUNTIME_RETAINED && owned->reference_count == 1u) {
+  if (owned->state == FTUN_RUNTIME_RETAINED && owned->reference_count == 2u) {
     if (FTUN_MANAGER(core)->retained_count == 0u ||
         owned->snapshot.accounted_bytes > FTUN_MANAGER(core)->retained_bytes ||
         !ftun_runtime_unlink_retained(core, owned)) {
@@ -875,8 +858,12 @@ ftun_status_t ftun_runtime_release(ftun_runtime_t **runtime)
     }
     FTUN_MANAGER(core)->retained_count--;
     FTUN_MANAGER(core)->retained_bytes -= owned->snapshot.accounted_bytes;
-    return ftun_runtime_finalize(owned);
+    owned->reference_count--;
+    *runtime = NULL;
+    return ftun_runtime_retire(core, owned);
   }
+  owned->reference_count--;
+  *runtime = NULL;
   return FTUN_OK;
 }
 

@@ -21,7 +21,8 @@
 #endif
 
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
-static int ftun_cli_random_uuid(uint8_t uuid[FTUN_FAKEIP_UUID_BYTES])
+static ftun_status_t ftun_cli_random_uuid(ftun_budget_t *budget,
+  uint8_t uuid[FTUN_FAKEIP_UUID_BYTES])
 {
   size_t offset = 0u;
   while (offset < FTUN_FAKEIP_UUID_BYTES) {
@@ -32,8 +33,17 @@ static int ftun_cli_random_uuid(uint8_t uuid[FTUN_FAKEIP_UUID_BYTES])
     } else if (count < 0 && errno == EINTR) {
       continue;
     } else {
-      int descriptor = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
-      if (descriptor < 0) return 0;
+      ftun_reservation_t *reservation = NULL;
+      ftun_budget_resources_t resources = {0u, 1u, 0u};
+      ftun_status_t status = ftun_budget_reserve_resources(budget, resources, &reservation);
+      int descriptor;
+      int closed;
+      if (status != FTUN_OK) return status;
+      descriptor = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+      if (descriptor < 0) {
+        (void)ftun_reservation_release(&reservation);
+        return FTUN_E_IO;
+      }
       while (offset < FTUN_FAKEIP_UUID_BYTES) {
         count = read(descriptor, uuid + offset,
                      FTUN_FAKEIP_UUID_BYTES - offset);
@@ -41,12 +51,14 @@ static int ftun_cli_random_uuid(uint8_t uuid[FTUN_FAKEIP_UUID_BYTES])
         else if (count < 0 && errno == EINTR) continue;
         else break;
       }
-      if (close(descriptor) != 0 || offset != FTUN_FAKEIP_UUID_BYTES) return 0;
+      closed = close(descriptor);
+      (void)ftun_reservation_release(&reservation);
+      if (closed != 0 || offset != FTUN_FAKEIP_UUID_BYTES) return FTUN_E_IO;
     }
   }
   uuid[6] = (uint8_t)((uuid[6] & 0x0fu) | 0x40u);
   uuid[8] = (uint8_t)((uuid[8] & 0x3fu) | 0x80u);
-  return 1;
+  return FTUN_OK;
 }
 
 static int ftun_cli_fakeip_range(const char *range,
@@ -87,15 +99,21 @@ static int ftun_cli_fakeip_range(const char *range,
 int ftun_cli_fakeip_init(const char *path)
 {
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
+  ftun_cli_checked_config_t checked = {0};
   ftun_config_t *config = NULL;
   ftun_fakeip_store_identity_t identity;
   char *directory = NULL;
+  ftun_reservation_t *directory_reservation = NULL;
   size_t length;
-  ftun_status_t status = ftun_cli_check_config(path, 0, &config);
-  if (status != FTUN_OK) return ftun_cli_error("fakeip init", status);
+  ftun_status_t status = ftun_cli_check_config(path, 0, &checked);
+  if (status != FTUN_OK) {
+    (void)ftun_cli_checked_config_destroy(&checked);
+    return ftun_cli_error("fakeip init", status);
+  }
+  config = checked.config;
   if (!config->dns.enable || !config->dns.fake_ip.enable ||
       !config->dns.fake_ip.persist || config->base.cache_file == NULL) {
-    (void)ftun_config_destroy(&config);
+    (void)ftun_cli_checked_config_destroy(&checked);
     fputs("ftun: fakeip init: persistent FakeIP is not enabled\n", stderr);
     return 1;
   }
@@ -103,26 +121,36 @@ int ftun_cli_fakeip_init(const char *path)
   if (!ftun_cli_fakeip_range(config->dns.fake_ip.range,
                              &identity.first_address,
                              &identity.end_address_exclusive) ||
-      !ftun_cli_random_uuid(identity.uuid)) {
-    (void)ftun_config_destroy(&config);
-    return ftun_cli_error("fakeip init", FTUN_E_IO);
+      (status = ftun_cli_random_uuid(config->budget, identity.uuid)) != FTUN_OK) {
+    (void)ftun_cli_checked_config_destroy(&checked);
+    return ftun_cli_error("fakeip init", status == FTUN_OK ? FTUN_E_IO : status);
   }
   length = strlen(config->base.cache_file);
   if (length > SIZE_MAX - sizeof(".fakeip")) {
-    (void)ftun_config_destroy(&config);
+    (void)ftun_cli_checked_config_destroy(&checked);
     return ftun_cli_error("fakeip init", FTUN_E_LIMIT);
+  }
+  status = ftun_budget_reserve(config->budget, length + sizeof(".fakeip"), &directory_reservation);
+  if (status != FTUN_OK) {
+    (void)ftun_cli_checked_config_destroy(&checked);
+    return ftun_cli_error("fakeip init", status);
   }
   directory = (char *)malloc(length + sizeof(".fakeip"));
   if (directory == NULL) {
-    (void)ftun_config_destroy(&config);
+    (void)ftun_reservation_release(&directory_reservation);
+    (void)ftun_cli_checked_config_destroy(&checked);
     return ftun_cli_error("fakeip init", FTUN_E_LIMIT);
   }
   memcpy(directory, config->base.cache_file, length);
   memcpy(directory + length, ".fakeip", sizeof(".fakeip"));
-  status = ftun_fakeip_store_initialize(directory, &identity);
+  status = ftun_fakeip_store_initialize_budget(config->budget, directory, &identity);
   if (status == FTUN_OK) printf("FakeIP state initialized: %s\n", directory);
   free(directory);
-  (void)ftun_config_destroy(&config);
+  (void)ftun_reservation_release(&directory_reservation);
+  {
+    ftun_status_t cleanup_status = ftun_cli_checked_config_destroy(&checked);
+    if (status == FTUN_OK) status = cleanup_status;
+  }
   return status == FTUN_OK ? 0 : ftun_cli_error("fakeip init", status);
 #else
   (void)path;

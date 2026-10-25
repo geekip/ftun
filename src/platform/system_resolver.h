@@ -2,7 +2,7 @@
 #define FTUN_PLATFORM_SYSTEM_RESOLVER_H
 
 #include "core/worker.h"
-#include "platform/linux/socket_protect.h"
+#include "network/socket_policy.h"
 
 #define FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES 254u
 #define FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS 16u

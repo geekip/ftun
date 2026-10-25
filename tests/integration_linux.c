@@ -5,6 +5,7 @@
 #include "config/model.h"
 #include "config/parser.h"
 #include "core/budget.h"
+#include "core/context.h"
 #include "core/operation.h"
 #include "proxy/runtime_state.h"
 #include "proxy/session.h"
@@ -14,6 +15,7 @@
 #include "proxy/tun/ingress.h"
 #include "proxy/outbound/outbound.h"
 #include "platform/linux/route.h"
+#include "platform/linux/interface.h"
 #include "platform/linux/tun.h"
 #include "platform/linux/uapi.h"
 #include "platform/system_resolver.h"
@@ -22,6 +24,7 @@
 #include "transport/relay.h"
 #include "transport/stream.h"
 #include "tun/service.h"
+#include "tun/owner.h"
 #include "proxy/udp/session.h"
 #include "util/buffer.h"
 #include "util/time.h"
@@ -29,6 +32,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
 #include <netinet/in.h>
 #include <net/ethernet.h>
 #include <net/if.h>
@@ -2865,6 +2869,7 @@ static ftun_status_t open_udp_flow(
   void *user, ftun_core_t *core, const ftun_runtime_t *runtime,
   const ftun_metadata_t *metadata,
   const ftun_route_result_t *prepared_route,
+  const ftun_udp_flow_admission_t *admission,
   ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out)
@@ -2886,6 +2891,7 @@ static ftun_status_t open_udp_flow(
   size_t dispatched = 0u;
   size_t index;
   (void)prepared_route;
+  (void)admission;
   (void)callback_user;
   if (out != NULL) *out = NULL;
   if (core != integration->core || runtime == NULL || metadata == NULL ||
@@ -3951,6 +3957,23 @@ static int integration_start(integration_t *integration)
   route_policy.lan_interface.data = "lan0";
   route_policy.lan_interface.length = 4u;
   route_policy.strict_route = true;
+  {
+    ftun_route_transaction_t *startup = NULL;
+    ftun_linux_route_async_t *adopted = NULL;
+    ftun_linux_route_async_info_t adopted_info;
+    /* 静态启动资源交给非阻塞事务；接管不重新安装，逆序撤销后再验证原动态路径。 */
+    if (ftun_linux_route_prepare(&route_policy, &startup) != FTUN_OK ||
+        ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+        ftun_linux_route_async_adopt(&startup, integration->loop,
+          integration->now_ms, 250u, integration->now_ms + 5000u, &adopted) != FTUN_OK ||
+        startup != NULL || ftun_linux_route_async_get_info(adopted, &adopted_info) != FTUN_OK ||
+        adopted_info.state != FTUN_LINUX_ROUTE_ASYNC_READY || adopted_info.active_count != 7u ||
+        ftun_linux_route_async_release(adopted, integration->now_ms,
+          integration->now_ms + 5000u) != FTUN_OK ||
+        integration_route_drive(integration, adopted, FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+          integration->now_ms + 5000u) != 0 ||
+        ftun_linux_route_async_destroy(&adopted) != FTUN_OK) return 1;
+  }
   if (ftun_linux_route_async_start(&route_policy, integration->loop,
       integration->now_ms, 250u, integration->now_ms + 5000u,
       &integration->routes) != FTUN_OK ||
@@ -4385,8 +4408,118 @@ static int integration_main(const char *self)
   return 0;
 }
 
+static int owner_update_drive(void *owner, ftun_tun_network_update_result_t *result)
+{
+  ftun_core_service_run_usage_t run;
+  uint64_t now_ms, deadline;
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  deadline = now_ms + 6000u;
+  for (;;) {
+    CHECK(ftun_tun_owner_query_network_update(owner, result) == FTUN_OK);
+    if (!result->pending) return 0;
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK && now_ms < deadline);
+    CHECK(ftun_tun_owner_service.run_once(owner, true, &run) == FTUN_OK);
+    CHECK(run.work <= 192u);
+  }
+}
+
+static int owner_address_matches(const uint8_t expected[4])
+{
+  struct ifaddrs *list = NULL, *entry;
+  size_t matches = 0u, addresses = 0u;
+  CHECK(getifaddrs(&list) == 0);
+  for (entry = list; entry != NULL; entry = entry->ifa_next) {
+    if (entry->ifa_addr == NULL || entry->ifa_addr->sa_family != AF_INET ||
+        strcmp(entry->ifa_name, "ftun-own-it0") != 0) continue;
+    addresses++;
+    if (memcmp(&((const struct sockaddr_in *)entry->ifa_addr)->sin_addr, expected, 4u) == 0) matches++;
+  }
+  freeifaddrs(list);
+  CHECK(matches == 1u && addresses == 1u);
+  return 0;
+}
+
+static int owner_recovery_main(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_event_loop_t *loop = NULL;
+  ftun_operation_queue_t *operations = NULL;
+  ftun_tun_owner_binding_t binding = {0};
+  ftun_core_service_binding_t service_binding = {&binding, sizeof(binding)};
+  ftun_l3_provider_t provider = {0};
+  ftun_config_t config = {0};
+  ftun_budget_usage_t baseline, final;
+  ftun_tun_network_update_result_t result;
+  ftun_interface_spec_t candidate = {{"ftun-own-it0", 12u}, {10u, 79u, 1u, 1u}, 24u, PROTECTION_MARK, false, NULL};
+  void *owner = NULL;
+  uint64_t now_ms, deadline;
+  unsigned int old_index;
+  const struct timespec pause = {0, 1000000};
+  CHECK(ftun_budget_create(NULL, 8u * 1024u * 1024u, 65536u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_operation_queue_create(budget, 8u, &operations) == FTUN_OK);
+  CHECK(ftun_event_loop_create_with_capacity(core, 64u, &loop) == FTUN_OK);
+  CHECK(ftun_libev_attach(loop) == FTUN_OK);
+  binding.provider = &provider;
+  binding.loop = loop;
+  binding.network = &ftun_linux_interface_ops;
+  binding.protection_mark = PROTECTION_MARK;
+  config.tun.present = true;
+  config.tun.interface_name = "ftun-own-it0";
+  config.tun.ipv4_address = "10.79.0.1/30";
+  config.tun.mtu = TUN_MTU;
+  config.tun.auto_route = true;
+  config.tun.strict_route = true;
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+    &config, 1u, &owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+  old_index = if_nametoindex("ftun-own-it0");
+  CHECK(old_index != 0u && owner_address_matches((uint8_t[]){10u, 79u, 0u, 1u}) == 0);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, now_ms + 5000u) == FTUN_OK);
+  CHECK(owner_update_drive(owner, &result) == 0 && result.committed && result.ready &&
+    result.device_generation == 1u && result.network_generation == 2u);
+  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_E_AGAIN);
+  CHECK(owner_update_drive(owner, &result) == 0 && result.rebuild && result.committed && result.ready &&
+    result.device_generation == 2u && result.network_generation == 3u);
+  CHECK(if_nametoindex("ftun-own-it0") != 0u && if_nametoindex("ftun-own-it0") != old_index);
+  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(ftun_tun_service_refresh_network(provider.service, 3u) == FTUN_E_AGAIN);
+  CHECK(owner_update_drive(owner, &result) == 0 && !result.rebuild && result.ready &&
+    result.device_generation == 2u && result.network_generation == 4u);
+  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  CHECK(ftun_tun_owner_start_rebuild(owner, 1u, 4u, now_ms + 5000u) == FTUN_E_STALE);
+  CHECK(ftun_tun_owner_start_rebuild(owner, 2u, 4u, now_ms + 5000u) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+    !result.pending && !result.ready && result.update_status == FTUN_E_CANCELLED);
+  deadline = now_ms + 5000u;
+  while (owner != NULL) {
+    ftun_status_t status = ftun_tun_owner_service.destroy_until(&owner, deadline);
+    CHECK(status == FTUN_OK || status == FTUN_E_AGAIN);
+    if (owner != NULL) {
+      CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK && now_ms < deadline);
+      (void)nanosleep(&pause, NULL);
+    }
+  }
+  CHECK(provider.service == NULL && if_nametoindex("ftun-own-it0") == 0u);
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+    final.used_resources.descriptors == baseline.used_resources.descriptors &&
+    final.used_resources.queue_slots == baseline.used_resources.queue_slots);
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK && ftun_libev_detach(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  CHECK(ftun_operation_queue_stop(operations) == FTUN_OK && ftun_operation_queue_destroy(&operations) == FTUN_OK);
+  CHECK(ftun_core_context_destroy(&core) == FTUN_OK && ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
+  if (argc == 2 && strcmp(argv[1], "--tun-owner-recovery") == 0) return owner_recovery_main();
   if (argc == 3 && strcmp(argv[1], "--peer") == 0) {
     return peer_main(argv[2], NULL);
   }
@@ -4498,7 +4631,7 @@ int main(int argc, char **argv)
                   "--mixed-connect-client PORT TARGET | "
                   "--mixed-forward-client PORT TARGET | "
                   "--echo-server TARGET READY | "
-                  "--dns-server ADDRESS PORT READY | --run\n",
+                  "--dns-server ADDRESS PORT READY | --tun-owner-recovery | --run\n",
           argv[0]);
   return 2;
 }

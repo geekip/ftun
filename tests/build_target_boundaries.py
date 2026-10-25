@@ -78,18 +78,18 @@ if actual_core != expected_core:
     fail(f"Core source set drifted: {sorted(actual_core ^ expected_core)}")
 
 expected_app = {
+    "src/app/runtime.c",
     "src/app/composition/default.c",
     "src/app/cli/dispatch.c",
     "src/app/cli/run.c",
+    "src/app/cli/result.c",
     "src/app/cli/check.c",
     "src/app/cli/control.c",
     "src/app/cli/fakeip.c",
     "src/app/cli/version.c",
 }
-expected_app.add(
-    "src/app/runtime.c" if target_map.get("proxy") != "OFF"
-    else "src/app/service_runtime.c"
-)
+if target_map.get("proxy") != "OFF":
+    expected_app.add("src/app/composition/proxy_runtime.c")
 actual_app = {source for source, owner in owners.items() if owner == "ftun_app"}
 if actual_app != expected_app:
     fail(f"App source set drifted: {sorted(actual_app ^ expected_app)}")
@@ -100,7 +100,7 @@ required_app_paths = {
     "src/app/api/api.c",
     "src/app/api/api.h",
 } | expected_app
-required_app_paths.update({"src/app/runtime.c", "src/app/service_runtime.c"})
+required_app_paths.add("src/app/runtime_support.h")
 missing_app_paths = {
     path for path in required_app_paths if not (root / path).is_file()
 }
@@ -108,12 +108,19 @@ if missing_app_paths:
     fail(f"App migration lost paths: {sorted(missing_app_paths)}")
 legacy_app_paths = {
     "src/main.c", "src/cli", "src/composition", "src/api",
+    "src/app/service_runtime.c",
 }
 remaining_app_paths = {
     path for path in legacy_app_paths if (root / path).exists()
 }
 if remaining_app_paths:
     fail(f"legacy App paths remain: {sorted(remaining_app_paths)}")
+for path in ("src/app/runtime.c", "src/app/cli/check.c"):
+    content = (root / path).read_text(encoding="utf-8")
+    if re.search(r'#\s*include\s+"(?:proxy|dns|tun)/', content):
+        fail(f"common App host retains concrete module dependency: {path}")
+    if re.search(r'FTUN_HAVE_MODULE_(?:PROXY|DNS|TUN|FRS|FAKEIP)', content):
+        fail(f"common App host retains module-specific lifecycle branches: {path}")
 
 required_proxy = {
     "src/proxy/service.c",
@@ -207,6 +214,7 @@ required_shared = {
     "src/network/view.c",
     "src/network/resolver.c",
     "src/transport/path.c",
+    "src/transport/control_channel.c",
     "src/transport/carrier.c",
     "src/transport/stream.c",
     "src/dns/control_transport.c",
@@ -254,6 +262,7 @@ tun_sources = {
     "src/tun/path.c",
     "src/tun/owner.c",
     "src/platform/linux/tun.c",
+    "src/platform/linux/interface.c",
     "src/platform/linux/route.c",
     "src/platform/linux/route_async.c",
 }
@@ -372,5 +381,10 @@ for required in (
         fail(f"independent DNS service contract omits {required}")
 if "ftun_proxy" in dns_contract_body or "ftun_runtime" in dns_contract_body:
     fail("independent DNS service contract links Proxy implementation")
+
+for directory in ("src/network", "src/transport", "src/tun"):
+    for header in (root / directory).glob("*.h"):
+        if re.search(r'#\s*include\s+"platform/linux/', header.read_text()):
+            fail(f"platform implementation leaked into contract: {header.relative_to(root)}")
 
 print("build target boundary: ok")

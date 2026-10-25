@@ -16,7 +16,7 @@
 } while (0)
 
 #define TEST_MTU 1500u
-#define TEST_PACKETS 8u
+#define TEST_PACKETS 16u
 #define TEST_WRITES 16u
 
 typedef struct {
@@ -40,6 +40,7 @@ typedef struct {
   size_t packets;
   size_t rebuilt;
   size_t quiesced;
+  size_t path_updates;
   bool stall;
 } raw_consumer_t;
 
@@ -199,6 +200,7 @@ static void raw_event(void *user, ftun_tun_lease_t lease,
       lease.generation != raw->expected.generation || status != FTUN_OK) return;
   if (event == FTUN_TUN_SERVICE_REBUILT) raw->rebuilt++;
   if (event == FTUN_TUN_SERVICE_QUIESCED) raw->quiesced++;
+  if (event == FTUN_TUN_SERVICE_PATH_UPDATED) raw->path_updates++;
 }
 
 static ftun_status_t proxy_receive_datagram(
@@ -470,6 +472,66 @@ static int test_shared_dispatch(void)
   CHECK(ftun_tun_service_notify(service, FTUN_EVENT_WRITE) == FTUN_OK);
   CHECK(ftun_tun_service_run(service, &work) == FTUN_OK && work == 1u &&
         device.write_count == 5u && device.writes[4][1] == 0xa1u);
+
+  /* 修改一个消费者的映射与路径，旧队列只属于旧路径；其他消费者继续运行。 */
+  fast.stall = true;
+  device.read_lengths[5] = make_udp_packet(
+    device.reads[5], source, specific_target, 6u);
+  device.read_count = 6u;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK && work == 1u);
+  device.write_status = FTUN_E_AGAIN;
+  CHECK(ftun_tun_service_write(fast_lease,
+          (ftun_bytes_t){raw_out_a, sizeof(raw_out_a)}) == FTUN_OK);
+  CHECK(ftun_tun_service_write(proxy.lease,
+          (ftun_bytes_t){proxy_out_a, sizeof(proxy_out_a)}) == FTUN_OK);
+  fill_route(&consumer_spec, &fast, specific_network, 16u, 20u);
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_E_REJECTED);
+  consumer_spec.route.network[1] = 2u;
+  consumer_spec.route.network[3] = 1u;
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_E_INVALID);
+  consumer_spec.route.network[3] = 0u;
+  consumer_spec.path.carrier_mtu = 1200u;
+  consumer_spec.path.headroom = 1200u;
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_E_INVALID);
+  consumer_spec.path.headroom = 100u;
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 2u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_E_STALE);
+  CHECK(ftun_tun_service_get_consumer_usage(fast_lease, &consumer_usage) == FTUN_OK &&
+        consumer_usage.path_generation == 1u && consumer_usage.blocked &&
+        consumer_usage.queued_inputs == 1u && consumer_usage.queued_outputs == 1u &&
+        fast.path_updates == 0u);
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_OK);
+  CHECK(ftun_tun_service_get_consumer_usage(fast_lease, &consumer_usage) == FTUN_OK &&
+        consumer_usage.path_generation == 2u && !consumer_usage.blocked &&
+        consumer_usage.inner_mtu == 1100u && consumer_usage.queued_inputs == 0u &&
+        consumer_usage.queued_outputs == 0u && fast.path_updates == 1u);
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_E_STALE);
+  CHECK(ftun_tun_service_update_consumer(fast_lease, 2u,
+          &consumer_spec.route, &consumer_spec.path) == FTUN_OK && fast.path_updates == 1u);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.active_leases == 4u && usage.device_generation == 1u &&
+        usage.queued_packets == 1u && usage.queued_inputs == 0u);
+  fast.stall = false;
+  device.write_status = FTUN_OK;
+  device.read_lengths[6] = make_udp_packet(
+    device.reads[6], source, specific_target, 7u);
+  device.read_lengths[7] = make_udp_packet(
+    device.reads[7], source, (uint8_t[]){10u, 2u, 1u, 1u}, 8u);
+  device.read_lengths[8] = make_udp_packet(
+    device.reads[8], source, proxy_target, 9u);
+  device.read_count = 9u;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_READ | FTUN_EVENT_WRITE) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK && work == 4u);
+  CHECK(slow.packets == 1u && slow.markers[0] == 7u && fast.packets == 2u &&
+        fast.markers[1] == 8u && proxy.datagrams == 2u && proxy.payload[0] == 9u &&
+        device.write_count == 6u && device.writes[5][1] == 0xa1u &&
+        device.open_count == 1u && device.close_count == 0u);
 
   CHECK(ftun_l3_provider_quiesce(&l3_provider) == FTUN_OK &&
         l3_provider.service == NULL && l3_provider.budget == NULL &&

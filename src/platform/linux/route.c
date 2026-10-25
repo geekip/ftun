@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "route.h"
+#include "core/budget.h"
 #include "route_internal.h"
 #include "uapi.h"
 #include <errno.h>
@@ -612,6 +613,7 @@ static ftun_status_t ftun_route_remove_active(
 {
   ftun_status_t first = FTUN_OK;
   size_t index = transaction->resource_count;
+  transaction->retiring = true;
   while (index != 0u) {
     ftun_status_t status;
     index--;
@@ -629,23 +631,32 @@ static ftun_status_t ftun_route_remove_active(
 }
 
 /* TASK-PLATFORM-002 / TEST-PLATFORM-002，目标 0.2.0：有所有权的路由事务。 */
-ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy,
-                                               const ftun_linux_route_io_t *io,
-                                               ftun_route_transaction_t **out)
+ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
+  const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
+  ftun_route_transaction_t **out)
 {
-  ftun_route_transaction_t *transaction;
+  ftun_route_transaction_t *transaction = NULL;
+  ftun_reservation_t *reservation = NULL, *descriptor = NULL;
   ftun_status_t status;
   size_t index;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_route_policy_valid(policy) || io == NULL ||
       io->apply == NULL || io->remove == NULL) return FTUN_E_INVALID;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, sizeof(*transaction), &reservation);
+    if (status == FTUN_OK) status = ftun_budget_reserve_resources(budget,
+      (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
+    if (status != FTUN_OK) goto fail;
+  }
   transaction = (ftun_route_transaction_t *)calloc(1u, sizeof(*transaction));
-  if (transaction == NULL) return FTUN_E_LIMIT;
+  if (transaction == NULL) { status = FTUN_E_LIMIT; goto fail; }
   transaction->magic = FTUN_LINUX_ROUTE_MAGIC;
+  transaction->budget = budget;
+  transaction->reservation = reservation;
   transaction->io = *io;
   if (!ftun_route_build(policy, transaction)) {
-    free(transaction);
-    return FTUN_E_LIMIT;
+    status = FTUN_E_LIMIT;
+    goto fail;
   }
   for (index = 0u; index < transaction->resource_count; index++) {
     status = transaction->io.apply(transaction->io.context,
@@ -654,23 +665,40 @@ ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy
       ftun_status_t rollback = ftun_route_remove_active(transaction);
       if (rollback != FTUN_OK) {
         *out = transaction;
+        (void)ftun_reservation_release(&descriptor);
         return FTUN_E_STATE_CORRUPT;
       }
-      transaction->magic = 0u;
-      free(transaction);
-      return status;
+      goto fail;
     }
     transaction->active[index] = true;
     transaction->active_count++;
   }
   *out = transaction;
+  (void)ftun_reservation_release(&descriptor);
   return FTUN_OK;
+fail:
+  free(transaction);
+  (void)ftun_reservation_release(&descriptor);
+  (void)ftun_reservation_release(&reservation);
+  return status;
+}
+
+ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy,
+  const ftun_linux_route_io_t *io, ftun_route_transaction_t **out)
+{
+  return ftun_linux_route_prepare_with_io_and_budget(NULL, policy, io, out);
+}
+
+ftun_status_t ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
+  const ftun_route_policy_t *policy, ftun_route_transaction_t **out)
+{
+  return ftun_linux_route_prepare_with_io_and_budget(budget, policy, &ftun_system_route_io, out);
 }
 
 ftun_status_t ftun_linux_route_prepare(const ftun_route_policy_t *policy,
-                                       ftun_route_transaction_t **out)
+  ftun_route_transaction_t **out)
 {
-  return ftun_linux_route_prepare_with_io(policy, &ftun_system_route_io, out);
+  return ftun_linux_route_prepare_with_budget(NULL, policy, out);
 }
 
 ftun_status_t ftun_linux_route_get_info(
@@ -690,17 +718,25 @@ ftun_status_t ftun_linux_route_release(
 {
   ftun_route_transaction_t *owned;
   ftun_status_t status;
+  ftun_reservation_t *reservation, *descriptor = NULL;
   if (transaction == NULL) return FTUN_E_INVALID;
   owned = *transaction;
   if (owned == NULL) return FTUN_OK;
   if (owned->magic != FTUN_LINUX_ROUTE_MAGIC || owned->io.remove == NULL) {
     return FTUN_E_INVALID;
   }
+  if (owned->budget != NULL && owned->active_count != 0u) {
+    status = ftun_budget_reserve_cleanup_resources(owned->budget,
+      (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
+    if (status != FTUN_OK) return status;
+  }
   status = ftun_route_remove_active(owned);
+  (void)ftun_reservation_release(&descriptor);
   if (status != FTUN_OK) return status;
   owned->magic = 0u;
   memset(&owned->io, 0, sizeof(owned->io));
+  reservation = owned->reservation;
   free(owned);
   *transaction = NULL;
-  return FTUN_OK;
+  return ftun_reservation_release(&reservation);
 }

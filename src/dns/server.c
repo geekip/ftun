@@ -43,6 +43,10 @@ typedef struct {
   uint8_t *response;
   size_t response_length;
   ftun_dns_transport_t current_transport;
+  ftun_dns_transport_binding_t binding;
+  bool selected;
+  bool cancelling;
+  bool completed_during_cancel;
 } ftun_dns_exchange_context_t;
 
 static ftun_error_t ftun_dns_server_error(ftun_status_t status,
@@ -88,7 +92,7 @@ static int ftun_dns_server_name_equal(ftun_dns_name_t left,
 }
 
 static ftun_status_t ftun_dns_server_query_validate(
-  const ftun_dns_query_t *query)
+  ftun_budget_t *budget, const ftun_dns_query_t *query)
 {
   ftun_dns_message_t *message = NULL;
   ftun_status_t status;
@@ -96,7 +100,7 @@ static ftun_status_t ftun_dns_server_query_validate(
       query->resolution_mode != 1u || query->deadline_ms == 0u ||
       query->wire.data == NULL || query->wire.length < FTUN_DNS_HEADER_BYTES ||
       query->wire.length > FTUN_DNS_MAX_MESSAGE_BYTES) return FTUN_E_INVALID;
-  status = ftun_dns_message_parse(query->wire, &message);
+  status = ftun_dns_message_parse_with_budget(budget, query->wire, &message);
   if (status != FTUN_OK) return status;
   if ((message->flags & 0x8000u) != 0u || message->id != query->id ||
       message->question.type != query->question.type ||
@@ -113,7 +117,7 @@ static ftun_status_t ftun_dns_server_finish(
   ftun_dns_exchange_context_t *context, ftun_status_t status,
   uint32_t stage)
 {
-  return ftun_operation_complete(context->completion_token,
+  return ftun_operation_complete_deferred(context->completion_token,
                                   ftun_dns_server_error(status, stage));
 }
 
@@ -142,10 +146,23 @@ static ftun_status_t ftun_dns_server_cancel(void *user)
 {
   ftun_dns_exchange_context_t *context =
     (ftun_dns_exchange_context_t *)user;
+  void *request;
+  ftun_status_t status;
   if (context == NULL) return FTUN_E_INVALID;
   if (context->transport_request == NULL) return FTUN_OK;
-  return context->server->query_transport.cancel(
-    context->server->query_transport.context, &context->transport_request);
+  request = context->transport_request;
+  context->cancelling = true;
+  context->completed_during_cancel = false;
+  /* 取消可以同步交付原请求结果；不要把旧句柄的清空写进回调中新建的
+   * TCP fallback 请求。新请求尚在途时取消未静默，留给 owner 后续重试。 */
+  status = context->server->query_transport.cancel(
+    context->server->query_transport.context, &request);
+  context->cancelling = false;
+  if (!context->completed_during_cancel) context->transport_request = request;
+  else if (context->transport_request != NULL && status == FTUN_OK) {
+    status = FTUN_E_AGAIN;
+  }
+  return status;
 }
 
 static void ftun_dns_server_transport_completed(
@@ -162,10 +179,24 @@ static ftun_status_t ftun_dns_server_submit(
     return ftun_dns_server_finish(context, FTUN_E_TIMEOUT,
                                   FTUN_DNS_SERVER_STAGE_TIMEOUT);
   }
+  if (!context->selected) {
+    status = server->query_transport.select(server->query_transport.context,
+      server->outbound_id, &context->binding);
+    if (status != FTUN_OK) {
+      return ftun_dns_server_finish(context, status,
+                                    FTUN_DNS_SERVER_STAGE_TRANSPORT);
+    }
+    if (context->binding.scope == NULL ||
+        context->binding.root_id != server->outbound_id) {
+      return ftun_dns_server_finish(context, FTUN_E_STATE_CORRUPT,
+                                    FTUN_DNS_SERVER_STAGE_TRANSPORT);
+    }
+    context->selected = true;
+  }
   context->query.transport = transport;
   context->current_transport = transport;
   status = server->query_transport.submit(
-    server->query_transport.context, server->outbound_id,
+    server->query_transport.context, &context->binding,
     context->query.policy_fingerprint, context->query.server_fingerprint,
     &server->upstream, transport, context->query.wire,
     context->query.deadline_ms,
@@ -192,13 +223,16 @@ static void ftun_dns_server_transport_completed(
   uint64_t now;
   if (context == NULL || context->server == NULL) return;
   server = context->server;
+  if (context->cancelling) context->completed_during_cancel = true;
   context->transport_request = NULL;
   if (status != FTUN_OK) {
     (void)ftun_dns_server_finish(context, status,
                                  FTUN_DNS_SERVER_STAGE_TRANSPORT);
     return;
   }
-  now = server->now(server->now_user);
+  now = server->query_transport.response_now == NULL
+    ? server->now(server->now_user)
+    : server->query_transport.response_now(server->query_transport.context);
   if (now >= context->query.deadline_ms) {
     (void)ftun_dns_server_finish(context, FTUN_E_TIMEOUT,
                                  FTUN_DNS_SERVER_STAGE_TIMEOUT);
@@ -210,7 +244,7 @@ static void ftun_dns_server_transport_completed(
                                  FTUN_DNS_SERVER_STAGE_RESPONSE);
     return;
   }
-  status = ftun_dns_message_parse(response, &message);
+  status = ftun_dns_message_parse_with_budget(server->budget, response, &message);
   if (status == FTUN_OK) {
     status = ftun_dns_message_matches(message, &context->query, transport,
                                       source, &matches);
@@ -257,6 +291,7 @@ ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
        options->transport != FTUN_DNS_TRANSPORT_TCP) ||
       options->max_response_bytes < FTUN_DNS_HEADER_BYTES ||
       options->max_response_bytes > FTUN_DNS_MAX_MESSAGE_BYTES ||
+      options->query_transport.select == NULL ||
       options->query_transport.submit == NULL ||
       options->query_transport.cancel == NULL) return FTUN_E_INVALID;
   status = ftun_budget_reserve(options->budget, sizeof(*server), &reservation);
@@ -319,7 +354,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
     return FTUN_E_INVALID;
   }
   (void)core_budget;
-  status = ftun_dns_server_query_validate(query);
+  status = ftun_dns_server_query_validate(server->budget, query);
   if (status != FTUN_OK) return status;
   if (server->now(server->now_user) >= query->deadline_ms) {
     return FTUN_E_TIMEOUT;
@@ -402,6 +437,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   return ftun_dns_server_submit(context, server->transport);
 
 fail:
+  (void)ftun_dns_answer_release(&cached);
   free(context);
   (void)ftun_reservation_release(&reservation);
   return status;

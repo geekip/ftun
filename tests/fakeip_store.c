@@ -5,12 +5,83 @@
 #include "core/budget.h"
 #include "core/worker.h"
 #include "proxy/state/fakeip_store.h"
+#include "proxy/state/fakeip_snapshot.h"
 
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <pthread.h>
+
+static ftun_budget_t *observed_budget;
+static pthread_mutex_t descriptor_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int observed_fds[16];
+static size_t observed_count, observed_opens;
+int __real_open(const char *path, int flags, ...);
+int __real_close(int descriptor);
+int __real_mkstemp(char *path);
+static void descriptor_admission(void)
+{
+  ftun_budget_usage_t usage;
+  if (ftun_budget_get_usage(observed_budget, &usage) != FTUN_OK ||
+      usage.used_resources.descriptors < observed_count + 1u) {
+    fputs("File descriptor was not admitted\n", stderr);
+    abort();
+  }
+  observed_opens++;
+}
+int __wrap_open(const char *path, int flags, ...)
+{
+  int descriptor;
+  mode_t mode = 0;
+  if ((flags & O_CREAT) != 0) {
+    va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args);
+  }
+  if (observed_budget == NULL) return __real_open(path, flags, mode);
+  (void)pthread_mutex_lock(&descriptor_mutex);
+  descriptor_admission();
+  descriptor = __real_open(path, flags, mode);
+  if (descriptor >= 0) { if (observed_count == 16u) abort(); observed_fds[observed_count++] = descriptor; }
+  (void)pthread_mutex_unlock(&descriptor_mutex);
+  return descriptor;
+}
+int __wrap_mkstemp(char *path)
+{
+  int descriptor;
+  size_t index;
+  if (observed_budget == NULL) return __real_mkstemp(path);
+  (void)pthread_mutex_lock(&descriptor_mutex);
+  descriptor_admission();
+  (void)pthread_mutex_unlock(&descriptor_mutex);
+  /* 静态libc的mkstemp会进入open包装器，不能持锁调用或重复登记。 */
+  descriptor = __real_mkstemp(path);
+  (void)pthread_mutex_lock(&descriptor_mutex);
+  for (index = 0u; index < observed_count; index++) {
+    if (observed_fds[index] == descriptor) break;
+  }
+  if (descriptor >= 0 && index == observed_count) {
+    if (observed_count == 16u) abort();
+    observed_fds[observed_count++] = descriptor;
+  }
+  (void)pthread_mutex_unlock(&descriptor_mutex);
+  return descriptor;
+}
+int __wrap_close(int descriptor)
+{
+  size_t i;
+  int result;
+  if (observed_budget == NULL) return __real_close(descriptor);
+  (void)pthread_mutex_lock(&descriptor_mutex);
+  result = __real_close(descriptor);
+  for (i = 0u; i < observed_count; i++) if (observed_fds[i] == descriptor) {
+    observed_fds[i] = observed_fds[--observed_count]; break;
+  }
+  (void)pthread_mutex_unlock(&descriptor_mutex);
+  return result;
+}
 
 #define CHECK(x) do { \
   if (!(x)) { \
@@ -183,8 +254,81 @@ static int test_cancel_halts_new_issuance(void)
   return 0;
 }
 
+static int test_bounded_resources(void)
+{
+  char directory[] = "/tmp/ftun-fakeip-budget.XXXXXX";
+  const size_t limits[] = {0u, 1u, 3u};
+  ftun_fakeip_store_identity_t identity = {{7u}, 100u, 200u};
+  size_t round;
+  CHECK(mkdtemp(directory) != NULL && rmdir(directory) == 0);
+  for (round = 0u; round < 3u; round++) {
+    ftun_budget_options_t options = {{1024u * 1024u, 0u, 64u}, {0}, {0}};
+    ftun_budget_usage_t usage, before;
+    ftun_reservation_t *hold = NULL;
+    ftun_budget_resources_t full = {0u, 2u, 0u}, one = {0u, 1u, 0u};
+    ftun_fakeip_store_options_t store_options = {0};
+    ftun_fakeip_store_t *store = NULL;
+    ftun_worker_t *worker = NULL;
+    ftun_fakeip_snapshot_t empty = {0}, *loaded = NULL;
+    ftun_fakeip_store_info_t info;
+    ftun_operation_t *operation = NULL;
+    completion_t completion = {0};
+    size_t opens;
+    options.limit.descriptors = limits[round];
+    CHECK(ftun_budget_create_resources(NULL, &options, &observed_budget) == FTUN_OK);
+    observed_count = observed_opens = 0u;
+    if (round < 2u) {
+      CHECK(ftun_fakeip_store_initialize_budget(observed_budget, directory, &identity) == FTUN_E_LIMIT);
+      CHECK(access(directory, F_OK) != 0 && observed_count == 0u);
+      CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
+        usage.used == 0u && usage.used_resources.descriptors == 0u);
+    } else {
+      CHECK(ftun_fakeip_store_initialize_budget(observed_budget, directory, &identity) == FTUN_OK);
+      CHECK(ftun_worker_create(observed_budget, 2u, &worker) == FTUN_OK);
+      store_options.directory = directory; store_options.budget = observed_budget;
+      store_options.worker = worker; store_options.completion = completed; store_options.user = &completion;
+      CHECK(ftun_budget_get_usage(observed_budget, &before) == FTUN_OK);
+      CHECK(ftun_fakeip_store_open(&store_options, &store) == FTUN_OK);
+      CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
+        usage.used > before.used && usage.used_resources.descriptors == 1u && observed_count == 1u);
+      CHECK(ftun_budget_reserve(observed_budget, usage.normal_available, &hold) == FTUN_OK);
+      CHECK(ftun_fakeip_store_reserve(store, 110u, &operation) == FTUN_E_LIMIT && operation == NULL);
+      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      CHECK(ftun_budget_reserve_resources(observed_budget, full, &hold) == FTUN_OK);
+      opens = observed_opens;
+      CHECK(ftun_fakeip_snapshot_load(store, 16u, &loaded) == FTUN_E_LIMIT && loaded == NULL);
+      CHECK(observed_opens == opens && ftun_reservation_release(&hold) == FTUN_OK);
+      memcpy(empty.uuid, identity.uuid, sizeof(empty.uuid));
+      CHECK(ftun_budget_reserve_resources(observed_budget, one, &hold) == FTUN_OK);
+      CHECK(ftun_fakeip_snapshot_save(store, &empty, &operation) == FTUN_OK);
+      CHECK(poll_until(worker, &completion, 1u) && completion.status == FTUN_E_LIMIT);
+      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      CHECK(ftun_fakeip_snapshot_load(store, 16u, &loaded) == FTUN_OK && loaded->mapping_count == 0u);
+      CHECK(ftun_fakeip_snapshot_destroy(&loaded) == FTUN_OK);
+      CHECK(ftun_fakeip_snapshot_save(store, &empty, &operation) == FTUN_OK);
+      CHECK(poll_until(worker, &completion, 2u) && completion.status == FTUN_OK);
+      CHECK(ftun_budget_reserve_resources(observed_budget, full, &hold) == FTUN_OK);
+      CHECK(ftun_fakeip_store_reserve(store, 110u, &operation) == FTUN_OK);
+      CHECK(poll_until(worker, &completion, 3u) && completion.status == FTUN_E_LIMIT);
+      CHECK(ftun_fakeip_store_get_info(store, &info) == FTUN_OK && info.halted && info.sequence == 0u && info.reserved_end == 100u);
+      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      CHECK(ftun_fakeip_store_destroy(&store) == FTUN_OK && observed_count == 0u);
+      CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
+        usage.used == before.used && usage.metadata_bytes == before.metadata_bytes &&
+        usage.used_resources.descriptors == before.used_resources.descriptors);
+      CHECK(ftun_worker_stop(worker) == FTUN_OK && ftun_worker_join(worker) == FTUN_OK);
+      CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
+      CHECK(remove_store(directory));
+    }
+    { ftun_budget_t *budget = observed_budget; observed_budget = NULL;
+      CHECK(ftun_budget_destroy(&budget) == FTUN_OK); }
+  }
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_bounded_resources() == 0);
   CHECK(test_durable_reservation_and_recovery() == 0);
   CHECK(test_cancel_halts_new_issuance() == 0);
   return 0;

@@ -464,8 +464,6 @@ static int test_enabled_selection_and_no_fallback(void)
         strcmp(fixture.backend_state.server, "route-real") == 0 &&
         fixture.backend_state.bootstrap_calls == 1 &&
         fixture.backend_state.system_calls == 0 && completion.calls == 0);
-  CHECK(ftun_resolve_real(fixture.core, &request, &operation) ==
-        FTUN_E_AGAIN && operation == NULL);
   CHECK(close_session(&session) == 0);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;

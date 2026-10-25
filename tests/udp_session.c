@@ -195,6 +195,7 @@ static void outbound_destroy(void *user)
 static ftun_status_t open_outbound(
   void *user, ftun_core_t *core, const ftun_runtime_t *runtime,
   const ftun_metadata_t *metadata, const ftun_route_result_t *route,
+  const ftun_udp_flow_admission_t *admission,
   ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out)
@@ -206,6 +207,7 @@ static ftun_status_t open_outbound(
   ftun_runtime_info_t info;
   if (out != NULL) *out = NULL;
   (void)route;
+  (void)admission;
   fixture->open_calls++;
   if (core != fixture->core || runtime == NULL || metadata == NULL ||
       result == NULL || receive == NULL || outbound_id == NULL ||
@@ -554,6 +556,23 @@ static int test_failure_no_replay_and_cancel(void)
   fixture.cancel_failures = 1;
   CHECK(ftun_udp_flow_table_destroy(&fixture.table) == FTUN_E_AGAIN &&
         fixture.table != NULL);
+  {
+    ftun_udp_flow_table_spec_t spec = {0};
+    ftun_udp_flow_table_t *other = NULL;
+    ftun_budget_usage_t before;
+    ftun_budget_usage_t after;
+    spec.core = fixture.core;
+    spec.budget = fixture.budget;
+    spec.capacity = 1u;
+    spec.idle_timeout_ms = 1000u;
+    spec.backend.open = open_outbound;
+    CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK && !usage.accepting);
+    CHECK(ftun_udp_flow_input(fixture.core, &metadata, &packet) == FTUN_E_CANCELLED);
+    CHECK(ftun_budget_get_usage(fixture.budget, &before) == FTUN_OK);
+    CHECK(ftun_udp_flow_table_create(&spec, &other) == FTUN_E_INVALID && other == NULL);
+    CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK &&
+          before.used == after.used);
+  }
   CHECK(ftun_udp_flow_table_destroy(&fixture.table) == FTUN_OK &&
         fixture.table == NULL && fixture.slots[3].destroyed == 1);
   CHECK(ftun_packet_release(&packet) == FTUN_OK);
@@ -647,7 +666,7 @@ static int test_existing_flow_bypasses_new_route(void)
   route.allowed_count = 1u;
   CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
   CHECK(ftun_udp_flow_input_routed(fixture.table, fixture.inbound,
-        &metadata, &route, &packet) == FTUN_OK);
+        &metadata, &route, NULL, &packet) == FTUN_OK);
   CHECK(fixture.open_calls == 1u && fixture.slots[0].sends == 1u);
 
   /* A later packet carries no reusable route result and a changed resolver
@@ -682,6 +701,11 @@ static int test_boundaries(void)
   ftun_packet_t packet = {{0}, 0u};
   ftun_udp_flow_table_t *other = (ftun_udp_flow_table_t *)(uintptr_t)1u;
   ftun_udp_flow_table_spec_t spec;
+  ftun_budget_t *foreign_budget = NULL;
+  ftun_core_t *foreign_core = NULL;
+  ftun_budget_usage_t before;
+  ftun_budget_usage_t after;
+  size_t lookups;
   char domain[] = "boundary.example";
   CHECK(fixture_start(&fixture, 2u, 100u) == 0);
   fill_fake_metadata(&metadata, resolved, domain);
@@ -714,8 +738,23 @@ static int test_boundaries(void)
   spec.capacity = 1u;
   spec.idle_timeout_ms = 1u;
   spec.backend.open = open_outbound;
+  CHECK(ftun_budget_get_usage(fixture.budget, &before) == FTUN_OK);
   CHECK(ftun_udp_flow_table_create(&spec, &other) == FTUN_E_INVALID &&
         other == NULL);
+  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK &&
+        before.used == after.used);
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u,
+                           &foreign_budget) == FTUN_OK);
+  CHECK(ftun_runtime_manager_create(foreign_budget, 4u, &foreign_core) == FTUN_OK);
+  spec.core = foreign_core;
+  spec.budget = foreign_budget;
+  CHECK(ftun_budget_get_usage(foreign_budget, &before) == FTUN_OK);
+  CHECK(ftun_udp_flow_table_create(&spec, &other) == FTUN_E_INVALID && other == NULL);
+  CHECK(ftun_budget_get_usage(foreign_budget, &after) == FTUN_OK &&
+        before.used == after.used);
+  lookups = fixture.inbound_lookups;
+  CHECK(ftun_udp_flow_input(foreign_core, &metadata, &packet) == FTUN_E_STALE &&
+        fixture.inbound_lookups == lookups);
   CHECK(ftun_udp_flow_input(NULL, &metadata, &packet) == FTUN_E_INVALID);
   CHECK(ftun_udp_flow_input_on(NULL, fixture.inbound,
         &metadata, &packet) == FTUN_E_INVALID);
@@ -724,11 +763,85 @@ static int test_boundaries(void)
   CHECK(ftun_udp_flow_table_destroy(NULL) == FTUN_E_INVALID);
   CHECK(ftun_packet_release(&packet) == FTUN_OK);
   CHECK(fixture_stop(&fixture) == 0);
+  CHECK(ftun_udp_flow_table_create(&spec, &other) == FTUN_OK);
+  CHECK(ftun_udp_flow_table_destroy(&other) == FTUN_OK && other == NULL);
+  CHECK(ftun_runtime_manager_destroy(&foreign_core) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(foreign_budget, &after) == FTUN_OK && after.used == 0u);
+  CHECK(ftun_budget_destroy(&foreign_budget) == FTUN_OK);
+  return 0;
+}
+
+static int test_inbound_retained_until_cancelled(void)
+{
+  fixture_t fixture;
+  ftun_metadata_t metadata;
+  ftun_endpoint_t resolved[2];
+  ftun_packet_t packet = {0};
+  ftun_datagram_usage_t usage;
+  const uint8_t bytes[] = {1u};
+  char domain[] = "retained.example";
+  CHECK(fixture_start(&fixture, 2u, 1000u) == 0);
+  fill_fake_metadata(&metadata, resolved, domain);
+  CHECK(make_packet(fixture.budget, bytes, sizeof(bytes), &packet) == 0);
+  fixture.async_send = 1;
+  CHECK(ftun_udp_flow_input_on(fixture.table, fixture.inbound,
+    &metadata, &packet) == FTUN_OK);
+  CHECK(ftun_datagram_stop(fixture.inbound) == FTUN_OK);
+  CHECK(ftun_datagram_destroy(&fixture.inbound) == FTUN_E_AGAIN);
+  fixture.cancel_failures = 1;
+  CHECK(ftun_udp_flow_close_inbound(fixture.table, fixture.inbound) == FTUN_E_AGAIN);
+  CHECK(ftun_datagram_destroy(&fixture.inbound) == FTUN_E_AGAIN);
+  CHECK(ftun_datagram_deliver(fixture.slots[0].channel, &resolved[0], &packet) ==
+    FTUN_E_CANCELLED && fixture.inbound_sends == 0u);
+  CHECK(complete_pending(&fixture.slots[0], FTUN_OK) == 0);
+  CHECK(ftun_udp_flow_close_inbound(fixture.table, fixture.inbound) == FTUN_OK);
+  CHECK(ftun_datagram_get_usage(fixture.inbound, &usage) == FTUN_OK &&
+    usage.reference_count == 1u);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_reap_stopped_quota(void)
+{
+  fixture_t fixture;
+  ftun_datagram_t *stopped;
+  ftun_metadata_t metadata;
+  ftun_endpoint_t resolved[2];
+  ftun_packet_t packet = {0};
+  ftun_udp_flow_usage_t usage;
+  size_t work;
+  char domain[] = "quota.example";
+  CHECK(fixture_start(&fixture, 4u, 1000u) == 0);
+  fill_fake_metadata(&metadata, resolved, domain);
+  CHECK(make_packet(fixture.budget, (const uint8_t *)"x", 1u, &packet) == 0);
+  fixture.async_send = 1;
+  CHECK(ftun_udp_flow_input_on(fixture.table, fixture.inbound, &metadata, &packet) == FTUN_OK);
+  stopped = fixture.inbound;
+  fixture.inbound = NULL;
+  CHECK(create_inbound(&fixture) == 0);
+  metadata.source.port++;
+  CHECK(ftun_udp_flow_input_on(fixture.table, fixture.inbound, &metadata, &packet) == FTUN_OK);
+  CHECK(ftun_datagram_stop(stopped) == FTUN_OK);
+  CHECK(ftun_udp_flow_reap_stopped(fixture.table, 1u, &work) == FTUN_OK && work == 1u);
+  fixture.cancel_failures = 1;
+  CHECK(ftun_udp_flow_reap_stopped(fixture.table, 1u, &work) == FTUN_E_AGAIN && work == 1u);
+  CHECK(ftun_datagram_destroy(&stopped) == FTUN_E_AGAIN);
+  CHECK(complete_pending(&fixture.slots[0], FTUN_OK) == 0);
+  CHECK(ftun_udp_flow_reap_stopped(fixture.table, 1u, &work) == FTUN_OK && work == 1u);
+  CHECK(ftun_udp_flow_reap_stopped(fixture.table, 1u, &work) == FTUN_OK && work == 1u);
+  CHECK(ftun_udp_flow_get_usage(fixture.table, &usage) == FTUN_OK && usage.active == 1u);
+  CHECK(fixture.slots[0].destroyed == 1 && fixture.slots[1].destroyed == 0);
+  CHECK(ftun_datagram_destroy(&stopped) == FTUN_OK);
+  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }
 
 int main(void)
 {
+  CHECK(test_reap_stopped_quota() == 0);
+  CHECK(test_inbound_retained_until_cancelled() == 0);
   CHECK(test_key_runtime_and_idle() == 0);
   CHECK(test_active_flow_refreshes_idle_deadline() == 0);
   CHECK(test_fake_reply_and_fixed_remote() == 0);

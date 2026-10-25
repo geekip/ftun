@@ -39,6 +39,7 @@ struct ftun_udp_flow_table {
   ftun_udp_flow_t *flows;
   ftun_udp_flow_t *buckets[FTUN_UDP_FLOW_BUCKETS];
   ftun_udp_flow_t *reap_cursor;
+  ftun_udp_flow_t *stopped_cursor;
   size_t capacity;
   size_t active;
   size_t created;
@@ -305,6 +306,7 @@ static void ftun_udp_flow_unlink(ftun_udp_flow_t *flow)
     }
   }
   if (table->reap_cursor == flow) table->reap_cursor = flow->next;
+  if (table->stopped_cursor == flow) table->stopped_cursor = flow->next;
   for (cursor = &table->flows; *cursor != NULL; cursor = &(*cursor)->next) {
     if (*cursor == flow) {
       *cursor = flow->next;
@@ -327,6 +329,8 @@ static ftun_status_t ftun_udp_flow_dispose(ftun_udp_flow_t *flow)
     if (status != FTUN_OK) return status;
     flow->outbound = NULL;
   }
+  status = ftun_datagram_release(&flow->inbound);
+  if (status != FTUN_OK) return status;
   status = ftun_runtime_release(&flow->runtime);
   if (status != FTUN_OK) return status;
   ftun_udp_flow_unlink(flow);
@@ -423,6 +427,7 @@ static void ftun_udp_flow_copy_metadata(ftun_udp_flow_t *flow,
 static ftun_status_t ftun_udp_flow_create(
   ftun_udp_flow_table_t *table, ftun_datagram_t *inbound,
   const ftun_metadata_t *metadata, const ftun_route_result_t *route,
+  const ftun_udp_flow_admission_t *admission,
   ftun_udp_flow_t **out)
 {
   ftun_udp_flow_t *flow;
@@ -435,7 +440,12 @@ static ftun_status_t ftun_udp_flow_create(
   uint32_t outbound_id = 0u;
   ftun_status_t status;
   *out = NULL;
-  status = ftun_runtime_active_acquire(table->core, &runtime);
+  if (admission != NULL) {
+    status = ftun_runtime_retain(admission->runtime);
+    if (status == FTUN_OK) runtime = admission->runtime;
+  } else {
+    status = ftun_runtime_active_acquire(table->core, &runtime);
+  }
   if (status != FTUN_OK) return status;
   status = ftun_runtime_get_info(runtime, &runtime_info);
   if (status != FTUN_OK || runtime_info.generation != metadata->generation) {
@@ -456,13 +466,20 @@ static ftun_status_t ftun_udp_flow_create(
   flow->table = table;
   flow->reservation = reservation;
   flow->runtime = runtime;
+  status = ftun_datagram_retain(inbound);
+  if (status != FTUN_OK) {
+    (void)ftun_runtime_release(&runtime);
+    free(flow);
+    (void)ftun_reservation_release(&reservation);
+    return status;
+  }
   flow->inbound = inbound;
   flow->route_pinned = route != NULL;
   flow->route_outbound_id = route == NULL ? 0u : route->outbound_id;
   ftun_udp_flow_copy_metadata(flow, metadata);
   memset(&remote, 0, sizeof(remote));
   status = table->backend.open(table->backend.user, table->core, runtime,
-                               &flow->metadata, route, ftun_udp_flow_result,
+                               &flow->metadata, route, admission, ftun_udp_flow_result,
                                ftun_udp_flow_receive, flow, &outbound_id,
                                &remote, &outbound);
   if (status == FTUN_OK && (outbound == NULL ||
@@ -480,6 +497,7 @@ static ftun_status_t ftun_udp_flow_create(
       (void)ftun_datagram_stop(outbound);
       (void)ftun_datagram_destroy(&outbound);
     }
+    (void)ftun_datagram_release(&flow->inbound);
     (void)ftun_runtime_release(&runtime);
     free(flow);
     (void)ftun_reservation_release(&reservation);
@@ -568,6 +586,7 @@ ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
                                          ftun_datagram_t *inbound,
                                          const ftun_metadata_t *metadata,
                                          const ftun_route_result_t *route,
+                                         const ftun_udp_flow_admission_t *admission,
                                          ftun_packet_t *packet)
 {
   ftun_udp_flow_t *flow;
@@ -578,6 +597,16 @@ ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
       table != ftun_udp_flow_active) return FTUN_E_INVALID;
   status = ftun_udp_metadata_validate(metadata);
   if (status != FTUN_OK) return status;
+  if (admission != NULL) {
+    uint64_t path_generation = 0u, resolver_generation = 0u;
+    if (route == NULL || admission->runtime == NULL ||
+        ftun_path_scope_generation(admission->path, &path_generation) != FTUN_OK ||
+        ftun_resolver_scope_generation(admission->resolver, &resolver_generation) != FTUN_OK) {
+      return FTUN_E_INVALID;
+    }
+    if (path_generation != metadata->generation ||
+        resolver_generation != metadata->generation) return FTUN_E_STALE;
+  }
   /* 旧入口没有预先完成的路由，因此仍需要具体目标。Engine 专用的路由
    * 入口可以为 SOCKS5 UDP 叶子保留域名，且不得擅自附带 IPv4 候选。 */
   if (route == NULL && metadata->resolved_count == 0u &&
@@ -597,7 +626,7 @@ ftun_status_t ftun_udp_flow_input_routed(ftun_udp_flow_table_t *table,
   if (flow != NULL && flow->inbound != inbound) return FTUN_E_REJECTED;
   if (flow == NULL) {
     if (table->active >= table->capacity) return FTUN_E_LIMIT;
-    status = ftun_udp_flow_create(table, inbound, metadata, route, &flow);
+    status = ftun_udp_flow_create(table, inbound, metadata, route, admission, &flow);
     if (status != FTUN_OK) return status;
   }
   status = ftun_datagram_send(flow->outbound, &flow->remote, packet);
@@ -665,7 +694,7 @@ ftun_status_t ftun_udp_flow_input_on(ftun_udp_flow_table_t *table,
                                      const ftun_metadata_t *metadata,
                                      ftun_packet_t *packet)
 {
-  return ftun_udp_flow_input_routed(table, inbound, metadata, NULL, packet);
+  return ftun_udp_flow_input_routed(table, inbound, metadata, NULL, NULL, packet);
 }
 
 ftun_status_t ftun_udp_flow_input(ftun_core_t *core,
@@ -754,6 +783,32 @@ ftun_status_t ftun_udp_flow_close_inbound(ftun_udp_flow_table_t *table,
     flow = next;
   }
   return FTUN_OK;
+}
+
+ftun_status_t ftun_udp_flow_reap_stopped(ftun_udp_flow_table_t *table,
+  size_t quota, size_t *out_work)
+{
+  ftun_status_t result = FTUN_OK;
+  if (out_work != NULL) *out_work = 0u;
+  if (table == NULL || table != ftun_udp_flow_active || quota == 0u ||
+      out_work == NULL) return FTUN_E_INVALID;
+  if (table->stopped_cursor == NULL) table->stopped_cursor = table->flows;
+  while (*out_work < quota && table->stopped_cursor != NULL) {
+    ftun_udp_flow_t *flow = table->stopped_cursor;
+    ftun_datagram_usage_t usage;
+    ftun_status_t status;
+    table->stopped_cursor = flow->next;
+    (*out_work)++;
+    status = ftun_datagram_get_usage(flow->inbound, &usage);
+    if (status == FTUN_OK && !usage.accepting) {
+      flow->failed = true;
+      flow->failure_status = FTUN_E_CANCELLED;
+      status = ftun_udp_flow_dispose(flow);
+      if (status == FTUN_OK) ftun_udp_flow_increment(&table->failed);
+    }
+    if (status != FTUN_OK && result == FTUN_OK) result = status;
+  }
+  return result;
 }
 
 ftun_status_t ftun_udp_flow_get_usage(const ftun_udp_flow_table_t *table,

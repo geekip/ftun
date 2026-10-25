@@ -1,4 +1,5 @@
 #include "dns/wire.h"
+#include "core/budget.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -377,8 +378,33 @@ static int test_random_inputs(void)
 }
 
 /* TASK-DNS-008 / TEST-DNS-008：RFC 固定夹具、压缩边界与关联键。 */
+static int test_owned_budget(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_dns_message_t *message = NULL;
+  ftun_budget_usage_t usage;
+  ftun_bytes_t input = {query_wire, sizeof(query_wire)};
+  size_t bytes;
+  CHECK(ftun_dns_message_parse(input, &message) == FTUN_OK);
+  bytes = sizeof(*message) + message->question.name.length + input.length;
+  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  CHECK(ftun_budget_create(NULL, bytes - 1u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_E_LIMIT && message == NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(ftun_budget_create(NULL, bytes, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == bytes);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN && budget != NULL);
+  CHECK(ftun_dns_message_release(&message) == FTUN_OK && message == NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_owned_budget() == 0);
   ftun_dns_message_t *message = (ftun_dns_message_t *)(uintptr_t)1;
   CHECK(ftun_dns_message_parse((ftun_bytes_t){NULL, 0u}, &message) ==
         FTUN_E_INVALID && message == NULL);

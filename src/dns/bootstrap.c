@@ -37,7 +37,7 @@ typedef struct {
   ftun_network_view_t *network_view;
   uint64_t network_generation;
   ftun_socket_policy_t protection;
-  char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char interface_name[FTUN_SOCKET_INTERFACE_BYTES];
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
   size_t domain_length;
   uint8_t question_name[FTUN_DNS_MAX_NAME_BYTES];
@@ -116,7 +116,7 @@ static int ftun_bootstrap_device_valid(ftun_string_t device)
   size_t index;
   if (device.length == 0u) return 1;
   if (device.data == NULL ||
-      device.length >= FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+      device.length >= FTUN_SOCKET_INTERFACE_BYTES) return 0;
   for (index = 0u; index < device.length; index++) {
     unsigned char byte = (unsigned char)device.data[index];
     if (byte <= (unsigned char)' ' || byte == (unsigned char)'/' ||
@@ -497,7 +497,7 @@ static ftun_status_t ftun_bootstrap_process_response(
   *out_matched = 0;
   if (!ftun_bootstrap_endpoint_equal(
         source, &context->servers[context->current_server])) return FTUN_OK;
-  status = ftun_dns_message_parse(
+  status = ftun_dns_message_parse_with_budget(context->budget,
     (ftun_bytes_t){context->response_wire, received}, &message);
   if (status != FTUN_OK) return status;
   memset(&query, 0, sizeof(query));

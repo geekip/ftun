@@ -7,6 +7,7 @@
 #include "dns/dispatcher.h"
 #include "event/event.h"
 #include "internal/contracts.h"
+#include "transport/path.h"
 
 #include <stdbool.h>
 
@@ -17,7 +18,8 @@ typedef struct ftun_dns_runtime_plan ftun_dns_runtime_plan_t;
 #endif
 
 typedef ftun_status_t (*ftun_dns_group_select_fn)(
-  void *user, uint32_t group_id, uint32_t *out_member);
+  void *user, const ftun_config_t *expected_config,
+  uint32_t group_id, uint32_t *out_member);
 
 typedef struct {
   ftun_dns_group_select_fn select_member;
@@ -25,20 +27,31 @@ typedef struct {
   void *user;
 } ftun_dns_runtime_adapter_t;
 
+/* 每个配置快照独立拥有 Provider；context 借用至该代完全排空。
+ * generation 必须来自准备中的配置，不能读取尚未提交的 Core 当前代。 */
+typedef struct {
+  uint64_t generation;
+  uint32_t socket_mark;
+  ftun_path_provider_ops_t path;
+  void *context;
+} ftun_dns_runtime_network_t;
+
+/* prepare/reload_prepare 的 *out 必须为空；失败后的非空输出保留拥有权，
+ * 仅能 destroy 重试。config/loop/adapter 依赖须保留到回收完成。 */
 ftun_status_t ftun_dns_runtime_prepare(
   ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_event_loop_t *loop,
   const ftun_config_t *config, const ftun_dns_runtime_adapter_t *adapter,
-  uint32_t socket_mark,
+  const ftun_dns_runtime_network_t *network,
   ftun_dns_runtime_t **out);
 ftun_status_t ftun_dns_runtime_prepare_reload(
   const ftun_dns_runtime_t *active, ftun_core_t *core,
   ftun_budget_t *budget, ftun_operation_queue_t *operations,
   ftun_event_loop_t *loop,
   const ftun_config_t *config, const ftun_dns_runtime_adapter_t *adapter,
-  uint32_t socket_mark,
+  const ftun_dns_runtime_network_t *network,
   ftun_dns_runtime_t **out);
-ftun_status_t ftun_dns_runtime_plan_prepare(const ftun_config_t *config,
+ftun_status_t ftun_dns_runtime_plan_prepare(ftun_budget_t *budget, const ftun_config_t *config,
                                            uint32_t socket_mark,
                                            ftun_dns_runtime_plan_t **out);
 ftun_status_t ftun_dns_runtime_plan_destroy(ftun_dns_runtime_plan_t **plan);
@@ -47,7 +60,7 @@ ftun_status_t ftun_dns_runtime_prepare_reload_planned(
   ftun_budget_t *budget, ftun_operation_queue_t *operations,
   ftun_event_loop_t *loop,
   const ftun_config_t *config, const ftun_dns_runtime_adapter_t *adapter,
-  uint32_t socket_mark,
+  const ftun_dns_runtime_network_t *network,
   const ftun_dns_runtime_plan_t *plan, ftun_dns_runtime_t **out);
 ftun_status_t ftun_dns_runtime_commit_reload(ftun_dns_runtime_t **active,
                                              ftun_dns_runtime_t **prepared,
@@ -56,6 +69,8 @@ ftun_status_t ftun_dns_runtime_commit_reload(ftun_dns_runtime_t **active,
  * reclaimed. AGAIN means the bounded retired slot is still in use. */
 ftun_status_t ftun_dns_runtime_reap(ftun_dns_runtime_t **retired);
 ftun_status_t ftun_dns_runtime_activate(ftun_dns_runtime_t *dns);
+/* 每单元至多推进一次有界传输并交付一个 waiter；未交付响应保留原接收
+ * 时刻和缓冲。run/stop 的回调重入返回 AGAIN，不释放活跃借用。 */
 ftun_status_t ftun_dns_runtime_run_once(ftun_dns_runtime_t *dns, size_t quota,
                                        size_t *out_work);
 bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns);
@@ -75,6 +90,10 @@ ftun_status_t ftun_dns_runtime_hijack_udp(
   ftun_dns_runtime_t *dns, ftun_datagram_t *inbound,
   const ftun_endpoint_t *client, const ftun_packet_t *packet);
 ftun_status_t ftun_dns_runtime_stop(ftun_dns_runtime_t *dns);
+/* 单次至多推进 32 个请求/结果单元；AGAIN 保留拥有链供宿主继续派发和
+ * 重试，TIMEOUT 不释放存活请求。deadline_ms 是所有重试共用的绝对期限。 */
+ftun_status_t ftun_dns_runtime_stop_until(ftun_dns_runtime_t *dns,
+                                        uint64_t deadline_ms);
 ftun_status_t ftun_dns_runtime_destroy(ftun_dns_runtime_t **dns);
 
 #endif

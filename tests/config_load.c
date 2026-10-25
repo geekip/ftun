@@ -73,6 +73,7 @@ int main(void)
   ssize_t executable_length;
   struct passwd *user;
   ftun_config_t *config = NULL;
+  ftun_config_trace_t trace;
   int descriptor;
 
   root = mkdtemp(temporary);
@@ -89,7 +90,9 @@ int main(void)
   CHECK(make_path(large_path, sizeof(large_path), config_directory, "large.json"));
   CHECK(write_file(config_path, valid, strlen(valid)));
 
-  CHECK(ftun_config_load(NULL, config_path, &config) == FTUN_OK && config != NULL);
+  CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_OK && config != NULL);
+  CHECK(trace.completed == FTUN_CONFIG_STEP_COMPILE && trace.failed == FTUN_CONFIG_STEP_NONE &&
+    trace.status == FTUN_OK);
   canonical = realpath(config_path, NULL);
   CHECK(canonical != NULL);
   CHECK(strcmp(config->source_path, canonical) == 0);
@@ -135,16 +138,19 @@ int main(void)
 
   CHECK(write_file(invalid_path, "{", 1u));
   config = (ftun_config_t *)(uintptr_t)1;
-  CHECK(ftun_config_load(NULL, invalid_path, &config) == FTUN_E_INVALID && config == NULL);
+  CHECK(ftun_config_load_traced(invalid_path, &config, &trace) == FTUN_E_INVALID && config == NULL);
+  CHECK(trace.completed == FTUN_CONFIG_STEP_READ && trace.failed == FTUN_CONFIG_STEP_PARSE);
   CHECK(write_file(semantic_path, "{\"log\":{\"level\":\"bad\"}}",
                    strlen("{\"log\":{\"level\":\"bad\"}}")));
-  CHECK(ftun_config_load(NULL, semantic_path, &config) == FTUN_E_INVALID && config == NULL);
+  CHECK(ftun_config_load_traced(semantic_path, &config, &trace) == FTUN_E_INVALID && config == NULL);
+  CHECK(trace.completed == FTUN_CONFIG_STEP_PATHS && trace.failed == FTUN_CONFIG_STEP_VALIDATE);
   CHECK(write_file(bad_tilde_path,
                    "{\"dns\":{\"enable\":false},\"log\":{\"file\":\"~other/x\"}}",
                    strlen("{\"dns\":{\"enable\":false},\"log\":{"
                           "\"file\":\"~other/x\"}}")));
-  CHECK(ftun_config_load(NULL, bad_tilde_path, &config) == FTUN_E_INVALID &&
+  CHECK(ftun_config_load_traced(bad_tilde_path, &config, &trace) == FTUN_E_INVALID &&
         config == NULL);
+  CHECK(trace.completed == FTUN_CONFIG_STEP_PARSE && trace.failed == FTUN_CONFIG_STEP_PATHS);
 
   descriptor = open(large_path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   CHECK(descriptor >= 0);
@@ -153,7 +159,8 @@ int main(void)
   CHECK(ftun_config_load(NULL, large_path, &config) == FTUN_E_LIMIT && config == NULL);
   CHECK(ftun_config_load(NULL, config_directory, &config) == FTUN_E_IO && config == NULL);
   CHECK(make_path(expected, sizeof(expected), config_directory, "missing.json"));
-  CHECK(ftun_config_load(NULL, expected, &config) == FTUN_E_IO && config == NULL);
+  CHECK(ftun_config_load_traced(expected, &config, &trace) == FTUN_E_IO && config == NULL);
+  CHECK(trace.completed == FTUN_CONFIG_STEP_NONE && trace.failed == FTUN_CONFIG_STEP_READ);
   CHECK(ftun_config_load(NULL, "", &config) == FTUN_E_INVALID && config == NULL);
   CHECK(ftun_config_load(NULL, NULL, &config) == FTUN_E_INVALID && config == NULL);
   CHECK(ftun_config_load(NULL, config_path, NULL) == FTUN_E_INVALID);

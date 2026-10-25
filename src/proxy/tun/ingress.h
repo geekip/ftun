@@ -61,7 +61,8 @@ typedef struct {
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * bind 创建 owner-loop 消费者上下文；输入同步借用，lwIP 在返回前取得独立
  * slice 引用。TCP accept 成功后 Stream 初始引用交给回调；UDP Datagram 仍由
- * ingress 拥有。close 会停止 Stream，须由接纳方销毁后重试 close。
+ * ingress 拥有；异步消费者必须 retain，在静默后 release。close 会停止
+ * Stream/Datagram，须由接纳方销毁 Stream 或归还 Datagram 引用后重试 close。
  */
 ftun_status_t ftun_tun_ingress_bind(
   const ftun_tun_ingress_spec_t *spec, ftun_tun_ingress_context_t **out);
@@ -94,5 +95,10 @@ ftun_status_t ftun_tun_ingress_can_set_identity(
   uint32_t inbound_id);
 ftun_status_t ftun_tun_ingress_get_usage(
   const ftun_tun_ingress_context_t *context, ftun_tun_ingress_usage_t *out);
+/* quiesce 仅关闭 IP 输入/输出；不在事件回调内释放消费者。
+ * close_step 每次至多处理 quota 个 bridge，未静默对象保留并返回 AGAIN。 */
+ftun_status_t ftun_tun_ingress_quiesce(ftun_tun_ingress_context_t *context);
+ftun_status_t ftun_tun_ingress_close_step(ftun_tun_ingress_context_t **context,
+  size_t quota, size_t *out_work);
 ftun_status_t ftun_tun_ingress_close(ftun_tun_ingress_context_t **context);
 #endif

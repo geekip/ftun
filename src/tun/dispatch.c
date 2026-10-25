@@ -225,7 +225,9 @@ static ftun_status_t ftun_tun_service_deliver(
     }
     return status;
   }
+  service->callback_depth++;
   status = consumer->consumer.packet(consumer->consumer.user, lease, packet);
+  service->callback_depth--;
   if (ftun_tun_service_lease_consumer(service, lease) == NULL) return FTUN_OK;
   if (status == FTUN_OK) {
     if (consumer->packets_received != SIZE_MAX) consumer->packets_received++;
@@ -262,6 +264,7 @@ static ftun_status_t ftun_tun_service_dispatch_queued(
       ftun_tun_service_packet_t *entry =
         &consumer->input[consumer->input_head];
       ftun_tun_lease_t lease = consumer->lease;
+      ftun_buffer_t *borrowed;
       uint8_t *data = NULL;
       size_t capacity = 0u;
       ftun_status_t status;
@@ -275,9 +278,19 @@ static ftun_status_t ftun_tun_service_dispatch_queued(
       if (status != FTUN_OK || entry->length > capacity) {
         return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
       }
+      /* release 可清空当前队列，但不能提前结束回调正在使用的借用。 */
+      borrowed = entry->buffer;
+      status = ftun_buffer_retain(borrowed);
+      if (status != FTUN_OK) return status;
+      service->callback_depth++;
       status = consumer->consumer.packet(
         consumer->consumer.user, lease,
         (ftun_bytes_t){data, entry->length});
+      service->callback_depth--;
+      {
+        ftun_status_t released = ftun_buffer_release(&borrowed);
+        if (released != FTUN_OK) return released;
+      }
       (*work)++;
       if (ftun_tun_service_lease_consumer(service, lease) == NULL) break;
       if (status == FTUN_E_AGAIN) {
@@ -359,7 +372,9 @@ void ftun_tun_service_broadcast(ftun_tun_service_t *service,
     ftun_tun_service_event_fn callback = consumer->consumer.event;
     void *user = consumer->consumer.user;
     if (lease.service == service && callback != NULL) {
+      service->callback_depth++;
       callback(user, lease, event, status);
+      service->callback_depth--;
     }
   }
 }
@@ -371,6 +386,8 @@ ftun_status_t ftun_tun_service_run(
   ftun_status_t status;
   if (out_work != NULL) *out_work = 0u;
   if (service == NULL || out_work == NULL) return FTUN_E_INVALID;
+  if (service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (!service->accepting) return FTUN_OK;
   status = ftun_tun_service_dispatch_queued(service, out_work);
   if (status != FTUN_OK) {
     ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_FAILED, status);

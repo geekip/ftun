@@ -55,7 +55,8 @@ ftun_status_t ftun_relay_start_with_pool_options(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
   ftun_buffer_pool_t *pool, const ftun_relay_options_t *options,
   ftun_relay_progress_fn progress, void *progress_user, ftun_relay_t **out);
-/* events 是本轮已就绪位；单次最多执行 options.max_work_per_round 个动作。 */
+/* events 是新增就绪位；READ 跨配额/背压保留至 AGAIN/EOF。
+ * 单次最多执行 options.max_work_per_round 个动作。 */
 ftun_status_t ftun_relay_process(ftun_relay_t *relay,
                                  uint32_t left_events,
                                  uint32_t right_events,

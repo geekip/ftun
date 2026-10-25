@@ -22,13 +22,20 @@ typedef struct {
   uint64_t network_generation;
   ftun_dial_domain_t requested_domain;
   ftun_socket_policy_t protection;
-  char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char interface_name[FTUN_SOCKET_INTERFACE_BYTES];
   uint64_t deadline_ms;
   ftun_dial_transport_t transport;
   ftun_dial_completion_fn completion;
   void *completion_user;
   ftun_dial_result_t result;
   ftun_dial_io_t io;
+  ftun_path_scope_t *scope;
+  ftun_path_t *path;
+  ftun_stream_options_t stream;
+  ftun_datagram_options_t datagram;
+  ftun_path_completion_fn path_completion;
+  ftun_path_notify_fn notify;
+  void *notify_user;
   int custom_io;
   int cancelling;
 } ftun_direct_context_t;
@@ -108,11 +115,13 @@ static int ftun_direct_request_valid(const ftun_direct_request_t *request)
 {
   if (request == NULL || request->loop == NULL ||
       request->operations == NULL || request->budget == NULL ||
-      request->target == NULL || request->completion == NULL ||
+      request->target == NULL ||
+      (request->scope == NULL ? request->completion == NULL || request->path_completion != NULL
+        : request->completion != NULL || request->path_completion == NULL) ||
       (request->transport != FTUN_DIAL_TCP &&
        request->transport != FTUN_DIAL_UDP)) return 0;
   if (request->protection.interface_name.length >=
-      FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+      FTUN_SOCKET_INTERFACE_BYTES) return 0;
   if (request->protection.interface_name.length != 0u &&
       request->protection.interface_name.data == NULL) return 0;
   if (request->protection.mark == 0u &&
@@ -140,6 +149,11 @@ static ftun_status_t ftun_direct_system_close(ftun_native_socket_t socket)
 static ftun_status_t ftun_direct_close_result(ftun_direct_context_t *context)
 {
   ftun_status_t status;
+  if (context->path != NULL) {
+    status = ftun_path_revoke(context->path);
+    if (status == FTUN_OK) status = ftun_path_destroy(&context->path);
+    return status;
+  }
   if (context->result.socket == FTUN_INVALID_SOCKET) return FTUN_OK;
   if (context->custom_io) {
     status = context->io.close_socket(context->io.context,
@@ -175,6 +189,7 @@ static void ftun_direct_release_context(ftun_direct_context_t *context)
   network_view = context->network_view;
   context->reservation = NULL;
   context->network_view = NULL;
+  (void)ftun_path_scope_release(&context->scope);
   memset(context, 0, sizeof(*context));
   free(context);
   (void)ftun_network_view_release(&network_view);
@@ -192,7 +207,11 @@ static void ftun_direct_completed(ftun_operation_t *operation,
   completion = context->completion;
   completion_user = context->completion_user;
   context->operation = NULL;
-  completion(operation, error, &context->result, completion_user);
+  if (context->path_completion != NULL) {
+    ftun_path_t *path = context->path;
+    context->path = NULL;
+    context->path_completion(operation, error, path, completion_user);
+  } else completion(operation, error, &context->result, completion_user);
   ftun_direct_release_context(context);
 }
 
@@ -206,6 +225,9 @@ static void ftun_direct_child_completed(ftun_operation_t *operation,
                                         ftun_error_t error,
                                         const ftun_dial_result_t *result,
                                         void *user);
+
+static void ftun_direct_path_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user);
 
 static ftun_status_t ftun_direct_start_attempt(ftun_direct_context_t *context)
 {
@@ -229,7 +251,19 @@ static ftun_status_t ftun_direct_start_attempt(ftun_direct_context_t *context)
     request.purpose = FTUN_DIAL_PURPOSE_BUSINESS;
     request.completion = ftun_direct_child_completed;
     request.user = context;
-    if (context->custom_io) {
+    if (context->scope != NULL) {
+      ftun_path_open_request_t channel = {0};
+      channel.dial = request;
+      channel.dial.completion = NULL;
+      channel.dial.user = NULL;
+      channel.stream = context->stream;
+      channel.datagram = context->datagram;
+      channel.completion = ftun_direct_path_completed;
+      channel.user = context;
+      channel.notify = context->notify;
+      channel.notify_user = context->notify_user;
+      status = ftun_path_scope_open(context->scope, context->core, &channel, &context->child);
+    } else if (context->custom_io) {
       status = ftun_dial_start_with_io(context->core, &request, &context->io,
                                        &context->child);
     } else {
@@ -273,6 +307,28 @@ static void ftun_direct_child_completed(ftun_operation_t *operation,
   (void)ftun_operation_complete(context->completion_token, error);
 }
 
+static void ftun_direct_path_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user)
+{
+  ftun_direct_context_t *context = (ftun_direct_context_t *)user;
+  ftun_status_t status;
+  (void)operation;
+  context->child = NULL;
+  context->path = path;
+  if (context->cancelling) {
+    (void)ftun_operation_cancel(context->operation);
+    return;
+  }
+  if (error.status == FTUN_OK && path == NULL) error.status = FTUN_E_STATE_CORRUPT;
+  if (error.status != FTUN_OK && context->transport == FTUN_DIAL_TCP &&
+      ftun_direct_retryable(error.status) && context->next_candidate < context->allowed_count) {
+    status = ftun_direct_start_attempt(context);
+    if (status == FTUN_OK) return;
+    error = ftun_direct_error(status, FTUN_DIAL_STAGE_CONNECT);
+  }
+  (void)ftun_operation_complete(context->completion_token, error);
+}
+
 static ftun_status_t ftun_direct_reject(ftun_direct_context_t *context,
                                         ftun_status_t original)
 {
@@ -296,7 +352,13 @@ static ftun_status_t ftun_direct_open_internal(
   size_t allocation_size;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_direct_request_valid(request) ||
-      (io != NULL && !ftun_direct_io_valid(io))) return FTUN_E_INVALID;
+      (io != NULL && (!ftun_direct_io_valid(io) || request->scope != NULL))) return FTUN_E_INVALID;
+  if (request->scope != NULL) {
+    uint64_t generation;
+    status = ftun_path_scope_generation(request->scope, &generation);
+    if (status != FTUN_OK) return status;
+    if (generation != request->target->generation) return FTUN_E_STALE;
+  }
   status = ftun_direct_target_validate(request->target);
   if (status != FTUN_OK) return status;
   if (request->target->allowed_count >
@@ -314,6 +376,16 @@ static ftun_status_t ftun_direct_open_internal(
   }
   context->core = core;
   context->reservation = reservation;
+  if (request->scope != NULL) {
+    status = ftun_path_scope_retain(request->scope);
+    if (status != FTUN_OK) { ftun_direct_release_context(context); return status; }
+    context->scope = request->scope;
+    context->stream = request->stream;
+    context->datagram = request->datagram;
+    context->path_completion = request->path_completion;
+    context->notify = request->notify;
+    context->notify_user = request->notify_user;
+  }
   context->loop = request->loop;
   context->operations = request->operations;
   context->budget = request->budget;

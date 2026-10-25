@@ -17,6 +17,7 @@ struct ftun_relay_direction {
   size_t length;
   size_t accepted;
   int source_eof;
+  int read_ready;
   int read_paused;
   int write_pending;
   int write_blocked;
@@ -90,6 +91,7 @@ static ftun_status_t ftun_relay_cancel_direction(
   }
   ftun_relay_release_buffer(direction);
   direction->buffer_ready = 0;
+  direction->read_ready = 0;
   direction->write_blocked = 0;
   direction->shutdown_blocked = 0;
   return status;
@@ -239,11 +241,13 @@ static ftun_status_t ftun_relay_read_direction(
     return FTUN_OK;
   }
   if (status == FTUN_E_EOF) {
+    direction->read_ready = 0;
     direction->source_eof = 1;
     if (direction->length == 0u) ftun_relay_release_buffer(direction);
     return FTUN_OK;
   }
   if (status == FTUN_E_AGAIN) {
+    direction->read_ready = 0;
     if (direction->length == 0u) ftun_relay_release_buffer(direction);
     return FTUN_OK;
   }
@@ -434,33 +438,22 @@ ftun_status_t ftun_relay_process(ftun_relay_t *relay,
     return ftun_relay_fail(relay, FTUN_E_IO);
   }
   relay->processing = 1;
+  /* 就绪状态跨配额、背压和写完成保留，读空后等待新的提示。 */
+  if ((left_events & FTUN_EVENT_READ) != 0u) relay->left_to_right.read_ready = 1;
+  if ((right_events & FTUN_EVENT_READ) != 0u) relay->right_to_left.read_ready = 1;
   while (work < relay->max_work && scans < 4u) {
     int did_work = 0;
     unsigned int slot = relay->cursor;
     relay->cursor = (relay->cursor + 1u) % 4u;
     scans++;
-    if (slot == 0u && ((left_events & FTUN_EVENT_READ) != 0u ||
+    if (slot == 0u && (relay->left_to_right.read_ready ||
                        relay->left_to_right.buffer_ready) &&
         ftun_relay_direction_readable(&relay->left_to_right)) {
-      size_t before_length = relay->left_to_right.length;
-      int before_eof = relay->left_to_right.source_eof;
       status = ftun_relay_read_direction(&relay->left_to_right, &did_work);
-      if (did_work && status == FTUN_OK &&
-          relay->left_to_right.length == before_length &&
-          relay->left_to_right.source_eof == before_eof) {
-        left_events &= ~FTUN_EVENT_READ;
-      }
-    } else if (slot == 1u && ((right_events & FTUN_EVENT_READ) != 0u ||
+    } else if (slot == 1u && (relay->right_to_left.read_ready ||
                               relay->right_to_left.buffer_ready) &&
                ftun_relay_direction_readable(&relay->right_to_left)) {
-      size_t before_length = relay->right_to_left.length;
-      int before_eof = relay->right_to_left.source_eof;
       status = ftun_relay_read_direction(&relay->right_to_left, &did_work);
-      if (did_work && status == FTUN_OK &&
-          relay->right_to_left.length == before_length &&
-          relay->right_to_left.source_eof == before_eof) {
-        right_events &= ~FTUN_EVENT_READ;
-      }
     } else if (slot == 2u) {
       status = ftun_relay_progress_direction(
         &relay->left_to_right,

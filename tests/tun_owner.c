@@ -1,14 +1,22 @@
+#define _POSIX_C_SOURCE 200809L
 #include "config/compile.h"
 #include "core/budget.h"
 #include "core/context.h"
 #include "core/module_plan.h"
 #include "core/operation.h"
 #include "event/event.h"
+#include "event/libev_adapter.h"
 #include "tun/owner.h"
+#include "platform/linux/interface.h"
+#include "platform/linux/route.h"
+#include "util/time.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #define CHECK(expression) do { \
   if (!(expression)) { \
@@ -18,6 +26,17 @@
   } \
 } while (0)
 
+static bool fail_plan_calloc;
+void *__real_calloc(size_t count, size_t size);
+void *__wrap_calloc(size_t count, size_t size)
+{
+  if (fail_plan_calloc) {
+    fail_plan_calloc = false;
+    return NULL;
+  }
+  return __real_calloc(count, size);
+}
+
 typedef struct {
   size_t opens;
   size_t closes;
@@ -25,6 +44,23 @@ typedef struct {
   size_t applies;
   size_t removes;
   size_t fail_apply_at;
+  bool fail_remove;
+  bool fail_rollback;
+  bool fail_open_once;
+  bool fail_close_once;
+  bool check_close_order;
+  bool close_order_error;
+  bool real_descriptor;
+  int descriptor;
+  ftun_linux_route_resource_t resources[32];
+  size_t resource_count;
+  bool provide_packet;
+  bool stall_writes;
+  bool withhold_replies;
+  bool withhold_add_reply;
+  bool has_reply;
+  ftun_linux_route_reply_t reply;
+  size_t async_requests;
 } host_state_t;
 
 typedef struct {
@@ -42,6 +78,14 @@ typedef struct {
   uint64_t generation;
   uint64_t pending_generation;
   bool needs_tun;
+  bool stall;
+  size_t received;
+  size_t network_updates;
+  size_t rebuilds;
+  size_t failures;
+  bool callback_error;
+  void *owner;
+  ftun_event_loop_t *loop;
 } consumer_runtime_t;
 
 static ftun_status_t fake_open(void *user, ftun_core_t *core,
@@ -55,6 +99,10 @@ static ftun_status_t fake_open(void *user, ftun_core_t *core,
       spec->name.length != 9u ||
       memcmp(spec->name.data, "ftun-own0", 9u) != 0 ||
       spec->mtu != 1420u) return FTUN_E_INVALID;
+  if (state->fail_open_once) {
+    state->fail_open_once = false;
+    return FTUN_E_IO;
+  }
   state->opens++;
   *out = (ftun_packet_port_t *)state;
   return FTUN_OK;
@@ -70,7 +118,7 @@ static ftun_status_t fake_get_info(void *user,
       out == NULL) return FTUN_E_INVALID;
   memcpy(out->name, "ftun-own0", 10u);
   out->mtu = 1420u;
-  out->native_socket = 77u;
+  out->native_socket = state->real_descriptor ? (ftun_native_socket_t)(unsigned int)state->descriptor : 77u;
   return FTUN_OK;
 }
 
@@ -78,9 +126,15 @@ static ftun_status_t fake_read(void *user, ftun_packet_port_t *port,
                                void *buffer, size_t capacity,
                                size_t *out_length)
 {
-  (void)buffer;
-  (void)capacity;
+  host_state_t *host = user;
   if (out_length != NULL) *out_length = 0u;
+  if (host != NULL && port == (ftun_packet_port_t *)host &&
+      host->provide_packet && buffer != NULL && capacity >= 4u && out_length != NULL) {
+    memcpy(buffer, (uint8_t[]){0x45u, 0x99u, 0u, 0u}, 4u);
+    *out_length = 4u;
+    host->provide_packet = false;
+    return FTUN_OK;
+  }
   return user != NULL && port == (ftun_packet_port_t *)user &&
     out_length != NULL ? FTUN_E_AGAIN : FTUN_E_INVALID;
 }
@@ -88,8 +142,9 @@ static ftun_status_t fake_read(void *user, ftun_packet_port_t *port,
 static ftun_status_t fake_write(void *user, ftun_packet_port_t *port,
                                 const void *packet, size_t length)
 {
-  return user != NULL && port == (ftun_packet_port_t *)user &&
-    packet != NULL && length != 0u ? FTUN_OK : FTUN_E_INVALID;
+  if (user == NULL || port != (ftun_packet_port_t *)user ||
+      packet == NULL || length == 0u) return FTUN_E_INVALID;
+  return ((host_state_t *)user)->stall_writes ? FTUN_E_AGAIN : FTUN_OK;
 }
 
 static ftun_status_t fake_close(void *user, ftun_packet_port_t **port)
@@ -98,19 +153,45 @@ static ftun_status_t fake_close(void *user, ftun_packet_port_t **port)
   if (state == NULL || port == NULL) return FTUN_E_INVALID;
   if (*port == NULL) return FTUN_OK;
   if (*port != (ftun_packet_port_t *)state) return FTUN_E_INVALID;
+  if (state->check_close_order && state->resource_count != 0u) state->close_order_error = true;
   state->closes++;
   *port = NULL;
+  if (state->fail_close_once) {
+    state->fail_close_once = false;
+    return FTUN_E_IO;
+  }
   return FTUN_OK;
+}
+
+static bool resource_equal(const ftun_linux_route_resource_t *left,
+                             const ftun_linux_route_resource_t *right)
+{
+  return left->kind == right->kind && left->family == right->family &&
+    strcmp(left->interface_name, right->interface_name) == 0 &&
+    memcmp(left->address, right->address, sizeof(left->address)) == 0 &&
+    left->prefix_length == right->prefix_length && left->table == right->table &&
+    left->priority == right->priority && left->mark == right->mark &&
+    left->mark_mask == right->mark_mask && left->metric == right->metric &&
+    left->protocol == right->protocol;
 }
 
 static ftun_status_t route_apply(
   void *context, const ftun_linux_route_resource_t *resource)
 {
   host_state_t *state = (host_state_t *)context;
+  size_t index;
   if (state == NULL || resource == NULL) return FTUN_E_INVALID;
   state->apply_attempts++;
   if (state->fail_apply_at != 0u &&
-      state->apply_attempts == state->fail_apply_at) return FTUN_E_IO;
+      state->apply_attempts == state->fail_apply_at) {
+    if (state->fail_rollback) state->fail_remove = true;
+    return FTUN_E_IO;
+  }
+  for (index = 0u; index < state->resource_count; index++) {
+    if (resource_equal(resource, &state->resources[index])) return FTUN_E_REJECTED;
+  }
+  if (state->resource_count >= 32u) return FTUN_E_LIMIT;
+  state->resources[state->resource_count++] = *resource;
   state->applies++;
   return FTUN_OK;
 }
@@ -119,7 +200,14 @@ static ftun_status_t route_remove(
   void *context, const ftun_linux_route_resource_t *resource)
 {
   host_state_t *state = (host_state_t *)context;
+  size_t index;
   if (state == NULL || resource == NULL) return FTUN_E_INVALID;
+  if (state->fail_remove) return FTUN_E_IO;
+  for (index = 0u; index < state->resource_count; index++) {
+    if (resource_equal(resource, &state->resources[index])) break;
+  }
+  if (index == state->resource_count) return FTUN_E_STATE_CORRUPT;
+  state->resources[index] = state->resources[--state->resource_count];
   state->removes++;
   return FTUN_OK;
 }
@@ -129,14 +217,48 @@ static ftun_status_t consume_packet(void *user, ftun_tun_lease_t lease,
 {
   consumer_runtime_t *runtime = (consumer_runtime_t *)user;
   (void)packet;
-  return runtime != NULL && lease.service == runtime->lease.service &&
-    lease.generation == runtime->lease.generation
-      ? FTUN_OK : FTUN_E_STALE;
+  if (runtime == NULL || lease.service != runtime->lease.service ||
+      lease.generation != runtime->lease.generation) return FTUN_E_STALE;
+  if (runtime->stall) return FTUN_E_AGAIN;
+  runtime->received++;
+  return FTUN_OK;
 }
 
-static ftun_status_t proxy_plan_prepare(
+static void network_event(void *user, ftun_tun_lease_t lease,
+  ftun_tun_service_event_t event, ftun_status_t status)
+{
+  consumer_runtime_t *runtime = user;
+  ftun_tun_service_usage_t usage;
+  if (runtime->owner != NULL) {
+    ftun_event_loop_usage_t before, after;
+    if (ftun_event_loop_get_usage(runtime->loop, &before) != FTUN_OK ||
+        ftun_tun_owner_service.quiesce(runtime->owner) != FTUN_E_AGAIN ||
+        ftun_event_loop_get_usage(runtime->loop, &after) != FTUN_OK ||
+        before.source_count != after.source_count) runtime->callback_error = true;
+  }
+  if (lease.service != runtime->lease.service ||
+      lease.generation != runtime->lease.generation ||
+      ftun_tun_service_get_usage(lease.service, &usage) != FTUN_OK ||
+      ftun_tun_service_refresh_network(lease.service, usage.network_generation) != FTUN_E_AGAIN) {
+    runtime->callback_error = true;
+    return;
+  }
+  if (event == FTUN_TUN_SERVICE_NETWORK_UPDATED) {
+    runtime->network_updates++;
+    if (status != FTUN_OK || !usage.accepting) runtime->callback_error = true;
+  } else if (event == FTUN_TUN_SERVICE_REBUILT) {
+    runtime->rebuilds++;
+    if (status != FTUN_OK || !usage.accepting) runtime->callback_error = true;
+  } else if (event == FTUN_TUN_SERVICE_FAILED) {
+    runtime->failures++;
+    if (status == FTUN_OK || usage.accepting) runtime->callback_error = true;
+  }
+}
+
+static ftun_status_t proxy_plan_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t socket_mark, void **out)
 {
+  (void)budget;
   (void)config;
   (void)socket_mark;
   if (out == NULL) return FTUN_E_INVALID;
@@ -361,17 +483,603 @@ static void set_config(ftun_config_t *config, ftun_feature_plan_t *plan,
   plan->required_modules |= FTUN_BUILD_MODULE_TUN;
 }
 
+static bool network_matches(const host_state_t *host, const uint8_t address[4],
+                              uint8_t prefix, bool strict_route)
+{
+  size_t addresses = 0u;
+  size_t blocks = 0u;
+  size_t index;
+  for (index = 0u; index < host->resource_count; index++) {
+    const ftun_linux_route_resource_t *resource = &host->resources[index];
+    if (resource->kind == FTUN_LINUX_ROUTE_ADDRESS) {
+      if (memcmp(resource->address, address, 4u) != 0 ||
+          resource->prefix_length != prefix) return false;
+      addresses++;
+    }
+    if (resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6) blocks++;
+  }
+  return addresses == 1u && blocks == (strict_route ? 1u : 0u);
+}
+
+static int test_network_update(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_interface_spec_t candidate = {0};
+  ftun_tun_network_update_result_t result;
+  ftun_l3_provider_info_t info;
+  ftun_tun_service_usage_t usage;
+  ftun_tun_consumer_t consumer = {0};
+  consumer_runtime_t client = {0};
+  void *owner = NULL;
+  size_t opens = host->opens;
+  size_t attempts;
+  size_t work;
+  set_config(&config, &plan, &inbound, true);
+  CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+        &config, 1u, &owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+  CHECK(ftun_l3_provider_get_info(binding->provider, &info) == FTUN_OK &&
+        info.device_generation == 1u && info.network_generation == 1u);
+  consumer.packet = consume_packet;
+  consumer.event = network_event;
+  consumer.user = &client;
+  CHECK(ftun_tun_service_acquire(binding->provider->service, &consumer, &client.lease) == FTUN_OK);
+  client.stall = true;
+  host->provide_packet = host->stall_writes = true;
+  CHECK(ftun_tun_service_notify(client.lease.service, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_tun_service_run(client.lease.service, &work) == FTUN_OK && work == 1u);
+  CHECK(ftun_tun_service_write(client.lease, (ftun_bytes_t){(const uint8_t *)"old", 3u}) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(client.lease.service, &usage) == FTUN_OK &&
+        usage.queued_inputs == 1u && usage.queued_packets == 1u);
+  candidate.name = (ftun_string_t){"ftun-own0", 9u};
+  memcpy(candidate.ipv4_address, (uint8_t[]){172u, 30u, 5u, 1u}, 4u);
+  candidate.prefix_length = 24u;
+  candidate.protection_mark = binding->protection_mark;
+  CHECK(ftun_tun_owner_update_network(owner, 1u, &candidate, &result) == FTUN_OK &&
+        result.committed && result.ready && result.network_generation == 2u);
+  CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+  CHECK(ftun_tun_service_get_usage(client.lease.service, &usage) == FTUN_OK &&
+        usage.queued_inputs == 0u && usage.queued_packets == 0u && usage.packets_dropped == 2u);
+  client.stall = host->stall_writes = false;
+  CHECK(ftun_tun_service_run(client.lease.service, &work) == FTUN_OK &&
+        work == 0u && client.received == 0u && client.network_updates == 1u);
+  host->provide_packet = true;
+  CHECK(ftun_tun_service_notify(client.lease.service, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_tun_service_run(client.lease.service, &work) == FTUN_OK &&
+        work == 1u && client.received == 1u);
+  CHECK(ftun_l3_provider_get_info(binding->provider, &info) == FTUN_OK &&
+        info.generation == 1u && info.device_generation == 1u && info.active_leases == 1u &&
+        info.network_generation == 2u && host->opens == opens + 1u);
+  attempts = host->apply_attempts;
+  CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_OK &&
+        result.network_generation == 2u && host->apply_attempts == attempts);
+  CHECK(ftun_tun_owner_update_network(owner, 1u, &candidate, &result) == FTUN_E_STALE &&
+        result.update_status == FTUN_E_STALE && host->apply_attempts == attempts);
+  candidate.prefix_length = 0u;
+  CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_INVALID &&
+        result.update_status == FTUN_E_INVALID && host->apply_attempts == attempts);
+  candidate.prefix_length = 28u;
+  candidate.protection_mark++;
+  CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_INVALID);
+  candidate.protection_mark--;
+  memcpy(candidate.ipv4_address, (uint8_t[]){172u, 31u, 7u, 1u}, 4u);
+  candidate.strict_route = true;
+  host->fail_apply_at = host->apply_attempts + 3u;
+  CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_IO &&
+        result.update_status == FTUN_E_IO && result.rollback_status == FTUN_OK &&
+        !result.committed && result.ready && result.network_generation == 3u);
+  CHECK(network_matches(host, (uint8_t[]){172u, 30u, 5u, 1u}, 24u, false));
+  host->fail_apply_at = host->apply_attempts + 3u;
+  host->fail_rollback = true;
+  CHECK(ftun_tun_owner_update_network(owner, 3u, &candidate, &result) == FTUN_E_STATE_CORRUPT &&
+        result.update_status == FTUN_E_STATE_CORRUPT && result.rollback_status == FTUN_E_IO &&
+        !result.committed && !result.ready && result.network_generation == 3u);
+  CHECK(host->opens == opens + 1u && host->opens == host->closes + 1u);
+  CHECK(ftun_tun_service_write(client.lease,
+        (ftun_bytes_t){(const uint8_t *)"x", 1u}) == FTUN_E_CANCELLED);
+  host->fail_apply_at = 0u;
+  host->fail_rollback = host->fail_remove = false;
+  CHECK(ftun_tun_service_rebuild(binding->provider->service) == FTUN_OK);
+  CHECK(network_matches(host, (uint8_t[]){172u, 30u, 5u, 1u}, 24u, false));
+  CHECK(ftun_l3_provider_get_info(binding->provider, &info) == FTUN_OK && info.accepting &&
+        info.device_generation == 2u && info.network_generation == 4u);
+  /* 内部网络计划不改变公开 reload 的配置基线。 */
+  CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_OK);
+  CHECK(ftun_tun_owner_update_network(owner, 4u, &candidate, &result) == FTUN_E_AGAIN);
+  CHECK(ftun_tun_owner_service.reload_commit(owner, 2u) == FTUN_OK);
+  config.tun.ipv4_address = "172.30.5.1/24";
+  CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 3u) == FTUN_E_RESTART_REQUIRED);
+  CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+  CHECK(!client.callback_error && client.network_updates == 2u && client.failures == 3u);
+  CHECK(ftun_tun_owner_update_network(owner, 4u, &candidate, &result) == FTUN_E_CANCELLED);
+  CHECK(ftun_tun_service_release(&client.lease) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.destroy_until(&owner, 100u) == FTUN_OK && owner == NULL);
+  CHECK(host->resource_count == 0u && host->applies == host->removes &&
+        host->opens == host->closes && binding->provider->service == NULL);
+  return 0;
+}
+
+static ftun_status_t async_submit(void *context, const ftun_linux_route_request_t *request)
+{
+  host_state_t *host = context;
+  size_t index;
+  host->async_requests++;
+  host->reply = (ftun_linux_route_reply_t){request->sequence, FTUN_OK, false};
+  if (request->kind == FTUN_LINUX_ROUTE_REQUEST_QUERY) {
+    for (index = 0u; index < host->resource_count; index++) {
+      if (resource_equal(&host->resources[index], &request->resource)) host->reply.present = true;
+    }
+  } else if (request->kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE) {
+    host->reply.status = route_remove(host, &request->resource);
+    if (host->reply.status == FTUN_E_STATE_CORRUPT) host->reply.status = FTUN_E_STALE;
+  } else if (request->kind == FTUN_LINUX_ROUTE_REQUEST_ADD) {
+    host->reply.status = route_apply(host, &request->resource);
+    if (host->withhold_add_reply) host->withhold_replies = true;
+  } else return FTUN_E_UNSUPPORTED;
+  host->has_reply = true;
+  return FTUN_OK;
+}
+
+static ftun_status_t async_receive(void *context, ftun_linux_route_reply_t *reply)
+{
+  host_state_t *host = context;
+  if (host->withhold_replies || !host->has_reply) return FTUN_E_AGAIN;
+  *reply = host->reply;
+  host->has_reply = false;
+  return FTUN_OK;
+}
+
+static int test_async_stop(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  const ftun_interface_ops_t *previous = binding->network;
+  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_budget_usage_t baseline, held, final;
+  ftun_status_t status;
+  uint64_t now_ms, deadline;
+  size_t closes = host->closes, attempts;
+  const struct timespec pause = {0, 250000000};
+  void *owner = NULL;
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  network.context = previous->context;
+  network.async.context = &io;
+  binding->network = &network;
+  set_config(&config, &plan, &inbound, true);
+  CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+    &config, 1u, &owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+  CHECK(host->resource_count != 0u);
+  host->withhold_replies = true;
+  CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK && binding->provider->service == NULL);
+  CHECK(host->async_requests == 0u && host->closes == closes);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  deadline = now_ms + 200u;
+  CHECK(ftun_tun_owner_service.stop_until(owner, deadline) == FTUN_E_AGAIN);
+  CHECK(host->async_requests == 1u && host->closes == closes);
+  CHECK(ftun_budget_get_usage(budget, &held) == FTUN_OK && held.used > baseline.used);
+  (void)nanosleep(&pause, NULL);
+  CHECK(ftun_tun_owner_service.stop_until(owner, deadline) == FTUN_E_TIMEOUT);
+  CHECK(ftun_tun_owner_service.destroy_until(&owner, deadline) == FTUN_E_TIMEOUT && owner != NULL);
+  CHECK(host->async_requests == 2u && host->closes == closes);
+  host->withhold_replies = false;
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  /* 对齐 Core destroy 的不等待清理入口；过期期限也必须有有限进展。 */
+  deadline = now_ms;
+  for (attempts = 0u; attempts < 64u; attempts++) {
+    status = ftun_tun_owner_service.destroy_until(&owner, deadline);
+    if (status == FTUN_OK) break;
+    CHECK(status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
+  }
+  CHECK(owner == NULL && host->closes == closes + 1u && host->resource_count == 0u);
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+    final.used_resources.descriptors == baseline.used_resources.descriptors &&
+    final.used_resources.queue_slots == baseline.used_resources.queue_slots);
+  binding->network = previous;
+  return 0;
+}
+
+static int drive_update(void *owner, ftun_tun_network_update_result_t *result)
+{
+  size_t round;
+  ftun_core_service_run_usage_t usage;
+  for (round = 0u; round < 128u; round++) {
+    CHECK(ftun_tun_owner_query_network_update(owner, result) == FTUN_OK);
+    if (!result->pending) return 0;
+    CHECK(ftun_tun_owner_service.run_once(owner, false, &usage) == FTUN_OK);
+    CHECK(usage.work <= 192u);
+  }
+  CHECK(!result->pending);
+  return 1;
+}
+
+static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  const ftun_interface_ops_t *previous = binding->network;
+  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_tun_network_update_result_t result;
+  ftun_core_service_run_usage_t run;
+  ftun_budget_usage_t baseline, final;
+  ftun_tun_consumer_t consumer = {0};
+  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, false, NULL};
+  size_t scenario;
+  network.context = previous->context;
+  network.async.context = &io;
+  binding->network = &network;
+  candidate.protection_mark = binding->protection_mark;
+  for (scenario = 0u; scenario < 5u; scenario++) {
+    void *owner = NULL;
+    consumer_runtime_t client = {0};
+    uint64_t now_ms, deadline;
+    size_t requests, attempts, round, closes = host->closes;
+    ftun_status_t status;
+    CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+    host->fail_apply_at = 0u;
+    host->fail_remove = host->fail_rollback = host->withhold_replies = false;
+    host->withhold_add_reply = host->has_reply = false;
+    set_config(&config, &plan, &inbound, true);
+    CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+      &config, 1u, &owner) == FTUN_OK);
+    CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+    consumer.packet = consume_packet;
+    consumer.event = network_event;
+    consumer.user = &client;
+    CHECK(ftun_tun_service_acquire(binding->provider->service, &consumer, &client.lease) == FTUN_OK);
+    attempts = host->apply_attempts;
+    requests = host->async_requests;
+    if (scenario == 1u || scenario == 2u) host->fail_apply_at = attempts + 3u;
+    if (scenario == 2u) host->fail_rollback = true;
+    if (scenario == 3u) host->withhold_replies = true;
+    if (scenario == 4u) host->withhold_add_reply = true;
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+    deadline = now_ms + (scenario == 3u ? 20u : 5000u);
+    CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_OK);
+    CHECK(host->apply_attempts == attempts && host->async_requests == requests);
+    CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK && result.pending &&
+      !result.ready && !result.committed && result.network_generation == 1u);
+    CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_E_AGAIN);
+    CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_E_AGAIN);
+    CHECK(ftun_tun_service_rebuild(client.lease.service) == FTUN_E_AGAIN);
+    CHECK(ftun_tun_service_write(client.lease,
+      (ftun_bytes_t){(const uint8_t *)"x", 1u}) == FTUN_E_CANCELLED);
+    if (scenario == 3u) {
+      const struct timespec pause = {0, 30000000};
+      CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      (void)nanosleep(&pause, NULL);
+      CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+        !result.pending && !result.ready && result.update_status == FTUN_E_TIMEOUT &&
+        result.rollback_status == FTUN_E_TIMEOUT && host->resource_count != 0u);
+    } else if (scenario == 4u) {
+      for (round = 0u; round < 16u && !host->withhold_replies; round++) {
+        CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      }
+      CHECK(host->withhold_replies && host->resource_count == 1u);
+      CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+      CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+        !result.pending && !result.ready && result.update_status == FTUN_E_CANCELLED);
+    } else {
+      candidate.ipv4_address[3] = 99u;
+      CHECK(drive_update(owner, &result) == 0);
+      candidate.ipv4_address[3] = 1u;
+      if (scenario == 0u) {
+        CHECK(result.committed && result.ready && result.update_status == FTUN_OK &&
+          result.network_generation == 2u);
+        CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+        CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_E_STALE);
+        CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK && result.committed);
+      } else if (scenario == 1u) {
+        CHECK(!result.committed && result.ready && result.update_status == FTUN_E_IO &&
+          result.rollback_status == FTUN_OK && result.network_generation == 2u);
+        CHECK(network_matches(host, (uint8_t[]){172u, 19u, 0u, 1u}, 30u, true));
+      } else {
+        CHECK(!result.committed && !result.ready && result.rollback_status != FTUN_OK &&
+          host->resource_count != 0u && result.network_generation == 1u);
+        host->fail_remove = host->fail_rollback = false;
+        host->fail_apply_at = 0u;
+        CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_OK);
+        CHECK(drive_update(owner, &result) == 0 && result.ready && result.committed);
+        CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+      }
+      CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_OK);
+      CHECK(ftun_tun_owner_service.reload_abort(owner) == FTUN_OK);
+    }
+    CHECK(!client.callback_error && host->closes == closes);
+    host->withhold_replies = host->withhold_add_reply = false;
+    CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+    CHECK(ftun_tun_service_release(&client.lease) == FTUN_OK);
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+    for (round = 0u; round < 128u && owner != NULL; round++) {
+      status = ftun_tun_owner_service.destroy_until(&owner, now_ms + 5000u);
+      CHECK(status == FTUN_OK || status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
+    }
+    CHECK(owner == NULL && host->resource_count == 0u && host->closes == closes + 1u);
+    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+      final.used_resources.descriptors == baseline.used_resources.descriptors &&
+      final.used_resources.queue_slots == baseline.used_resources.queue_slots);
+  }
+  binding->network = previous;
+  return 0;
+}
+
+static void pressure_timer(ftun_event_source_t *source, uint32_t events, void *user)
+{ (void)source; (void)events; (void)user; }
+
+static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  const ftun_interface_ops_t *previous = binding->network;
+  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_tun_network_update_result_t result;
+  ftun_core_service_run_usage_t run;
+  ftun_budget_usage_t baseline, final;
+  ftun_tun_consumer_t consumer = {0};
+  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, false, NULL};
+  size_t scenario;
+  network.context = previous->context;
+  network.async.context = &io;
+  binding->network = &network;
+  candidate.protection_mark = binding->protection_mark;
+  host->check_close_order = true;
+  for (scenario = 0u; scenario < 8u; scenario++) {
+    void *owner = NULL;
+    consumer_runtime_t client = {0};
+    ftun_event_source_t *pressure[16] = {0};
+    uint64_t now_ms, deadline;
+    size_t round, opens = host->opens, closes = host->closes;
+    ftun_status_t status;
+    CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+    host->fail_apply_at = 0u;
+    host->fail_remove = host->fail_rollback = host->withhold_replies = false;
+    host->withhold_add_reply = host->has_reply = false;
+    host->fail_open_once = host->fail_close_once = false;
+    set_config(&config, &plan, &inbound, true);
+    CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+      &config, 1u, &owner) == FTUN_OK);
+    CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+    client.owner = owner;
+    client.loop = binding->loop;
+    consumer.packet = consume_packet;
+    consumer.event = network_event;
+    consumer.user = &client;
+    CHECK(ftun_tun_service_acquire(binding->provider->service, &consumer, &client.lease) == FTUN_OK);
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+    deadline = now_ms + 5000u;
+    if (scenario == 0u) {
+      CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_OK);
+      CHECK(drive_update(owner, &result) == 0 && result.ready && result.committed);
+      CHECK(ftun_tun_owner_start_rebuild(owner, 2u, 2u, deadline) == FTUN_E_STALE);
+    }
+    if (scenario == 1u) host->fail_remove = true;
+    if (scenario == 2u) host->fail_open_once = true;
+    if (scenario == 3u) host->fail_apply_at = host->apply_attempts + 3u;
+    if (scenario == 4u) host->fail_close_once = true;
+    if (scenario == 5u) host->withhold_replies = true;
+    if (scenario == 6u) host->withhold_add_reply = true;
+    if (scenario == 5u) {
+      CHECK(ftun_tun_owner_start_rebuild(owner, 1u, 1u, now_ms + 20u) == FTUN_OK);
+    } else {
+      CHECK(ftun_tun_service_rebuild(client.lease.service) == FTUN_E_AGAIN);
+    }
+    CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+      result.pending && result.rebuild && !result.ready && result.device_generation == 1u);
+    CHECK(host->opens == opens + 1u && host->closes == closes);
+    CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_E_AGAIN);
+    CHECK(ftun_tun_service_rebuild(client.lease.service) == FTUN_E_AGAIN);
+    CHECK(ftun_tun_service_write(client.lease,
+      (ftun_bytes_t){(const uint8_t *)"x", 1u}) == FTUN_E_CANCELLED);
+    if (scenario == 7u) {
+      for (round = 0u; round < 15u; round++) {
+        CHECK(ftun_event_timer_start(binding->loop, now_ms + 60000u,
+          pressure_timer, NULL, &pressure[round]) == FTUN_OK);
+      }
+    }
+    if (scenario == 5u) {
+      const struct timespec pause = {0, 30000000};
+      CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      (void)nanosleep(&pause, NULL);
+      CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+        !result.pending && !result.ready && result.update_status == FTUN_E_TIMEOUT);
+      CHECK(host->closes == closes && client.rebuilds == 0u);
+    } else if (scenario == 6u) {
+      for (round = 0u; round < 16u && !host->withhold_replies; round++) {
+        CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+      }
+      CHECK(host->withhold_replies && host->resource_count == 1u && host->closes == closes + 1u);
+      CHECK(client.rebuilds == 0u);
+      CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+      CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
+        !result.pending && result.rebuild && !result.ready && result.update_status == FTUN_E_CANCELLED);
+    } else {
+      CHECK(drive_update(owner, &result) == 0);
+      if (scenario != 0u) {
+        CHECK(!result.ready && !result.committed && client.rebuilds == 0u);
+        CHECK(result.update_status == (scenario == 7u ? FTUN_E_LIMIT : FTUN_E_IO));
+        if (scenario == 1u) CHECK(host->closes == closes && host->resource_count != 0u);
+        else CHECK(host->closes == closes + 1u && host->resource_count == 0u);
+        host->fail_remove = false;
+        host->fail_apply_at = 0u;
+        for (round = 0u; round < 16u; round++) CHECK(ftun_event_source_cancel(&pressure[round]) == FTUN_OK);
+        CHECK(ftun_tun_owner_start_rebuild(owner, result.device_generation,
+          result.network_generation, deadline) == FTUN_OK);
+        CHECK(drive_update(owner, &result) == 0);
+      }
+      CHECK(result.rebuild && result.ready && result.committed && result.update_status == FTUN_OK);
+      CHECK(client.rebuilds == 1u && result.network_generation == (scenario == 0u ? 3u : 2u));
+      CHECK(result.device_generation == ((scenario == 3u || scenario == 7u) ? 3u : 2u));
+      CHECK(network_matches(host, scenario == 0u ? candidate.ipv4_address :
+        (uint8_t[]){172u, 19u, 0u, 1u}, scenario == 0u ? 24u : 30u, scenario != 0u));
+      if (scenario == 0u) {
+        CHECK(ftun_tun_service_refresh_network(client.lease.service, result.network_generation) == FTUN_E_AGAIN);
+        CHECK(drive_update(owner, &result) == 0 && !result.rebuild && result.ready && result.committed);
+        CHECK(result.device_generation == 2u && result.network_generation == 4u &&
+          host->opens == opens + 2u && host->closes == closes + 1u);
+      }
+      CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_OK);
+      CHECK(ftun_tun_owner_service.reload_abort(owner) == FTUN_OK);
+    }
+    CHECK(!client.callback_error && !host->close_order_error);
+    host->withhold_replies = host->withhold_add_reply = false;
+    CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+    CHECK(ftun_tun_service_release(&client.lease) == FTUN_OK);
+    CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+    for (round = 0u; round < 128u && owner != NULL; round++) {
+      status = ftun_tun_owner_service.destroy_until(&owner, now_ms + 5000u);
+      CHECK(status == FTUN_OK || status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
+    }
+    CHECK(owner == NULL && host->resource_count == 0u && !host->close_order_error &&
+      host->opens - opens == host->closes - closes);
+    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+      final.used_resources.descriptors == baseline.used_resources.descriptors &&
+      final.used_resources.queue_slots == baseline.used_resources.queue_slots);
+  }
+  host->check_close_order = false;
+  binding->network = previous;
+  return 0;
+}
+
+static int test_owner_deadline_wakeup(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  const ftun_interface_ops_t *previous = binding->network;
+  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_tun_network_update_result_t result;
+  ftun_core_service_run_usage_t run;
+  ftun_event_loop_usage_t usage;
+  ftun_budget_usage_t baseline, final;
+  void *owner = NULL;
+  uint64_t now_ms, deadline;
+  size_t round;
+  int pair[2];
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+  host->real_descriptor = true;
+  host->descriptor = pair[0];
+  host->withhold_replies = host->withhold_add_reply = host->has_reply = false;
+  network.context = previous->context;
+  network.async.context = &io;
+  binding->network = &network;
+  CHECK(ftun_libev_attach(binding->loop) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  set_config(&config, &plan, &inbound, true);
+  CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+    &config, 1u, &owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+  host->withhold_replies = true;
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  deadline = now_ms + 40u;
+  CHECK(ftun_tun_owner_start_rebuild(owner, 1u, 1u, deadline) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+  /* 注入的网络后端不注册 Event source；总期限仍必须有唤醒来源。 */
+  CHECK(ftun_event_loop_get_usage(binding->loop, &usage) == FTUN_OK && usage.source_count != 0u);
+  for (round = 0u; round < 16u; round++) {
+    CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK);
+    if (!result.pending) break;
+    CHECK(ftun_tun_owner_service.run_once(owner, true, &run) == FTUN_OK);
+  }
+  CHECK(!result.pending && result.update_status == FTUN_E_TIMEOUT && !result.ready);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK && now_ms >= deadline);
+  CHECK(ftun_event_loop_get_usage(binding->loop, &usage) == FTUN_OK && usage.source_count == 0u);
+  host->withhold_replies = false;
+  for (round = 0u; round < 64u && owner != NULL; round++) {
+    ftun_status_t status = ftun_tun_owner_service.destroy_until(&owner, now_ms + 5000u);
+    CHECK(status == FTUN_OK || status == FTUN_E_AGAIN);
+  }
+  CHECK(owner == NULL && host->resource_count == 0u);
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+    final.used_resources.descriptors == baseline.used_resources.descriptors &&
+    final.used_resources.queue_slots == baseline.used_resources.queue_slots);
+  CHECK(ftun_event_loop_stop(binding->loop) == FTUN_OK);
+  CHECK(ftun_libev_detach(binding->loop) == FTUN_OK);
+  CHECK(close(pair[0]) == 0 && close(pair[1]) == 0);
+  host->real_descriptor = false;
+  binding->network = previous;
+  return 0;
+}
+
+static int test_plan_budget(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_reservation_t *hold = NULL;
+  ftun_core_service_plan_t first = {0}, second = {0};
+  ftun_config_t config;
+  ftun_feature_plan_t features;
+  ftun_config_inbound_t inbound;
+  ftun_budget_usage_t usage;
+  size_t charge;
+  set_config(&config, &features, &inbound, true);
+  CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, 65536u, &hold) == FTUN_OK);
+  CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
+    0u, &first) == FTUN_E_LIMIT && first.implementation == NULL);
+  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  fail_plan_calloc = true;
+  CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
+    0u, &first) == FTUN_E_LIMIT && first.implementation == NULL && !fail_plan_calloc);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  config.tun.mtu = 0u;
+  CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
+    0u, &first) == FTUN_E_INVALID && first.implementation == NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  config.tun.mtu = 1400u;
+  CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
+    0u, &first) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+    usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 0u);
+  charge = usage.used;
+  CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
+    0u, &second) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 2u * charge);
+  CHECK(ftun_core_service_plan_destroy(&first) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == charge);
+  CHECK(ftun_core_service_plan_destroy(&second) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   host_state_t host;
   consumer_state_t consumer;
   ftun_tun_device_ops_t device_ops;
   ftun_linux_route_io_t route_io;
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
   ftun_tun_owner_binding_t owner_binding;
   ftun_l3_provider_t provider;
   ftun_core_module_descriptor_t modules[3];
   ftun_core_module_catalog_t catalog;
   ftun_core_module_runtime_t *runtime = NULL;
+  ftun_core_module_reload_plan_t *reload_plan = NULL;
   ftun_core_t *core = NULL;
   ftun_budget_t *budget = NULL;
   ftun_operation_queue_t *operations = NULL;
@@ -384,6 +1092,8 @@ int main(void)
   ftun_tun_lease_t stale_lease;
   size_t applies_before;
   size_t attempts_before;
+
+  CHECK(test_plan_budget() == 0);
 
   memset(&host, 0, sizeof(host));
   memset(&consumer, 0, sizeof(consumer));
@@ -410,7 +1120,10 @@ int main(void)
   owner_binding.provider = &provider;
   owner_binding.loop = loop;
   owner_binding.device_ops = &device_ops;
-  owner_binding.route_io = &route_io;
+  network.context = &route_io;
+  /* 既有同步恢复故障夹具；异步停止由单独场景提供非阻塞 IO。 */
+  memset(&network.async, 0, sizeof(network.async));
+  owner_binding.network = &network;
   owner_binding.protection_mark = UINT32_C(0x4654);
   consumer.provider = &provider;
 
@@ -488,16 +1201,46 @@ int main(void)
         provider_info.device.mtu == 1420u);
 
   /* 物理重建只替换 owner 的设备，既有 consumer lease 保持。 */
+  applies_before = host.applies;
   CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_OK);
   CHECK(host.opens == 4u && host.closes == 3u &&
         consumer.lease.service == provider.service);
+  CHECK(host.applies > applies_before && host.removes == applies_before);
 
-  CHECK(ftun_core_module_runtime_reload_prepare(
-        runtime, &config, 2u) == FTUN_OK);
+  /* 撤销失败时禁止收发，保留旧设备与事务；重试不得重复打开设备。 */
+  host.fail_remove = true;
+  CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_E_IO);
+  CHECK(host.opens == 4u && host.closes == 3u);
+  CHECK(ftun_l3_provider_get_info(&provider, &provider_info) == FTUN_OK &&
+        !provider_info.accepting && provider_info.device_generation == 2u);
+  CHECK(ftun_tun_service_write(consumer.lease,
+        (ftun_bytes_t){(const uint8_t *)"x", 1u}) == FTUN_E_CANCELLED);
+  host.fail_remove = false;
+  host.fail_apply_at = host.apply_attempts + 3u;
+  host.fail_rollback = true;
+  CHECK(ftun_tun_service_rebuild(provider.service) != FTUN_OK);
+  CHECK(host.opens == 5u && host.closes == 4u && host.fail_remove);
+  CHECK(ftun_l3_provider_get_info(&provider, &provider_info) == FTUN_OK &&
+        !provider_info.accepting && provider_info.device_generation == 2u);
+  /* 部分恢复且补偿失败，候选设备保留到剩余路由可撤销。 */
+  CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_E_IO);
+  CHECK(host.opens == 5u && host.closes == 4u);
+  host.fail_remove = host.fail_rollback = false;
+  host.fail_apply_at = 0u;
+  CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_OK);
+  CHECK(host.opens == 6u && host.closes == 5u);
+  CHECK(ftun_l3_provider_get_info(&provider, &provider_info) == FTUN_OK &&
+        provider_info.accepting && provider_info.device_generation == 3u);
+
+  CHECK(ftun_core_module_reload_plan_prepare(&catalog, budget, &config,
+        owner_binding.protection_mark, &reload_plan, NULL) == FTUN_OK);
+  CHECK(ftun_core_module_runtime_reload_prepare_planned(
+        runtime, &config, 2u, reload_plan) == FTUN_OK);
   CHECK(ftun_l3_provider_get_info(&provider, &provider_info) == FTUN_OK &&
         provider_info.reload_prepared &&
         provider_info.pending_generation == 2u);
   CHECK(ftun_core_module_runtime_reload_commit(runtime, 2u) == FTUN_OK);
+  CHECK(ftun_core_module_reload_plan_destroy(&reload_plan) == FTUN_OK);
   CHECK(ftun_l3_provider_get_info(&provider, &provider_info) == FTUN_OK &&
         provider_info.generation == 2u && !provider_info.reload_prepared);
   memset(&stale_consumer, 0, sizeof(stale_consumer));
@@ -522,6 +1265,24 @@ int main(void)
   CHECK(provider.service == NULL && host.opens == host.closes &&
         host.applies == host.removes && consumer.lease.service == NULL);
 
+  /* 首次激活也遵循相同恢复契约；补偿失败时保留未发布的 service/事务。 */
+  host.fail_apply_at = host.apply_attempts + 3u;
+  host.fail_rollback = true;
+  CHECK(ftun_core_module_runtime_prepare(&catalog, core, budget, operations,
+        &config, 1u, &runtime, NULL) == FTUN_OK);
+  CHECK(ftun_core_module_runtime_activate(runtime, 100u) != FTUN_OK);
+  CHECK(runtime != NULL && provider.service == NULL && host.opens == host.closes + 1u);
+  CHECK(ftun_core_module_runtime_destroy_until(&runtime, 100u) != FTUN_OK && runtime != NULL);
+  host.fail_remove = host.fail_rollback = false;
+  host.fail_apply_at = 0u;
+  CHECK(ftun_core_module_runtime_destroy_until(&runtime, 100u) == FTUN_OK);
+  CHECK(host.opens == host.closes && host.applies == host.removes);
+
+  CHECK(test_network_update(core, budget, operations, &owner_binding, &host) == 0);
+  CHECK(test_async_stop(core, budget, operations, &owner_binding, &host) == 0);
+  CHECK(test_async_update(core, budget, operations, &owner_binding, &host) == 0);
+  CHECK(test_async_rebuild(core, budget, operations, &owner_binding, &host) == 0);
+  CHECK(test_owner_deadline_wakeup(core, budget, operations, &owner_binding, &host) == 0);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_stop(operations) == FTUN_OK);

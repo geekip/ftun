@@ -116,22 +116,24 @@ static ftun_status_t owned_execute(ftun_bytes_t input, uint8_t *result,
   return FTUN_OK;
 }
 
-static void input_cleanup(ftun_bytes_t input)
+static ftun_status_t input_cleanup(ftun_bytes_t input)
 {
   if (input.length == 4u && memcmp(input.data, "hold", 4u) == 0) {
     input_cleanup_calls++;
   }
+  return FTUN_OK;
 }
 
-static void result_cleanup(ftun_bytes_t result)
+static ftun_status_t result_cleanup(ftun_bytes_t result)
 {
   void *owned = NULL;
-  if (result.length != sizeof(owned)) return;
+  if (result.length != sizeof(owned)) return FTUN_E_INVALID;
   memcpy(&owned, result.data, sizeof(owned));
   if (owned != NULL) {
     result_cleanup_calls++;
     free(owned);
   }
+  return FTUN_OK;
 }
 
 static void completed(ftun_operation_t *operation, ftun_error_t error,
@@ -226,6 +228,144 @@ static void open_gate(void)
   gate_open = 1;
   (void)pthread_cond_broadcast(&gate_condition);
   (void)pthread_mutex_unlock(&gate_mutex);
+}
+
+static ftun_status_t retry_result_status, retry_input_status;
+static size_t retry_result_calls, retry_input_calls, retry_freed;
+
+static ftun_status_t retry_result_cleanup(ftun_bytes_t bytes)
+{
+  void *owned = NULL;
+  retry_result_calls++;
+  if (retry_result_status != FTUN_OK) return retry_result_status;
+  if (bytes.length != sizeof(owned)) return FTUN_E_INVALID;
+  memcpy(&owned, bytes.data, sizeof(owned));
+  if (owned != NULL) { free(owned); retry_freed++; }
+  owned = NULL;
+  memcpy((void *)(uintptr_t)bytes.data, &owned, sizeof(owned));
+  return FTUN_OK;
+}
+
+static ftun_status_t retry_input_cleanup(ftun_bytes_t bytes)
+{
+  (void)bytes;
+  retry_input_calls++;
+  return retry_input_status;
+}
+
+static ftun_status_t failed_owned_execute(ftun_bytes_t input, uint8_t *result,
+                                           size_t capacity, size_t *out_size)
+{
+  ftun_status_t status = owned_execute(input, result, capacity, out_size);
+  return status == FTUN_OK ? FTUN_E_IO : status;
+}
+
+/* 结果失败、输入失败、执行错误和迟到取消均保留同一任务槽及额度。 */
+static int retry_cleanup(unsigned mode)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_worker_t *worker = NULL;
+  ftun_worker_job_t job = {0};
+  ftun_worker_usage_t usage;
+  ftun_budget_usage_t memory;
+  ftun_operation_t *operation = NULL, *rejected = NULL;
+  completion_state_t completion = {0}, unused = {0};
+  size_t count, baseline, charged;
+  retry_result_calls = retry_input_calls = retry_freed = 0u;
+  retry_result_status = FTUN_E_AGAIN;
+  retry_input_status = FTUN_E_IO;
+  CHECK(ftun_budget_create(NULL, 65536u, 1024u, &budget) == FTUN_OK);
+  CHECK(ftun_worker_create(budget, 1u, &worker) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK);
+  baseline = memory.used;
+  job.execute = mode == 2u ? gate_owned_execute :
+    mode == 1u ? failed_owned_execute : owned_execute;
+  job.result_capacity = sizeof(void *);
+  job.input = (ftun_bytes_t){(const uint8_t *)"copy", 4u};
+  job.result_cleanup = retry_result_cleanup;
+  job.input_cleanup = retry_input_cleanup;
+  if (mode == 2u) reset_gate();
+  CHECK(ftun_worker_submit(worker, &job, completed, &completion, &operation) == FTUN_OK);
+  if (mode == 2u) {
+    CHECK(wait_for_gate());
+    CHECK(ftun_operation_cancel(operation) == FTUN_OK);
+    CHECK(ftun_worker_poll(worker, 1u, &count) == FTUN_OK && count == 1u);
+    CHECK(retry_result_calls == 0u && retry_input_calls == 0u);
+    open_gate();
+  }
+  CHECK(wait_for_ready(worker));
+  CHECK(ftun_worker_poll(worker, 1u, &count) == FTUN_E_AGAIN);
+  CHECK(completion.calls == 1 && retry_result_calls == 1u && retry_input_calls == 0u);
+  CHECK(completion.status == (mode == 2u ? FTUN_E_CANCELLED :
+    mode == 1u ? FTUN_E_IO : FTUN_OK));
+  CHECK(completion.result_size == (mode == 0u ? sizeof(void *) : 0u));
+  CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK &&
+    usage.tasks == 1u && usage.cleanup_pending == 1u && usage.running == 0u);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used > baseline);
+  charged = memory.used;
+  CHECK(ftun_worker_submit(worker, &job, completed, &unused, &rejected) == FTUN_E_LIMIT && rejected == NULL);
+  CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_AGAIN && count == 0u);
+  CHECK(retry_result_calls == 2u && retry_freed == 0u && retry_input_calls == 0u);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == charged);
+  retry_result_status = FTUN_OK;
+  CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_IO && count == 0u);
+  CHECK(retry_result_calls == 3u && retry_freed == 1u && retry_input_calls == 1u);
+  CHECK(ftun_worker_stop(worker) == FTUN_OK);
+  CHECK(ftun_worker_join(worker) == FTUN_OK);
+  CHECK(ftun_worker_destroy(&worker) == FTUN_E_AGAIN && worker != NULL);
+  CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_IO);
+  CHECK(retry_result_calls == 3u && retry_input_calls == 2u && completion.calls == 1);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == charged);
+  retry_input_status = FTUN_OK;
+  CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_OK && count == 0u);
+  CHECK(retry_input_calls == 3u && retry_result_calls == 3u && retry_freed == 1u);
+  CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK && usage.tasks == 0u && usage.cleanup_pending == 0u);
+  CHECK(!ftun_worker_has_ready(worker));
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == baseline);
+  CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
+static int cleanup_quota(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_worker_t *worker = NULL;
+  ftun_worker_job_t job = {0};
+  ftun_operation_t *operation = NULL;
+  completion_state_t first = {0}, second = {0};
+  ftun_worker_usage_t usage;
+  size_t count, attempts, prior;
+  retry_result_calls = retry_freed = 0u;
+  retry_result_status = FTUN_E_IO;
+  CHECK(ftun_budget_create(NULL, 65536u, 1024u, &budget) == FTUN_OK);
+  CHECK(ftun_worker_create(budget, 2u, &worker) == FTUN_OK);
+  job.execute = owned_execute;
+  job.result_capacity = sizeof(void *);
+  job.result_cleanup = retry_result_cleanup;
+  CHECK(ftun_worker_submit(worker, &job, completed, &first, &operation) == FTUN_OK);
+  CHECK(ftun_worker_submit(worker, &job, completed, &second, &operation) == FTUN_OK);
+  for (attempts = 0u; attempts < 5000u; attempts++) {
+    CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK);
+    if (usage.completed == 2u) break;
+    sleep_one_millisecond();
+  }
+  CHECK(usage.completed == 2u);
+  CHECK(ftun_worker_poll(worker, 2u, &count) == FTUN_E_IO && count == 2u);
+  prior = retry_result_calls;
+  CHECK(prior == 2u);
+  CHECK(ftun_worker_poll(worker, 1u, &count) == FTUN_E_IO && count == 0u);
+  CHECK(retry_result_calls == prior + 1u);
+  retry_result_status = FTUN_OK;
+  CHECK(ftun_worker_poll(worker, 1u, &count) == FTUN_OK && count == 0u);
+  CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK && usage.cleanup_pending == 1u && usage.tasks == 1u);
+  CHECK(ftun_worker_poll(worker, 1u, &count) == FTUN_OK);
+  CHECK(retry_freed == 2u && first.calls == 1 && second.calls == 1);
+  CHECK(ftun_worker_stop(worker) == FTUN_OK && ftun_worker_join(worker) == FTUN_OK);
+  CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
 }
 
 /* TASK-CORE-006 / TEST-CORE-006：复制输入、有界接纳、取消与迟到清理。 */
@@ -418,5 +558,9 @@ int main(void)
   CHECK(ftun_worker_destroy(NULL) == FTUN_E_INVALID);
   CHECK(ftun_worker_get_usage(NULL, &usage) == FTUN_E_INVALID);
   CHECK(usage.capacity == 0u && usage.tasks == 0u);
+  CHECK(retry_cleanup(0u) == 0);
+  CHECK(retry_cleanup(1u) == 0);
+  CHECK(retry_cleanup(2u) == 0);
+  CHECK(cleanup_quota() == 0);
   return 0;
 }

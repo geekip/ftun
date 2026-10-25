@@ -54,6 +54,12 @@ ftun_status_t ftun_session_pin_route(ftun_session_t *session,
 ftun_status_t ftun_session_operation_complete(ftun_session_t *session,
                                                ftun_operation_t *operation,
                                                ftun_error_t result);
+/* 入站 adapter 需要先发送错误回复时使用：仅 RESOLVING/CONNECTING 的
+ * 非取消终态错误进入 REPLYING，记录错误并保持 inbound 可写。调用方必须
+ * 持有有界回复期限，回复完成或超时后 finish/cancel；不能再进入 RELAYING。
+ * 已开始关闭、成功及取消沿用 operation_complete 的行为。 */
+ftun_status_t ftun_session_operation_complete_for_reply(ftun_session_t *session,
+  ftun_operation_t *operation, ftun_error_t result);
 /* RESOLVING completion 在清零 operation 前调用。addresses 是解析器返回的
  * 无端口 IPv4，同步复制进 Session 并补 original target 端口；只允许首次
  * 写入，后续路由和出口必须复用，不能以再次解析扩大候选。 */

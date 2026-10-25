@@ -6,10 +6,11 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define FTUN_VERSION "1.0.2"
+#define FTUN_VERSION "1.0.3"
 #define FTUN_ABI_VERSION 1u
 /* REQ-CAPI-001：只公开宿主边界，不暴露 libev/lwIP/TLS 类型。
- * 0.x 不承诺稳定 ABI；options 使用 struct_size 向后兼容。 */
+ * ABI 1 固定 v1.0.2 已发布布局；options 使用 struct_size 接受较短输入。
+ * v1.0.1 的旧 info 布局不在兼容范围内，不能替换链接使用本库。 */
 typedef struct ftun_core ftun_core_t;
 typedef struct ftun_operation ftun_operation_t;
 typedef struct {
@@ -47,6 +48,8 @@ typedef enum {
   FTUN_STAGE_COMMIT,
   FTUN_STAGE_CONTROL
 } ftun_error_stage_t;
+/* get_info 没有输出长度参数，此结构不得追加字段或改变布局。
+ * 新的内部统计不通过这个公开输出结构写入。 */
 typedef struct {
   ftun_core_state_t state;
   uint64_t generation;

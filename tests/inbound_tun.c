@@ -515,6 +515,48 @@ static int test_udp_datagram(void)
         memcmp(output + header_length + 8u, reply, sizeof(reply)) == 0);
   CHECK(input_packet(&fixture, packet, length, 13u) == FTUN_OK &&
         fixture.datagrams == 2u);
+  CHECK(ftun_datagram_retain(fixture.datagram) == FTUN_OK);
+  CHECK(ftun_tun_ingress_close(&fixture.ingress) == FTUN_E_AGAIN &&
+        fixture.ingress != NULL);
+  CHECK(ftun_tun_ingress_get_usage(fixture.ingress, &usage) == FTUN_OK &&
+        !usage.accepting && usage.udp_channels == 1u);
+  CHECK(packet_from_payload(fixture.budget, reply, sizeof(reply), &response) == 0);
+  CHECK(ftun_datagram_send(fixture.datagram, &fixture.udp_metadata.source,
+        &response) == FTUN_E_CANCELLED && fixture.output_count == 1u);
+  CHECK(ftun_packet_release(&response) == FTUN_OK);
+  CHECK(ftun_datagram_release(&fixture.datagram) == FTUN_OK);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
+static int test_bounded_udp_close(void)
+{
+  fixture_t fixture;
+  ftun_datagram_t *held;
+  ftun_tun_ingress_usage_t usage;
+  ftun_packet_t reply = {0};
+  static const uint8_t client[4] = {10u, 0u, 0u, 3u};
+  static const uint8_t target[4] = {8u, 8u, 8u, 8u};
+  uint8_t packet[128];
+  size_t length, work;
+  CHECK(fixture_start(&fixture, false, true) == 0);
+  length = make_udp_packet(packet, sizeof(packet), client, target, 53000u, 53u, NULL, 0u);
+  CHECK(input_packet(&fixture, packet, length, 13u) == FTUN_OK);
+  held = fixture.datagram;
+  CHECK(ftun_datagram_retain(held) == FTUN_OK);
+  length = make_udp_packet(packet, sizeof(packet), client, target, 53001u, 53u, NULL, 0u);
+  CHECK(input_packet(&fixture, packet, length, 13u) == FTUN_OK);
+  CHECK(ftun_tun_ingress_quiesce(fixture.ingress) == FTUN_OK);
+  CHECK(input_packet(&fixture, packet, length, 13u) == FTUN_E_CANCELLED);
+  CHECK(packet_from_payload(fixture.budget, (const uint8_t *)"x", 1u, &reply) == 0);
+  CHECK(ftun_datagram_send(fixture.datagram, &fixture.udp_metadata.source, &reply) == FTUN_E_CANCELLED);
+  CHECK(fixture.output_count == 0u);
+  CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_E_AGAIN && work == 1u);
+  CHECK(ftun_tun_ingress_get_usage(fixture.ingress, &usage) == FTUN_OK && usage.udp_channels == 1u);
+  CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_E_AGAIN && work == 1u);
+  CHECK(ftun_datagram_release(&held) == FTUN_OK);
+  CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_OK && work == 1u && fixture.ingress == NULL);
+  CHECK(ftun_packet_release(&reply) == FTUN_OK);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }
@@ -583,6 +625,7 @@ int main(void)
   CHECK(test_tcp_stream() == 0);
   CHECK(test_close_pending_tcp_write() == 0);
   CHECK(test_udp_datagram() == 0);
+  CHECK(test_bounded_udp_close() == 0);
   CHECK(test_boundaries_and_rejection() == 0);
   return 0;
 }

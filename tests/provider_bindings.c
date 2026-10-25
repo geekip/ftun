@@ -28,6 +28,10 @@ typedef struct {
   size_t quiesces;
   size_t stops;
   bool stop_again;
+  ftun_status_t reload_status;
+  ftun_status_t quiesce_status;
+  ftun_system_resolve_completion_fn resolver_completion;
+  void *resolver_user;
 } provider_state_t;
 
 static void operation_completed(ftun_operation_t *operation,
@@ -49,13 +53,28 @@ static ftun_status_t provider_accept(provider_state_t *state,
   return status;
 }
 
+static void resolver_operation_completed(ftun_operation_t *operation,
+  ftun_error_t error, void *user)
+{
+  provider_state_t *state = user;
+  operation_completed(operation, error, user);
+  state->resolver_completion(operation, error, NULL, state->resolver_user);
+}
+
 static ftun_status_t resolver_start(
   void *context, ftun_core_t *core,
   const ftun_resolver_provider_request_t *request, ftun_operation_t **out)
 {
   (void)core;
-  (void)request;
-  return provider_accept((provider_state_t *)context, out);
+  provider_state_t *state = context;
+  ftun_operation_token_t token;
+  ftun_status_t status;
+  state->resolver_completion = request->system.completion;
+  state->resolver_user = request->system.user;
+  status = ftun_operation_accept(state->operations, resolver_operation_completed,
+    state, out, &token);
+  if (status == FTUN_OK) state->starts++;
+  return status;
 }
 
 static ftun_status_t path_start(void *context, ftun_core_t *core,
@@ -72,7 +91,7 @@ static ftun_status_t reload_prepare(void *context, uint64_t generation)
   provider_state_t *state = (provider_state_t *)context;
   if (generation == 0u) return FTUN_E_INVALID;
   state->reload_prepares++;
-  return FTUN_OK;
+  return state->reload_status;
 }
 
 static void reload_commit(void *context, uint64_t generation)
@@ -89,8 +108,9 @@ static void reload_abort(void *context, uint64_t generation)
 
 static ftun_status_t provider_quiesce(void *context)
 {
-  ((provider_state_t *)context)->quiesces++;
-  return FTUN_OK;
+  provider_state_t *state = (provider_state_t *)context;
+  state->quiesces++;
+  return state->quiesce_status;
 }
 
 static ftun_status_t provider_stop(void *context, uint64_t deadline_ms)
@@ -157,6 +177,11 @@ int main(void)
   ftun_l3_provider_t invalid_l3;
   ftun_bootstrap_request_t dns_request;
   ftun_operation_t *dns_operation = (ftun_operation_t *)(uintptr_t)1;
+#if defined(FTUN_EXPECT_DNS)
+  const ftun_status_t dns_missing = FTUN_E_AGAIN;
+#else
+  const ftun_status_t dns_missing = FTUN_E_UNSUPPORTED;
+#endif
 #endif
   provider_state_t resolver_state;
   provider_state_t path_state;
@@ -194,11 +219,11 @@ int main(void)
   bindings.fakeip_slot = &fakeip;
   CHECK(ftun_proxy_dns_runtime_adapter_valid(&dns_adapter));
   CHECK(!ftun_proxy_dns_has_hijack(&dns_adapter));
-  CHECK(ftun_proxy_dns_hijack_tcp(&dns_adapter, -1) == FTUN_E_AGAIN);
+  CHECK(ftun_proxy_dns_hijack_tcp(&dns_adapter, -1) == dns_missing);
   CHECK(ftun_proxy_dns_hijack_udp(&dns_adapter, NULL, NULL, NULL) ==
-        FTUN_E_AGAIN);
+        dns_missing);
   CHECK(ftun_proxy_dns_resolve_named(&dns_adapter, &dns_request,
-        (ftun_string_t){"named", 5u}, &dns_operation) == FTUN_E_AGAIN &&
+        (ftun_string_t){"named", 5u}, &dns_operation) == dns_missing &&
         dns_operation == NULL);
   CHECK(ftun_proxy_bindings_valid(&bindings));
   invalid_l3.generation = 1u;
@@ -243,6 +268,17 @@ int main(void)
   CHECK(ftun_resolver_provider_start(resolver, core, &resolver_request,
         &operation) == FTUN_OK && operation != NULL);
   CHECK(cancel_and_dispatch(operations, operation));
+  resolver_state.reload_status = FTUN_E_IO;
+  CHECK(ftun_resolver_provider_reload_prepare(resolver, 7u) == FTUN_E_IO);
+  CHECK(ftun_resolver_provider_get_info(resolver, &resolver_info) == FTUN_OK &&
+        resolver_info.pending_generation == 7u && !resolver_info.reload_prepared);
+  CHECK(ftun_resolver_provider_reload_prepare(resolver, 7u) == FTUN_E_INVALID);
+  CHECK(ftun_resolver_provider_reload_commit(resolver, 7u) == FTUN_E_INVALID);
+  CHECK(ftun_resolver_provider_reload_abort(resolver) == FTUN_OK);
+  CHECK(resolver_state.reload_aborts == 1u);
+  CHECK(ftun_resolver_provider_reload_abort(resolver) == FTUN_OK &&
+        resolver_state.reload_aborts == 1u);
+  resolver_state.reload_status = FTUN_OK;
   CHECK(ftun_resolver_provider_reload_prepare(resolver, 7u) == FTUN_OK);
   CHECK(ftun_resolver_provider_reload_abort(resolver) == FTUN_OK);
   CHECK(ftun_resolver_provider_reload_prepare(resolver, 7u) == FTUN_OK);
@@ -253,6 +289,14 @@ int main(void)
   resolver_request.generation = 6u;
   CHECK(ftun_resolver_provider_start(resolver, core, &resolver_request,
         &operation) == FTUN_E_STALE && operation == NULL);
+  resolver_state.quiesce_status = FTUN_E_IO;
+  CHECK(ftun_resolver_provider_quiesce(resolver) == FTUN_E_IO);
+  CHECK(ftun_resolver_provider_get_info(resolver, &resolver_info) == FTUN_OK &&
+        !resolver_info.accepting && !resolver_info.stopped);
+  resolver_state.quiesce_status = FTUN_E_AGAIN;
+  CHECK(ftun_resolver_provider_stop_until(resolver, 200u) == FTUN_E_AGAIN);
+  CHECK(resolver_state.stops == 0u);
+  resolver_state.quiesce_status = FTUN_OK;
   CHECK(ftun_resolver_provider_quiesce(resolver) == FTUN_OK);
   resolver_request.generation = 7u;
   CHECK(ftun_resolver_provider_start(resolver, core, &resolver_request,
@@ -266,9 +310,9 @@ int main(void)
   CHECK(ftun_resolver_provider_stop_until(resolver, 200u) == FTUN_OK);
   CHECK(ftun_resolver_provider_destroy(&resolver) == FTUN_OK);
   CHECK(resolver_state.starts == 1u && resolver_state.completions == 1u &&
-        resolver_state.reload_prepares == 2u &&
+        resolver_state.reload_prepares == 3u &&
         resolver_state.reload_commits == 1u &&
-        resolver_state.reload_aborts == 1u && resolver_state.quiesces == 1u &&
+        resolver_state.reload_aborts == 2u && resolver_state.quiesces == 3u &&
         resolver_state.stops == 2u);
 
   path_spec.budget = budget;
@@ -284,39 +328,59 @@ int main(void)
   dial_request.loop = (ftun_event_loop_t *)(uintptr_t)1;
   dial_request.operations = operations;
   dial_request.budget = budget;
-  dial_request.network_generation = 9u;
+  dial_request.network_generation = 0u;
   dial_request.requested_domain = FTUN_DIAL_DOMAIN_UNDERLAY;
   dial_request.transport = FTUN_DIAL_TCP;
   dial_request.purpose = FTUN_DIAL_PURPOSE_BUSINESS;
   dial_request.completion = dial_completed;
-  CHECK(ftun_path_provider_open_datagram(path, core, &dial_request,
+  CHECK(ftun_path_provider_open_datagram(path, core, 9u, &dial_request,
         &operation) == FTUN_E_INVALID && operation == NULL);
-  CHECK(ftun_path_provider_open_stream(path, core, &dial_request,
+  CHECK(ftun_path_provider_open_stream(path, core, 9u, &dial_request,
         &operation) == FTUN_OK && operation != NULL);
   CHECK(cancel_and_dispatch(operations, operation));
+  path_state.reload_status = FTUN_E_IO;
+  CHECK(ftun_path_provider_reload_prepare(path, 10u) == FTUN_E_IO);
+  CHECK(ftun_path_provider_get_info(path, &path_info) == FTUN_OK &&
+        path_info.pending_generation == 10u && !path_info.reload_prepared);
+  CHECK(ftun_path_provider_reload_prepare(path, 10u) == FTUN_E_INVALID);
+  CHECK(ftun_path_provider_reload_commit(path, 10u) == FTUN_E_INVALID);
+  CHECK(ftun_path_provider_reload_abort(path) == FTUN_OK);
+  CHECK(path_state.reload_aborts == 1u);
+  CHECK(ftun_path_provider_reload_abort(path) == FTUN_OK &&
+        path_state.reload_aborts == 1u);
+  path_state.reload_status = FTUN_OK;
   CHECK(ftun_path_provider_reload_prepare(path, 10u) == FTUN_OK);
   CHECK(ftun_path_provider_reload_commit(path, 10u) == FTUN_OK);
   CHECK(ftun_path_provider_get_info(path, &path_info) == FTUN_OK &&
         path_info.generation == 10u && path_info.accepting);
-  dial_request.network_generation = 10u;
   dial_request.transport = FTUN_DIAL_UDP;
+  CHECK(ftun_path_provider_open_datagram(path, core, 9u, &dial_request,
+        &operation) == FTUN_E_STALE && operation == NULL);
   dial_request.budget = foreign_budget;
-  CHECK(ftun_path_provider_open_datagram(path, core, &dial_request,
+  CHECK(ftun_path_provider_open_datagram(path, core, 10u, &dial_request,
         &operation) == FTUN_E_REJECTED && operation == NULL);
   dial_request.budget = budget;
-  CHECK(ftun_path_provider_open_datagram(path, core, &dial_request,
+  CHECK(ftun_path_provider_open_datagram(path, core, 10u, &dial_request,
         &operation) == FTUN_OK && operation != NULL);
   CHECK(cancel_and_dispatch(operations, operation));
+  path_state.quiesce_status = FTUN_E_IO;
+  CHECK(ftun_path_provider_quiesce(path) == FTUN_E_IO);
+  CHECK(ftun_path_provider_get_info(path, &path_info) == FTUN_OK &&
+        !path_info.accepting && !path_info.stopped);
+  path_state.quiesce_status = FTUN_E_AGAIN;
+  CHECK(ftun_path_provider_stop_until(path, 200u) == FTUN_E_AGAIN);
+  CHECK(path_state.stops == 0u);
+  path_state.quiesce_status = FTUN_OK;
   CHECK(ftun_path_provider_quiesce(path) == FTUN_OK);
-  CHECK(ftun_path_provider_open_datagram(path, core, &dial_request,
+  CHECK(ftun_path_provider_open_datagram(path, core, 10u, &dial_request,
         &operation) == FTUN_E_CANCELLED && operation == NULL);
   CHECK(ftun_path_provider_reload_prepare(path, 11u) == FTUN_E_CANCELLED);
   CHECK(ftun_path_provider_stop_until(path, 0u) == FTUN_E_INVALID);
   CHECK(ftun_path_provider_stop_until(path, 200u) == FTUN_OK);
   CHECK(ftun_path_provider_destroy(&path) == FTUN_OK);
   CHECK(path_state.starts == 2u && path_state.completions == 2u &&
-        path_state.reload_prepares == 1u && path_state.reload_commits == 1u &&
-        path_state.quiesces == 1u && path_state.stops == 1u);
+        path_state.reload_prepares == 2u && path_state.reload_commits == 1u &&
+        path_state.reload_aborts == 1u && path_state.quiesces == 3u && path_state.stops == 1u);
 
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);

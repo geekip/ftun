@@ -89,7 +89,7 @@
       ]
     },
     {
-      "pattern": "src/app/service_runtime.c",
+      "pattern": "src/app/runtime_support.h",
       "targets": [
         "ftun_app"
       ]
@@ -186,6 +186,12 @@
     },
     {
       "pattern": "src/tun/*.c",
+      "targets": [
+        "ftun_tun"
+      ]
+    },
+    {
+      "pattern": "src/platform/linux/interface.c",
       "targets": [
         "ftun_tun"
       ]

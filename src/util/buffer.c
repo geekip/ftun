@@ -1,8 +1,11 @@
 #include "buffer.h"
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define FTUN_BUFFER_MIN_CLASS 256u
+#define FTUN_BUFFER_CLASS_COUNT (sizeof(size_t) * CHAR_BIT - 8u)
+typedef char ftun_buffer_class_mask_fits[(FTUN_BUFFER_CLASS_COUNT <= 64u) ? 1 : -1];
 
 struct ftun_buffer {
   ftun_buffer_pool_t *pool;
@@ -24,6 +27,11 @@ typedef struct {
   int pending;
 } ftun_buffer_waiter_t;
 
+typedef struct {
+  size_t wait_head;
+  size_t wait_tail;
+} ftun_buffer_class_queue_t;
+
 struct ftun_buffer_pool {
   ftun_budget_t *budget;
   ftun_reservation_t *reservation;
@@ -41,8 +49,8 @@ struct ftun_buffer_pool {
   ftun_buffer_waiter_t *waiters;
   size_t waiter_capacity;
   size_t free_waiter;
-  size_t wait_head;
-  size_t wait_tail;
+  ftun_buffer_class_queue_t *classes;
+  size_t waiting_classes;
   size_t waiting;
   size_t wake_quota;
   size_t notifications;
@@ -55,9 +63,64 @@ struct ftun_buffer_pool {
   int notification_pending;
   int notification_sent;
   int dispatching;
+  /* 冷诊断计数置于调度热字段之后。 */
+  size_t selection_steps;
+  size_t max_selection_steps;
+  size_t availability_probes;
+  size_t max_availability_probes;
+  size_t idle_scan_steps;
+  size_t max_trim_buffers;
 };
 
 #define FTUN_BUFFER_WAITER_NONE SIZE_MAX
+
+static size_t ftun_buffer_class_index(size_t capacity)
+{
+#if defined(__GNUC__) || defined(__clang__)
+  return (size_t)__builtin_ctzll((unsigned long long)capacity) - 8u;
+#else
+  size_t index = 0u;
+  while (capacity > FTUN_BUFFER_MIN_CLASS) { capacity >>= 1u; index++; }
+  return index;
+#endif
+}
+
+static size_t ftun_buffer_first_class(uint64_t classes)
+{
+#if defined(__GNUC__) || defined(__clang__)
+  return (size_t)__builtin_ctzll(classes);
+#else
+  size_t index = 0u;
+  while ((classes & UINT64_C(1)) == 0u) { classes >>= 1u; index++; }
+  return index;
+#endif
+}
+
+static size_t ftun_buffer_count_add(size_t count, size_t amount)
+{
+  return amount > SIZE_MAX - count ? SIZE_MAX : count + amount;
+}
+
+static ftun_status_t ftun_buffer_pool_trim_idle(
+  ftun_buffer_pool_t *pool, size_t target_idle_bytes);
+
+/* 压力回收不递归通知；调用方完成本次资源判断/分配后再合并通知。 */
+static ftun_status_t ftun_buffer_pool_pressure_trim(ftun_buffer_pool_t *pool)
+{
+  size_t bytes = pool->idle_bytes;
+  size_t buffers = pool->idle_buffers;
+  ftun_status_t status = ftun_buffer_pool_trim_idle(pool, 0u);
+  if (status != FTUN_OK) return status;
+  if (pool->pressure_trims != SIZE_MAX) pool->pressure_trims++;
+  bytes -= pool->idle_bytes;
+  buffers -= pool->idle_buffers;
+  if (buffers > pool->max_trim_buffers) pool->max_trim_buffers = buffers;
+  pool->pressure_trimmed_bytes = bytes > SIZE_MAX - pool->pressure_trimmed_bytes
+    ? SIZE_MAX : pool->pressure_trimmed_bytes + bytes;
+  pool->pressure_trimmed_buffers = buffers > SIZE_MAX - pool->pressure_trimmed_buffers
+    ? SIZE_MAX : pool->pressure_trimmed_buffers + buffers;
+  return FTUN_OK;
+}
 
 /* TASK-UTIL-002 / TEST-UTIL-002，目标 0.2.0：分档、有界闲置与所有者引用。 */
 static ftun_status_t ftun_buffer_class(size_t requested, size_t *out)
@@ -65,10 +128,19 @@ static ftun_status_t ftun_buffer_class(size_t requested, size_t *out)
   size_t capacity = FTUN_BUFFER_MIN_CLASS;
   if (out != NULL) *out = 0u;
   if (requested == 0u || out == NULL) return FTUN_E_INVALID;
+#if defined(__GNUC__) || defined(__clang__)
+  if (requested > capacity) {
+    unsigned int bits = (unsigned int)(sizeof(unsigned long long) * CHAR_BIT) -
+      (unsigned int)__builtin_clzll((unsigned long long)(requested - 1u));
+    if (bits >= sizeof(size_t) * CHAR_BIT) return FTUN_E_LIMIT;
+    capacity = (size_t)1u << bits;
+  }
+#else
   while (capacity < requested) {
     if (capacity > SIZE_MAX / 2u) return FTUN_E_LIMIT;
     capacity *= 2u;
   }
+#endif
   if (capacity > SIZE_MAX - sizeof(ftun_buffer_t)) return FTUN_E_LIMIT;
   *out = capacity;
   return FTUN_OK;
@@ -114,61 +186,113 @@ static ftun_status_t ftun_buffer_free(ftun_buffer_t *buffer)
   return FTUN_OK;
 }
 
-static int ftun_buffer_pool_idle_class(const ftun_buffer_pool_t *pool,
-                                       size_t capacity)
+static int ftun_buffer_pool_idle_class(ftun_buffer_pool_t *pool, size_t capacity)
 {
   const ftun_buffer_t *buffer;
   for (buffer = pool->idle; buffer != NULL; buffer = buffer->next) {
+    pool->idle_scan_steps = ftun_buffer_count_add(pool->idle_scan_steps, 1u);
     if (buffer->capacity == capacity) return 1;
   }
   return 0;
 }
 
-static int ftun_buffer_pool_can_acquire(ftun_buffer_pool_t *pool,
-                                        size_t capacity)
+static ftun_status_t ftun_buffer_pool_can_acquire(ftun_buffer_pool_t *pool,
+                                                 size_t capacity, int *out)
 {
   ftun_budget_usage_t usage;
+  ftun_status_t status;
   size_t charge;
-  if (ftun_buffer_pool_idle_class(pool, capacity)) return 1;
-  if (capacity > SIZE_MAX - sizeof(ftun_buffer_t)) return 0;
-  charge = sizeof(ftun_buffer_t) + capacity;
-  return ftun_budget_get_usage(pool->budget, &usage) == FTUN_OK &&
-    charge <= usage.normal_available_resources.memory_bytes;
-}
-
-static size_t ftun_buffer_pool_ready_waiter(ftun_buffer_pool_t *pool)
-{
-  ftun_budget_usage_t usage;
-  size_t available = 0u;
-  size_t slot;
-  if (ftun_budget_get_usage(pool->budget, &usage) == FTUN_OK) {
-    available = usage.normal_available_resources.memory_bytes;
+  *out = 0;
+  if (ftun_buffer_pool_idle_class(pool, capacity)) {
+    *out = 1;
+    return FTUN_OK;
   }
-  for (slot = pool->wait_head; slot != FTUN_BUFFER_WAITER_NONE;
-       slot = pool->waiters[slot].next) {
-    size_t capacity = pool->waiters[slot].capacity;
-    if (pool->waiters[slot].pending &&
-        (ftun_buffer_pool_idle_class(pool, capacity) ||
-         (capacity <= SIZE_MAX - sizeof(ftun_buffer_t) &&
-          sizeof(ftun_buffer_t) + capacity <= available))) {
-      return slot;
+  if (capacity > SIZE_MAX - sizeof(ftun_buffer_t)) return FTUN_E_LIMIT;
+  charge = sizeof(ftun_buffer_t) + capacity;
+  status = ftun_budget_get_usage(pool->budget, &usage);
+  if (status != FTUN_OK) return status;
+  if (charge > usage.normal_available_resources.memory_bytes && pool->idle != NULL) {
+    size_t reclaimable = pool->idle_bytes;
+    if (pool->idle_buffers > (SIZE_MAX - reclaimable) / sizeof(ftun_buffer_t)) {
+      reclaimable = SIZE_MAX;
+    } else {
+      reclaimable += pool->idle_buffers * sizeof(ftun_buffer_t);
+    }
+    /* 这里只排除连最大回收量都不足的情况，不能把相加结果当作可用额度。
+     * ancestor cleanup/保证额仍必须在实际释放后重新验证。 */
+    if (charge - usage.normal_available_resources.memory_bytes <= reclaimable) {
+      status = ftun_buffer_pool_pressure_trim(pool);
+      if (status != FTUN_OK) return status;
+      status = ftun_budget_get_usage(pool->budget, &usage);
+      if (status != FTUN_OK) return status;
     }
   }
-  return FTUN_BUFFER_WAITER_NONE;
+  *out = charge <= usage.normal_available_resources.memory_bytes;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_buffer_pool_ready_waiter(ftun_buffer_pool_t *pool,
+                                                   size_t *out)
+{
+  size_t heads[FTUN_BUFFER_CLASS_COUNT];
+  size_t count = 0u, index, steps = 0u, probes = 0u;
+  uint64_t classes = pool->waiting_classes;
+  ftun_status_t status = FTUN_OK;
+  *out = FTUN_BUFFER_WAITER_NONE;
+  while (classes != 0u) {
+    size_t category = ftun_buffer_first_class(classes);
+    classes &= classes - 1u;
+    heads[count++] = pool->classes[category].wait_head;
+    steps++;
+  }
+  /* 同类只检查队首；不同类仍按原到达顺序探测，保留压力回收的先后语义。 */
+  for (index = 1u; index < count; index++) {
+    size_t position = index, slot = heads[index];
+    while (position != 0u) {
+      steps++;
+      if (pool->waiters[heads[position - 1u]].generation < pool->waiters[slot].generation) break;
+      heads[position] = heads[position - 1u];
+      position--;
+    }
+    heads[position] = slot;
+  }
+  for (index = 0u; index < count; index++) {
+    size_t slot = heads[index];
+    int available;
+    steps++;
+    probes++;
+    if (!pool->waiters[slot].pending) { status = FTUN_E_STATE_CORRUPT; break; }
+    status = ftun_buffer_pool_can_acquire(pool, pool->waiters[slot].capacity,
+                                         &available);
+    if (status != FTUN_OK) break;
+    if (available) {
+      *out = slot;
+      break;
+    }
+  }
+  pool->selection_steps = ftun_buffer_count_add(pool->selection_steps, steps);
+  pool->availability_probes = ftun_buffer_count_add(pool->availability_probes, probes);
+  if (steps > pool->max_selection_steps) pool->max_selection_steps = steps;
+  if (probes > pool->max_availability_probes) pool->max_availability_probes = probes;
+  return status;
 }
 
 static void ftun_buffer_pool_notify(ftun_buffer_pool_t *pool)
 {
   ftun_buffer_pool_wakeup_fn wakeup;
   void *user;
+  size_t slot;
+  ftun_status_t status;
   if (pool->waiting == 0u) {
     pool->notification_pending = 0;
     pool->notification_sent = 0;
     return;
   }
+  if (pool->dispatching) return;
   if (pool->notification_pending && pool->notification_sent) return;
-  if (pool->wait_head == FTUN_BUFFER_WAITER_NONE ||
-      ftun_buffer_pool_ready_waiter(pool) == FTUN_BUFFER_WAITER_NONE) return;
+  status = ftun_buffer_pool_ready_waiter(pool, &slot);
+  /* 异常也安排 owner dispatch，由有返回值的入口报告，不静默隐藏。 */
+  if (status == FTUN_OK && slot == FTUN_BUFFER_WAITER_NONE) return;
   if (!pool->notification_pending) {
     pool->notification_pending = 1;
     pool->notification_sent = 0;
@@ -184,18 +308,23 @@ static void ftun_buffer_pool_notify(ftun_buffer_pool_t *pool)
 static void ftun_buffer_waiter_unlink(ftun_buffer_pool_t *pool, size_t slot)
 {
   ftun_buffer_waiter_t *waiter = &pool->waiters[slot];
+  size_t category = ftun_buffer_class_index(waiter->capacity);
+  ftun_buffer_class_queue_t *queue = &pool->classes[category];
   if (waiter->previous != FTUN_BUFFER_WAITER_NONE) {
     pool->waiters[waiter->previous].next = waiter->next;
   } else {
-    pool->wait_head = waiter->next;
+    queue->wait_head = waiter->next;
   }
   if (waiter->next != FTUN_BUFFER_WAITER_NONE) {
     pool->waiters[waiter->next].previous = waiter->previous;
   } else {
-    pool->wait_tail = waiter->previous;
+    queue->wait_tail = waiter->previous;
   }
   waiter->previous = FTUN_BUFFER_WAITER_NONE;
   waiter->next = FTUN_BUFFER_WAITER_NONE;
+  if (queue->wait_head == FTUN_BUFFER_WAITER_NONE) {
+    pool->waiting_classes &= ~((size_t)1u << category);
+  }
 }
 
 static void ftun_buffer_waiter_recycle(ftun_buffer_pool_t *pool, size_t slot)
@@ -207,6 +336,15 @@ static void ftun_buffer_waiter_recycle(ftun_buffer_pool_t *pool, size_t slot)
   waiter->previous = FTUN_BUFFER_WAITER_NONE;
   waiter->next = pool->free_waiter;
   pool->free_waiter = slot;
+}
+
+ftun_status_t ftun_buffer_pool_budget(const ftun_buffer_pool_t *pool,
+  ftun_budget_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (pool == NULL || out == NULL) return FTUN_E_INVALID;
+  *out = pool->budget;
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_buffer_acquire(ftun_budget_t *budget, size_t capacity,
@@ -229,6 +367,7 @@ ftun_status_t ftun_buffer_pool_create_waitable(
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
   size_t charge = sizeof(*pool);
+  size_t pool_bytes = sizeof(*pool);
   size_t index;
   if (out != NULL) *out = NULL;
   if (budget == NULL || out == NULL ||
@@ -237,13 +376,19 @@ ftun_status_t ftun_buffer_pool_create_waitable(
        (wake_quota == 0u || wake_quota > waiter_capacity))) {
     return FTUN_E_INVALID;
   }
+  if (waiter_capacity != 0u) {
+    pool_bytes += FTUN_BUFFER_CLASS_COUNT * sizeof(ftun_buffer_class_queue_t);
+    charge = pool_bytes;
+  }
   if (waiter_capacity > (SIZE_MAX - charge) / sizeof(ftun_buffer_waiter_t)) {
     return FTUN_E_LIMIT;
   }
   charge += waiter_capacity * sizeof(ftun_buffer_waiter_t);
-  status = ftun_budget_reserve(budget, charge, &reservation);
+  /* 等待节点可独立保留回调，槽位归 Pool；Flow 只持 token，不重复准入。 */
+  status = ftun_budget_reserve_resources(budget,
+    (ftun_budget_resources_t){charge, 0u, waiter_capacity}, &reservation);
   if (status != FTUN_OK) return status;
-  pool = (ftun_buffer_pool_t *)calloc(1u, sizeof(*pool));
+  pool = (ftun_buffer_pool_t *)calloc(1u, pool_bytes);
   if (pool != NULL && waiter_capacity != 0u) {
     pool->waiters = (ftun_buffer_waiter_t *)calloc(
       waiter_capacity, sizeof(*pool->waiters));
@@ -255,6 +400,13 @@ ftun_status_t ftun_buffer_pool_create_waitable(
     return FTUN_E_LIMIT;
   }
   pool->budget = budget;
+  if (pool_bytes != sizeof(*pool)) {
+    pool->classes = (ftun_buffer_class_queue_t *)(pool + 1u);
+    for (index = 0u; index < FTUN_BUFFER_CLASS_COUNT; index++) {
+      pool->classes[index].wait_head = FTUN_BUFFER_WAITER_NONE;
+      pool->classes[index].wait_tail = FTUN_BUFFER_WAITER_NONE;
+    }
+  }
   pool->reservation = reservation;
   pool->idle_limit_bytes = idle_limit_bytes;
   pool->idle_limit_buffers = idle_limit_buffers;
@@ -262,8 +414,6 @@ ftun_status_t ftun_buffer_pool_create_waitable(
   pool->wake_quota = wake_quota;
   pool->free_waiter = waiter_capacity == 0u
     ? FTUN_BUFFER_WAITER_NONE : 0u;
-  pool->wait_head = FTUN_BUFFER_WAITER_NONE;
-  pool->wait_tail = FTUN_BUFFER_WAITER_NONE;
   for (index = 0u; index < waiter_capacity; index++) {
     pool->waiters[index].previous = FTUN_BUFFER_WAITER_NONE;
     pool->waiters[index].next = index + 1u < waiter_capacity
@@ -287,6 +437,9 @@ ftun_status_t ftun_buffer_pool_set_wakeup(
 {
   if (pool == NULL || (wakeup == NULL && user != NULL)) return FTUN_E_INVALID;
   if (pool->dispatching) return FTUN_E_AGAIN;
+  if (pool->wakeup != wakeup || pool->wakeup_user != user) {
+    pool->notification_sent = 0;
+  }
   pool->wakeup = wakeup;
   pool->wakeup_user = user;
   ftun_buffer_pool_notify(pool);
@@ -299,6 +452,7 @@ ftun_status_t ftun_buffer_pool_acquire(ftun_buffer_pool_t *pool, size_t capacity
   ftun_buffer_t *buffer;
   ftun_buffer_t *previous = NULL;
   size_t buffer_class;
+  int trimmed = 0;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (pool == NULL || out == NULL) return FTUN_E_INVALID;
@@ -326,23 +480,24 @@ ftun_status_t ftun_buffer_pool_acquire(ftun_buffer_pool_t *pool, size_t capacity
   pool->cache_misses++;
   status = ftun_buffer_allocate(pool->budget, pool, buffer_class, out);
   if (status == FTUN_E_LIMIT && pool->idle != NULL) {
-    size_t idle_bytes = pool->idle_bytes;
-    size_t idle_buffers = pool->idle_buffers;
-    status = ftun_buffer_pool_trim(pool, 0u);
+    status = ftun_buffer_pool_pressure_trim(pool);
     if (status != FTUN_OK) return status;
-    pool->pressure_trims++;
-    pool->pressure_trimmed_bytes += idle_bytes - pool->idle_bytes;
-    pool->pressure_trimmed_buffers += idle_buffers - pool->idle_buffers;
+    trimmed = 1;
     status = ftun_buffer_allocate(pool->budget, pool, buffer_class, out);
   }
-  if (status != FTUN_OK) return status;
+  if (status != FTUN_OK) {
+    if (trimmed) ftun_buffer_pool_notify(pool);
+    return status;
+  }
   if (pool->active_buffers == SIZE_MAX) {
     buffer = *out;
     *out = NULL;
     (void)ftun_buffer_free(buffer);
+    if (trimmed) ftun_buffer_pool_notify(pool);
     return FTUN_E_LIMIT;
   }
   pool->active_buffers++;
+  if (trimmed) ftun_buffer_pool_notify(pool);
   return FTUN_OK;
 }
 
@@ -352,40 +507,53 @@ ftun_status_t ftun_buffer_pool_wait(
 {
   ftun_buffer_waiter_t *waiter;
   size_t buffer_class;
+  size_t category;
+  ftun_buffer_class_queue_t *queue;
   size_t slot;
+  int available;
   ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (pool == NULL || ready == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_buffer_class(capacity, &buffer_class);
   if (status != FTUN_OK) return status;
-  if (ftun_buffer_pool_can_acquire(pool, buffer_class)) return FTUN_E_AGAIN;
-  if (pool->free_waiter == FTUN_BUFFER_WAITER_NONE) {
+  status = ftun_buffer_pool_can_acquire(pool, buffer_class, &available);
+  if (status != FTUN_OK) return status;
+  if (available) {
+    ftun_buffer_pool_notify(pool);
+    return FTUN_E_AGAIN;
+  }
+  if (pool->free_waiter == FTUN_BUFFER_WAITER_NONE ||
+      pool->next_waiter_generation == UINT64_MAX) {
     if (pool->rejected_waiters != SIZE_MAX) pool->rejected_waiters++;
+    ftun_buffer_pool_notify(pool);
     return FTUN_E_LIMIT;
   }
   slot = pool->free_waiter;
+  category = ftun_buffer_class_index(buffer_class);
+  queue = &pool->classes[category];
   waiter = &pool->waiters[slot];
   pool->free_waiter = waiter->next;
   pool->next_waiter_generation++;
-  if (pool->next_waiter_generation == 0u) pool->next_waiter_generation++;
   memset(waiter, 0, sizeof(*waiter));
-  waiter->previous = pool->wait_tail;
+  waiter->previous = queue->wait_tail;
   waiter->next = FTUN_BUFFER_WAITER_NONE;
   waiter->capacity = buffer_class;
   waiter->ready = ready;
   waiter->user = user;
   waiter->generation = pool->next_waiter_generation;
   waiter->pending = 1;
-  if (pool->wait_tail != FTUN_BUFFER_WAITER_NONE) {
-    pool->waiters[pool->wait_tail].next = slot;
+  if (queue->wait_tail != FTUN_BUFFER_WAITER_NONE) {
+    pool->waiters[queue->wait_tail].next = slot;
   } else {
-    pool->wait_head = slot;
+    queue->wait_head = slot;
   }
-  pool->wait_tail = slot;
+  queue->wait_tail = slot;
+  pool->waiting_classes |= (size_t)1u << category;
   pool->waiting++;
   out->pool = pool;
   out->slot = slot;
   out->generation = waiter->generation;
+  ftun_buffer_pool_notify(pool);
   return FTUN_OK;
 }
 
@@ -430,7 +598,13 @@ ftun_status_t ftun_buffer_pool_dispatch(
     ftun_buffer_waiter_t *waiter;
     ftun_buffer_ready_fn ready;
     void *user;
-    size_t slot = ftun_buffer_pool_ready_waiter(pool);
+    size_t slot;
+    ftun_status_t status = ftun_buffer_pool_ready_waiter(pool, &slot);
+    if (status != FTUN_OK) {
+      pool->dispatching = 0;
+      *out_callbacks = callbacks;
+      return status;
+    }
     if (slot == FTUN_BUFFER_WAITER_NONE) {
       break;
     }
@@ -477,11 +651,18 @@ ftun_status_t ftun_buffer_pool_get_usage(const ftun_buffer_pool_t *pool,
   out->wake_callbacks = pool->wake_callbacks;
   out->cancelled_waiters = pool->cancelled_waiters;
   out->rejected_waiters = pool->rejected_waiters;
+  out->selection_steps = pool->selection_steps;
+  out->max_selection_steps = pool->max_selection_steps;
+  out->availability_probes = pool->availability_probes;
+  out->max_availability_probes = pool->max_availability_probes;
+  out->idle_scan_steps = pool->idle_scan_steps;
+  out->max_trim_buffers = pool->max_trim_buffers;
   out->dispatching = pool->dispatching != 0;
   return FTUN_OK;
 }
 
-ftun_status_t ftun_buffer_pool_trim(ftun_buffer_pool_t *pool, size_t target_idle_bytes)
+static ftun_status_t ftun_buffer_pool_trim_idle(
+  ftun_buffer_pool_t *pool, size_t target_idle_bytes)
 {
   if (pool == NULL) return FTUN_E_INVALID;
   while (pool->idle != NULL && pool->idle_bytes > target_idle_bytes) {
@@ -503,8 +684,14 @@ ftun_status_t ftun_buffer_pool_trim(ftun_buffer_pool_t *pool, size_t target_idle
       return status;
     }
   }
-  ftun_buffer_pool_notify(pool);
   return FTUN_OK;
+}
+
+ftun_status_t ftun_buffer_pool_trim(ftun_buffer_pool_t *pool, size_t target_idle_bytes)
+{
+  ftun_status_t status = ftun_buffer_pool_trim_idle(pool, target_idle_bytes);
+  if (status == FTUN_OK) ftun_buffer_pool_notify(pool);
+  return status;
 }
 
 ftun_status_t ftun_buffer_pool_destroy(ftun_buffer_pool_t **pool)
@@ -594,7 +781,7 @@ ftun_status_t ftun_buffer_release(ftun_buffer_t **buffer)
     pool->idle = owned;
     pool->idle_buffers++;
     pool->idle_bytes += owned->capacity;
-    ftun_buffer_pool_notify(pool);
+    if (pool->waiting != 0u) ftun_buffer_pool_notify(pool);
     return FTUN_OK;
   }
   status = ftun_buffer_free(owned);
@@ -603,7 +790,7 @@ ftun_status_t ftun_buffer_release(ftun_buffer_t **buffer)
     owned->references = 1u;
     *buffer = owned;
   } else {
-    ftun_buffer_pool_notify(pool);
+    if (pool->waiting != 0u) ftun_buffer_pool_notify(pool);
   }
   return status;
 }

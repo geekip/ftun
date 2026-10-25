@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_OUTBOUND_DIRECT_H
 #define FTUN_PROXY_OUTBOUND_DIRECT_H
-#include "transport/dialer.h"
+#include "transport/path.h"
 
 struct ftun_direct_request {
   ftun_event_loop_t *loop;
@@ -15,6 +15,15 @@ struct ftun_direct_request {
   ftun_dial_transport_t transport;
   ftun_dial_completion_fn completion;
   void *user;
+  /* 非空时通过已接纳配置 scope 返回拥有型 Path，completion 必须为空。
+   * 同步复制 options 并保留 scope；path_completion 成功转移 Path 创建者
+   * 引用，失败给 NULL。scope 代次必须与 target 相同；不使用裸 socket。 */
+  ftun_path_scope_t *scope;
+  ftun_stream_options_t stream;
+  ftun_datagram_options_t datagram;
+  ftun_path_completion_fn path_completion;
+  ftun_path_notify_fn notify;
+  void *notify_user;
 };
 
 /* 直连出口。

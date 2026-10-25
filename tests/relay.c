@@ -276,26 +276,30 @@ static int test_backpressure_and_half_close(void)
         (usage.left_interests & FTUN_EVENT_READ) == 0u &&
         (usage.right_interests & FTUN_EVENT_WRITE) == 0u);
 
-  for (index = 0u; index < 4u; index++) {
-    CHECK(complete_write(&fixture.right_backend, FTUN_OK) == 0);
-    CHECK(dispatch_all(&fixture, 1u) == 0);
-    if (index != 3u) CHECK(process(&fixture, 0u, 0u, 1u) == 0);
-    if (index == 1u) {
+  for (index = 0u; index < 32u; index++) {
+    if (fixture.right_backend.write.stream != NULL) {
+      CHECK(complete_write(&fixture.right_backend, FTUN_OK) == 0);
+      CHECK(dispatch_all(&fixture, 1u) == 0);
+    }
+    if (fixture.right_backend.output_length == 4u) {
       CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
       CHECK(usage.left_to_right_buffered == 4u &&
             (usage.left_interests & FTUN_EVENT_READ) == 0u);
     }
-    if (index == 2u) {
+    if (fixture.right_backend.output_length == 6u) {
       CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
-      CHECK(usage.left_to_right_buffered == 2u &&
-            (usage.left_interests & FTUN_EVENT_READ) != 0u);
+      CHECK(usage.left_to_right_buffered == 2u);
+      CHECK(usage.left_eof || (usage.left_interests & FTUN_EVENT_READ) != 0u);
     }
+    if (fixture.right_backend.output_length == sizeof(left_input)) break;
+    CHECK(process(&fixture, 0u, 0u, 1u) == 0);
   }
   CHECK(fixture.right_backend.output_length == sizeof(left_input) &&
         memcmp(fixture.right_backend.output, left_input, sizeof(left_input)) == 0);
   CHECK(fixture.right_backend.shutdown_calls == 0);
 
-  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  CHECK(ftun_relay_get_usage(fixture.relay, &usage) == FTUN_OK);
+  if (!usage.left_eof) CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
   fixture.right_backend.shutdown_status = FTUN_E_AGAIN;
   CHECK(process(&fixture, 0u, 0u, 1u) == 0);
   CHECK(fixture.right_backend.shutdown_calls == 1);
@@ -315,6 +319,45 @@ static int test_backpressure_and_half_close(void)
         usage.total_read_bytes == 8u && usage.total_written_bytes == 8u);
   CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK && fixture.relay == NULL);
   CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
+static int test_read_hint_survives_backpressure(void)
+{
+  fixture_t fixture;
+  size_t round;
+  int reads;
+  CHECK(fixture_start(&fixture, 8u, 3u, 1u) == 0);
+  memcpy(fixture.left_backend.input, "abcdefghijkl", 12u);
+  fixture.left_backend.input_length = 12u;
+  fixture.left_backend.read_chunk = 4u;
+  fixture.right_backend.accept_limit = 2u;
+  /* 只发一次 READ，配额与异步写背压不能丢失尚未读空的状态。 */
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  for (round = 0u; round < 64u; round++) {
+    size_t work;
+    if (fixture.right_backend.write.stream != NULL) {
+      CHECK(complete_write(&fixture.right_backend, FTUN_OK) == 0);
+      CHECK(dispatch_all(&fixture, 1u) == 0);
+    }
+    CHECK(ftun_relay_process(fixture.relay, 0u, 0u, &work) == FTUN_OK);
+    CHECK(work <= 1u);
+  }
+  CHECK(fixture.right_backend.output_length == 12u &&
+        memcmp(fixture.right_backend.output, "abcdefghijkl", 12u) == 0);
+  reads = fixture.left_backend.read_calls;
+  /* 已经读到 AGAIN 后，无关 WRITE 或推进不能重新触发空读。 */
+  for (round = 0u; round < 8u; round++) {
+    CHECK(process(&fixture, 0u, FTUN_EVENT_WRITE, 0u) == 0);
+  }
+  CHECK(fixture.left_backend.read_calls == reads);
+  fixture.left_backend.input[12] = 'm';
+  fixture.left_backend.input_length = 13u;
+  CHECK(process(&fixture, 0u, 0u, 0u) == 0);
+  CHECK(fixture.left_backend.read_calls == reads);
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 1u) == 0);
+  CHECK(fixture.left_backend.read_calls == reads + 1);
+  CHECK(fixture_destroy(&fixture, 1) == 0);
   return 0;
 }
 
@@ -533,14 +576,61 @@ static int test_pool_wait_resume_and_cancel(void)
   return 0;
 }
 
+static int test_mixed_pool_resume(void)
+{
+  fixture_t fixture;
+  const ftun_relay_options_t options = {512u, 256u, 1u};
+  ftun_buffer_pool_t *pool = NULL;
+  ftun_buffer_t *held[2] = {NULL, NULL};
+  ftun_reservation_t *blocker = NULL;
+  ftun_budget_usage_t budget_usage;
+  ftun_buffer_pool_usage_t pool_usage;
+  ftun_relay_usage_t relay_usage;
+  size_t callbacks, progress_calls = 0u, wakeups = 0u, work;
+  CHECK(fixture_start(&fixture, 8u, 3u, 1u) == 0);
+  CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
+  CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create_waitable(fixture.budget, 1024u, 4u, 2u, 1u, &pool) == FTUN_OK);
+  CHECK(ftun_buffer_pool_set_wakeup(pool, pool_wakeup, &wakeups) == FTUN_OK);
+  CHECK(ftun_relay_start_with_pool_options(NULL, fixture.left, fixture.right,
+    pool, &options, relay_progress, &progress_calls, &fixture.relay) == FTUN_OK);
+  CHECK(ftun_buffer_pool_acquire(pool, 256u, &held[0]) == FTUN_OK);
+  CHECK(ftun_buffer_pool_acquire(pool, 256u, &held[1]) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(fixture.budget, &budget_usage) == FTUN_OK);
+  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available, &blocker) == FTUN_OK);
+  fixture.left_backend.input[0] = 'm';
+  fixture.left_backend.input_length = 1u;
+  CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_READ, 0u, &work) == FTUN_OK && work == 0u);
+  CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK && relay_usage.left_buffer_waiting);
+  CHECK(ftun_buffer_release(&held[0]) == FTUN_OK && wakeups == 0u);
+  CHECK(ftun_buffer_release(&held[1]) == FTUN_OK && wakeups == 1u);
+  CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 1u);
+  CHECK(progress_calls == 1u);
+  /* 两个小块触发恢复；不再提供新的 FD readiness。 */
+  CHECK(ftun_relay_process(fixture.relay, 0u, 0u, &work) == FTUN_OK && work == 1u);
+  CHECK(fixture.left_backend.read_calls == 1);
+  CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK && !relay_usage.left_buffer_waiting);
+  CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK &&
+        pool_usage.waiting == 0u && pool_usage.pressure_trimmed_buffers == 2u);
+  CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
+  CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK);
+  CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 0u);
+  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
+  CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
 /* TASK-TRANSPORT-004 / TEST-TRANSPORT-004：水位、工作上限与排空 half-close。 */
 int main(void)
 {
   CHECK(test_backpressure_and_half_close() == 0);
+  CHECK(test_read_hint_survives_backpressure() == 0);
   CHECK(test_write_interest_and_cancel_retry() == 0);
   CHECK(test_lazy_budget_and_error() == 0);
   CHECK(test_boundaries_and_default() == 0);
   CHECK(test_related_budget_hierarchy() == 0);
   CHECK(test_pool_wait_resume_and_cancel() == 0);
+  CHECK(test_mixed_pool_resume() == 0);
   return 0;
 }

@@ -283,7 +283,8 @@ ftun_status_t ftun_session_submit(ftun_core_t *core,
     (void)ftun_runtime_release(&runtime);
     return status != FTUN_OK ? status : FTUN_E_STALE;
   }
-  status = ftun_budget_reserve(manager_budget, accounted_bytes, &reservation);
+  /* Session属于入站数据链；同根校验不允许绕过该Stream的对象/模块上限。 */
+  status = ftun_budget_reserve(stream_budget, accounted_bytes, &reservation);
   if (status != FTUN_OK) {
     (void)ftun_runtime_release(&runtime);
     return status;
@@ -334,7 +335,8 @@ ftun_status_t ftun_session_transition(ftun_session_t *session,
 {
   if (session == NULL) return FTUN_E_INVALID;
   if (session->pending_operation != NULL) return FTUN_E_AGAIN;
-  if (!ftun_session_transition_allowed(session->state, next)) {
+  if (session->terminal_error.status != FTUN_OK ||
+      !ftun_session_transition_allowed(session->state, next)) {
     return FTUN_E_STALE;
   }
   if (next == FTUN_SESSION_CONNECTING && !session->route_pinned) {
@@ -399,6 +401,22 @@ ftun_status_t ftun_session_operation_complete(ftun_session_t *session,
   return ftun_session_close(session, terminal, 0);
 }
 
+ftun_status_t ftun_session_operation_complete_for_reply(ftun_session_t *session,
+  ftun_operation_t *operation, ftun_error_t result)
+{
+  if (session == NULL || operation == NULL) return FTUN_E_INVALID;
+  if (session->pending_operation != operation) return FTUN_E_STALE;
+  if (result.status != FTUN_OK && result.status != FTUN_E_AGAIN &&
+      result.status != FTUN_E_CANCELLED &&
+      (session->state == FTUN_SESSION_RESOLVING || session->state == FTUN_SESSION_CONNECTING)) {
+    session->pending_operation = NULL;
+    session->terminal_error = result;
+    session->state = FTUN_SESSION_REPLYING;
+    return FTUN_OK;
+  }
+  return ftun_session_operation_complete(session, operation, result);
+}
+
 ftun_status_t ftun_session_store_resolved(
   ftun_session_t *session, ftun_operation_t *operation,
   const ftun_endpoint_t *addresses, size_t address_count)
@@ -445,6 +463,9 @@ ftun_status_t ftun_session_finish(ftun_session_t *session,
   }
   if (result.status == FTUN_OK && session->state != FTUN_SESSION_DRAINING) {
     return FTUN_E_STALE;
+  }
+  if (session->state == FTUN_SESSION_REPLYING && session->terminal_error.status != FTUN_OK) {
+    return ftun_session_close(session, session->terminal_error, 1);
   }
   return ftun_session_close(session, result, 0);
 }

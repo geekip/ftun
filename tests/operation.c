@@ -1,6 +1,12 @@
+#if !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
 #include "core/operation.h"
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <string.h>
+#include <time.h>
 
 #define CHECK(x) do { \
   if (!(x)) { \
@@ -42,6 +48,316 @@ static void completed(ftun_operation_t *operation, ftun_error_t result, void *us
   if (ftun_operation_cancel(operation) == FTUN_E_STALE) state->cancel_was_stale++;
   if (ftun_operation_dispatch(state->queue, 1u, &dispatched) == FTUN_E_AGAIN &&
       dispatched == 0u) state->recursive_was_again++;
+}
+
+typedef struct {
+  ftun_operation_queue_t *queue;
+  ftun_operation_t *operation;
+  ftun_operation_token_t token;
+  ftun_operation_token_t stale;
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+  pthread_t owner;
+  int phase;
+  int threaded;
+  int deferred;
+  int failed;
+  int calls;
+  int hook_calls;
+  ftun_status_t hook_result;
+  ftun_status_t first_result;
+  ftun_status_t duplicate_result;
+  ftun_status_t retry_result;
+  ftun_status_t stale_result;
+  ftun_error_t delivered;
+} window_t;
+
+/* 仅测试使用有界握手固定两个线程的相遇窗口；产品 hook 不得等待生产者。 */
+static int window_wait(window_t *window, int phase)
+{
+  struct timespec limit;
+  if (clock_gettime(CLOCK_REALTIME, &limit) != 0) return 0;
+  limit.tv_sec += 5;
+  while (window->phase < phase && !window->failed) {
+    if (pthread_cond_timedwait(&window->condition, &window->mutex,
+                               &limit) != 0) {
+      window->failed = 1;
+      (void)pthread_cond_broadcast(&window->condition);
+    }
+  }
+  return !window->failed;
+}
+
+static void window_completed(ftun_operation_t *operation,
+                               ftun_error_t result, void *user)
+{
+  window_t *window = (window_t *)user;
+  (void)operation;
+  if (!pthread_equal(pthread_self(), window->owner)) window->failed = 1;
+  window->calls++;
+  window->delivered = result;
+}
+
+static void *window_producer(void *user)
+{
+  window_t *window = (window_t *)user;
+  const ftun_error_t result = {FTUN_OK, 37u, 91};
+  (void)pthread_mutex_lock(&window->mutex);
+  if (!window_wait(window, 1)) {
+    (void)pthread_mutex_unlock(&window->mutex);
+    return NULL;
+  }
+  (void)pthread_mutex_unlock(&window->mutex);
+  window->first_result = window->deferred
+    ? ftun_operation_complete_deferred(window->token, result)
+    : ftun_operation_complete(window->token, result);
+  window->stale_result = ftun_operation_complete_deferred(window->stale, result);
+  window->duplicate_result = window->deferred
+    ? ftun_operation_complete_deferred(window->token, result)
+    : ftun_operation_complete(window->token, result);
+  (void)pthread_mutex_lock(&window->mutex);
+  window->phase = 2;
+  (void)pthread_cond_broadcast(&window->condition);
+  if (!window_wait(window, 3)) {
+    (void)pthread_mutex_unlock(&window->mutex);
+    return NULL;
+  }
+  (void)pthread_mutex_unlock(&window->mutex);
+  /* AGAIN 没有消费结果，必须保留完整结果并在取消调用退出后重交。 */
+  window->retry_result = ftun_operation_complete(window->token, result);
+  (void)pthread_mutex_lock(&window->mutex);
+  window->phase = 4;
+  (void)pthread_cond_broadcast(&window->condition);
+  (void)pthread_mutex_unlock(&window->mutex);
+  return NULL;
+}
+
+static ftun_status_t window_cancel(void *user)
+{
+  window_t *window = (window_t *)user;
+  const ftun_error_t result = {FTUN_OK, 37u, 91};
+  size_t dispatched = 0u;
+  window->hook_calls++;
+  if (ftun_operation_cancel(window->operation) != FTUN_E_AGAIN ||
+      ftun_operation_set_cancel_hook(window->operation, NULL, NULL) !=
+        FTUN_E_AGAIN) window->failed = 1;
+  if (window->threaded) {
+    (void)pthread_mutex_lock(&window->mutex);
+    window->phase = 1;
+    (void)pthread_cond_broadcast(&window->condition);
+    (void)window_wait(window, 2);
+    (void)pthread_mutex_unlock(&window->mutex);
+  } else {
+    window->first_result = window->deferred
+      ? ftun_operation_complete_deferred(window->token, result)
+      : ftun_operation_complete(window->token, result);
+    window->stale_result = ftun_operation_complete_deferred(window->stale, result);
+    window->duplicate_result = window->deferred
+      ? ftun_operation_complete_deferred(window->token, result)
+      : ftun_operation_complete(window->token, result);
+  }
+  if (ftun_operation_dispatch(window->queue, 1u, &dispatched) != FTUN_OK ||
+      dispatched != 0u) window->failed = 1;
+  return window->hook_result;
+}
+
+static int test_cancel_window(int threaded, int deferred, int already_terminal,
+                               ftun_status_t hook_result)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_operation_queue_usage_t usage;
+  ftun_operation_t *unused = NULL;
+  ftun_operation_token_t replacement = {0};
+  const ftun_error_t result = {FTUN_OK, 37u, 91};
+  window_t window;
+  pthread_t producer;
+  size_t dispatched;
+  memset(&window, 0, sizeof(window));
+  window.owner = pthread_self();
+  window.threaded = threaded;
+  window.deferred = deferred;
+  window.hook_result = hook_result;
+  CHECK(pthread_mutex_init(&window.mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&window.condition, NULL) == 0);
+  CHECK(ftun_budget_create(NULL, 4096u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_operation_queue_create(budget, 1u, &window.queue) == FTUN_OK);
+  CHECK(ftun_operation_accept(window.queue, window_completed, &window,
+    &unused, &window.stale) == FTUN_OK);
+  CHECK(ftun_operation_reject(&unused) == FTUN_OK);
+  CHECK(ftun_operation_accept(window.queue, window_completed, &window,
+    &window.operation, &window.token) == FTUN_OK);
+  CHECK(window.token.slot == window.stale.slot &&
+        window.token.generation != window.stale.generation);
+  CHECK(ftun_operation_set_cancel_hook(window.operation, window_cancel,
+                                       &window) == FTUN_OK);
+  if (already_terminal) {
+    CHECK(ftun_operation_complete(window.token, result) == FTUN_OK);
+  }
+  if (threaded) CHECK(pthread_create(&producer, NULL, window_producer,
+                                    &window) == 0);
+  CHECK(ftun_operation_cancel(window.operation) == hook_result);
+  CHECK(!window.failed && window.hook_calls == 1 && window.calls == 0);
+  CHECK(window.first_result == (already_terminal ? FTUN_E_STALE :
+                                deferred ? FTUN_OK : FTUN_E_AGAIN));
+  CHECK(window.stale_result == FTUN_E_STALE);
+  CHECK(window.duplicate_result ==
+        (deferred || already_terminal ? FTUN_E_STALE : FTUN_E_AGAIN));
+  CHECK(ftun_operation_queue_get_usage(window.queue, &usage) == FTUN_OK);
+  CHECK(usage.inflight == 1u &&
+        usage.ready == (size_t)(deferred || already_terminal || hook_result == FTUN_OK));
+  CHECK(ftun_operation_dispatch(window.queue, 1u, &dispatched) == FTUN_OK);
+  CHECK(dispatched == (size_t)(deferred || already_terminal || hook_result == FTUN_OK));
+  if (dispatched != 0u) {
+    CHECK(window.delivered.status ==
+          (hook_result == FTUN_OK ? FTUN_E_CANCELLED : FTUN_OK));
+    if (hook_result != FTUN_OK) {
+      CHECK(window.delivered.stage == 37u && window.delivered.native_code == 91);
+    }
+    /* 取消成功后的迟到完成还必须不能污染同槽位的新请求。 */
+    CHECK(ftun_operation_accept(window.queue, window_completed, &window,
+      &unused, &replacement) == FTUN_OK);
+  }
+  if (threaded) {
+    struct timespec limit;
+    CHECK(clock_gettime(CLOCK_MONOTONIC, &limit) == 0);
+    limit.tv_sec += 5;
+    (void)pthread_mutex_lock(&window.mutex);
+    window.phase = 3;
+    (void)pthread_cond_broadcast(&window.condition);
+    (void)pthread_mutex_unlock(&window.mutex);
+    /* 生产者尚未 join 时 owner 实际推进队列。 */
+    for (;;) {
+      int finished;
+      struct timespec now;
+      CHECK(ftun_operation_dispatch(window.queue, 1u, &dispatched) == FTUN_OK);
+      (void)pthread_mutex_lock(&window.mutex);
+      finished = window.phase == 4 || window.failed;
+      (void)pthread_mutex_unlock(&window.mutex);
+      if (finished) break;
+      CHECK(clock_gettime(CLOCK_MONOTONIC, &now) == 0);
+      CHECK(now.tv_sec < limit.tv_sec ||
+            (now.tv_sec == limit.tv_sec && now.tv_nsec < limit.tv_nsec));
+    }
+    CHECK(pthread_join(producer, NULL) == 0);
+  } else {
+    window.retry_result = ftun_operation_complete(window.token, result);
+  }
+  CHECK(!window.failed);
+  CHECK(window.retry_result ==
+        (deferred || already_terminal || hook_result == FTUN_OK
+          ? FTUN_E_STALE : FTUN_OK));
+  CHECK(ftun_operation_dispatch(window.queue, 1u, &dispatched) == FTUN_OK);
+  CHECK(window.calls == 1);
+  if (!already_terminal && hook_result != FTUN_OK) {
+    CHECK(window.delivered.status == FTUN_OK && window.delivered.stage == 37u &&
+          window.delivered.native_code == 91);
+  }
+  if (unused != NULL) {
+    CHECK(ftun_operation_queue_get_usage(window.queue, &usage) == FTUN_OK &&
+          usage.inflight == 1u && usage.ready == 0u);
+    CHECK(ftun_operation_reject(&unused) == FTUN_OK);
+  }
+  CHECK(ftun_operation_complete(window.token, result) == FTUN_E_STALE);
+  CHECK(ftun_operation_queue_stop(window.queue) == FTUN_OK);
+  CHECK(ftun_operation_queue_destroy(&window.queue) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(pthread_cond_destroy(&window.condition) == 0);
+  CHECK(pthread_mutex_destroy(&window.mutex) == 0);
+  return 0;
+}
+
+typedef struct {
+  ftun_operation_queue_t *queue;
+  size_t calls;
+  int failed;
+} stop_step_t;
+
+static ftun_status_t stop_step_cancel(void *user)
+{
+  stop_step_t *state = (stop_step_t *)user;
+  size_t visited = 99u;
+  bool more = true;
+  state->calls++;
+  if (ftun_operation_queue_stop_step(state->queue, 1u, &visited, &more) !=
+        FTUN_E_AGAIN || visited != 0u || more ||
+      ftun_operation_queue_reopen(state->queue) != FTUN_E_AGAIN) {
+    state->failed = 1;
+  }
+  return state->calls == 1u ? FTUN_E_AGAIN : FTUN_OK;
+}
+
+static int test_stop_steps(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_operation_queue_t *queue = NULL;
+  ftun_operation_t *operations[65] = {0};
+  ftun_operation_token_t tokens[65] = {{0}};
+  callback_state_t callbacks[65];
+  callback_state_t extra = {0};
+  stop_step_t hook;
+  ftun_operation_queue_usage_t usage;
+  ftun_operation_t *replacement = NULL;
+  ftun_operation_token_t replacement_token = {0};
+  size_t visited = 0u, dispatched = 0u, index, last = 0u;
+  bool more = false;
+  const ftun_error_t result = {FTUN_OK, 0u, 0};
+  memset(callbacks, 0, sizeof(callbacks));
+  memset(&hook, 0, sizeof(hook));
+  CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_operation_queue_create(budget, 65u, &queue) == FTUN_OK);
+  hook.queue = queue;
+  for (index = 0u; index < 65u; index++) {
+    callbacks[index].queue = queue;
+    callbacks[index].expected = FTUN_E_CANCELLED;
+    CHECK(ftun_operation_accept(queue, completed, &callbacks[index],
+      &operations[index], &tokens[index]) == FTUN_OK);
+    if (tokens[index].slot == 64u) last = index;
+  }
+  CHECK(ftun_operation_set_cancel_hook(operations[last], stop_step_cancel,
+                                        &hook) == FTUN_OK);
+  /* 空槽也消耗扫描配额，跨轮派发不能让游标跳过尾部失败项。 */
+  for (index = 0u; index < 65u; index++) {
+    if (tokens[index].slot < 64u && tokens[index].slot % 2u == 0u) {
+      CHECK(ftun_operation_reject(&operations[index]) == FTUN_OK);
+    }
+  }
+  CHECK(ftun_operation_queue_stop_step(queue, 0u, &visited, &more) ==
+        FTUN_E_INVALID && visited == 0u && !more);
+  CHECK(ftun_operation_queue_stop_step(queue, 32u, &visited, &more) == FTUN_OK);
+  CHECK(visited == 32u && more && hook.calls == 0u);
+  CHECK(ftun_operation_accept(queue, completed, &callbacks[0],
+    &replacement, &replacement_token) == FTUN_E_CANCELLED && replacement == NULL);
+  CHECK(ftun_operation_queue_reopen(queue) == FTUN_E_AGAIN);
+  CHECK(ftun_operation_dispatch(queue, 32u, &dispatched) == FTUN_OK);
+  CHECK(dispatched == 16u);
+  CHECK(ftun_operation_queue_stop_step(queue, 32u, &visited, &more) == FTUN_OK);
+  CHECK(visited == 32u && more);
+  CHECK(ftun_operation_dispatch(queue, 32u, &dispatched) == FTUN_OK);
+  CHECK(dispatched == 16u);
+  CHECK(ftun_operation_queue_stop_step(queue, 32u, &visited, &more) == FTUN_E_AGAIN);
+  CHECK(visited == 1u && !more && hook.calls == 1u && !hook.failed);
+  CHECK(ftun_operation_queue_get_usage(queue, &usage) == FTUN_OK &&
+        usage.inflight == 1u && usage.ready == 0u);
+  CHECK(ftun_operation_queue_stop(queue) == FTUN_OK && hook.calls == 2u);
+  CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK && dispatched == 1u);
+  for (index = 0u; index < 65u; index++) {
+    CHECK(callbacks[index].calls ==
+      (int)(tokens[index].slot % 2u != 0u || tokens[index].slot == 64u));
+  }
+  CHECK(ftun_operation_queue_reopen(queue) == FTUN_OK);
+  extra.queue = queue;
+  extra.expected = FTUN_E_CANCELLED;
+  CHECK(ftun_operation_accept(queue, completed, &extra,
+    &replacement, &replacement_token) == FTUN_OK);
+  CHECK(ftun_operation_complete(tokens[last], result) == FTUN_E_STALE);
+  CHECK(ftun_operation_cancel(replacement) == FTUN_OK);
+  CHECK(ftun_operation_dispatch(queue, 1u, &dispatched) == FTUN_OK);
+  CHECK(extra.calls == 1 && !hook.failed);
+  CHECK(ftun_operation_queue_stop_step(queue, 32u, &visited, &more) == FTUN_OK);
+  CHECK(visited == 0u && !more);
+  CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
 }
 
 int main(void)
@@ -265,5 +581,23 @@ int main(void)
           queue == NULL);
     CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   }
+  {
+    int threaded;
+    int terminal;
+    int deferred;
+    const ftun_status_t results[] = {FTUN_OK, FTUN_E_IO, FTUN_E_AGAIN};
+    size_t index;
+    for (threaded = 0; threaded <= 1; threaded++) {
+      for (deferred = 0; deferred <= 1; deferred++) {
+        for (terminal = 0; terminal <= 1; terminal++) {
+          for (index = 0u; index < sizeof(results) / sizeof(results[0]); index++) {
+            CHECK(test_cancel_window(threaded, deferred, terminal, results[index]) == 0);
+          }
+        }
+      }
+    }
+  }
+  CHECK(test_stop_steps() == 0);
+  puts("operation: cancel windows=24; bounded stop and exactly-once passed");
   return 0;
 }

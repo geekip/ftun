@@ -38,7 +38,7 @@ typedef struct {
   ftun_endpoint_t endpoints[FTUN_BOOTSTRAP_MAX_SERVERS];
   ftun_native_socket_t sockets[FTUN_BOOTSTRAP_MAX_SERVERS];
   uint32_t mark;
-  char device[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char device[FTUN_SOCKET_INTERFACE_BYTES];
   int open_calls;
   int protect_calls;
   int connect_calls;
@@ -537,6 +537,27 @@ static int test_tc_timeout_and_cancel(void)
   return 0;
 }
 
+static int test_cancel_failure_then_response(void)
+{
+  fixture_t fixture;
+  ftun_operation_t *operation = NULL;
+  CHECK(fixture_start(&fixture, 8u) == 0);
+  CHECK(ftun_bootstrap_resolve_with_io(NULL, &fixture.request,
+                                       &fixture.dial_io, &fixture.io,
+                                       &operation) == FTUN_OK);
+  CHECK(dispatch_operations(&fixture, 1u));
+  fixture.backend.cancel_failures = 1;
+  CHECK(ftun_operation_cancel(operation) == FTUN_E_IO);
+  CHECK(fixture.completion.calls == 0 && fixture.sockets.close_calls == 0);
+  CHECK(deliver(&fixture, response_ok, sizeof(response_ok),
+                &fixture.sockets.endpoints[0]));
+  CHECK(dispatch_operations(&fixture, 1u));
+  CHECK(fixture.completion.calls == 1 && fixture.completion.error.status == FTUN_OK &&
+        fixture.completion.address_count == 2u && fixture.sockets.close_calls == 1);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 static int test_send_again_and_deferred_cleanup(void)
 {
   fixture_t fixture;
@@ -698,6 +719,7 @@ int main(void)
   CHECK(test_explicit_success_and_copy() == 0);
   CHECK(test_source_filter_and_retry() == 0);
   CHECK(test_tc_timeout_and_cancel() == 0);
+  CHECK(test_cancel_failure_then_response() == 0);
   CHECK(test_send_again_and_deferred_cleanup() == 0);
   CHECK(test_sync_boundaries() == 0);
   CHECK(test_system_branch() == 0);

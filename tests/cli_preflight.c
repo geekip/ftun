@@ -1,0 +1,203 @@
+#define _POSIX_C_SOURCE 200809L
+#include "app/cli/internal.h"
+#include "config/compile.h"
+#include "config/config.h"
+#include "core/context.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+#include "app/cli/fakeip.c"
+#include <stdarg.h>
+static bool force_random_fallback;
+static ftun_budget_t *random_budget;
+static size_t random_opens;
+static int random_fd = -1;
+ssize_t __real_getrandom(void *buffer, size_t size, unsigned int flags);
+ssize_t __wrap_getrandom(void *buffer, size_t size, unsigned int flags)
+{
+  if (!force_random_fallback) return __real_getrandom(buffer, size, flags);
+  errno = ENOSYS;
+  return -1;
+}
+int __real_open(const char *path, int flags, ...);
+int __real_close(int descriptor);
+int __wrap_open(const char *path, int flags, ...)
+{
+  mode_t mode = 0;
+  int descriptor;
+  if ((flags & O_CREAT) != 0) {
+    va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args);
+  }
+  if (random_budget != NULL && strcmp(path, "/dev/urandom") == 0) {
+    ftun_budget_usage_t usage;
+    if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
+        usage.used_resources.descriptors != 1u) abort();
+    random_opens++;
+    descriptor = __real_open(path, flags, mode);
+    random_fd = descriptor;
+    return descriptor;
+  }
+  return __real_open(path, flags, mode);
+}
+int __wrap_close(int descriptor)
+{
+  if (random_budget != NULL && descriptor == random_fd) {
+    ftun_budget_usage_t usage;
+    if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
+        usage.used_resources.descriptors != 1u) abort();
+    random_fd = -1;
+  }
+  return __real_close(descriptor);
+}
+#endif
+
+#define CHECK(x) do { if (!(x)) { \
+  fprintf(stderr, "cli preflight failed at %d: %s\n", __LINE__, #x); return 1; \
+} } while (0)
+
+static ftun_budget_t *loaded_budget;
+static unsigned int core_destroy_calls;
+static int reject_load, hold_config, hold_core;
+
+ftun_status_t __real_ftun_config_load_budget_traced(ftun_budget_t *budget,
+  const char *path, ftun_config_t **out, ftun_config_trace_t *trace);
+ftun_status_t __wrap_ftun_config_load_budget_traced(ftun_budget_t *budget,
+  const char *path, ftun_config_t **out, ftun_config_trace_t *trace)
+{
+  loaded_budget = budget;
+  if (reject_load) {
+    *out = NULL;
+    trace->failed = FTUN_CONFIG_STEP_READ;
+    trace->status = FTUN_E_LIMIT;
+    return FTUN_E_LIMIT;
+  }
+  return __real_ftun_config_load_budget_traced(budget, path, out, trace);
+}
+
+ftun_status_t __real_ftun_config_destroy(ftun_config_t **config);
+ftun_status_t __wrap_ftun_config_destroy(ftun_config_t **config)
+{
+  if (hold_config && config != NULL && *config != NULL) return FTUN_E_AGAIN;
+  return __real_ftun_config_destroy(config);
+}
+
+ftun_status_t __real_ftun_core_destroy(ftun_core_t **core);
+ftun_status_t __wrap_ftun_core_destroy(ftun_core_t **core)
+{
+  if (core != NULL && *core != NULL) {
+    core_destroy_calls++;
+    if (hold_core) return FTUN_E_AGAIN;
+  }
+  return __real_ftun_core_destroy(core);
+}
+
+static int write_config(const char *path, const char *text)
+{
+  FILE *file = fopen(path, "w");
+  CHECK(file != NULL);
+  CHECK(fputs(text, file) >= 0);
+  CHECK(fclose(file) == 0);
+  return 0;
+}
+
+static int ownership(const char *path)
+{
+  ftun_cli_checked_config_t checked = {0};
+  ftun_budget_usage_t before, after;
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core;
+  ftun_config_t *config;
+  size_t bytes;
+  CHECK(ftun_cli_check_config(path, 0, &checked) == FTUN_OK);
+  CHECK(checked.core != NULL && checked.config != NULL);
+  CHECK(ftun_core_context_budget(checked.core, &budget) == FTUN_OK);
+  CHECK(budget != NULL && loaded_budget == budget);
+  CHECK(checked.config->budget == budget && checked.config->reservation != NULL);
+  CHECK(checked.config->plan != NULL && checked.config->plan->reservation != NULL);
+  bytes = checked.config->owned_bytes + checked.config->plan->owned_bytes;
+  CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
+  CHECK(before.used >= bytes && before.used_resources.descriptors == 0u);
+  core = checked.core;
+  config = checked.config;
+  CHECK(ftun_cli_check_config(path, 0, &checked) == FTUN_E_INVALID);
+  CHECK(checked.core == core && checked.config == config);
+
+  /* 配置清理失败时不得碰预算宿主，第二次可以继续同一拥有链。 */
+  core_destroy_calls = 0u;
+  hold_config = 1;
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_E_AGAIN);
+  CHECK(core_destroy_calls == 0u && checked.core == core && checked.config == config);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used);
+  hold_config = 0;
+  hold_core = 1;
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_E_AGAIN);
+  CHECK(checked.config == NULL && checked.core == core && core_destroy_calls == 1u);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used + bytes == before.used);
+  hold_core = 0;
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  CHECK(checked.core == NULL && checked.config == NULL);
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  return 0;
+}
+
+static int failures(const char *path)
+{
+  ftun_cli_checked_config_t checked = {0};
+  CHECK(ftun_cli_check_config(NULL, 0, &checked) == FTUN_E_INVALID);
+  CHECK(ftun_cli_check_config(path, 0, NULL) == FTUN_E_INVALID);
+  CHECK(ftun_cli_checked_config_destroy(NULL) == FTUN_E_INVALID);
+  reject_load = 1;
+  CHECK(ftun_cli_check_config(path, 0, &checked) == FTUN_E_LIMIT);
+  CHECK(checked.core != NULL && checked.config == NULL && loaded_budget != NULL);
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  reject_load = 0;
+  CHECK(ftun_cli_check_config(path, 1, &checked) == FTUN_E_INVALID);
+  CHECK(checked.core != NULL && checked.config != NULL);
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  CHECK(write_config(path, "{bad}") == 0);
+  CHECK(ftun_cli_check_config(path, 0, &checked) == FTUN_E_INVALID);
+  CHECK(checked.core != NULL && checked.config == NULL);
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  CHECK(unlink(path) == 0);
+  CHECK(ftun_cli_check_config(path, 0, &checked) != FTUN_OK);
+  CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
+  return 0;
+}
+
+static int random_resources(void)
+{
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  ftun_budget_options_t options = {{4096u, 0u, 0u}, {0}, {0}};
+  ftun_budget_usage_t usage, before;
+  uint8_t uuid[FTUN_FAKEIP_UUID_BYTES];
+  force_random_fallback = true;
+  CHECK(ftun_budget_create_resources(NULL, &options, &random_budget) == FTUN_OK);
+  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_E_LIMIT && random_opens == 0u);
+  CHECK(ftun_budget_destroy(&random_budget) == FTUN_OK);
+  options.limit.descriptors = 1u;
+  CHECK(ftun_budget_create_resources(NULL, &options, &random_budget) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(random_budget, &before) == FTUN_OK);
+  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_OK && random_opens == 1u && random_fd == -1);
+  CHECK((uuid[6] & 0xf0u) == 0x40u && (uuid[8] & 0xc0u) == 0x80u);
+  CHECK(ftun_budget_get_usage(random_budget, &usage) == FTUN_OK &&
+    usage.used == 0u && usage.metadata_bytes == before.metadata_bytes && usage.used_resources.descriptors == 0u);
+  CHECK(ftun_budget_destroy(&random_budget) == FTUN_OK);
+  force_random_fallback = false;
+#endif
+  return 0;
+}
+
+int main(void)
+{
+  char path[] = "/tmp/ftun-preflight.XXXXXX";
+  int descriptor = mkstemp(path);
+  CHECK(descriptor >= 0 && close(descriptor) == 0);
+  CHECK(random_resources() == 0);
+  CHECK(write_config(path, "{\"dns\":{\"enable\":false}}") == 0);
+  CHECK(ownership(path) == 0);
+  CHECK(failures(path) == 0);
+  return 0;
+}

@@ -72,7 +72,11 @@ typedef struct {
 
 /* lwIP raw API 移植。
  * 需求 REQ-CORE-001；任务 TASK-TUN-002；目标 0.2.0；验收 TEST-TUN-002。
- * 单个实例由同一个 owner loop 串行调用。输入同步借用 packet，并把 slice 的
+ * lwIP 全局协议状态与分配钩子限定进程仅有一个活跃实例，由创建方的同一个
+ * owner loop 串行调用（包括创建/销毁，不支持并发创建）。重复创建返回
+ * INVALID 且 out=NULL，不能用另一个预算或 Core 绕过；创建方拥有 stack，
+ * 预算必须活到 stack 销毁，销毁保留非空句柄时不得创建替代实例。
+ * 输入同步借用 packet，并把 slice 的
  * 独立引用交给 pbuf；输出回调中的字节只在回调期间有效。
  * 接收 pbuf 在 consume 前保留，且只对真实消费字节调用 tcp_recved。
  * write_ref 使用无复制 tcp_write，slice 保留至 ACK 或 flow 终止。

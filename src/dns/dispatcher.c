@@ -16,20 +16,20 @@ typedef struct {
   size_t wire_length;
 } ftun_dns_local_context_t;
 
-int ftun_dns_query_request_valid(const ftun_dns_query_t *query)
+ftun_status_t ftun_dns_query_request_validate(ftun_budget_t *budget, const ftun_dns_query_t *query)
 {
   ftun_dns_message_t *message = NULL;
   ftun_status_t status;
   int valid;
   if (query == NULL || query->completion == NULL || query->wire.data == NULL ||
-      query->wire.length < FTUN_DNS_HEADER_BYTES) return 0;
-  status = ftun_dns_message_parse(query->wire, &message);
-  if (status != FTUN_OK) return 0;
+      query->wire.length < FTUN_DNS_HEADER_BYTES) return FTUN_E_INVALID;
+  status = ftun_dns_message_parse_with_budget(budget, query->wire, &message);
+  if (status != FTUN_OK) return status == FTUN_E_LIMIT ? status : FTUN_E_INVALID;
   valid = (message->flags & 0x8000u) == 0u && message->id == query->id &&
           message->question.type == query->question.type &&
           message->question.class_code == query->question.class_code;
   (void)ftun_dns_message_release(&message);
-  return valid;
+  return valid ? FTUN_OK : FTUN_E_INVALID;
 }
 
 ftun_status_t ftun_dns_name_domain(ftun_dns_name_t name,
@@ -164,8 +164,9 @@ ftun_status_t ftun_dns_dispatch_fixed(void *user, ftun_core_t *core,
   (void)user;
   if (out != NULL) *out = NULL;
   if (core == NULL || dispatcher == NULL || query == NULL || out == NULL ||
-      query->entry != FTUN_DNS_ENTRY_FIXED ||
-      !ftun_dns_query_request_valid(query)) return FTUN_E_INVALID;
+      query->entry != FTUN_DNS_ENTRY_FIXED) return FTUN_E_INVALID;
+  status = ftun_dns_query_request_validate(dispatcher->budget, query);
+  if (status != FTUN_OK) return status;
   server_index = query->fixed_server;
   if (server_index >= dispatcher->server_count) return FTUN_E_INVALID;
   status = ftun_dns_server_get_info(dispatcher->servers[server_index],
@@ -213,6 +214,7 @@ ftun_status_t ftun_dns_dispatcher_create(
     dispatcher->servers[index] = options->servers[index];
   }
   dispatcher->budget = options->budget;
+  dispatcher->config_scope = options->config_scope;
   dispatcher->operations = options->operations;
   dispatcher->select_server = options->select_server;
   dispatcher->select_named_server = options->select_named_server;

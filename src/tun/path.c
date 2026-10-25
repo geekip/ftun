@@ -196,7 +196,9 @@ static void ftun_tun_service_report_packet_error(
     ftun_tun_service_increment(&consumer->sources_rejected);
   }
   if (callback != NULL && ftun_tun_service_lease_consumer(service, lease) != NULL) {
+    service->callback_depth++;
     callback(user, lease, &error);
+    service->callback_depth--;
   }
 }
 
@@ -257,31 +259,7 @@ ftun_status_t ftun_tun_service_update_path(
   ftun_tun_service_t *service = lease.service;
   ftun_tun_service_consumer_t *consumer =
     ftun_tun_service_lease_consumer(service, lease);
-  uint32_t inner_mtu;
-  ftun_tun_service_event_fn callback;
-  void *user;
-  ftun_status_t status;
   if (consumer == NULL) return FTUN_E_STALE;
-  if (path == NULL ||
-      !ftun_tun_service_path_valid(service, &consumer->route, path,
-                                   &inner_mtu)) return FTUN_E_INVALID;
-  if (!service->accepting) return FTUN_E_CANCELLED;
-  if (ftun_tun_service_path_equal(&consumer->path, path)) return FTUN_OK;
-  status = ftun_tun_service_consumer_clear(service, consumer);
-  if (status != FTUN_OK) return status;
-  consumer->path = *path;
-  consumer->inner_mtu = inner_mtu;
-  consumer->path_generation++;
-  if (consumer->path_generation == 0u) consumer->path_generation++;
-  consumer->feedback_tokens = path->carrier_mtu == 0u
-    ? 0u : FTUN_TUN_FEEDBACK_BURST;
-  consumer->feedback_progress = 0u;
-  callback = consumer->consumer.event;
-  user = consumer->consumer.user;
-  status = ftun_tun_service_interests(service);
-  if (status != FTUN_OK) return status;
-  if (callback != NULL) {
-    callback(user, lease, FTUN_TUN_SERVICE_PATH_UPDATED, FTUN_OK);
-  }
-  return FTUN_OK;
+  return ftun_tun_service_update_consumer(
+    lease, consumer->path_generation, &consumer->route, path);
 }

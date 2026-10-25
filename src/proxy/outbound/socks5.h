@@ -2,7 +2,7 @@
 #define FTUN_PROXY_OUTBOUND_SOCKS5_H
 
 #include "protocol/socks5.h"
-#include "transport/dialer.h"
+#include "transport/path.h"
 
 typedef struct ftun_socks5_connection ftun_socks5_connection_t;
 
@@ -33,6 +33,15 @@ typedef struct {
   ftun_dial_transport_t transport;
   ftun_socks5_completion_fn completion;
   void *user;
+  /* 拥有型控制通道；scope 必须与 target 同代。握手使用 Stream，
+   * 完成后 connection 继续拥有 Path 与通知状态，直至 close 成功。
+   * stream 的 budget/operations 可为空，沿用本请求；用户回调不能内联
+   * 销毁通知栈中的对象，须安排 owner 后续清理。 */
+  ftun_path_scope_t *scope;
+  ftun_stream_options_t stream;
+  ftun_datagram_options_t datagram;
+  ftun_path_notify_fn notify;
+  void *notify_user;
 } ftun_socks5_connect_request_t;
 
 typedef struct {
@@ -92,7 +101,17 @@ ftun_status_t ftun_socks5_connection_decode_udp(
  * UDP association 不能经此入口拆分控制/数据 socket。 */
 ftun_status_t ftun_socks5_connection_take_tcp(
   ftun_socks5_connection_t **connection, ftun_native_socket_t *out);
-/* close 总是消费 connection，并尝试关闭控制与数据 socket。 */
+/* 拥有型 TCP 成功后的借用 Path，生命期由 connection 保证；不能转移或
+ * 单独 destroy。Relay 等额外 Stream 引用必须先释放，再 close connection。 */
+ftun_status_t ftun_socks5_connection_path(ftun_socks5_connection_t *connection,
+  ftun_path_t **out);
+/* 拥有型 UDP 关联的逻辑 Datagram，封装/来源及固定目标核验归协议对象。
+ * 通道仅借用，不能单独 destroy。接收回调返回 AGAIN 后由 resume 恢复。 */
+ftun_status_t ftun_socks5_connection_datagram(ftun_socks5_connection_t *connection,
+  ftun_datagram_t **out);
+ftun_status_t ftun_socks5_connection_resume(ftun_socks5_connection_t *connection);
+/* native close 消费 connection；拥有型 close 失败保留 Path、通道与回调状态
+ * 供重试，成功才消费 connection。 */
 ftun_status_t ftun_socks5_connection_close(
   ftun_socks5_connection_t **connection);
 

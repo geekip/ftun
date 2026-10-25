@@ -10,8 +10,20 @@ typedef void (*ftun_dns_transport_completion_fn)(
   const ftun_endpoint_t *source, ftun_bytes_t response);
 
 typedef struct {
+  /* 借用 transport 所属实例；由 server inflight 保活至最终回调返回。 */
+  const void *scope;
+  uint32_t root_id;
+  uint32_t leaf_id;
+} ftun_dns_transport_binding_t;
+
+typedef struct {
+  /* 仅在逻辑查询首次 cache miss 后选择一次；失败清空输出且不取得资源。
+   * binding 按值保存，UDP/TCP fallback 不再读取当前组状态。 */
+  ftun_status_t (*select)(void *context, uint32_t root_id,
+                          ftun_dns_transport_binding_t *out);
   /* 成功接纳后不得在 submit 返回前同步回调；response 仅借到回调返回。 */
-  ftun_status_t (*submit)(void *context, uint32_t outbound_id,
+  ftun_status_t (*submit)(void *context,
+                          const ftun_dns_transport_binding_t *binding,
                           uint64_t policy_fingerprint,
                           uint64_t server_fingerprint,
                           const ftun_endpoint_t *upstream,
@@ -19,9 +31,14 @@ typedef struct {
                           ftun_bytes_t query, uint64_t deadline_ms,
                           ftun_dns_transport_completion_fn completion,
                           void *user, void **out_request);
-  /* 成功后 transport 不再回调并清空句柄；AGAIN 表示稍后重试取消。 */
+  /* 成功后 transport 不再回调并清空原请求句柄；AGAIN 表示稍后重试取消。
+   * 取消调用内允许同步交付原请求结果；server 保留结果至 Operation 仲裁，
+   * 取消失败不丢结果，取消成功仅产生 CANCELLED 的 owner callback。 */
   ftun_status_t (*cancel)(void *context, void **request);
   void *context;
+  /* 仅供成功结果校验使用的接收时刻；缺省仍使用 server.now。
+   * 新查询与 TCP fallback 的准入必须继续检查真实当前期限。 */
+  uint64_t (*response_now)(void *context);
 } ftun_dns_query_transport_t;
 
 typedef uint64_t (*ftun_dns_server_now_fn)(void *user);

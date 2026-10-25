@@ -1,8 +1,7 @@
-/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_accept，目标 0.4.0。 */
+/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_connection_create，目标 0.4.0。 */
 #include "mixed.h"
 #include "proxy/inbound/socks5.h"
 #include "protocol/http.h"
-#include "transport/stream.h"
 
 #include <string.h>
 #include <stdlib.h>
@@ -18,6 +17,7 @@ typedef enum {
 } ftun_mixed_state_t;
 
 struct ftun_mixed_connection {
+  ftun_reservation_t *reservation;
   ftun_mixed_state_t state;
   ftun_socks5_server_t *socks5;
   uint8_t http_buffer[FTUN_HTTP_MAX_HEADER_BYTES];
@@ -160,15 +160,25 @@ ftun_status_t ftun_mixed_connection_create(const ftun_inbound_spec_t *spec,
 {
   ftun_mixed_connection_t *connection;
   ftun_status_t status;
+  ftun_reservation_t *reservation = NULL;
   if (out != NULL) *out = NULL;
   if (spec == NULL || out == NULL || spec->kind != FTUN_INBOUND_MIXED) {
     return FTUN_E_INVALID;
   }
+  if (spec->budget != NULL) {
+    status = ftun_budget_reserve(spec->budget, sizeof(*connection), &reservation);
+    if (status != FTUN_OK) return status;
+  }
   connection = (ftun_mixed_connection_t *)calloc(1u, sizeof(*connection));
-  if (connection == NULL) return FTUN_E_LIMIT;
+  if (connection == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  connection->reservation = reservation;
   status = ftun_socks5_server_create(spec, &connection->socks5);
   if (status != FTUN_OK) {
     free(connection);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
   connection->state = FTUN_MIXED_DETECT;
@@ -287,6 +297,12 @@ ftun_status_t ftun_mixed_connection_feed(ftun_mixed_connection_t *connection,
       ? connection->http_wire : connection->http_buffer;
     event->wire.length = connection->request.kind == FTUN_HTTP_PROXY_FORWARD
       ? wire_header + body_preread : header + body_preread;
+    {
+      size_t offset = header + (connection->request.kind == FTUN_HTTP_PROXY_FORWARD
+        ? body_preread : 0u);
+      event->preread.data = connection->http_buffer + offset;
+      event->preread.length = connection->http_length - offset;
+    }
     event->body_remaining = connection->request.has_content_length
       ? connection->request.content_length - body_preread : 0u;
     return FTUN_OK;
@@ -374,41 +390,11 @@ ftun_status_t ftun_mixed_connection_destroy(
   owned = *connection;
   if (owned == NULL) return FTUN_OK;
   status = ftun_socks5_server_destroy(&owned->socks5);
+  if (status != FTUN_OK) return status;
+  status = ftun_reservation_release(&owned->reservation);
+  if (status != FTUN_OK) return status;
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *connection = NULL;
   return status;
-}
-
-ftun_status_t ftun_mixed_accept(ftun_core_t *core, ftun_stream_t *client, const ftun_inbound_spec_t *spec)
-{
-  uint8_t input[FTUN_HTTP_MAX_HEADER_BYTES];
-  size_t length = 0u;
-  ftun_bytes_t bytes;
-  ftun_mixed_protocol_t protocol;
-  ftun_status_t status;
-  if (core == NULL || client == NULL || spec == NULL ||
-      spec->kind != FTUN_INBOUND_MIXED) return FTUN_E_INVALID;
-  status = ftun_stream_read(client, input, sizeof(input), &length);
-  if (status != FTUN_OK) return status;
-  bytes.data = input;
-  bytes.length = length;
-  status = ftun_mixed_classify(bytes, &protocol);
-  if (status != FTUN_OK) return status;
-  if (protocol == FTUN_MIXED_PROTOCOL_HTTP) {
-    ftun_http_request_t request;
-    size_t consumed = 0u;
-    return ftun_http_decode_request(bytes, &request, &consumed);
-  }
-  {
-    ftun_socks5_server_t *server = NULL;
-    ftun_socks5_server_event_t event;
-    size_t consumed = 0u;
-    status = ftun_socks5_server_create(spec, &server);
-    if (status == FTUN_OK) {
-      status = ftun_socks5_server_feed(server, bytes, &consumed, &event);
-    }
-    (void)ftun_socks5_server_destroy(&server);
-    return status;
-  }
 }

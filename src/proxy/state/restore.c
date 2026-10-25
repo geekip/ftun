@@ -1,4 +1,5 @@
 #include "proxy/state/restore.h"
+#include "core/context.h"
 #include "config/model.h"
 #include "proxy/state/group_cache.h"
 #include "util/time.h"
@@ -97,6 +98,7 @@ static ftun_status_t ftun_state_restore_target(
   bool candidate)
 {
   ftun_group_cache_snapshot_t *snapshot = NULL;
+  ftun_budget_t *budget = NULL;
   ftun_status_t status;
   if (core == NULL || config == NULL || health_max_age_ms == 0u) {
     return FTUN_E_INVALID;
@@ -105,7 +107,8 @@ static ftun_status_t ftun_state_restore_target(
   if (config->base.cache_file == NULL || config->base.cache_file[0] == '\0') {
     return FTUN_E_INVALID;
   }
-  status = ftun_group_cache_load(config->base.cache_file, &snapshot);
+  status = ftun_core_context_budget(core, &budget);
+  if (status == FTUN_OK) status = ftun_group_cache_load_budget(budget, config->base.cache_file, &snapshot);
   status = ftun_state_apply_snapshot(core, config, snapshot, status, now_ms,
                                      health_max_age_ms, out, candidate);
   (void)ftun_group_cache_destroy(&snapshot);

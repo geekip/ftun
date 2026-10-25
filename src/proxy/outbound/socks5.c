@@ -39,6 +39,7 @@ struct ftun_socks5_connection {
   ftun_budget_t *budget;
   ftun_event_source_t *io_source;
   ftun_event_source_t *timer_source;
+  ftun_event_source_t *pump_source;
   ftun_endpoint_t *proxy_candidates;
   size_t proxy_candidate_count;
   size_t next_proxy_candidate;
@@ -51,7 +52,7 @@ struct ftun_socks5_connection {
   ftun_dial_domain_t proxy_domain;
   uint64_t selected_network_generation;
   ftun_socket_policy_t protection;
-  char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char interface_name[FTUN_SOCKET_INTERFACE_BYTES];
   uint8_t target_domain[FTUN_SOCKS5_MAX_DOMAIN_BYTES];
   uint8_t username[FTUN_SOCKS5_MAX_CREDENTIAL_BYTES];
   uint8_t password[FTUN_SOCKS5_MAX_CREDENTIAL_BYTES];
@@ -72,11 +73,48 @@ struct ftun_socks5_connection {
   ftun_socks5_io_t protocol_io;
   ftun_error_t pending_error;
   ftun_socks5_state_t state;
+  ftun_path_scope_t *scope;
+  ftun_path_t *control_path;
+  ftun_stream_t *control_stream;
+  ftun_path_t *data_path;
+  ftun_datagram_t *wire_datagram;
+  ftun_datagram_t *datagram;
+  ftun_datagram_options_t datagram_options;
+  ftun_datagram_send_token_t datagram_send;
+  ftun_status_t channel_failure;
+  bool cancelling_send;
+  ftun_stream_options_t stream_options;
+  ftun_path_notify_fn notify;
+  void *notify_user;
+  ftun_buffer_slice_t output_slice;
+  ftun_operation_t *write_operation;
+  ftun_status_t write_error;
+  bool scheduled;
+  bool busy;
+  bool terminal_queued;
   int custom_dial_io;
   int cancelling;
   int has_pending_error;
   int ready;
 };
+
+static ftun_status_t ftun_socks5_schedule(ftun_socks5_connection_t *connection);
+static ftun_status_t ftun_socks5_owned_finish(ftun_socks5_connection_t *connection,
+  ftun_error_t error);
+static void ftun_socks5_path_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user);
+static void ftun_socks5_path_notify(ftun_path_t *path, uint32_t events,
+  ftun_error_t error, void *user);
+static void ftun_socks5_write_completed(ftun_operation_t *operation,
+  ftun_error_t error, void *user);
+
+static ftun_status_t ftun_socks5_datagram_create(ftun_socks5_connection_t *connection);
+static void ftun_socks5_wire_result(ftun_datagram_t *channel, ftun_error_t error,
+  const ftun_endpoint_t *target, const ftun_packet_t *packet, void *user);
+static ftun_status_t ftun_socks5_wire_receive(ftun_datagram_t *channel,
+  const ftun_endpoint_t *source, const ftun_packet_t *packet, void *user);
+static void ftun_socks5_data_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user);
 
 static ftun_error_t ftun_socks5_error(ftun_status_t status, uint32_t stage)
 {
@@ -211,7 +249,7 @@ static int ftun_socks5_request_valid(
       (request->transport != FTUN_DIAL_TCP &&
        request->transport != FTUN_DIAL_UDP)) return 0;
   if (request->protection.interface_name.length >=
-      FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+      FTUN_SOCKET_INTERFACE_BYTES) return 0;
   if (request->protection.interface_name.length != 0u &&
       request->protection.interface_name.data == NULL) return 0;
   if (request->protection.mark == 0u &&
@@ -325,6 +363,33 @@ static ftun_status_t ftun_socks5_close_sockets(
 {
   ftun_status_t result;
   ftun_status_t status;
+  if (connection->scope != NULL) {
+    if (connection->scheduled) return FTUN_E_AGAIN;
+    if (connection->write_operation != NULL) {
+      status = ftun_operation_cancel(connection->write_operation);
+      return status == FTUN_OK || status == FTUN_E_STALE ? FTUN_E_AGAIN : status;
+    }
+    status = ftun_buffer_slice_release(&connection->output_slice);
+    if (status != FTUN_OK) return status;
+    if (connection->datagram != NULL) {
+      status = ftun_datagram_stop(connection->datagram);
+      if (status == FTUN_OK) status = ftun_datagram_destroy(&connection->datagram);
+      if (status != FTUN_OK) return status;
+    }
+    if (connection->data_path != NULL) {
+      status = ftun_path_revoke(connection->data_path);
+      if (status == FTUN_OK) status = ftun_path_destroy(&connection->data_path);
+      if (status != FTUN_OK) return status;
+      connection->wire_datagram = NULL;
+    }
+    if (connection->control_path != NULL) {
+      status = ftun_path_revoke(connection->control_path);
+      if (status == FTUN_OK) status = ftun_path_destroy(&connection->control_path);
+      if (status != FTUN_OK) return status;
+      connection->control_stream = NULL;
+    }
+    return FTUN_OK;
+  }
   if (connection->data_socket != FTUN_INVALID_SOCKET &&
       connection->data_socket == connection->control_socket) {
     connection->data_socket = FTUN_INVALID_SOCKET;
@@ -349,6 +414,18 @@ static ftun_status_t ftun_socks5_cancel(void *user)
     (ftun_socks5_connection_t *)user;
   ftun_status_t status;
   if (connection == NULL) return FTUN_E_INVALID;
+  if (connection->scope != NULL) {
+    connection->cancelling = 1;
+    if (connection->busy || connection->scheduled) return FTUN_E_AGAIN;
+    if (connection->child != NULL) {
+      status = ftun_operation_cancel(connection->child);
+      return status == FTUN_OK || status == FTUN_E_STALE ? FTUN_E_AGAIN : status;
+    }
+    status = ftun_socks5_cancel_sources(connection);
+    if (status == FTUN_OK) status = ftun_socks5_close_sockets(connection);
+    if (status == FTUN_OK) status = ftun_event_source_cancel(&connection->pump_source);
+    return status;
+  }
   if (connection->child != NULL) {
     if (connection->cancelling) return FTUN_E_AGAIN;
     status = ftun_operation_cancel(connection->child);
@@ -371,6 +448,7 @@ static void ftun_socks5_release_context(
   network_view = connection->network_view;
   connection->reservation = NULL;
   connection->network_view = NULL;
+  (void)ftun_path_scope_release(&connection->scope);
   memset(connection, 0, sizeof(*connection));
   free(connection);
   (void)ftun_network_view_release(&network_view);
@@ -390,6 +468,11 @@ static void ftun_socks5_completed(ftun_operation_t *operation,
   connection->operation = NULL;
   if (error.status == FTUN_OK) {
     connection->ready = 1;
+    /* UDP 控制端在父完成排队期间也可能关闭，重新读一次以免丢失旧通知。 */
+    if (connection->scope != NULL && connection->transport == FTUN_DIAL_UDP) {
+      ftun_socks5_path_notify(connection->control_path, FTUN_PATH_READABLE,
+        ftun_socks5_error(FTUN_OK, FTUN_SOCKS5_STAGE_UDP_DIAL), connection);
+    }
     completion(operation, error, connection, completion_user);
     return;
   }
@@ -402,6 +485,7 @@ static ftun_status_t ftun_socks5_finish(
   ftun_socks5_connection_t *connection, ftun_error_t error)
 {
   ftun_status_t status;
+  if (connection->scope != NULL) return ftun_socks5_owned_finish(connection, error);
   status = ftun_socks5_cancel_sources(connection);
   if (status != FTUN_OK) {
     connection->pending_error = error;
@@ -453,7 +537,18 @@ static ftun_status_t ftun_socks5_start_proxy_attempt(
     request.purpose = FTUN_DIAL_PURPOSE_PROXY;
     request.completion = ftun_socks5_child_completed;
     request.user = connection;
-    if (connection->custom_dial_io) {
+    if (connection->scope != NULL) {
+      ftun_path_open_request_t channel = {0};
+      channel.dial = request;
+      channel.dial.completion = NULL;
+      channel.dial.user = NULL;
+      channel.stream = connection->stream_options;
+      channel.completion = ftun_socks5_path_completed;
+      channel.user = connection;
+      channel.notify = ftun_socks5_path_notify;
+      channel.notify_user = connection;
+      status = ftun_path_scope_open(connection->scope, connection->core, &channel, &connection->child);
+    } else if (connection->custom_dial_io) {
       status = ftun_dial_start_with_io(connection->core, &request,
                                        &connection->dial_io,
                                        &connection->child);
@@ -479,6 +574,7 @@ static ftun_status_t ftun_socks5_watch(
   ftun_socks5_connection_t *connection, uint32_t interests)
 {
   ftun_status_t status;
+  if (connection->scope != NULL) return ftun_socks5_schedule(connection);
   status = ftun_event_source_cancel(&connection->io_source);
   if (status != FTUN_OK) return status;
   return ftun_event_io_start(connection->loop, connection->control_socket,
@@ -611,7 +707,7 @@ static ftun_status_t ftun_socks5_start_udp(
   if (ftun_socks5_ipv4_unspecified(&connection->relay)) {
     memcpy(connection->relay.address, connection->proxy_endpoint.address, 4u);
   }
-  status = ftun_socks5_cancel_sources(connection);
+  status = connection->scope == NULL ? ftun_socks5_cancel_sources(connection) : FTUN_OK;
   if (status != FTUN_OK) return status;
   memset(&request, 0, sizeof(request));
   request.loop = connection->loop;
@@ -632,6 +728,25 @@ static ftun_status_t ftun_socks5_start_udp(
   request.completion = ftun_socks5_child_completed;
   request.user = connection;
   connection->state = FTUN_SOCKS5_STATE_DIAL_UDP;
+  if (connection->scope != NULL) {
+    ftun_path_open_request_t channel = {0};
+    status = ftun_socks5_datagram_create(connection);
+    if (status != FTUN_OK) return status;
+    channel.dial = request;
+    channel.dial.completion = NULL;
+    channel.dial.user = NULL;
+    channel.datagram.budget = connection->budget;
+    channel.datagram.max_pending_packets = 1u;
+    channel.datagram.max_pending_bytes = UINT16_MAX + 263u;
+    channel.datagram.result = ftun_socks5_wire_result;
+    channel.datagram.receive = ftun_socks5_wire_receive;
+    channel.datagram.user = connection;
+    channel.completion = ftun_socks5_data_completed;
+    channel.user = connection;
+    channel.notify = ftun_socks5_path_notify;
+    channel.notify_user = connection;
+    return ftun_path_scope_open(connection->scope, connection->core, &channel, &connection->child);
+  }
   if (connection->custom_dial_io) {
     return ftun_dial_start_with_io(connection->core, &request,
                                    &connection->dial_io,
@@ -704,18 +819,47 @@ static ftun_status_t ftun_socks5_process_write(
   ftun_status_t status;
   size_t sent = 0u;
   size_t remaining;
-  if (connection->output_offset >= connection->output_length) {
-    return FTUN_E_STATE_CORRUPT;
+  if (connection->scope != NULL) {
+    if (connection->write_operation != NULL) return FTUN_E_AGAIN;
+    if (connection->write_error != FTUN_OK) return connection->write_error;
+    if (connection->output_offset < connection->output_length) {
+      ftun_buffer_slice_t slice;
+      if (connection->output_slice.owner == NULL) {
+        ftun_buffer_t *buffer = NULL;
+        uint8_t *data;
+        size_t capacity;
+        status = ftun_buffer_acquire(connection->budget, connection->output_length, &buffer);
+        if (status != FTUN_OK) return status;
+        status = ftun_buffer_data(buffer, &data, &capacity);
+        if (status == FTUN_OK) {
+          memcpy(data, connection->output, connection->output_length);
+          status = ftun_buffer_slice(buffer, 0u, connection->output_length, &connection->output_slice);
+        }
+        (void)ftun_buffer_release(&buffer);
+        if (status != FTUN_OK) return status;
+      }
+      slice = connection->output_slice;
+      slice.offset += connection->output_offset;
+      slice.length -= connection->output_offset;
+      status = ftun_stream_write_ref_with_completion(connection->control_stream, &slice,
+        ftun_socks5_write_completed, connection, &sent, &connection->write_operation);
+      if (status == FTUN_OK) connection->output_offset += sent;
+      return status == FTUN_OK ? FTUN_E_AGAIN : status;
+    }
+    status = ftun_buffer_slice_release(&connection->output_slice);
+    if (status != FTUN_OK) return status;
+  } else {
+    if (connection->output_offset >= connection->output_length) return FTUN_E_STATE_CORRUPT;
+    remaining = connection->output_length - connection->output_offset;
+    status = connection->protocol_io.send_socket(
+      connection->protocol_io.context, connection->control_socket,
+      connection->output + connection->output_offset, remaining, &sent);
+    if (status == FTUN_E_AGAIN) return FTUN_OK;
+    if (status != FTUN_OK) return status;
+    if (sent == 0u || sent > remaining) return FTUN_E_STATE_CORRUPT;
+    connection->output_offset += sent;
+    if (connection->output_offset != connection->output_length) return FTUN_OK;
   }
-  remaining = connection->output_length - connection->output_offset;
-  status = connection->protocol_io.send_socket(
-    connection->protocol_io.context, connection->control_socket,
-    connection->output + connection->output_offset, remaining, &sent);
-  if (status == FTUN_E_AGAIN) return FTUN_OK;
-  if (status != FTUN_OK) return status;
-  if (sent == 0u || sent > remaining) return FTUN_E_STATE_CORRUPT;
-  connection->output_offset += sent;
-  if (connection->output_offset != connection->output_length) return FTUN_OK;
   connection->input_length = 0u;
   if (connection->state == FTUN_SOCKS5_STATE_WRITE_METHOD) {
     connection->state = FTUN_SOCKS5_STATE_READ_METHOD;
@@ -738,11 +882,16 @@ static ftun_status_t ftun_socks5_process_read(
   if (needed == 0u || needed > sizeof(connection->input) ||
       connection->input_length > needed) return FTUN_E_STATE_CORRUPT;
   if (connection->input_length < needed) {
-    status = connection->protocol_io.receive_socket(
-      connection->protocol_io.context, connection->control_socket,
-      connection->input + connection->input_length,
-      needed - connection->input_length, &received);
-    if (status == FTUN_E_AGAIN) return FTUN_OK;
+    if (connection->scope != NULL) {
+      status = ftun_stream_read(connection->control_stream,
+        connection->input + connection->input_length, needed - connection->input_length, &received);
+    } else {
+      status = connection->protocol_io.receive_socket(
+        connection->protocol_io.context, connection->control_socket,
+        connection->input + connection->input_length,
+        needed - connection->input_length, &received);
+    }
+    if (status == FTUN_E_AGAIN) return connection->scope != NULL ? FTUN_E_AGAIN : FTUN_OK;
     if (status == FTUN_E_EOF) return FTUN_E_IO;
     if (status != FTUN_OK) return status;
     if (received == 0u || received > needed - connection->input_length) {
@@ -864,6 +1013,323 @@ static void ftun_socks5_child_completed(ftun_operation_t *operation,
     ftun_socks5_error(FTUN_E_STATE_CORRUPT, FTUN_SOCKS5_STAGE_PROXY_DIAL));
 }
 
+static ftun_status_t ftun_socks5_owned_finish(ftun_socks5_connection_t *connection,
+  ftun_error_t error)
+{
+  ftun_status_t status;
+  if (connection->terminal_queued) return FTUN_E_STALE;
+  connection->pending_error = error;
+  connection->has_pending_error = 1;
+  if (connection->scheduled) return FTUN_E_AGAIN;
+  /* 工厂可能在结果交付前通知错误，子操作仍拥有结果及其回调上下文。 */
+  if (connection->child != NULL) {
+    status = ftun_operation_cancel(connection->child);
+    return status == FTUN_OK || status == FTUN_E_STALE ? FTUN_E_AGAIN : status;
+  }
+  status = ftun_socks5_cancel_sources(connection);
+  if (status == FTUN_OK && error.status != FTUN_OK) status = ftun_socks5_close_sockets(connection);
+  if (status != FTUN_OK) {
+    /* write completion 会独立唤醒；其他可重试清理也不能丢失拥有者。 */
+    if (connection->write_operation == NULL) (void)ftun_socks5_schedule(connection);
+    return status;
+  }
+  status = ftun_event_source_cancel(&connection->pump_source);
+  if (status == FTUN_OK) status = ftun_operation_complete(connection->completion_token, error);
+  if (status == FTUN_OK) {
+    connection->terminal_queued = true;
+    connection->has_pending_error = 0;
+  }
+  return status;
+}
+
+static void ftun_socks5_owned_pump(void *user)
+{
+  ftun_socks5_connection_t *connection = (ftun_socks5_connection_t *)user;
+  size_t work;
+  connection->scheduled = false;
+  if (connection->terminal_queued || connection->operation == NULL) return;
+  if (connection->cancelling) {
+    ftun_status_t status = ftun_operation_cancel(connection->operation);
+    if (status != FTUN_OK && status != FTUN_E_STALE &&
+        connection->child == NULL && connection->write_operation == NULL) {
+      (void)ftun_socks5_schedule(connection);
+    }
+    return;
+  }
+  connection->busy = true;
+  if (connection->has_pending_error) {
+    (void)ftun_socks5_owned_finish(connection, connection->pending_error);
+    connection->busy = false;
+    return;
+  }
+  for (work = 0u; work < 16u; work++) {
+    ftun_status_t status;
+    if (connection->state == FTUN_SOCKS5_STATE_DIAL_PROXY ||
+        connection->state == FTUN_SOCKS5_STATE_DIAL_UDP ||
+        connection->state == FTUN_SOCKS5_STATE_READY || connection->terminal_queued) break;
+    if (connection->state == FTUN_SOCKS5_STATE_WRITE_METHOD ||
+        connection->state == FTUN_SOCKS5_STATE_WRITE_AUTH ||
+        connection->state == FTUN_SOCKS5_STATE_WRITE_REQUEST) {
+      status = ftun_socks5_process_write(connection);
+    } else status = ftun_socks5_process_read(connection);
+    if (status == FTUN_E_AGAIN) break;
+    if (status != FTUN_OK) {
+      (void)ftun_socks5_owned_finish(connection,
+        ftun_socks5_error(status, ftun_socks5_state_stage(connection)));
+      break;
+    }
+  }
+  connection->busy = false;
+  if (work == 16u) (void)ftun_socks5_schedule(connection);
+}
+
+static void ftun_socks5_pump_ready(ftun_event_source_t *source, uint32_t events, void *user)
+{
+  (void)source;
+  (void)events;
+  ftun_socks5_owned_pump(user);
+}
+
+static ftun_status_t ftun_socks5_schedule(ftun_socks5_connection_t *connection)
+{
+  ftun_status_t status;
+  if (connection->scheduled || connection->terminal_queued || connection->ready) return FTUN_OK;
+  status = ftun_event_task_ready(connection->pump_source);
+  if (status == FTUN_OK) connection->scheduled = true;
+  return status;
+}
+
+static void ftun_socks5_write_completed(ftun_operation_t *operation,
+  ftun_error_t error, void *user)
+{
+  ftun_socks5_connection_t *connection = (ftun_socks5_connection_t *)user;
+  (void)operation;
+  connection->write_operation = NULL;
+  connection->write_error = error.status;
+  (void)ftun_socks5_schedule(connection);
+}
+
+static void ftun_socks5_path_notify(ftun_path_t *path, uint32_t events,
+  ftun_error_t error, void *user)
+{
+  ftun_socks5_connection_t *connection = (ftun_socks5_connection_t *)user;
+  if (connection->ready) {
+    bool was_busy = connection->busy;
+    connection->busy = true;
+    if (connection->transport == FTUN_DIAL_UDP && path == connection->control_path &&
+        (events & FTUN_PATH_READABLE) != 0u) {
+      uint8_t byte;
+      size_t length = 0u;
+      ftun_status_t status = ftun_stream_read(connection->control_stream, &byte, 1u, &length);
+      if (status != FTUN_E_AGAIN) {
+        error = ftun_socks5_error(status == FTUN_OK ? FTUN_E_PROTOCOL : status,
+          FTUN_SOCKS5_STAGE_UDP_DIAL);
+        events |= FTUN_PATH_ERROR;
+      }
+    }
+    if ((events & FTUN_PATH_ERROR) != 0u && error.status != FTUN_OK &&
+        error.status != FTUN_E_AGAIN && error.status != FTUN_E_LIMIT) connection->channel_failure = error.status;
+    if (connection->notify != NULL) connection->notify(path, events, error, connection->notify_user);
+    connection->busy = was_busy;
+    return;
+  }
+  if (connection->terminal_queued || connection->cancelling || connection->has_pending_error) return;
+  if ((events & FTUN_PATH_ERROR) != 0u && error.status != FTUN_OK && !connection->has_pending_error) {
+    connection->pending_error = error;
+    connection->has_pending_error = 1;
+  }
+  (void)ftun_socks5_schedule(connection);
+}
+
+static void ftun_socks5_path_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user)
+{
+  ftun_socks5_connection_t *connection = (ftun_socks5_connection_t *)user;
+  ftun_path_info_t info;
+  ftun_status_t status;
+  (void)operation;
+  connection->child = NULL;
+  connection->control_path = path;
+  if (connection->cancelling || connection->has_pending_error) {
+    (void)ftun_socks5_schedule(connection);
+    return;
+  }
+  if (error.status != FTUN_OK) {
+    if (ftun_socks5_retryable(error.status) &&
+        connection->next_proxy_candidate < connection->proxy_candidate_count) {
+      status = ftun_socks5_start_proxy_attempt(connection);
+      if (status == FTUN_OK) return;
+      error = ftun_socks5_error(status, FTUN_SOCKS5_STAGE_PROXY_DIAL);
+    }
+    (void)ftun_socks5_owned_finish(connection, error);
+    return;
+  }
+  status = ftun_path_get_info(path, &info);
+  if (status == FTUN_OK) status = ftun_path_stream(path, &connection->control_stream);
+  if (status == FTUN_OK) {
+    connection->proxy_endpoint = info.endpoint;
+    connection->proxy_domain = info.domain;
+    connection->selected_network_generation = info.network_generation;
+    status = ftun_socks5_begin_handshake(connection);
+  }
+  if (status != FTUN_OK) (void)ftun_socks5_owned_finish(connection,
+    ftun_socks5_error(status, FTUN_SOCKS5_STAGE_METHOD));
+}
+
+static bool ftun_socks5_logical_endpoint_equal(const ftun_endpoint_t *left,
+  const ftun_endpoint_t *right)
+{
+  if (left == NULL || right == NULL || left->kind != right->kind || left->port != right->port) return false;
+  if (left->kind == FTUN_ADDRESS_IPV4) return memcmp(left->address, right->address, 4u) == 0;
+  return left->kind == FTUN_ADDRESS_DOMAIN && left->domain.length == right->domain.length &&
+    memcmp(left->domain.data, right->domain.data, left->domain.length) == 0;
+}
+
+static ftun_status_t ftun_socks5_datagram_send_start(void *user,
+  ftun_datagram_send_token_t send, const ftun_endpoint_t *target, const ftun_packet_t *packet)
+{
+  ftun_socks5_connection_t *connection = user;
+  ftun_buffer_t *buffer = NULL;
+  ftun_buffer_slice_t slice = {0};
+  ftun_packet_t wire = {0};
+  ftun_bytes_t payload;
+  uint8_t *storage;
+  size_t capacity, written;
+  ftun_status_t status;
+  bool was_busy = connection->busy;
+  if (!connection->ready || connection->wire_datagram == NULL) return FTUN_E_AGAIN;
+  if (connection->channel_failure != FTUN_OK) return connection->channel_failure;
+  if (!ftun_socks5_logical_endpoint_equal(target, &connection->target)) return FTUN_E_REJECTED;
+  if (connection->datagram_send.channel != NULL) return FTUN_E_AGAIN;
+  status = ftun_packet_view(packet, &payload);
+  if (status != FTUN_OK) return status;
+  if (payload.length > UINT16_MAX) return FTUN_E_LIMIT;
+  connection->busy = true;
+  status = ftun_buffer_acquire(connection->budget, payload.length + 263u, &buffer);
+  if (status == FTUN_OK) status = ftun_buffer_data(buffer, &storage, &capacity);
+  if (status == FTUN_OK) status = ftun_socks5_connection_encode_udp(connection,
+    payload, storage, capacity, &written);
+  if (status == FTUN_OK) status = ftun_buffer_slice(buffer, 0u, written, &slice);
+  if (status == FTUN_OK) status = ftun_packet_init(&wire, &slice, packet->source_id);
+  if (status == FTUN_OK) {
+    connection->datagram_send = send;
+    status = ftun_datagram_send(connection->wire_datagram, &connection->relay, &wire);
+    if (status != FTUN_OK) memset(&connection->datagram_send, 0, sizeof(connection->datagram_send));
+  }
+  (void)ftun_packet_release(&wire);
+  (void)ftun_buffer_slice_release(&slice);
+  (void)ftun_buffer_release(&buffer);
+  connection->busy = was_busy;
+  return status;
+}
+
+static ftun_status_t ftun_socks5_datagram_send_cancel(void *user,
+  ftun_datagram_send_token_t send)
+{
+  ftun_socks5_connection_t *connection = user;
+  ftun_status_t status;
+  if (connection->datagram_send.channel != send.channel ||
+      connection->datagram_send.slot != send.slot ||
+      connection->datagram_send.generation != send.generation) return FTUN_E_STALE;
+  connection->cancelling_send = true;
+  status = ftun_datagram_stop(connection->wire_datagram);
+  connection->cancelling_send = false;
+  if (status == FTUN_OK) memset(&connection->datagram_send, 0, sizeof(connection->datagram_send));
+  return status;
+}
+
+static void ftun_socks5_datagram_destroy(void *user)
+{
+  /* connection 拥有控制/物理通道；逻辑 Datagram 销毁不能提前释放它。 */
+  (void)user;
+}
+
+static ftun_status_t ftun_socks5_datagram_create(ftun_socks5_connection_t *connection)
+{
+  ftun_datagram_options_t options = connection->datagram_options;
+  ftun_datagram_backend_t backend = {0};
+  if (options.budget == NULL) options.budget = connection->budget;
+  backend.context = connection;
+  backend.send_start = ftun_socks5_datagram_send_start;
+  backend.send_cancel = ftun_socks5_datagram_send_cancel;
+  backend.destroy = ftun_socks5_datagram_destroy;
+  return ftun_datagram_create(&options, &backend, &connection->datagram);
+}
+
+static void ftun_socks5_wire_result(ftun_datagram_t *channel, ftun_error_t error,
+  const ftun_endpoint_t *target, const ftun_packet_t *packet, void *user)
+{
+  ftun_socks5_connection_t *connection = user;
+  ftun_datagram_send_token_t send = connection->datagram_send;
+  bool was_busy = connection->busy;
+  (void)channel;
+  (void)target;
+  (void)packet;
+  /* 外层 cancel hook 执行期间不能完成它的 token；由 hook 的 OK 终结。 */
+  if (connection->cancelling_send) return;
+  connection->busy = true;
+  if (send.channel != NULL && ftun_datagram_send_complete(send, error) == FTUN_OK) {
+    memset(&connection->datagram_send, 0, sizeof(connection->datagram_send));
+  }
+  connection->busy = was_busy;
+}
+
+static ftun_status_t ftun_socks5_wire_receive(ftun_datagram_t *channel,
+  const ftun_endpoint_t *source, const ftun_packet_t *packet, void *user)
+{
+  ftun_socks5_connection_t *connection = user;
+  ftun_socks5_udp_datagram_t decoded;
+  ftun_packet_t logical = {0};
+  ftun_buffer_slice_t slice;
+  ftun_bytes_t wire;
+  size_t consumed = 0u;
+  ftun_status_t status;
+  bool was_busy = connection->busy;
+  (void)channel;
+  if (!connection->ready) return FTUN_E_AGAIN;
+  if (connection->datagram == NULL) return FTUN_E_CANCELLED;
+  status = ftun_packet_view(packet, &wire);
+  if (status == FTUN_OK) status = ftun_socks5_connection_decode_udp(connection, source, wire, &decoded, &consumed);
+  if (status != FTUN_OK || consumed != wire.length) return FTUN_OK;
+  if (!ftun_socks5_logical_endpoint_equal(&decoded.endpoint, &connection->target) &&
+      !(connection->target.kind == FTUN_ADDRESS_DOMAIN && decoded.endpoint.kind == FTUN_ADDRESS_IPV4 &&
+        decoded.endpoint.port == connection->target.port)) return FTUN_OK;
+  slice = packet->payload;
+  slice.offset += wire.length - decoded.payload.length;
+  slice.length = decoded.payload.length;
+  status = ftun_packet_init(&logical, &slice, packet->source_id);
+  connection->busy = true;
+  if (status == FTUN_OK) status = ftun_datagram_deliver(connection->datagram,
+    &connection->target, &logical);
+  (void)ftun_packet_release(&logical);
+  connection->busy = was_busy;
+  return status;
+}
+
+static void ftun_socks5_data_completed(ftun_operation_t *operation,
+  ftun_error_t error, ftun_path_t *path, void *user)
+{
+  ftun_socks5_connection_t *connection = user;
+  ftun_status_t status = error.status;
+  (void)operation;
+  connection->child = NULL;
+  connection->data_path = path;
+  if (connection->cancelling || connection->has_pending_error) {
+    (void)ftun_socks5_schedule(connection);
+    return;
+  }
+  if (status == FTUN_OK) status = ftun_path_datagram(path, &connection->wire_datagram);
+  if (status == FTUN_OK) {
+    uint8_t byte;
+    size_t length = 0u;
+    status = ftun_stream_read(connection->control_stream, &byte, 1u, &length);
+    status = status == FTUN_E_AGAIN ? FTUN_OK : status == FTUN_OK ? FTUN_E_PROTOCOL : status;
+  }
+  if (status == FTUN_OK) connection->state = FTUN_SOCKS5_STATE_READY;
+  (void)ftun_socks5_owned_finish(connection,
+    ftun_socks5_error(status, FTUN_SOCKS5_STAGE_UDP_DIAL));
+}
+
 static ftun_status_t ftun_socks5_reject(
   ftun_socks5_connection_t *connection, ftun_status_t original)
 {
@@ -874,6 +1340,7 @@ static ftun_status_t ftun_socks5_reject(
   status = ftun_operation_reject(&connection->operation);
   if (status != FTUN_OK && cleanup == FTUN_OK) cleanup = status;
   if (connection->operation == NULL) {
+    (void)ftun_event_source_cancel(&connection->pump_source);
     (void)ftun_socks5_close_sockets(connection);
     ftun_socks5_release_context(connection);
   }
@@ -896,6 +1363,18 @@ static ftun_status_t ftun_socks5_connect_internal(
       (dial_io != NULL && !ftun_socks5_dial_io_valid(dial_io)) ||
       (protocol_io != NULL && !ftun_socks5_protocol_io_valid(protocol_io))) {
     return FTUN_E_INVALID;
+  }
+  if (request->scope != NULL) {
+    uint64_t generation;
+    if (dial_io != NULL || protocol_io != NULL) return FTUN_E_INVALID;
+    status = ftun_path_scope_generation(request->scope, &generation);
+    if (status != FTUN_OK) return status;
+    if (generation != request->target->generation) return FTUN_E_STALE;
+    if (request->transport == FTUN_DIAL_UDP && request->datagram.budget != NULL) {
+      bool same = false;
+      status = ftun_budget_same_root(request->budget, request->datagram.budget, &same);
+      if (status != FTUN_OK || !same) return status == FTUN_OK ? FTUN_E_INVALID : status;
+    }
   }
   if (request->transport == FTUN_DIAL_UDP && !request->proxy->udp_enabled) {
     return FTUN_E_UNSUPPORTED;
@@ -920,6 +1399,15 @@ static ftun_status_t ftun_socks5_connect_internal(
   }
   connection->core = core;
   connection->reservation = reservation;
+  if (request->scope != NULL) {
+    status = ftun_path_scope_retain(request->scope);
+    if (status != FTUN_OK) { ftun_socks5_release_context(connection); return status; }
+    connection->scope = request->scope;
+    connection->stream_options = request->stream;
+    connection->datagram_options = request->datagram;
+    connection->notify = request->notify;
+    connection->notify_user = request->notify_user;
+  }
   connection->loop = request->loop;
   connection->operations = request->operations;
   connection->budget = request->budget;
@@ -989,6 +1477,11 @@ static ftun_status_t ftun_socks5_connect_internal(
   status = ftun_operation_set_cancel_hook(connection->operation,
                                           ftun_socks5_cancel, connection);
   if (status != FTUN_OK) return ftun_socks5_reject(connection, status);
+  if (connection->scope != NULL) {
+    status = ftun_event_task_start(connection->loop, ftun_socks5_pump_ready,
+      connection, &connection->pump_source);
+    if (status != FTUN_OK) return ftun_socks5_reject(connection, status);
+  }
   status = ftun_socks5_start_proxy_attempt(connection);
   if (status != FTUN_OK) return ftun_socks5_reject(connection, status);
   *out = connection->operation;
@@ -1072,11 +1565,44 @@ ftun_status_t ftun_socks5_connection_close(
       owned->io_source != NULL || owned->timer_source != NULL) {
     return FTUN_E_AGAIN;
   }
+  if (owned->scope != NULL && (owned->busy || owned->scheduled)) return FTUN_E_AGAIN;
+  owned->busy = true;
   status = ftun_socks5_close_sockets(owned);
+  owned->busy = false;
+  if (owned->scope != NULL && status != FTUN_OK) return status;
   owned->ready = 0;
   ftun_socks5_release_context(owned);
   *connection = NULL;
   return status;
+}
+
+ftun_status_t ftun_socks5_connection_path(ftun_socks5_connection_t *connection,
+  ftun_path_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (connection == NULL || out == NULL) return FTUN_E_INVALID;
+  if (!connection->ready || connection->scope == NULL ||
+      connection->transport != FTUN_DIAL_TCP || connection->control_path == NULL) return FTUN_E_AGAIN;
+  *out = connection->control_path;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_socks5_connection_datagram(ftun_socks5_connection_t *connection,
+  ftun_datagram_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (connection == NULL || out == NULL) return FTUN_E_INVALID;
+  if (!connection->ready || connection->scope == NULL ||
+      connection->transport != FTUN_DIAL_UDP || connection->datagram == NULL) return FTUN_E_AGAIN;
+  *out = connection->datagram;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_socks5_connection_resume(ftun_socks5_connection_t *connection)
+{
+  if (connection == NULL) return FTUN_E_INVALID;
+  if (!connection->ready || connection->data_path == NULL) return FTUN_E_AGAIN;
+  return ftun_path_resume(connection->data_path);
 }
 
 ftun_status_t ftun_socks5_connection_take_tcp(

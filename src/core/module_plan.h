@@ -41,18 +41,27 @@ typedef struct {
   size_t drained_count;
   bool reload_prepared;
   bool rolled_back;
+  bool cleanup_only;
+  size_t reload_pending_count;
+  ftun_status_t first_error;
+  ftun_status_t cleanup_error;
 } ftun_core_module_info_t;
 
 bool ftun_core_module_catalog_valid(
   const ftun_core_module_catalog_t *catalog);
 
 ftun_status_t ftun_core_module_reload_plan_prepare(
-  const ftun_core_module_catalog_t *catalog, const ftun_config_t *config,
+  const ftun_core_module_catalog_t *catalog, ftun_budget_t *budget, const ftun_config_t *config,
   uint32_t socket_mark, ftun_core_module_reload_plan_t **out,
   ftun_diagnostic_t *diagnostic);
 ftun_status_t ftun_core_module_reload_plan_destroy(
   ftun_core_module_reload_plan_t **plan);
+ftun_status_t ftun_core_module_reload_plan_get_errors(
+  const ftun_core_module_reload_plan_t *plan,
+  ftun_status_t *first_error, ftun_status_t *cleanup_error);
 
+/* prepare 的 out 必须初始化为空。失败后的非空输出仍归调用者拥有，
+ * 仅可清理；所有 descriptor、binding 和借用依赖必须保留至 destroy 成功。 */
 ftun_status_t ftun_core_module_runtime_prepare(
   const ftun_core_module_catalog_t *catalog, ftun_core_t *core,
   ftun_budget_t *budget, ftun_operation_queue_t *operations,

@@ -11,6 +11,7 @@ struct ftun_network_view {
   uint32_t magic;
   size_t references;
   uint64_t generation;
+  bool revoked;
   size_t protected_prefix_count;
   size_t overlay_route_count;
   size_t underlay_exception_count;
@@ -229,9 +230,17 @@ ftun_status_t ftun_network_view_get_info(const ftun_network_view_t *view,
     return FTUN_E_INVALID;
   }
   out->generation = view->generation;
+  out->revoked = __atomic_load_n(&view->revoked, __ATOMIC_ACQUIRE);
   out->protected_prefix_count = view->protected_prefix_count;
   out->overlay_route_count = view->overlay_route_count;
   out->underlay_exception_count = view->underlay_exception_count;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_network_view_revoke(ftun_network_view_t *view)
+{
+  if (view == NULL || view->magic != FTUN_NETWORK_VIEW_MAGIC) return FTUN_E_INVALID;
+  __atomic_store_n(&view->revoked, true, __ATOMIC_RELEASE);
   return FTUN_OK;
 }
 
@@ -273,6 +282,7 @@ ftun_status_t ftun_network_view_select_dial(
     return FTUN_E_INVALID;
   }
   purpose_bit = FTUN_DIAL_PURPOSE_BIT(purpose);
+  if (__atomic_load_n(&view->revoked, __ATOMIC_ACQUIRE)) return FTUN_E_CANCELLED;
   out->generation = view->generation;
   for (index = 0u; index < view->underlay_exception_count; index++) {
     const ftun_network_underlay_exception_t *item =

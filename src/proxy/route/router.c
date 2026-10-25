@@ -27,21 +27,11 @@ ftun_status_t ftun_route_table_accounted_bytes(const char *const *rules,
   }
   total += rule_count * sizeof(ftun_rule_t *);
   for (index = 0u; index < rule_count; index++) {
-    size_t length;
-    const char *first;
-    const char *second;
-    if (rules[index] == NULL) return FTUN_E_INVALID;
-    length = strlen(rules[index]);
-    first = strchr(rules[index], ',');
-    second = first == NULL ? NULL : strchr(first + 1u, ',');
-    if (total > SIZE_MAX - sizeof(ftun_rule_t)) return FTUN_E_LIMIT;
-    total += sizeof(ftun_rule_t);
-    if (second != NULL) {
-      size_t operand = (size_t)(second - first - 1u);
-      if (total > SIZE_MAX - operand - 1u) return FTUN_E_LIMIT;
-      total += operand + 1u;
-    }
-    if (length == SIZE_MAX) return FTUN_E_LIMIT;
+    size_t bytes;
+    ftun_status_t status = ftun_rule_accounted_bytes(rules[index], &bytes);
+    if (status != FTUN_OK) return status;
+    if (bytes > SIZE_MAX - total) return FTUN_E_LIMIT;
+    total += bytes;
   }
   *out = total;
   return FTUN_OK;

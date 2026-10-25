@@ -16,6 +16,8 @@ typedef ftun_status_t (*ftun_dns_dispatch_fn)(
 
 typedef struct {
   ftun_budget_t *budget;
+  /* POLICY 裸出口 ID 的配置作用域；宿主保活，固定 server 入口可为空。 */
+  const ftun_config_t *config_scope;
   ftun_operation_queue_t *operations;
   ftun_dns_server_t *const *servers;
   size_t server_count;

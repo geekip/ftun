@@ -37,8 +37,11 @@ typedef struct {
 /* TASK-TLS-001 / TEST-TLS-001：同步推进的非阻塞 TLS 客户端。底层 IO 的
  * AGAIN 被精确映射为 wants_read/wants_write；不允许关闭 peer/hostname 验证。
  * budget 为借用且必须比 client 长寿；准入会为包装对象、主机名和有界
- * 明文工作区保留逻辑预算。options 与 io 只在 create 同步借用，backend
- * 自行复制所需主机名状态。 */
+ * 明文工作量保留逻辑预算；maximum_plaintext 限制单次 read/write，
+ * 不表示预分配该大小的第一方缓冲。wolfSSL context/session、证书、
+ * 原生缓冲和 allocator 开销未精确计量，不构成 native/RSS 硬限额。
+ * options 与 io 只在 create 同步借用，backend 复制所需主机名与回调，
+ * io.user 及其底层传输借用至 client 销毁；FD/队列由传输拥有方计量。 */
 ftun_status_t ftun_tls_client_open(const ftun_tls_options_t *options,
                                    const ftun_tls_io_t *io,
                                    ftun_tls_client_t **out);

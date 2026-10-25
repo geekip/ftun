@@ -77,6 +77,9 @@ ip rule add priority 12339 to 192.0.2.53/32 lookup main protocol 186
 before_v4=$(ip -4 rule show)
 before_v6=$(ip -6 rule show)
 before_table=$(ip -4 route show table 100 2>/dev/null || true)
+before_owner_table=$(ip -4 route show table 51820 2>/dev/null || true)
+
+"$test_binary" --tun-owner-recovery
 
 ip netns exec ftun-peer "$test_binary" --peer "$temporary/ready" \
   >"$temporary/peer.log" 2>&1 &
@@ -100,6 +103,7 @@ after_table=$(ip -4 route show table 100 2>/dev/null || true)
 [ "$after_v4" = "$before_v4" ]
 [ "$after_v6" = "$before_v6" ]
 [ "$after_table" = "$before_table" ]
+[ "$(ip -4 route show table 51820 2>/dev/null || true)" = "$before_owner_table" ]
 if ip link show ftun-it0 >/dev/null 2>&1; then
   echo "TUN device leaked after integration shutdown" >&2
   exit 1

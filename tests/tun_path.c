@@ -22,6 +22,8 @@ typedef struct {
   size_t write_lengths[TEST_PACKETS];
   size_t write_count;
   ftun_status_t write_status;
+  bool fail_update;
+  uint32_t interests;
 } fake_device_t;
 
 typedef struct {
@@ -38,6 +40,11 @@ typedef struct {
   size_t feedback_sent;
   ftun_tun_packet_error_t last_error;
   bool stall;
+  ftun_buffer_pool_t *release_pool;
+  size_t release_checks;
+  size_t release_errors;
+  bool release_event;
+  bool release_error;
 } consumer_state_t;
 
 static uint16_t checksum(const uint8_t *data, size_t length)
@@ -157,6 +164,106 @@ static ftun_status_t fake_close(void *user, ftun_packet_port_t **port)
   return FTUN_OK;
 }
 
+static ftun_status_t event_update(void *context, ftun_event_source_t *source,
+                                   uint32_t interests)
+{
+  fake_device_t *device = (fake_device_t *)context;
+  (void)source;
+  if (device->fail_update) return FTUN_E_IO;
+  device->interests = interests;
+  return FTUN_OK;
+}
+
+static ftun_status_t event_start(void *context, ftun_event_source_t *source,
+                                  ftun_native_socket_t socket, uint32_t interests)
+{
+  (void)socket;
+  return event_update(context, source, interests);
+}
+
+static ftun_status_t event_timer(void *context, ftun_event_source_t *source,
+                                  uint64_t deadline)
+{
+  (void)context;
+  (void)source;
+  (void)deadline;
+  return FTUN_E_UNSUPPORTED;
+}
+
+static ftun_status_t event_cancel(void *context, ftun_event_source_t *source)
+{
+  (void)context;
+  (void)source;
+  return FTUN_OK;
+}
+
+static void event_idle(void *context) { (void)context; }
+
+static ftun_status_t event_run(void *context, bool block)
+{
+  (void)context;
+  (void)block;
+  return FTUN_OK;
+}
+
+static const ftun_event_backend_ops_t event_ops = {
+  .io_start = event_start,
+  .io_update = event_update,
+  .timer_start = event_timer,
+  .source_cancel = event_cancel,
+  .wakeup = event_idle,
+  .run_once = event_run,
+  .stop = event_idle,
+  .destroy = event_idle
+};
+
+static ftun_status_t consume_packet(void *user, ftun_tun_lease_t lease,
+                                    ftun_bytes_t packet);
+
+static void release_in_callback(consumer_state_t *state,
+                                 ftun_tun_lease_t lease, ftun_bytes_t packet)
+{
+  ftun_tun_service_t *borrowed = lease.service;
+  ftun_tun_path_t path = {0};
+  ftun_tun_consumer_t callbacks = {0};
+  ftun_tun_lease_t rejected = {0};
+  size_t work = SIZE_MAX;
+  callbacks.packet = consume_packet;
+  callbacks.user = state;
+  if (ftun_tun_service_run(borrowed, &work) != FTUN_E_AGAIN || work != 0u ||
+      ftun_tun_service_rebuild(borrowed) != FTUN_E_AGAIN ||
+      ftun_tun_service_quiesce(borrowed) != FTUN_E_AGAIN ||
+      ftun_tun_service_update_path(lease, &path) != FTUN_E_AGAIN) {
+    state->release_errors++;
+    return;
+  }
+  if (ftun_tun_service_release(&state->expected) != FTUN_OK ||
+      ftun_tun_service_acquire(borrowed, &callbacks, &rejected) != FTUN_E_AGAIN ||
+      rejected.service != NULL ||
+      ftun_tun_service_destroy(&borrowed) != FTUN_E_AGAIN ||
+      borrowed != lease.service) {
+    state->release_errors++;
+    return;
+  }
+  if (packet.data != NULL) {
+    ftun_buffer_t *other = NULL;
+    uint8_t *data = NULL;
+    size_t capacity = 0u;
+    uint8_t first = packet.data[0];
+    if (ftun_buffer_pool_acquire(state->release_pool, packet.length,
+                                 &other) != FTUN_OK ||
+        ftun_buffer_data(other, &data, &capacity) != FTUN_OK ||
+        capacity < packet.length) {
+      state->release_errors++;
+    } else {
+      memset(data, 0xee, packet.length);
+      if (packet.data[0] != first) state->release_errors++;
+    }
+    if (ftun_buffer_release(&other) != FTUN_OK) state->release_errors++;
+  }
+  state->release_checks++;
+}
+
 static ftun_status_t consume_packet(void *user, ftun_tun_lease_t lease,
                                     ftun_bytes_t packet)
 {
@@ -165,6 +272,7 @@ static ftun_status_t consume_packet(void *user, ftun_tun_lease_t lease,
       lease.generation != state->expected.generation || packet.data == NULL ||
       packet.length < 20u) return FTUN_E_STATE_CORRUPT;
   if (state->stall) return FTUN_E_AGAIN;
+  if (state->release_pool != NULL) release_in_callback(state, lease, packet);
   state->received++;
   state->last_length = packet.length;
   return FTUN_OK;
@@ -181,6 +289,9 @@ static void consume_event(void *user, ftun_tun_lease_t lease,
   }
   if (event == FTUN_TUN_SERVICE_PATH_UPDATED) state->path_updates++;
   else if (event == FTUN_TUN_SERVICE_REBUILT) state->rebuilds++;
+  if (state->release_event) {
+    release_in_callback(state, lease, (ftun_bytes_t){NULL, 0u});
+  }
 }
 
 static void consume_error(void *user, ftun_tun_lease_t lease,
@@ -200,6 +311,9 @@ static void consume_error(void *user, ftun_tun_lease_t lease,
     state->sources++;
   }
   if (error->feedback_sent) state->feedback_sent++;
+  if (state->release_error) {
+    release_in_callback(state, lease, (ftun_bytes_t){NULL, 0u});
+  }
 }
 
 static int append_read(fake_device_t *device, size_t length,
@@ -258,6 +372,7 @@ static int test_path_contract(void)
         FTUN_OK);
   CHECK(ftun_buffer_pool_create(budget, 2048u, 64u, &buffers) == FTUN_OK);
   CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
+  CHECK(ftun_event_loop_attach_backend(loop, &event_ops, &device) == FTUN_OK);
   service_spec.budget = budget;
   service_spec.loop = loop;
   service_spec.buffers = buffers;
@@ -400,6 +515,14 @@ static int test_path_contract(void)
   path.carrier_mtu = 1500u;
   path.headroom = 100u;
   path.flags = FTUN_TUN_PATH_VALIDATE_OUTPUT_SOURCE;
+  device.fail_update = true;
+  CHECK(ftun_tun_service_update_path(lease, &path) == FTUN_E_IO);
+  CHECK(ftun_tun_service_get_consumer_usage(lease, &usage) == FTUN_OK &&
+        usage.queued_inputs == 1u && usage.queued_outputs == 1u && usage.blocked &&
+        usage.path_generation == 1u && usage.inner_mtu == 1200u &&
+        state.path_updates == 0u &&
+        (device.interests & FTUN_EVENT_WRITE) != 0u);
+  device.fail_update = false;
   CHECK(ftun_tun_service_update_path(lease, &path) == FTUN_OK);
   CHECK(state.path_updates == 1u);
   CHECK(ftun_tun_service_get_consumer_usage(lease, &usage) == FTUN_OK &&
@@ -444,6 +567,105 @@ static int test_path_contract(void)
   CHECK(ftun_tun_service_release(&lease) == FTUN_OK);
   CHECK(ftun_tun_service_destroy(&service) == FTUN_OK && service == NULL);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_detach_backend(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
+        budget_usage.used == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
+static int test_callback_packet_borrow(void)
+{
+  static const uint8_t source[4] = {10u, 77u, 0u, 2u};
+  static const uint8_t target[4] = {198u, 18u, 1u, 2u};
+  ftun_budget_t *budget = NULL;
+  ftun_buffer_pool_t *buffers = NULL;
+  ftun_event_loop_t *loop = NULL;
+  ftun_tun_service_t *service = NULL;
+  ftun_tun_service_spec_t spec;
+  ftun_tun_device_ops_t ops;
+  ftun_tun_consumer_t consumer;
+  ftun_tun_service_usage_t usage;
+  ftun_budget_usage_t budget_usage;
+  fake_device_t device;
+  consumer_state_t state;
+  size_t work = 0u;
+  size_t mode;
+
+  memset(&device, 0, sizeof(device));
+  memset(&state, 0, sizeof(state));
+  memset(&spec, 0, sizeof(spec));
+  memset(&ops, 0, sizeof(ops));
+  memset(&consumer, 0, sizeof(consumer));
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u, &budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create(budget, 2048u, 64u, &buffers) == FTUN_OK);
+  CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
+  spec.budget = budget;
+  spec.loop = loop;
+  spec.buffers = buffers;
+  spec.device.name = (ftun_string_t){"ftun-pth0", 9u};
+  spec.device.mtu = TEST_MTU;
+  spec.input_capacity = 2u;
+  spec.output_capacity = 2u;
+  spec.read_quota = 2u;
+  spec.write_quota = 2u;
+  ops.open = fake_open;
+  ops.get_info = fake_get_info;
+  ops.read = fake_read;
+  ops.write = fake_write;
+  ops.close = fake_close;
+  ops.user = &device;
+  CHECK(ftun_tun_service_create_with_ops(&spec, &ops, &service) == FTUN_OK);
+  consumer.packet = consume_packet;
+  consumer.event = consume_event;
+  consumer.packet_error = consume_error;
+  consumer.user = &state;
+  CHECK(ftun_tun_service_acquire(service, &consumer, &state.expected) == FTUN_OK);
+  state.stall = true;
+  CHECK(append_read(&device, 100u, source, target, 0u));
+  CHECK(run_reads(service, 1u));
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.queued_inputs == 1u);
+  state.stall = false;
+  state.release_pool = buffers;
+  CHECK(ftun_tun_service_resume(state.expected) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK && work == 1u);
+  CHECK(state.release_checks == 1u && state.release_errors == 0u);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.queued_inputs == 0u && usage.queued_input_bytes == 0u &&
+        usage.active_leases == 0u);
+  for (mode = 0u; mode < 5u; mode++) {
+    ftun_tun_path_t path = {TEST_MTU, 0u, 0u};
+    memset(&state, 0, sizeof(state));
+    CHECK(ftun_tun_service_acquire(service, &consumer, &state.expected) == FTUN_OK);
+    if (mode == 0u) {
+      state.release_pool = buffers;
+      CHECK(append_read(&device, 100u, source, target, 0u));
+      CHECK(run_reads(service, 1u));
+    } else if (mode == 1u) {
+      state.release_event = true;
+      CHECK(ftun_tun_service_update_path(state.expected, &path) == FTUN_OK);
+    } else if (mode == 2u) {
+      state.release_event = true;
+      CHECK(ftun_tun_service_rebuild(service) == FTUN_OK);
+    } else if (mode == 3u) {
+      uint8_t malformed = 0u;
+      state.release_error = true;
+      CHECK(ftun_tun_service_update_path(state.expected, &path) == FTUN_OK);
+      CHECK(ftun_tun_service_write(state.expected,
+              (ftun_bytes_t){&malformed, 1u}) == FTUN_E_PROTOCOL);
+    } else {
+      state.release_event = true;
+      CHECK(ftun_tun_service_quiesce(service) == FTUN_OK);
+    }
+    CHECK(state.release_checks == 1u && state.release_errors == 0u);
+    CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+          usage.active_leases == 0u && usage.queued_inputs == 0u);
+  }
+  CHECK(ftun_tun_service_destroy(&service) == FTUN_OK);
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
@@ -454,6 +676,7 @@ static int test_path_contract(void)
 
 int main(void)
 {
+  CHECK(test_callback_packet_borrow() == 0);
   CHECK(test_path_contract() == 0);
   return 0;
 }

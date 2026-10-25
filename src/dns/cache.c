@@ -160,7 +160,7 @@ static ftun_status_t ftun_cache_skip_name(ftun_bytes_t wire, size_t *cursor)
   }
 }
 
-static ftun_status_t ftun_cache_ttls(ftun_bytes_t wire, size_t *offsets,
+static ftun_status_t ftun_cache_ttls(ftun_budget_t *budget, ftun_bytes_t wire, size_t *offsets,
                                      uint32_t *ttls, size_t capacity,
                                      size_t *out_count, uint32_t *out_minimum,
                                      int *out_negative)
@@ -179,7 +179,7 @@ static ftun_status_t ftun_cache_ttls(ftun_bytes_t wire, size_t *offsets,
   if (out_count == NULL || out_minimum == NULL || out_negative == NULL) {
     return FTUN_E_INVALID;
   }
-  status = ftun_dns_message_parse(wire, &message);
+  status = ftun_dns_message_parse_with_budget(budget, wire, &message);
   if (status != FTUN_OK) return status;
   *out_negative = message->rcode == 3u ||
                   (message->rcode == 0u && message->answer_count == 0u);
@@ -513,14 +513,14 @@ ftun_status_t ftun_dns_cache_store(ftun_dns_cache_t *cache,
   if (cache == NULL) return FTUN_E_INVALID;
   status = ftun_cache_key(query, key, &key_length);
   if (status != FTUN_OK) return status;
-  status = ftun_dns_message_parse(wire, &message);
+  status = ftun_dns_message_parse_with_budget(cache->budget, wire, &message);
   if (status != FTUN_OK) return status;
   status = ftun_dns_message_matches(message, query, query->transport,
                                     &query->upstream, &matches);
   (void)ftun_dns_message_release(&message);
   if (status != FTUN_OK || !matches) return status == FTUN_OK ?
     FTUN_E_PROTOCOL : status;
-  status = ftun_cache_ttls(wire, offsets, ttls, FTUN_DNS_MAX_RECORDS,
+  status = ftun_cache_ttls(cache->budget, wire, offsets, ttls, FTUN_DNS_MAX_RECORDS,
                            &ttl_count, &minimum, &negative);
   if (status != FTUN_OK) return status;
   if (minimum == 0u) return FTUN_E_EOF;

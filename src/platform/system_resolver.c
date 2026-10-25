@@ -71,7 +71,7 @@ static int ftun_system_resolver_device_valid(ftun_string_t device)
   size_t index;
   if (device.length == 0u) return 1;
   if (device.data == NULL ||
-      device.length >= FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+      device.length >= FTUN_SOCKET_INTERFACE_BYTES) return 0;
   for (index = 0u; index < device.length; index++) {
     unsigned char byte = (unsigned char)device.data[index];
     if (byte <= (unsigned char)' ' || byte == (unsigned char)'/' ||

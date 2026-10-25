@@ -26,14 +26,16 @@ ftun_status_t ftun_proxy_dns_dispatch(
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (adapter == NULL || adapter->core == NULL ||
-      core == NULL || core != adapter->core || query == NULL || out == NULL ||
-      !ftun_dns_query_request_valid(query)) return FTUN_E_INVALID;
+      core == NULL || core != adapter->core || query == NULL || out == NULL) return FTUN_E_INVALID;
   if (dispatcher == NULL) return FTUN_E_AGAIN;
+  status = ftun_dns_query_request_validate(dispatcher->budget, query);
+  if (status != FTUN_OK) return status;
   if (adapter->fakeip_slot != NULL) fakeip = *adapter->fakeip_slot;
   if (query->entry == FTUN_DNS_ENTRY_FIXED) {
     server_index = query->fixed_server;
   } else if (query->entry == FTUN_DNS_ENTRY_POLICY) {
     ftun_runtime_t *runtime = NULL;
+    const ftun_config_t *config = NULL;
     const ftun_route_table_t *table = NULL;
     ftun_route_result_t route;
     ftun_metadata_t metadata;
@@ -43,9 +45,17 @@ ftun_status_t ftun_proxy_dns_dispatch(
     metadata.network = 0u;
     status = ftun_runtime_active_acquire(core, &runtime);
     if (status != FTUN_OK) return status;
-    status = ftun_runtime_route_table(runtime, &table);
+    status = ftun_runtime_config(runtime, &config);
+    if (status == FTUN_OK && config != dispatcher->config_scope) {
+      status = FTUN_E_STALE;
+    }
+    if (status == FTUN_OK) status = ftun_runtime_route_table(runtime, &table);
     if (status == FTUN_OK) {
       status = ftun_route_table_evaluate_known(table, &metadata, &route);
+    }
+    if (status == FTUN_OK && route.kind == FTUN_ROUTE_READY) {
+      status = dispatcher->select_server(route.outbound_id, &server_index,
+                                         dispatcher->select_user);
     }
     if (ftun_runtime_release(&runtime) != FTUN_OK && status == FTUN_OK) {
       status = FTUN_E_STATE_CORRUPT;
@@ -55,9 +65,6 @@ ftun_status_t ftun_proxy_dns_dispatch(
       return ftun_dns_local_answer(dispatcher, query, 5u, 0, 0u, out);
     }
     if (route.kind != FTUN_ROUTE_READY) return FTUN_E_STATE_CORRUPT;
-    status = dispatcher->select_server(route.outbound_id, &server_index,
-                                       dispatcher->select_user);
-    if (status != FTUN_OK) return status;
   } else {
     return FTUN_E_INVALID;
   }
@@ -105,6 +112,7 @@ ftun_status_t ftun_proxy_dns_dispatch(
 
 typedef struct {
   ftun_reservation_t *reservation;
+  ftun_budget_t *budget;
   ftun_system_resolve_completion_fn completion;
   void *completion_user;
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
@@ -136,7 +144,7 @@ static void ftun_dns_named_completed(ftun_operation_t *operation,
   result.domain.data = context->domain;
   result.domain.length = context->domain_length;
   if (error.status == FTUN_OK) {
-    error.status = ftun_dns_message_parse(response, &message);
+    error.status = ftun_dns_message_parse_with_budget(context->budget, response, &message);
     error.stage = 3u;
   }
   if (error.status == FTUN_OK) {
@@ -250,6 +258,7 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
     return FTUN_E_LIMIT;
   }
   context->reservation = reservation;
+  context->budget = request->budget;
   context->completion = request->completion;
   context->completion_user = request->user;
   context->domain_length = request->domain.length;

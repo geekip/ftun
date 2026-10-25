@@ -3,6 +3,7 @@
 
 #include "proxy/session.h"
 #include "dns/bootstrap.h"
+#include "network/resolver.h"
 
 /* 路由前真实解析请求。session 必须处于 ROUTING、尚未固定出口且没有已有
  * 真实候选；query 携带唯一域名、deadline、保护策略和完成回调。
@@ -38,13 +39,19 @@ typedef struct {
  * 同一 Session，再调用 ftun_session_operation_complete；之后从原规则继续。
  * 已有结果或已固定出口返回 STALE 且零回调，防止二次解析覆盖候选。
  */
-ftun_status_t ftun_resolve_real(ftun_core_t *core,
-                                const ftun_resolve_request_t *request,
-                                ftun_operation_t **out);
-
-/* 测试及后续 DNS Server adapter 注入；backend/context 由调用方保持。 */
+/* 显式 backend 的来源选择契约测试入口；生产消费者使用 Provider。 */
 ftun_status_t ftun_resolve_real_with_backend(
   ftun_core_t *core, const ftun_resolve_request_t *request,
   const ftun_resolver_backend_t *backend, ftun_operation_t **out);
+
+/* 生产来源选择入口。scope 在逻辑请求接纳时固定配置代次；命名来源由
+ * Composition 绑定到该代 DNS 服务，接纳后不改用新代或其他来源。 */
+ftun_status_t ftun_proxy_dns_resolve_with_provider(
+  ftun_core_t *core, ftun_resolver_scope_t *scope, bool dns_enabled,
+  ftun_string_t default_server, const ftun_bootstrap_request_t *query,
+  ftun_dial_purpose_t purpose, ftun_operation_t **out);
+ftun_status_t ftun_resolve_real_with_provider(ftun_core_t *core,
+  const ftun_resolve_request_t *request, ftun_resolver_scope_t *scope,
+  ftun_operation_t **out);
 
 #endif

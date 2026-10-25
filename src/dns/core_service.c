@@ -1,6 +1,7 @@
 #include "dns/core_service.h"
 
 #include "util/time.h"
+#include "core/budget.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -11,10 +12,12 @@
 typedef struct {
   ftun_core_t *core;
   ftun_budget_t *budget;
+  ftun_reservation_t *reservation;
   ftun_operation_queue_t *operations;
   ftun_event_loop_t *loop;
   ftun_dns_service_slot_t *slot;
   ftun_dns_runtime_adapter_t adapter;
+  ftun_dns_runtime_network_t network;
   ftun_dns_runtime_t *active;
   ftun_dns_runtime_t *pending;
   ftun_dns_runtime_t *retired;
@@ -31,7 +34,8 @@ typedef struct {
 
 bool ftun_dns_service_binding_valid(const ftun_dns_service_binding_t *binding)
 {
-  return binding != NULL && binding->loop != NULL && binding->slot != NULL;
+  return binding != NULL && binding->loop != NULL && binding->slot != NULL &&
+    binding->path.open != NULL;
 }
 
 ftun_status_t ftun_dns_service_slot_get(
@@ -54,14 +58,14 @@ static void ftun_dns_service_publish(ftun_dns_service_instance_t *service,
   service->slot->accepting = accepting && service->active != NULL;
 }
 
-static ftun_status_t ftun_dns_service_plan_prepare(
+static ftun_status_t ftun_dns_service_plan_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t socket_mark, void **out)
 {
   ftun_dns_runtime_plan_t *plan = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
-  status = ftun_dns_runtime_plan_prepare(config, socket_mark, &plan);
+  status = ftun_dns_runtime_plan_prepare(budget, config, socket_mark, &plan);
   if (status == FTUN_OK) *out = plan;
   return status;
 }
@@ -85,6 +89,7 @@ static ftun_status_t ftun_dns_service_prepare(
 {
   const ftun_dns_service_binding_t *bindings;
   ftun_dns_service_instance_t *service;
+  ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || budget == NULL || operations == NULL ||
@@ -98,8 +103,14 @@ static ftun_status_t ftun_dns_service_prepare(
       bindings->slot->active != NULL || bindings->slot->accepting) {
     return FTUN_E_INVALID;
   }
+  status = ftun_budget_reserve(budget, sizeof(*service), &reservation);
+  if (status != FTUN_OK) return status;
   service = (ftun_dns_service_instance_t *)calloc(1u, sizeof(*service));
-  if (service == NULL) return FTUN_E_LIMIT;
+  if (service == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  service->reservation = reservation;
   service->core = core;
   service->budget = budget;
   service->operations = operations;
@@ -108,15 +119,21 @@ static ftun_status_t ftun_dns_service_prepare(
   service->adapter = bindings->adapter;
   service->socket_mark = bindings->socket_mark;
   service->generation = generation;
+  service->network.generation = generation;
+  service->network.socket_mark = bindings->socket_mark;
+  service->network.path = bindings->path;
+  service->network.context = bindings->path_context;
   status = ftun_dns_runtime_prepare(core, budget, operations, service->loop,
-    config, &service->adapter, service->socket_mark,
+    config, &service->adapter, &service->network,
     &service->active);
-  if (status != FTUN_OK) {
+  if (status != FTUN_OK && service->active == NULL) {
     free(service);
+    (void)ftun_reservation_release(&reservation);
     return status;
   }
+  /* 失败且仍拥有 runtime 时，仅可由上层 cleanup-only service 销毁。 */
   *out = service;
-  return FTUN_OK;
+  return status;
 }
 
 static ftun_status_t ftun_dns_service_activate(void *implementation)
@@ -143,10 +160,13 @@ static ftun_status_t ftun_dns_service_reload_prepare_planned(
   ftun_status_t status;
   if (service == NULL || config == NULL || generation <= service->generation ||
       service->stopped || service->reload_prepared ||
-      service->retired != NULL) return FTUN_E_INVALID;
+      service->retired != NULL || service->pending != NULL) {
+    return FTUN_E_INVALID;
+  }
+  service->network.generation = generation;
   status = ftun_dns_runtime_prepare_reload_planned(
     service->active, service->core, service->budget, service->operations,
-    service->loop, config, &service->adapter, service->socket_mark,
+    service->loop, config, &service->adapter, &service->network,
     (const ftun_dns_runtime_plan_t *)plan,
     &service->pending);
   if (status == FTUN_OK) {
@@ -256,11 +276,15 @@ static ftun_status_t ftun_dns_service_run_once(
   ftun_dns_service_instance_t *service =
     (ftun_dns_service_instance_t *)implementation;
   uint64_t started_ms = 0u;
+  uint64_t before_event_ms = 0u;
+  uint64_t after_event_ms = 0u;
   uint64_t finished_ms = 0u;
+  ftun_event_loop_usage_t event_usage;
   size_t active_work = 0u;
   size_t retired_work = 0u;
   size_t callbacks = 0u;
   bool immediate;
+  bool blocked;
   ftun_status_t status;
   if (out_usage != NULL) memset(out_usage, 0, sizeof(*out_usage));
   if (service == NULL || !service->activated || service->stopped ||
@@ -281,18 +305,30 @@ static ftun_status_t ftun_dns_service_run_once(
   immediate = active_work != 0u || retired_work != 0u ||
     service->deadline_ready || ftun_dns_runtime_has_ready(service->active) ||
     ftun_dns_runtime_has_ready(service->retired);
-  status = ftun_event_loop_run_once(service->loop, may_block && !immediate,
+  blocked = may_block && !immediate;
+  status = ftun_monotonic_now(&before_event_ms);
+  if (status != FTUN_OK) return status;
+  status = ftun_event_loop_run_once(service->loop, blocked,
     FTUN_DNS_SERVICE_EVENT_QUOTA, &callbacks);
+  if (status != FTUN_OK) return status;
+  status = ftun_monotonic_now(&after_event_ms);
   if (status != FTUN_OK) return status;
   service->deadline_ready = false;
   status = ftun_dns_service_schedule(service);
+  if (status == FTUN_OK) status = ftun_event_loop_get_usage(service->loop, &event_usage);
+  if (status == FTUN_OK) status = ftun_monotonic_now(&finished_ms);
   if (status != FTUN_OK) return status;
-  (void)ftun_monotonic_now(&finished_ms);
-  out_usage->work = active_work + retired_work + callbacks;
-  out_usage->busy_ms = finished_ms >= started_ms ? finished_ms - started_ms : 0u;
+  out_usage->work = active_work + retired_work + event_usage.last_work;
+  /* 等待型回合仅计派发与两侧 owner 工作，排除 backend 阻塞等待。 */
+  if (before_event_ms >= started_ms) out_usage->busy_ms = before_event_ms - started_ms;
+  if (finished_ms >= after_event_ms) out_usage->busy_ms += finished_ms - after_event_ms;
+  if (blocked) out_usage->busy_ms += event_usage.last_dispatch_ms;
+  else if (after_event_ms >= before_event_ms) {
+    out_usage->busy_ms += after_event_ms - before_event_ms;
+  }
   out_usage->quota_exhausted = active_work == FTUN_DNS_SERVICE_QUOTA ||
     retired_work == FTUN_DNS_SERVICE_QUOTA ||
-    callbacks == FTUN_DNS_SERVICE_EVENT_QUOTA;
+    callbacks == FTUN_DNS_SERVICE_EVENT_QUOTA || event_usage.backend_quota_exhausted;
   return FTUN_OK;
 }
 
@@ -328,9 +364,9 @@ static ftun_status_t ftun_dns_service_stop_until(
   ftun_status_t status;
   if (service == NULL || deadline_ms == 0u) return FTUN_E_INVALID;
   result = ftun_dns_service_quiesce(service);
-  status = ftun_dns_runtime_stop(service->active);
+  status = ftun_dns_runtime_stop_until(service->active, deadline_ms);
   if (result == FTUN_OK) result = status;
-  status = ftun_dns_runtime_stop(service->retired);
+  status = ftun_dns_runtime_stop_until(service->retired, deadline_ms);
   if (result == FTUN_OK) result = status;
   if (result == FTUN_OK) service->stopped = true;
   return result;
@@ -347,12 +383,13 @@ static ftun_status_t ftun_dns_service_destroy_until(
 {
   ftun_dns_service_instance_t *service;
   ftun_status_t status;
+  ftun_reservation_t *reservation;
   if (implementation == NULL || deadline_ms == 0u) return FTUN_E_INVALID;
   service = (ftun_dns_service_instance_t *)*implementation;
   if (service == NULL) return FTUN_OK;
   status = ftun_dns_service_stop_until(service, deadline_ms);
   if (status != FTUN_OK) return status;
-  if (service->reload_prepared) {
+  if (service->reload_prepared || service->pending != NULL) {
     status = ftun_dns_service_reload_abort(service);
     if (status != FTUN_OK) return status;
   }
@@ -362,10 +399,11 @@ static ftun_status_t ftun_dns_service_destroy_until(
   service->slot->active = NULL;
   service->slot->generation = 0u;
   service->slot->accepting = false;
+  reservation = service->reservation;
   memset(service, 0, sizeof(*service));
   free(service);
   *implementation = NULL;
-  return FTUN_OK;
+  return ftun_reservation_release(&reservation);
 }
 
 const ftun_core_service_descriptor_t ftun_dns_core_service = {

@@ -5,7 +5,8 @@ bool ftun_proxy_bindings_valid(const ftun_proxy_bindings_t *bindings)
   bool l3_bound;
   bool l3_empty;
   if (bindings == NULL || bindings->loop == NULL ||
-      bindings->resolver.start == NULL || bindings->path.start == NULL ||
+      bindings->resolver.start == NULL ||
+      (bindings->path.start == NULL && bindings->path.open == NULL) ||
       bindings->fakeip_slot == NULL) {
     return false;
   }

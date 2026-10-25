@@ -45,6 +45,9 @@ ftun_status_t ftun_rule_compile_with_frs(
   void *resolver_user, ftun_rule_frs_bind_fn frs_bind, void *frs_user,
   ftun_rule_t **out);
 ftun_status_t ftun_rule_destroy(ftun_rule_t **rule);
+/* 已由配置接纳的规则：自身、真正拥有的operand或FRS绑定句柄。
+ * 不重复累计共享FRS视图；准入由调用方所属的Runtime承担。 */
+ftun_status_t ftun_rule_accounted_bytes(const char *text, size_t *out);
 
 /* 共享 matcher。
  * 需求 REQ-ROUTE-001；任务 TASK-ROUTE-002；目标 0.3.0；验收 TEST-ROUTE-002。

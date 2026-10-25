@@ -8,8 +8,7 @@ static ftun_status_t ftun_tun_device_open(
   void *user, ftun_core_t *core, const ftun_tun_spec_t *spec,
   ftun_packet_port_t **out)
 {
-  (void)user;
-  return ftun_packet_port_open(core, spec, out);
+  return ftun_packet_port_open_with_budget(core, (ftun_budget_t *)user, spec, out);
 }
 
 static ftun_status_t ftun_tun_device_get_info(
@@ -210,12 +209,36 @@ static ftun_status_t ftun_tun_service_all_inputs_clear(
   return result;
 }
 
-static ftun_status_t ftun_tun_service_device_open(
+static ftun_status_t ftun_tun_service_network_withdraw(ftun_tun_service_t *service)
+{
+  ftun_status_t status;
+  if (!service->network_started) return FTUN_OK;
+  status = service->network.withdraw(service->network.context);
+  if (status == FTUN_OK) service->network_started = false;
+  return status;
+}
+
+static ftun_status_t ftun_tun_service_device_close(ftun_tun_service_t *service)
+{
+  ftun_status_t status = ftun_event_source_cancel(&service->source);
+  if (status != FTUN_OK) return status;
+  status = ftun_tun_service_network_withdraw(service);
+  if (status != FTUN_OK) return status;
+  status = service->ops.close(service->ops.user, &service->port);
+  if (service->port == NULL) {
+    memset(&service->info, 0, sizeof(service->info));
+    service->events = 0u;
+  }
+  return status;
+}
+
+static ftun_status_t ftun_tun_service_port_open(
   ftun_tun_service_t *service)
 {
   ftun_tun_spec_t spec;
-  uint32_t interests = FTUN_EVENT_ERROR;
   ftun_status_t status;
+  if (service->device_generation == UINT64_MAX ||
+      service->network_generation == UINT64_MAX) return FTUN_E_LIMIT;
   memset(&spec, 0, sizeof(spec));
   spec.name.data = service->device_name;
   spec.name.length = strlen(service->device_name);
@@ -231,6 +254,18 @@ static ftun_status_t ftun_tun_service_device_open(
        service->info.native_socket > (ftun_native_socket_t)INT32_MAX)) {
     status = FTUN_E_STATE_CORRUPT;
   }
+  return status;
+}
+
+static ftun_status_t ftun_tun_service_device_open(
+  ftun_tun_service_t *service)
+{
+  uint32_t interests = FTUN_EVENT_ERROR;
+  ftun_status_t status = ftun_tun_service_port_open(service);
+  if (status == FTUN_OK && service->network.restore != NULL) {
+    service->network_started = true;
+    status = service->network.restore(service->network.context);
+  }
   if (service->accepting && service->active_leases != 0u) {
     interests |= FTUN_EVENT_READ;
   }
@@ -240,20 +275,20 @@ static ftun_status_t ftun_tun_service_device_open(
       ftun_tun_service_ready, service, &service->source);
   }
   if (status != FTUN_OK) {
-    (void)ftun_event_source_cancel(&service->source);
-    (void)service->ops.close(service->ops.user, &service->port);
-    memset(&service->info, 0, sizeof(service->info));
-    return status;
+    ftun_status_t cleanup = ftun_tun_service_device_close(service);
+    return cleanup == FTUN_OK ? status : cleanup;
   }
   service->device_generation++;
-  if (service->device_generation == 0u) service->device_generation++;
+  service->network_generation++;
   return FTUN_OK;
 }
 
 ftun_status_t ftun_tun_service_create(
   const ftun_tun_service_spec_t *spec, ftun_tun_service_t **out)
 {
-  return ftun_tun_service_create_with_ops(spec, &ftun_tun_system_ops, out);
+  ftun_tun_device_ops_t ops = ftun_tun_system_ops;
+  ops.user = spec == NULL ? NULL : spec->budget;
+  return ftun_tun_service_create_with_ops(spec, &ops, out);
 }
 
 ftun_status_t ftun_tun_service_create_with_ops(
@@ -278,6 +313,7 @@ ftun_status_t ftun_tun_service_create_with_ops(
       memchr(spec->device.name.data, '\0', spec->device.name.length) != NULL ||
       spec->device.mtu == 0u || spec->output_capacity == 0u ||
       spec->read_quota == 0u || spec->write_quota == 0u ||
+      ((spec->network.restore == NULL) != (spec->network.withdraw == NULL)) ||
       !ftun_tun_service_ops_valid(ops)) return FTUN_E_INVALID;
   consumer_capacity = spec->consumer_capacity == 0u
     ? 1u : spec->consumer_capacity;
@@ -339,6 +375,7 @@ ftun_status_t ftun_tun_service_create_with_ops(
   service->loop = spec->loop;
   service->buffers = spec->buffers;
   service->ops = *ops;
+  service->network = spec->network;
   service->mtu = spec->device.mtu;
   service->consumer_capacity = consumer_capacity;
   service->input_capacity = input_capacity;
@@ -349,6 +386,11 @@ ftun_status_t ftun_tun_service_create_with_ops(
   service->accepting = true;
   status = ftun_tun_service_device_open(service);
   if (status != FTUN_OK) {
+    service->accepting = false;
+    if (service->port != NULL || service->source != NULL || service->network_started) {
+      *out = service;
+      return status;
+    }
     free(service->input);
     free(service->output_entries);
     free(service->input_entries);
@@ -439,6 +481,7 @@ ftun_status_t ftun_l3_provider_get_info(
   out->generation = provider->generation;
   out->pending_generation = provider->pending_generation;
   out->device_generation = usage.device_generation;
+  out->network_generation = usage.network_generation;
   out->active_leases = usage.active_leases;
   out->accepting = usage.accepting;
   out->reload_prepared = provider->reload_prepared;
@@ -461,30 +504,185 @@ ftun_status_t ftun_tun_service_rebuild(ftun_tun_service_t *service)
 {
   ftun_status_t status;
   if (service == NULL) return FTUN_E_INVALID;
-  if (!service->accepting) return FTUN_E_CANCELLED;
-  status = ftun_event_source_cancel(&service->source);
-  if (status != FTUN_OK) return status;
-  status = ftun_tun_service_all_outputs_clear(service);
-  if (status != FTUN_OK) return status;
-  status = service->ops.close(service->ops.user, &service->port);
-  if (service->port == NULL) {
-    memset(&service->info, 0, sizeof(service->info));
-    service->events = 0u;
+  if (service->rebuilding || service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (service->quiesced) return FTUN_E_CANCELLED;
+  if (service->device_generation == UINT64_MAX ||
+      service->network_generation == UINT64_MAX) return FTUN_E_LIMIT;
+  if (service->network.change != NULL) {
+    return service->network.change(service->network.context, true,
+      service->device_generation, service->network_generation);
   }
-  if (status != FTUN_OK) return status;
-  status = ftun_tun_service_device_open(service);
+  service->rebuilding = true;
+  service->accepting = false;
+  status = ftun_event_source_cancel(&service->source);
+  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  if (status == FTUN_OK) status = ftun_tun_service_device_close(service);
+  if (status == FTUN_OK) status = ftun_tun_service_device_open(service);
   if (status == FTUN_OK) {
-    ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_REBUILT, FTUN_OK);
+    service->accepting = true;
+    status = ftun_tun_service_interests(service);
+  }
+  if (status != FTUN_OK) {
+    service->accepting = false;
+    /* 已恢复但 watcher 更新失败时也撤销；失败句柄仍由 service 保留。 */
+    (void)ftun_tun_service_device_close(service);
+  }
+  ftun_tun_service_broadcast(service, status == FTUN_OK
+    ? FTUN_TUN_SERVICE_REBUILT : FTUN_TUN_SERVICE_FAILED, status);
+  service->rebuilding = false;
+  return status;
+}
+
+ftun_status_t ftun_tun_service_refresh_network(
+  ftun_tun_service_t *service, uint64_t expected_network_generation)
+{
+  ftun_status_t status;
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->rebuilding || service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (service->quiesced) return FTUN_E_CANCELLED;
+  if (expected_network_generation != service->network_generation) return FTUN_E_STALE;
+  if (service->network_generation == UINT64_MAX) return FTUN_E_LIMIT;
+  if (service->port == NULL) return FTUN_E_AGAIN;
+  if (service->network.restore == NULL) return FTUN_E_UNSUPPORTED;
+  if (service->network.change != NULL) {
+    return service->network.change(service->network.context, false,
+      service->device_generation, expected_network_generation);
+  }
+  service->rebuilding = true;
+  service->accepting = false;
+  status = ftun_event_source_cancel(&service->source);
+  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  if (status == FTUN_OK) status = ftun_tun_service_network_withdraw(service);
+  if (status == FTUN_OK) {
+    service->network_started = true;
+    status = service->network.restore(service->network.context);
+  }
+  if (status == FTUN_OK) {
+    uint32_t interests = FTUN_EVENT_ERROR;
+    if (service->active_leases != 0u) interests |= FTUN_EVENT_READ;
+    status = ftun_event_io_start(service->loop, service->info.native_socket,
+      interests, ftun_tun_service_ready, service, &service->source);
+  }
+  service->events = 0u;
+  if (status == FTUN_OK) {
+    service->network_generation++;
+    service->accepting = true;
+  } else {
+    /* 原错误保留；撤销失败的句柄仍由 context 拥有，后续重试先撤销。 */
+    (void)ftun_tun_service_network_withdraw(service);
+  }
+  ftun_tun_service_broadcast(service, status == FTUN_OK
+    ? FTUN_TUN_SERVICE_NETWORK_UPDATED : FTUN_TUN_SERVICE_FAILED, status);
+  service->rebuilding = false;
+  return status;
+}
+
+static ftun_status_t ftun_tun_service_change_pause(
+  ftun_tun_service_t *service, uint64_t expected_network_generation, bool rebuild)
+{
+  ftun_status_t status;
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->rebuilding || service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (service->quiesced) return FTUN_E_CANCELLED;
+  if (expected_network_generation != service->network_generation) return FTUN_E_STALE;
+  if (service->network_generation == UINT64_MAX) return FTUN_E_LIMIT;
+  if (!rebuild && service->port == NULL) return FTUN_E_AGAIN;
+  service->rebuilding = true;
+  service->rebuild_paused = rebuild;
+  service->rebuild_port_ready = false;
+  service->accepting = false;
+  status = ftun_event_source_cancel(&service->source);
+  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  service->events = 0u;
+  service->network_paused = status == FTUN_OK;
+  ftun_tun_service_broadcast(service, status == FTUN_OK
+    ? FTUN_TUN_SERVICE_NETWORK_CHANGING : FTUN_TUN_SERVICE_FAILED, status);
+  if (status != FTUN_OK) {
+    service->rebuilding = false;
+    service->rebuild_paused = false;
   }
   return status;
 }
 
-ftun_status_t ftun_tun_service_quiesce(ftun_tun_service_t *service)
+ftun_status_t ftun_tun_service_network_pause(
+  ftun_tun_service_t *service, uint64_t expected_network_generation)
 {
-  ftun_status_t result;
+  return ftun_tun_service_change_pause(service, expected_network_generation, false);
+}
+
+ftun_status_t ftun_tun_service_rebuild_pause(
+  ftun_tun_service_t *service, uint64_t expected_device_generation,
+  uint64_t expected_network_generation)
+{
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->device_generation != expected_device_generation) return FTUN_E_STALE;
+  if (service->device_generation == UINT64_MAX) return FTUN_E_LIMIT;
+  return ftun_tun_service_change_pause(service, expected_network_generation, true);
+}
+
+ftun_status_t ftun_tun_service_reopen_paused(ftun_tun_service_t *service)
+{
   ftun_status_t status;
   if (service == NULL) return FTUN_E_INVALID;
-  if (!service->accepting && service->source == NULL) return FTUN_OK;
+  if (service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (!service->network_paused || !service->rebuild_paused) return FTUN_E_INVALID;
+  if (service->rebuild_port_ready) return FTUN_E_AGAIN;
+  /* withdraw 确认拥有者已清空网络责任，才消费旧端口。 */
+  status = ftun_tun_service_device_close(service);
+  if (status != FTUN_OK) return status;
+  status = ftun_tun_service_port_open(service);
+  if (status != FTUN_OK) {
+    ftun_status_t cleanup = ftun_tun_service_device_close(service);
+    return cleanup == FTUN_OK ? status : cleanup;
+  }
+  service->device_generation++;
+  service->rebuild_port_ready = true;
+  /* 后续安装可能部分成功；destroy 必须仍向拥有者确认清理完成。 */
+  service->network_started = service->network.restore != NULL;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_tun_service_network_finish(
+  ftun_tun_service_t *service, ftun_status_t result)
+{
+  ftun_status_t status = result;
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->callback_depth != 0u) return FTUN_E_AGAIN;
+  if (!service->network_paused) return FTUN_E_INVALID;
+  if (result == FTUN_OK) {
+    uint32_t interests = FTUN_EVENT_ERROR;
+    if (service->port == NULL || (service->rebuild_paused && !service->rebuild_port_ready)) {
+      return FTUN_E_STATE_CORRUPT;
+    }
+    if (service->active_leases != 0u) interests |= FTUN_EVENT_READ;
+    status = ftun_event_io_start(service->loop, service->info.native_socket,
+      interests, ftun_tun_service_ready, service, &service->source);
+    if (status == FTUN_OK) {
+      service->network_generation++;
+      service->accepting = true;
+    }
+  }
+  ftun_tun_service_broadcast(service, status == FTUN_OK
+    ? (service->rebuild_paused ? FTUN_TUN_SERVICE_REBUILT : FTUN_TUN_SERVICE_NETWORK_UPDATED)
+    : FTUN_TUN_SERVICE_FAILED, status);
+  service->network_paused = false;
+  service->rebuild_paused = false;
+  service->rebuild_port_ready = false;
+  service->rebuilding = false;
+  return status;
+}
+
+ftun_status_t ftun_tun_service_quiesce_io(ftun_tun_service_t *service)
+{
+  ftun_status_t result, status;
+  bool was_quiesced;
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->callback_depth != 0u || service->rebuilding) return FTUN_E_AGAIN;
+  was_quiesced = service->quiesced;
+  service->quiesced = true;
   service->accepting = false;
   result = ftun_event_source_cancel(&service->source);
   status = ftun_tun_service_all_outputs_clear(service);
@@ -492,6 +690,30 @@ ftun_status_t ftun_tun_service_quiesce(ftun_tun_service_t *service)
   status = ftun_tun_service_all_inputs_clear(service);
   if (status != FTUN_OK && result == FTUN_OK) result = status;
   service->events = 0u;
+  if (result == FTUN_OK && !was_quiesced) {
+    ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_QUIESCED, FTUN_OK);
+  }
+  return result;
+}
+
+ftun_status_t ftun_tun_service_quiesce(ftun_tun_service_t *service)
+{
+  ftun_status_t result;
+  ftun_status_t status;
+  if (service == NULL) return FTUN_E_INVALID;
+  if (service->callback_depth != 0u || service->rebuilding) return FTUN_E_AGAIN;
+  if (service->quiesced && service->source == NULL && !service->network_started &&
+      service->queued_inputs == 0u && service->queued_outputs == 0u) return FTUN_OK;
+  service->quiesced = true;
+  service->accepting = false;
+  result = ftun_event_source_cancel(&service->source);
+  status = ftun_tun_service_all_outputs_clear(service);
+  if (status != FTUN_OK && result == FTUN_OK) result = status;
+  status = ftun_tun_service_all_inputs_clear(service);
+  if (status != FTUN_OK && result == FTUN_OK) result = status;
+  service->events = 0u;
+  status = ftun_tun_service_network_withdraw(service);
+  if (status != FTUN_OK && result == FTUN_OK) result = status;
   if (result == FTUN_OK) {
     ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_QUIESCED, FTUN_OK);
   }
@@ -506,6 +728,7 @@ ftun_status_t ftun_tun_service_get_usage(
   if (service == NULL || out == NULL) return FTUN_E_INVALID;
   out->device = service->info;
   out->device_generation = service->device_generation;
+  out->network_generation = service->network_generation;
   out->active_leases = service->active_leases;
   out->queued_inputs = service->queued_inputs;
   out->queued_input_bytes = service->queued_input_bytes;
@@ -569,14 +792,15 @@ ftun_status_t ftun_tun_service_destroy(ftun_tun_service_t **service)
   if (service == NULL) return FTUN_E_INVALID;
   owned = *service;
   if (owned == NULL) return FTUN_OK;
-  if (owned->active_leases != 0u) return FTUN_E_AGAIN;
+  if (owned->active_leases != 0u || owned->rebuilding ||
+      owned->callback_depth != 0u) return FTUN_E_AGAIN;
   status = ftun_event_source_cancel(&owned->source);
   if (status != FTUN_OK) return status;
   status = ftun_tun_service_all_outputs_clear(owned);
   if (status != FTUN_OK) return status;
   status = ftun_tun_service_all_inputs_clear(owned);
   if (status != FTUN_OK) return status;
-  status = owned->ops.close(owned->ops.user, &owned->port);
+  status = ftun_tun_service_device_close(owned);
   if (status != FTUN_OK) return status;
   reservation = owned->reservation;
   owned->reservation = NULL;

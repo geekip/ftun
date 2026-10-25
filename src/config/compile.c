@@ -1,5 +1,6 @@
 #include "compile.h"
 #include "model.h"
+#include "core/budget.h"
 #include "validate.h"
 #include <stdlib.h>
 #include <string.h>
@@ -530,9 +531,12 @@ static void ftun_plan_compile_definitions(const ftun_config_t *config,
 ftun_status_t ftun_feature_plan_destroy(ftun_feature_plan_t **plan)
 {
   ftun_feature_plan_t *owned;
+  ftun_status_t status;
   if (plan == NULL) return FTUN_E_INVALID;
   owned = *plan;
   if (owned == NULL) return FTUN_OK;
+  status = ftun_reservation_release(&owned->reservation);
+  if (status != FTUN_OK) return status;
   free(owned->outbound_states);
   free(owned->dns_server_states);
   free(owned->rule_order);
@@ -545,14 +549,31 @@ ftun_status_t ftun_feature_plan_destroy(ftun_feature_plan_t **plan)
 ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan_t **out)
 {
   ftun_feature_plan_t *plan;
+  ftun_reservation_t *reservation = NULL;
+  size_t bytes = sizeof(*plan);
   ftun_status_t status;
   int needs_default_dns = 0;
   if (out != NULL) *out = NULL;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_config_validate(config, NULL);
   if (status != FTUN_OK) return status;
+  if (config->outbound_count > SIZE_MAX - bytes) return FTUN_E_LIMIT;
+  bytes += config->outbound_count;
+  if (config->dns.server_count > SIZE_MAX - bytes) return FTUN_E_LIMIT;
+  bytes += config->dns.server_count;
+  if (config->rules.count > (SIZE_MAX - bytes) / sizeof(size_t)) return FTUN_E_LIMIT;
+  bytes += config->rules.count * sizeof(size_t);
+  if (config->budget != NULL) {
+    status = ftun_budget_reserve(config->budget, bytes, &reservation);
+    if (status != FTUN_OK) return status;
+  }
   plan = (ftun_feature_plan_t *)calloc(1u, sizeof(*plan));
-  if (plan == NULL) return FTUN_E_LIMIT;
+  if (plan == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  plan->owned_bytes = bytes;
+  plan->reservation = reservation;
   plan->outbound_count = config->outbound_count;
   plan->dns_server_count = config->dns.server_count;
   plan->rule_count = config->rules.count;

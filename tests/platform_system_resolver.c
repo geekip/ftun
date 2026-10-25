@@ -26,7 +26,7 @@ typedef struct {
   int calls;
   ftun_status_t status;
   uint32_t mark;
-  char device[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char device[FTUN_SOCKET_INTERFACE_BYTES];
 } path_state_t;
 
 typedef struct {
@@ -407,7 +407,7 @@ static int test_path_and_input_boundaries(void)
   ftun_operation_t *operation = (ftun_operation_t *)(uintptr_t)1;
   char embedded[] = {'a', '\0', 'b'};
   char long_label[65];
-  char device[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char device[FTUN_SOCKET_INTERFACE_BYTES];
   CHECK(fixture_start(&fixture, 1u) == 0);
   fixture.request.user = &state;
   fixture.path.status = FTUN_E_REJECTED;

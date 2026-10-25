@@ -1,4 +1,6 @@
 #include "core/budget.h"
+#include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 
@@ -21,8 +23,296 @@ static int check_usage(ftun_budget_t *budget, size_t used, size_t normal,
   return 0;
 }
 
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+  size_t arrived;
+  size_t generation;
+  size_t participants;
+} test_barrier_t;
+
+static int barrier_init(test_barrier_t *barrier, size_t participants)
+{
+  barrier->arrived = 0u;
+  barrier->generation = 0u;
+  barrier->participants = participants;
+  CHECK(pthread_mutex_init(&barrier->mutex, NULL) == 0);
+  CHECK(pthread_cond_init(&barrier->condition, NULL) == 0);
+  return 0;
+}
+
+static void barrier_wait(test_barrier_t *barrier)
+{
+  size_t generation;
+  (void)pthread_mutex_lock(&barrier->mutex);
+  generation = barrier->generation;
+  if (++barrier->arrived == barrier->participants) {
+    barrier->arrived = 0u;
+    barrier->generation++;
+    (void)pthread_cond_broadcast(&barrier->condition);
+  } else {
+    while (barrier->generation == generation)
+      (void)pthread_cond_wait(&barrier->condition, &barrier->mutex);
+  }
+  (void)pthread_mutex_unlock(&barrier->mutex);
+}
+
+static int barrier_destroy(test_barrier_t *barrier)
+{
+  CHECK(pthread_cond_destroy(&barrier->condition) == 0);
+  CHECK(pthread_mutex_destroy(&barrier->mutex) == 0);
+  return 0;
+}
+
+#define ADMISSION_ROUNDS 300u
+
+typedef struct {
+  ftun_budget_t *leaf;
+  test_barrier_t *barrier;
+  ftun_reservation_t *reservation;
+  ftun_status_t status;
+} admission_state_t;
+
+static void *admit_concurrently(void *user)
+{
+  admission_state_t *state = user;
+  size_t round;
+  for (round = 0u; round < ADMISSION_ROUNDS; round++) {
+    barrier_wait(state->barrier);
+    state->status = ftun_budget_reserve_resources(state->leaf,
+      (ftun_budget_resources_t){1u, 1u, 1u}, &state->reservation);
+    barrier_wait(state->barrier);
+    /* owner 在第三道屏障前接管并释放成功的 reservation。 */
+    barrier_wait(state->barrier);
+  }
+  return NULL;
+}
+
+static int concurrent_admission(void)
+{
+  ftun_budget_options_t options = {{1u, 1u, 1u}, {0u, 0u, 0u}, {0u, 0u, 0u}};
+  ftun_budget_t *root = NULL, *modules[2] = {NULL, NULL};
+  ftun_budget_t *leaves[2] = {NULL, NULL};
+  admission_state_t states[2];
+  pthread_t threads[2];
+  test_barrier_t barrier;
+  ftun_budget_usage_t usage;
+  size_t root_metadata, tree_metadata, index, round;
+  CHECK(ftun_budget_create_resources(NULL, &options, &root) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+  root_metadata = usage.metadata_bytes;
+  CHECK(root_metadata != 0u);
+  CHECK(barrier_init(&barrier, 3u) == 0);
+  for (index = 0u; index < 2u; index++) {
+    CHECK(ftun_budget_create_resources(root, &options, &modules[index]) == FTUN_OK);
+    CHECK(ftun_budget_create_resources(modules[index], &options, &leaves[index]) == FTUN_OK);
+    states[index].leaf = leaves[index];
+    states[index].barrier = &barrier;
+    states[index].reservation = NULL;
+    states[index].status = FTUN_E_STATE_CORRUPT;
+    CHECK(pthread_create(&threads[index], NULL, admit_concurrently, &states[index]) == 0);
+  }
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+  tree_metadata = usage.metadata_bytes;
+  CHECK(tree_metadata > root_metadata);
+  for (round = 0u; round < ADMISSION_ROUNDS; round++) {
+    size_t accepted = 0u;
+    barrier_wait(&barrier);
+    barrier_wait(&barrier);
+    for (index = 0u; index < 2u; index++) {
+      CHECK(states[index].status == FTUN_OK || states[index].status == FTUN_E_LIMIT);
+      if (states[index].status == FTUN_OK) accepted++;
+      else CHECK(states[index].reservation == NULL);
+    }
+    CHECK(accepted == 1u);
+    CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+    CHECK(usage.used_resources.memory_bytes == 1u &&
+          usage.used_resources.descriptors == 1u &&
+          usage.used_resources.queue_slots == 1u &&
+          usage.metadata_bytes > tree_metadata);
+    for (index = 0u; index < 2u; index++) {
+      CHECK(ftun_reservation_release(&states[index].reservation) == FTUN_OK);
+    }
+    CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+    CHECK(usage.used == 0u && usage.metadata_bytes == tree_metadata);
+    barrier_wait(&barrier);
+  }
+  for (index = 0u; index < 2u; index++) {
+    CHECK(pthread_join(threads[index], NULL) == 0);
+    CHECK(ftun_budget_destroy(&leaves[index]) == FTUN_OK);
+    CHECK(ftun_budget_destroy(&modules[index]) == FTUN_OK);
+  }
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+  CHECK(usage.metadata_bytes == root_metadata && usage.child_count == 0u);
+  CHECK(ftun_budget_destroy(&root) == FTUN_OK);
+  CHECK(barrier_destroy(&barrier) == 0);
+  return 0;
+}
+
+typedef struct {
+  pthread_mutex_t mutex;
+  ftun_budget_t *root;
+  size_t done;
+} churn_shared_t;
+
+typedef struct {
+  churn_shared_t *shared;
+  int result;
+} churn_state_t;
+
+static int run_churn(churn_shared_t *shared)
+{
+  ftun_budget_options_t module_options = {
+    {64u, 32u, 32u}, {0u, 0u, 0u}, {8u, 4u, 4u}
+  };
+  ftun_budget_options_t leaf_options = {
+    {64u, 32u, 32u}, {0u, 0u, 0u}, {0u, 0u, 0u}
+  };
+  size_t round;
+  for (round = 0u; round < 300u; round++) {
+    ftun_budget_t *module = NULL, *leaf = NULL;
+    ftun_reservation_t *reservations[8] = {NULL};
+    ftun_reservation_t *cleanup = NULL;
+    ftun_budget_usage_t usage;
+    size_t index;
+    CHECK(ftun_budget_create_resources(shared->root, &module_options, &module) == FTUN_OK);
+    CHECK(ftun_budget_create_resources(module, &leaf_options, &leaf) == FTUN_OK);
+    for (index = 0u; index < 8u; index++) {
+      ftun_status_t status = ftun_budget_reserve_resources(leaf,
+        (ftun_budget_resources_t){1u, 1u, 1u}, &reservations[index]);
+      CHECK(status == FTUN_OK || status == FTUN_E_LIMIT);
+      if (reservations[index] != NULL) {
+        status = ftun_reservation_resize(reservations[index],
+          (ftun_budget_resources_t){2u, 2u, 2u});
+        CHECK(status == FTUN_OK || status == FTUN_E_LIMIT);
+        CHECK(ftun_reservation_resize(reservations[index],
+          (ftun_budget_resources_t){1u, 1u, 1u}) == FTUN_OK);
+      }
+      CHECK(ftun_budget_get_usage(leaf, &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == usage.used_resources.descriptors &&
+            usage.used_resources.memory_bytes == usage.used_resources.queue_slots);
+    }
+    CHECK(ftun_budget_reserve_cleanup_resources(leaf,
+      (ftun_budget_resources_t){1u, 1u, 1u}, &cleanup) == FTUN_OK);
+    CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+    for (index = 0u; index < 8u; index++)
+      CHECK(ftun_reservation_release(&reservations[index]) == FTUN_OK);
+    CHECK(ftun_budget_destroy(&leaf) == FTUN_OK);
+    CHECK(ftun_budget_destroy(&module) == FTUN_OK);
+  }
+  return 0;
+}
+
+static void *churn(void *user)
+{
+  churn_state_t *state = user;
+  state->result = run_churn(state->shared);
+  (void)pthread_mutex_lock(&state->shared->mutex);
+  state->shared->done++;
+  (void)pthread_mutex_unlock(&state->shared->mutex);
+  return NULL;
+}
+
+static int concurrent_tree_lifecycle(void)
+{
+  ftun_budget_options_t options = {
+    {64u, 64u, 64u}, {8u, 8u, 8u}, {0u, 0u, 0u}
+  };
+  churn_shared_t shared;
+  churn_state_t states[4];
+  pthread_t threads[4];
+  ftun_budget_usage_t usage;
+  size_t metadata, index, done = 0u;
+  shared.done = 0u;
+  CHECK(pthread_mutex_init(&shared.mutex, NULL) == 0);
+  CHECK(ftun_budget_create_resources(NULL, &options, &shared.root) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(shared.root, &usage) == FTUN_OK);
+  metadata = usage.metadata_bytes;
+  for (index = 0u; index < 4u; index++) {
+    states[index].shared = &shared;
+    states[index].result = -1;
+    CHECK(pthread_create(&threads[index], NULL, churn, &states[index]) == 0);
+  }
+  while (done != 4u) {
+    CHECK(ftun_budget_get_usage(shared.root, &usage) == FTUN_OK);
+    CHECK(usage.used_resources.memory_bytes == usage.used_resources.descriptors &&
+          usage.used_resources.memory_bytes == usage.used_resources.queue_slots &&
+          usage.used_resources.descriptors <= options.limit.descriptors &&
+          usage.child_count <= 4u && usage.metadata_bytes >= metadata);
+    (void)pthread_mutex_lock(&shared.mutex);
+    done = shared.done;
+    (void)pthread_mutex_unlock(&shared.mutex);
+    (void)sched_yield();
+  }
+  for (index = 0u; index < 4u; index++) {
+    CHECK(pthread_join(threads[index], NULL) == 0);
+    CHECK(states[index].result == 0);
+  }
+  CHECK(ftun_budget_get_usage(shared.root, &usage) == FTUN_OK);
+  CHECK(usage.used == 0u && usage.child_count == 0u && usage.metadata_bytes == metadata);
+  CHECK(ftun_budget_destroy(&shared.root) == FTUN_OK);
+  CHECK(pthread_mutex_destroy(&shared.mutex) == 0);
+  return 0;
+}
+
+static int reservation_resize(void)
+{
+  ftun_budget_t *root = NULL, *first = NULL, *second = NULL;
+  ftun_reservation_t *value = NULL, *cleanup = NULL;
+  ftun_budget_options_t root_options = {{100u, 10u, 10u}, {10u, 1u, 1u}, {0}};
+  ftun_budget_options_t child_options = {{90u, 9u, 9u}, {0}, {20u, 2u, 2u}};
+  ftun_budget_usage_t before, after;
+  CHECK(ftun_budget_create_resources(NULL, &root_options, &root) == FTUN_OK);
+  CHECK(ftun_budget_create_resources(root, &child_options, &first) == FTUN_OK);
+  CHECK(ftun_budget_create_resources(root, &child_options, &second) == FTUN_OK);
+  CHECK(ftun_budget_reserve_resources(first, (ftun_budget_resources_t){10u, 1u, 1u}, &value) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &before) == FTUN_OK);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){70u, 7u, 7u}) == FTUN_OK);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){71u, 6u, 6u}) == FTUN_E_LIMIT);
+  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used == 70u &&
+    after.used_resources.descriptors == 7u && after.used_resources.queue_slots == 7u);
+  CHECK(after.metadata_bytes == before.metadata_bytes);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){5u, 8u, 1u}) == FTUN_E_LIMIT);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){20u, 2u, 2u}) == FTUN_OK);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){10u, 3u, 1u}) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used == 10u &&
+    after.used_resources.descriptors == 3u && after.used_resources.queue_slots == 1u);
+  CHECK(ftun_reservation_resize(value, (ftun_budget_resources_t){0}) == FTUN_E_INVALID);
+  CHECK(ftun_reservation_resize(NULL, (ftun_budget_resources_t){1u, 0u, 0u}) == FTUN_E_INVALID);
+  CHECK(ftun_reservation_release(&value) == FTUN_OK);
+  CHECK(ftun_budget_reserve_cleanup_resources(root, (ftun_budget_resources_t){1u, 1u, 1u}, &cleanup) == FTUN_OK);
+  CHECK(ftun_reservation_resize(cleanup, (ftun_budget_resources_t){100u, 10u, 10u}) == FTUN_OK);
+  CHECK(ftun_reservation_resize(cleanup, (ftun_budget_resources_t){101u, 10u, 10u}) == FTUN_E_LIMIT);
+  CHECK(ftun_reservation_resize(cleanup, (ftun_budget_resources_t){1u, 1u, 1u}) == FTUN_OK);
+  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&first) == FTUN_OK && ftun_budget_destroy(&second) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&root) == FTUN_OK);
+  return 0;
+}
+
+static int independent_dimensions(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_reservation_t *normal = NULL, *cleanup = NULL, *memory = NULL;
+  ftun_budget_options_t options = {{100u, 10u, 10u}, {10u, 1u, 1u}, {0}};
+  ftun_budget_usage_t usage;
+  CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
+  CHECK(ftun_budget_reserve_resources(budget, (ftun_budget_resources_t){10u, 1u, 0u}, &normal) == FTUN_OK);
+  CHECK(ftun_budget_reserve_cleanup_resources(budget, (ftun_budget_resources_t){0u, 9u, 0u}, &cleanup) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, 1u, &memory) == FTUN_OK);
+  CHECK(ftun_reservation_release(&memory) == FTUN_OK);
+  CHECK(ftun_reservation_resize(normal, (ftun_budget_resources_t){20u, 0u, 0u}) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 20u && usage.used_resources.descriptors == 9u);
+  CHECK(ftun_budget_reserve(budget, 71u, &memory) == FTUN_E_LIMIT && memory == NULL);
+  CHECK(ftun_reservation_release(&normal) == FTUN_OK && ftun_reservation_release(&cleanup) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(reservation_resize() == 0);
+  CHECK(independent_dimensions() == 0);
   ftun_budget_t *global = (ftun_budget_t *)(uintptr_t)1;
   ftun_budget_t *module = (ftun_budget_t *)(uintptr_t)1;
   ftun_budget_t *nested = (ftun_budget_t *)(uintptr_t)1;
@@ -185,5 +475,7 @@ int main(void)
           usage.used == 0u && usage.child_count == 0u);
     CHECK(ftun_budget_destroy(&global) == FTUN_OK);
   }
+  CHECK(concurrent_admission() == 0);
+  CHECK(concurrent_tree_lifecycle() == 0);
   return 0;
 }

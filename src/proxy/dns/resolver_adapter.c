@@ -109,49 +109,6 @@ static ftun_status_t ftun_resolver_validate(
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_resolver_system(
-  void *context, ftun_core_t *core,
-  const ftun_system_resolve_request_t *request, ftun_operation_t **out)
-{
-  (void)context;
-  return ftun_system_resolve(core, request, out);
-}
-
-static ftun_status_t ftun_resolver_bootstrap(
-  void *context, ftun_core_t *core,
-  const ftun_bootstrap_request_t *request, ftun_operation_t **out)
-{
-  (void)context;
-#if defined(FTUN_HAVE_MODULE_DNS)
-  return ftun_bootstrap_resolve(core, request, out);
-#else
-  (void)core;
-  (void)request;
-  if (out != NULL) *out = NULL;
-  return FTUN_E_UNSUPPORTED;
-#endif
-}
-
-static ftun_status_t ftun_resolver_server(
-  void *context, ftun_core_t *core, ftun_string_t server,
-  const ftun_bootstrap_request_t *request, ftun_operation_t **out)
-{
-  (void)context;
-  (void)core;
-  (void)server;
-  (void)request;
-  if (out != NULL) *out = NULL;
-  /* 命名 DNS 必须由 Proxy/DNS adapter 显式注入 backend。 */
-  return FTUN_E_AGAIN;
-}
-
-static const ftun_resolver_backend_t ftun_resolver_default_backend = {
-  ftun_resolver_system,
-  ftun_resolver_bootstrap,
-  ftun_resolver_server,
-  NULL
-};
-
 /* TASK-DNS-005 / TEST-DNS-005，目标 0.2.0：路由前 REAL 来源选择。 */
 ftun_status_t ftun_resolve_real_with_backend(
   ftun_core_t *core, const ftun_resolve_request_t *request,
@@ -187,10 +144,55 @@ ftun_status_t ftun_resolve_real_with_backend(
                                   &request->query, out);
 }
 
-ftun_status_t ftun_resolve_real(ftun_core_t *core,
-                                const ftun_resolve_request_t *request,
-                                ftun_operation_t **out)
+ftun_status_t ftun_proxy_dns_resolve_with_provider(
+  ftun_core_t *core, ftun_resolver_scope_t *scope, bool dns_enabled,
+  ftun_string_t default_server, const ftun_bootstrap_request_t *query,
+  ftun_dial_purpose_t purpose, ftun_operation_t **out)
 {
-  return ftun_resolve_real_with_backend(core, request,
-                                         &ftun_resolver_default_backend, out);
+  ftun_resolver_provider_request_t request = {0};
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (core == NULL || scope == NULL || query == NULL || out == NULL ||
+      !ftun_resolver_name_valid(default_server)) return FTUN_E_INVALID;
+  status = ftun_resolver_scope_generation(scope, &request.generation);
+  if (status != FTUN_OK) return status;
+  request.system.worker = query->worker;
+  request.system.budget = query->budget;
+  request.system.domain = query->domain;
+  request.system.protection = query->protection;
+  request.system.deadline_ms = query->deadline_ms;
+  request.system.check_path = query->check_system_path;
+  request.system.path_user = query->system_path_user;
+  request.system.completion = query->completion;
+  request.system.user = query->user;
+  request.purpose = purpose;
+  request.requested_domain = FTUN_DIAL_DOMAIN_UNDERLAY;
+  request.loop = query->loop;
+  request.operations = query->operations;
+  request.network_view = query->network_view;
+  request.network_generation = query->network_generation;
+  request.query_id = query->query_id;
+  if (!dns_enabled) request.source = FTUN_RESOLVER_SYSTEM;
+  else if (default_server.length != 0u) {
+    request.source = FTUN_RESOLVER_NAMED;
+    request.resolver_name = default_server;
+  } else {
+    request.source = FTUN_RESOLVER_BOOTSTRAP;
+    request.servers = query->servers;
+    request.server_count = query->server_count;
+  }
+  return ftun_resolver_scope_start(scope, core, &request, out);
+}
+
+ftun_status_t ftun_resolve_real_with_provider(ftun_core_t *core,
+  const ftun_resolve_request_t *request, ftun_resolver_scope_t *scope,
+  ftun_operation_t **out)
+{
+  ftun_status_t status;
+  if (out != NULL) *out = NULL;
+  if (out == NULL) return FTUN_E_INVALID;
+  status = ftun_resolver_validate(request);
+  return status == FTUN_OK ? ftun_proxy_dns_resolve_with_provider(core, scope,
+    request->dns_enabled, request->default_server, &request->query,
+    FTUN_DIAL_PURPOSE_BUSINESS, out) : status;
 }

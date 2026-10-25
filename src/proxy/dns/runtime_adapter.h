@@ -15,7 +15,8 @@ typedef struct {
 bool ftun_proxy_dns_runtime_adapter_valid(
   const ftun_proxy_dns_runtime_adapter_t *adapter);
 ftun_status_t ftun_proxy_dns_select_member(
-  void *user, uint32_t group_id, uint32_t *out_member);
+  void *user, const ftun_config_t *expected_config,
+  uint32_t group_id, uint32_t *out_member);
 bool ftun_proxy_dns_has_hijack(
   const ftun_proxy_dns_runtime_adapter_t *adapter);
 ftun_status_t ftun_proxy_dns_hijack_tcp(

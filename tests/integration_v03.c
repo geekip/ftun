@@ -79,8 +79,19 @@ static int poll_worker(ftun_worker_t *worker, store_completion_t *completion,
   return completion->calls == expected;
 }
 
+static ftun_status_t transport_select(void *user, uint32_t root,
+  ftun_dns_transport_binding_t *out)
+{
+  memset(out, 0, sizeof(*out));
+  out->scope = user;
+  out->root_id = root;
+  out->leaf_id = root;
+  return FTUN_OK;
+}
+
 static ftun_status_t transport_submit(
-  void *user, uint32_t outbound, uint64_t policy_fingerprint,
+  void *user, const ftun_dns_transport_binding_t *binding,
+  uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
   ftun_dns_transport_t protocol, ftun_bytes_t query, uint64_t deadline,
   ftun_dns_transport_completion_fn completion, void *completion_user,
@@ -96,7 +107,7 @@ static ftun_status_t transport_submit(
   transport->user = completion_user;
   transport->source = *upstream;
   transport->protocol = protocol;
-  transport->outbound = outbound;
+  transport->outbound = binding->root_id;
   transport->pending = 1;
   *out_request = transport;
   return FTUN_OK;
@@ -337,6 +348,7 @@ int main(void)
   server_options.transport = FTUN_DNS_TRANSPORT_UDP;
   server_options.tcp_fallback = true;
   server_options.max_response_bytes = 512u;
+  server_options.query_transport.select = transport_select;
   server_options.query_transport.submit = transport_submit;
   server_options.query_transport.cancel = transport_cancel;
   server_options.query_transport.context = &transport;
@@ -350,6 +362,7 @@ int main(void)
   CHECK(ftun_dns_server_create(&server_options, &servers[1]) == FTUN_OK);
   views[0] = servers[0]; views[1] = servers[1];
   dispatcher_options.budget = budget;
+  CHECK(ftun_runtime_active_config(core, &dispatcher_options.config_scope) == FTUN_OK);
   dispatcher_options.operations = operations;
   dispatcher_options.servers = views;
   dispatcher_options.server_count = 2u;

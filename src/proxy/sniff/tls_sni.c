@@ -1,4 +1,5 @@
 #include "tls_sni.h"
+#include "core/budget.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -115,9 +116,10 @@ static ftun_status_t ftun_tls_client_hello(const uint8_t *data, size_t length,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_sniff_tls_sni(ftun_bytes_t preread, ftun_sniff_result_t *out)
+ftun_status_t ftun_sniff_tls_sni_with_budget(ftun_budget_t *budget, ftun_bytes_t preread, ftun_sniff_result_t *out)
 {
   uint8_t *handshake = NULL;
+  ftun_reservation_t *reservation = NULL;
   size_t handshake_length = 0u;
   size_t cursor = 0u;
   size_t wanted = 4u;
@@ -131,8 +133,15 @@ ftun_status_t ftun_sniff_tls_sni(ftun_bytes_t preread, ftun_sniff_result_t *out)
     return FTUN_OK;
   }
   if (preread.length > FTUN_SNIFF_TLS_MAX_BYTES) return FTUN_E_PROTOCOL;
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, FTUN_SNIFF_TLS_MAX_BYTES, &reservation);
+    if (status != FTUN_OK) return status;
+  }
   handshake = (uint8_t *)malloc(FTUN_SNIFF_TLS_MAX_BYTES);
-  if (handshake == NULL) return FTUN_E_LIMIT;
+  if (handshake == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
   while (cursor < preread.length && handshake_length < wanted) {
     size_t record_length;
     size_t take;
@@ -179,6 +188,12 @@ ftun_status_t ftun_sniff_tls_sni(ftun_bytes_t preread, ftun_sniff_result_t *out)
 
 done:
   free(handshake);
+  if (ftun_reservation_release(&reservation) != FTUN_OK) status = FTUN_E_STATE_CORRUPT;
   if (status != FTUN_OK) memset(out, 0, sizeof(*out));
   return status;
+}
+
+ftun_status_t ftun_sniff_tls_sni(ftun_bytes_t preread, ftun_sniff_result_t *out)
+{
+  return ftun_sniff_tls_sni_with_budget(NULL, preread, out);
 }

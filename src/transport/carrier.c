@@ -13,6 +13,12 @@ typedef enum {
   FTUN_CARRIER_MESSAGE_CALLBACK
 } ftun_carrier_message_state_t;
 
+struct ftun_carrier_message;
+typedef struct {
+  struct ftun_carrier_message *head;
+  struct ftun_carrier_message *tail;
+} ftun_carrier_pending_t;
+
 typedef struct {
   ftun_carrier_t *carrier;
   ftun_operation_queue_t *return_operations;
@@ -27,9 +33,12 @@ typedef struct {
   size_t pending_bytes;
   size_t active_flows;
   size_t message_cursor;
+  ftun_carrier_pending_t pending;
   int accepting;
   int in_callback;
 } ftun_carrier_owner_t;
+
+struct ftun_carrier_message;
 
 typedef struct {
   ftun_carrier_t *carrier;
@@ -45,12 +54,24 @@ typedef struct {
   size_t max_pending_bytes;
   size_t pending_messages;
   size_t pending_bytes;
+  struct ftun_carrier_message *send_head;
+  struct ftun_carrier_message *send_tail;
+  ftun_carrier_pending_t pending;
   int accepting;
 } ftun_carrier_flow_t;
 
 typedef struct ftun_carrier_message {
   ftun_carrier_t *carrier;
   struct ftun_carrier_message *free_next;
+  struct ftun_carrier_message *send_previous;
+  struct ftun_carrier_message *send_next;
+  struct ftun_carrier_message *ready_left;
+  struct ftun_carrier_message *ready_right;
+  struct ftun_carrier_message *ready_parent;
+  struct ftun_carrier_message *pending_previous[3];
+  struct ftun_carrier_message *pending_next[3];
+  int ready_height;
+  int ready_linked;
   ftun_operation_t *operation;
   ftun_operation_token_t completion_token;
   ftun_buffer_slice_t payload;
@@ -69,6 +90,7 @@ typedef struct ftun_carrier_message {
   size_t offset;
   size_t offered;
   size_t accepted;
+  int send_linked;
 } ftun_carrier_message_t;
 
 struct ftun_carrier {
@@ -79,6 +101,21 @@ struct ftun_carrier {
   ftun_carrier_flow_t *flows;
   ftun_carrier_message_t *messages;
   ftun_carrier_message_t *free_messages;
+  ftun_carrier_message_t *ready[2];
+  size_t ready_empty_datagrams;
+  size_t last_selection_visits;
+  size_t last_work;
+  size_t selection_visits;
+  size_t max_selection_visits;
+  int processing;
+  int cancelling;
+  int failing;
+  ftun_carrier_pending_t pending;
+  size_t index_visits;
+  size_t last_index_visits;
+  size_t last_cleanup_visits;
+  size_t cleanup_visits;
+  size_t last_backend_attempts;
   size_t max_owners;
   size_t max_flows;
   size_t max_pending_messages;
@@ -115,6 +152,34 @@ struct ftun_carrier {
 static void ftun_carrier_count(size_t *value)
 {
   if (*value != SIZE_MAX) (*value)++;
+}
+
+static size_t ftun_carrier_work_add(size_t left, size_t right)
+{ return right > SIZE_MAX - left ? SIZE_MAX : left + right; }
+
+static void ftun_carrier_work_begin(ftun_carrier_t *carrier)
+{
+  carrier->last_selection_visits = carrier->last_cleanup_visits = 0u;
+  carrier->last_work = carrier->last_backend_attempts = 0u;
+  carrier->last_index_visits = 0u;
+}
+
+static void ftun_carrier_work_end(ftun_carrier_t *carrier)
+{
+  carrier->selection_visits = ftun_carrier_work_add(carrier->selection_visits, carrier->last_selection_visits);
+  carrier->cleanup_visits = ftun_carrier_work_add(carrier->cleanup_visits, carrier->last_cleanup_visits);
+  if (carrier->last_selection_visits > carrier->max_selection_visits)
+    carrier->max_selection_visits = carrier->last_selection_visits;
+  carrier->last_work = ftun_carrier_work_add(carrier->last_selection_visits, carrier->last_backend_attempts);
+  carrier->last_work = ftun_carrier_work_add(carrier->last_work, carrier->last_index_visits);
+  carrier->last_work = ftun_carrier_work_add(carrier->last_work, carrier->last_cleanup_visits);
+}
+
+static void ftun_carrier_index_count(ftun_carrier_t *carrier)
+{
+  ftun_carrier_count(&carrier->index_visits);
+  if (carrier->processing || carrier->cancelling || carrier->failing)
+    ftun_carrier_count(&carrier->last_index_visits);
 }
 
 static uint64_t ftun_carrier_next_generation(ftun_carrier_t *carrier)
@@ -236,6 +301,226 @@ static void ftun_carrier_wake_owner(ftun_carrier_message_t *message)
   }
 }
 
+/* 三条独立拥有链：全连接、owner、flow。RETURNING仍占拥有额度，
+ * 直到Operation回调返回才摘链；遍历先轮转当前项，不跨后端调用保存next。 */
+static void ftun_carrier_pending_append(ftun_carrier_pending_t *list,
+  ftun_carrier_message_t *message, size_t lane)
+{
+  message->pending_previous[lane] = list->tail;
+  message->pending_next[lane] = NULL;
+  if (list->tail != NULL) list->tail->pending_next[lane] = message;
+  else list->head = message;
+  list->tail = message;
+}
+
+static void ftun_carrier_pending_remove(ftun_carrier_pending_t *list,
+  ftun_carrier_message_t *message, size_t lane)
+{
+  if (message->pending_previous[lane] != NULL) message->pending_previous[lane]->pending_next[lane] = message->pending_next[lane];
+  else list->head = message->pending_next[lane];
+  if (message->pending_next[lane] != NULL) message->pending_next[lane]->pending_previous[lane] = message->pending_previous[lane];
+  else list->tail = message->pending_previous[lane];
+  message->pending_next[lane] = message->pending_previous[lane] = NULL;
+}
+
+static void ftun_carrier_pending_rotate(ftun_carrier_pending_t *list, size_t lane)
+{
+  ftun_carrier_message_t *message = list->head;
+  if (message == list->tail) return;
+  ftun_carrier_pending_remove(list, message, lane);
+  ftun_carrier_pending_append(list, message, lane);
+}
+
+static void ftun_carrier_pending_link(ftun_carrier_message_t *message)
+{
+  ftun_carrier_owner_t *owner = ftun_carrier_message_owner(message);
+  ftun_carrier_flow_t *flow = ftun_carrier_message_flow(message);
+  ftun_carrier_pending_append(&message->carrier->pending, message, 0u);
+  ftun_carrier_pending_append(&owner->pending, message, 1u);
+  if (flow != NULL) ftun_carrier_pending_append(&flow->pending, message, 2u);
+}
+
+static void ftun_carrier_pending_unlink(ftun_carrier_message_t *message)
+{
+  ftun_carrier_owner_t *owner = ftun_carrier_message_owner(message);
+  ftun_carrier_flow_t *flow = ftun_carrier_message_flow(message);
+  ftun_carrier_pending_remove(&message->carrier->pending, message, 0u);
+  ftun_carrier_pending_remove(&owner->pending, message, 1u);
+  if (flow != NULL) ftun_carrier_pending_remove(&flow->pending, message, 2u);
+}
+
+/* 只索引可重试的控制帧/Datagram和Stream队首，按owner/slot排序。
+ * 槽位数组仍拥有对象；AVL链接随实际sizeof准入，不分配调度节点。 */
+static int ftun_carrier_ready_height(ftun_carrier_message_t *node)
+{ return node == NULL ? 0 : node->ready_height; }
+
+static void ftun_carrier_ready_refresh(ftun_carrier_message_t *node)
+{
+  int left = ftun_carrier_ready_height(node->ready_left);
+  int right = ftun_carrier_ready_height(node->ready_right);
+  node->ready_height = 1 + (left > right ? left : right);
+}
+
+static void ftun_carrier_ready_replace(ftun_carrier_message_t *old,
+  ftun_carrier_message_t *replacement)
+{
+  if (old->ready_parent == NULL) old->carrier->ready[old->kind == FTUN_CARRIER_SEND_CONTROL] = replacement;
+  else if (old->ready_parent->ready_left == old) old->ready_parent->ready_left = replacement;
+  else old->ready_parent->ready_right = replacement;
+  if (replacement != NULL) replacement->ready_parent = old->ready_parent;
+}
+
+static ftun_carrier_message_t *ftun_carrier_ready_rotate(ftun_carrier_message_t *node, int left)
+{
+  ftun_carrier_message_t *pivot = left ? node->ready_right : node->ready_left;
+  ftun_carrier_index_count(node->carrier);
+  ftun_carrier_ready_replace(node, pivot);
+  if (left) {
+    node->ready_right = pivot->ready_left;
+    if (node->ready_right != NULL) node->ready_right->ready_parent = node;
+    pivot->ready_left = node;
+  } else {
+    node->ready_left = pivot->ready_right;
+    if (node->ready_left != NULL) node->ready_left->ready_parent = node;
+    pivot->ready_right = node;
+  }
+  node->ready_parent = pivot;
+  ftun_carrier_ready_refresh(node);
+  ftun_carrier_ready_refresh(pivot);
+  return pivot;
+}
+
+static void ftun_carrier_ready_balance(ftun_carrier_message_t *node)
+{
+  while (node != NULL) {
+    int balance;
+    ftun_carrier_index_count(node->carrier);
+    ftun_carrier_ready_refresh(node);
+    balance = ftun_carrier_ready_height(node->ready_left) - ftun_carrier_ready_height(node->ready_right);
+    if (balance > 1) {
+      if (ftun_carrier_ready_height(node->ready_left->ready_left) < ftun_carrier_ready_height(node->ready_left->ready_right))
+        (void)ftun_carrier_ready_rotate(node->ready_left, 1);
+      node = ftun_carrier_ready_rotate(node, 0);
+    } else if (balance < -1) {
+      if (ftun_carrier_ready_height(node->ready_right->ready_right) < ftun_carrier_ready_height(node->ready_right->ready_left))
+        (void)ftun_carrier_ready_rotate(node->ready_right, 0);
+      node = ftun_carrier_ready_rotate(node, 1);
+    }
+    node = node->ready_parent;
+  }
+}
+
+static void ftun_carrier_ready_insert(ftun_carrier_message_t *message)
+{
+  ftun_carrier_message_t **place, *parent = NULL;
+  ftun_carrier_flow_t *flow;
+  if (message->ready_linked || message->state != FTUN_CARRIER_MESSAGE_QUEUED) return;
+  if (message->kind == FTUN_CARRIER_SEND_STREAM) {
+    flow = ftun_carrier_message_flow(message);
+    if (flow == NULL || flow->send_head != message) return;
+  }
+  place = &message->carrier->ready[message->kind == FTUN_CARRIER_SEND_CONTROL];
+  while (*place != NULL) {
+    parent = *place;
+    ftun_carrier_index_count(message->carrier);
+    place = message->owner_slot < parent->owner_slot ||
+      (message->owner_slot == parent->owner_slot && message->slot < parent->slot)
+      ? &parent->ready_left : &parent->ready_right;
+  }
+  *place = message;
+  message->ready_parent = parent;
+  message->ready_height = 1;
+  message->ready_linked = 1;
+  if (message->kind == FTUN_CARRIER_SEND_DATAGRAM && message->payload.length == 0u)
+    message->carrier->ready_empty_datagrams++;
+  ftun_carrier_ready_balance(parent);
+}
+
+static void ftun_carrier_ready_remove(ftun_carrier_message_t *message)
+{
+  ftun_carrier_message_t *repair;
+  if (!message->ready_linked) return;
+  if (message->kind == FTUN_CARRIER_SEND_DATAGRAM && message->payload.length == 0u)
+    message->carrier->ready_empty_datagrams--;
+  ftun_carrier_index_count(message->carrier);
+  if (message->ready_left != NULL && message->ready_right != NULL) {
+    ftun_carrier_message_t *next = message->ready_right;
+    while (next->ready_left != NULL) {
+      next = next->ready_left;
+      ftun_carrier_index_count(message->carrier);
+    }
+    if (next->ready_parent == message) repair = next;
+    else {
+      repair = next->ready_parent;
+      ftun_carrier_ready_replace(next, next->ready_right);
+      next->ready_right = message->ready_right;
+      next->ready_right->ready_parent = next;
+    }
+    ftun_carrier_ready_replace(message, next);
+    next->ready_left = message->ready_left;
+    next->ready_left->ready_parent = next;
+  } else {
+    repair = message->ready_parent;
+    ftun_carrier_ready_replace(message, message->ready_left != NULL ? message->ready_left : message->ready_right);
+  }
+  message->ready_left = message->ready_right = message->ready_parent = NULL;
+  message->ready_height = message->ready_linked = 0;
+  ftun_carrier_ready_balance(repair);
+}
+
+static ftun_carrier_message_t *ftun_carrier_ready_lower(ftun_carrier_t *carrier,
+  ftun_carrier_message_t *node, size_t owner, size_t slot)
+{
+  ftun_carrier_message_t *found = NULL;
+  while (node != NULL) {
+    ftun_carrier_count(&carrier->last_selection_visits);
+    if (node->owner_slot < owner || (node->owner_slot == owner && node->slot < slot)) node = node->ready_right;
+    else { found = node; node = node->ready_left; }
+  }
+  return found;
+}
+
+static ftun_carrier_message_t *ftun_carrier_ready_next(ftun_carrier_t *carrier,
+  ftun_carrier_message_t *node)
+{
+  if (node->ready_right != NULL) {
+    node = node->ready_right;
+    ftun_carrier_count(&carrier->last_selection_visits);
+    while (node->ready_left != NULL) {
+      node = node->ready_left;
+      ftun_carrier_count(&carrier->last_selection_visits);
+    }
+    return node;
+  }
+  while (node->ready_parent != NULL && node->ready_parent->ready_right == node) {
+    node = node->ready_parent;
+    ftun_carrier_count(&carrier->last_selection_visits);
+  }
+  return node->ready_parent;
+}
+
+static void ftun_carrier_send_unlink(ftun_carrier_message_t *message)
+{
+  ftun_carrier_flow_t *flow;
+  ftun_carrier_ready_remove(message);
+  if (!message->send_linked) return;
+  flow = ftun_carrier_message_flow(message);
+  if (message->send_previous != NULL) {
+    message->send_previous->send_next = message->send_next;
+  } else {
+    flow->send_head = message->send_next;
+  }
+  if (message->send_next != NULL) {
+    message->send_next->send_previous = message->send_previous;
+  } else {
+    flow->send_tail = message->send_previous;
+  }
+  message->send_previous = NULL;
+  message->send_next = NULL;
+  message->send_linked = 0;
+  if (flow->send_head != NULL) ftun_carrier_ready_insert(flow->send_head);
+}
+
 static void ftun_carrier_credit_release(ftun_carrier_message_t *message)
 {
   ftun_carrier_t *carrier = message->carrier;
@@ -276,6 +561,7 @@ static ftun_status_t ftun_carrier_message_finish(
   if (status != FTUN_OK) return status;
   status = ftun_operation_complete(message->completion_token, error);
   if (status != FTUN_OK) return status;
+  ftun_carrier_send_unlink(message);
   message->state = FTUN_CARRIER_MESSAGE_RETURNING;
   ftun_carrier_wake_owner(message);
   return FTUN_OK;
@@ -291,6 +577,7 @@ static ftun_status_t ftun_carrier_message_cancel(void *user)
   }
   carrier = message->carrier;
   if (message->state == FTUN_CARRIER_MESSAGE_QUEUED) {
+    ftun_carrier_send_unlink(message);
     message->state = FTUN_CARRIER_MESSAGE_RETURNING;
     return FTUN_OK;
   }
@@ -302,6 +589,8 @@ static ftun_status_t ftun_carrier_message_cancel(void *user)
     return FTUN_E_STALE;
   }
   message->state = FTUN_CARRIER_MESSAGE_CANCELLING;
+  if (carrier->processing || carrier->cancelling || carrier->failing)
+    ftun_carrier_count(&carrier->last_cleanup_visits);
   status = carrier->backend.send_cancel(carrier->backend.context,
                                         ftun_carrier_send_token(message));
   if (status != FTUN_OK) {
@@ -309,6 +598,7 @@ static ftun_status_t ftun_carrier_message_cancel(void *user)
     return status;
   }
   ftun_carrier_credit_release(message);
+  ftun_carrier_send_unlink(message);
   message->state = FTUN_CARRIER_MESSAGE_RETURNING;
   return FTUN_OK;
 }
@@ -350,6 +640,7 @@ static void ftun_carrier_message_dispatched(ftun_operation_t *operation,
   completion(operation, error, completion_user);
   owner->in_callback = 0;
 
+  ftun_carrier_pending_unlink(message);
   if (carrier->pending_messages != 0u) carrier->pending_messages--;
   if (carrier->pending_bytes >= length) carrier->pending_bytes -= length;
   if (owner->pending_messages != 0u) owner->pending_messages--;
@@ -431,7 +722,8 @@ ftun_status_t ftun_carrier_create(const ftun_carrier_options_t *options,
     return FTUN_E_LIMIT;
   }
   charge = sizeof(*carrier) + owner_bytes + flow_bytes + message_bytes;
-  resources = (ftun_budget_resources_t){charge, 1u,
+  /* Carrier 本身没有物理 FD；具体 backend 负责其自有传输资源准入。 */
+  resources = (ftun_budget_resources_t){charge, 0u,
                                         options->max_pending_messages};
   status = ftun_budget_reserve_resources(options->budget, resources,
                                          &reservation);
@@ -632,6 +924,14 @@ static ftun_status_t ftun_carrier_message_submit(
   if (!carrier->accepting || !owner->accepting ||
       (flow != NULL && !flow->accepting)) return carrier->failed
     ? carrier->terminal_error.status : FTUN_E_CANCELLED;
+  if ((kind == FTUN_CARRIER_SEND_CONTROL &&
+       bytes.length > carrier->control_credit_bytes) ||
+      (kind == FTUN_CARRIER_SEND_DATAGRAM &&
+       (bytes.length > carrier->connection_credit_bytes ||
+        bytes.length > flow->credit_bytes))) {
+    ftun_carrier_count(&carrier->rejected_messages);
+    return FTUN_E_LIMIT;
+  }
   if (owner->pending_messages >= owner->max_pending_messages ||
       bytes.length > owner->max_pending_bytes - owner->pending_bytes) {
     ftun_carrier_count(&carrier->rejected_messages);
@@ -699,6 +999,16 @@ static ftun_status_t ftun_carrier_message_submit(
     return status;
   }
   message->state = FTUN_CARRIER_MESSAGE_QUEUED;
+  if (kind == FTUN_CARRIER_SEND_STREAM) {
+    message->send_previous = flow->send_tail;
+    if (flow->send_tail != NULL) {
+      flow->send_tail->send_next = message;
+    } else {
+      flow->send_head = message;
+    }
+    flow->send_tail = message;
+    message->send_linked = 1;
+  }
   carrier->pending_messages++;
   carrier->pending_bytes += bytes.length;
   owner->pending_messages++;
@@ -712,6 +1022,8 @@ static ftun_status_t ftun_carrier_message_submit(
     flow->pending_messages++;
     flow->pending_bytes += bytes.length;
   }
+  ftun_carrier_pending_link(message);
+  ftun_carrier_ready_insert(message);
   *out_operation = message->operation;
   return FTUN_OK;
 }
@@ -764,7 +1076,7 @@ static size_t ftun_carrier_message_available(
     }
     connection_available = carrier->control_credit_bytes -
       carrier->control_inflight_bytes;
-    return remaining < connection_available ? remaining : connection_available;
+    return remaining <= connection_available ? remaining : 0u;
   }
   flow = ftun_carrier_message_flow(message);
   if (flow == NULL ||
@@ -787,36 +1099,49 @@ static int ftun_carrier_message_eligible(ftun_carrier_message_t *message,
       message->state != FTUN_CARRIER_MESSAGE_QUEUED ||
       message->last_attempt_round == message->carrier->process_round) return 0;
   if ((message->kind == FTUN_CARRIER_SEND_CONTROL) != control) return 0;
+  if (message->kind == FTUN_CARRIER_SEND_STREAM) {
+    ftun_carrier_flow_t *flow = ftun_carrier_message_flow(message);
+    if (flow == NULL || flow->send_head != message) return 0;
+  }
   return ftun_carrier_message_available(message) != 0u ||
     (message->kind == FTUN_CARRIER_SEND_DATAGRAM &&
      message->payload.length == 0u);
 }
 
-static ftun_carrier_message_t *ftun_carrier_select(
-  ftun_carrier_t *carrier, int control)
+static ftun_carrier_message_t *ftun_carrier_select(ftun_carrier_t *carrier, int control)
 {
-  size_t owner_offset;
-  for (owner_offset = 0u; owner_offset < carrier->max_owners; owner_offset++) {
-    size_t owner_slot = (carrier->owner_cursor + owner_offset) %
-      carrier->max_owners;
-    ftun_carrier_owner_t *owner = &carrier->owners[owner_slot];
-    size_t message_offset;
-    if (owner->carrier != carrier) continue;
-    for (message_offset = 0u;
-         message_offset < carrier->max_pending_messages; message_offset++) {
-      size_t message_slot = (owner->message_cursor + message_offset) %
-        carrier->max_pending_messages;
-      ftun_carrier_message_t *message = &carrier->messages[message_slot];
-      if (message->owner_slot != owner->slot ||
-          message->owner_generation != owner->generation ||
-          !ftun_carrier_message_eligible(message, control)) continue;
-      owner->message_cursor = (message_slot + 1u) %
-        carrier->max_pending_messages;
-      carrier->owner_cursor = (owner_slot + 1u) % carrier->max_owners;
-      message->last_attempt_round = carrier->process_round;
-      return message;
-    }
-  }
+  ftun_carrier_message_t *root = carrier->ready[control];
+  ftun_carrier_message_t *first;
+  size_t first_owner;
+  /* 整个连接credit耗尽时无需探测各候选；零长Datagram仍可独立推进。 */
+  if (control && carrier->control_inflight_bytes >= carrier->control_credit_bytes) return NULL;
+  if (!control && carrier->connection_inflight_bytes >= carrier->connection_credit_bytes &&
+      carrier->ready_empty_datagrams == 0u) return NULL;
+  first = ftun_carrier_ready_lower(carrier, root, carrier->owner_cursor, 0u);
+  if (first == NULL) first = ftun_carrier_ready_lower(carrier, root, 0u, 0u);
+  if (first == NULL) return NULL;
+  first_owner = first->owner_slot;
+  do {
+    ftun_carrier_owner_t *owner = &carrier->owners[first->owner_slot];
+    ftun_carrier_message_t *begin = ftun_carrier_ready_lower(carrier, root, owner->slot, owner->message_cursor);
+    ftun_carrier_message_t *message;
+    if (begin == NULL || begin->owner_slot != owner->slot) begin = first;
+    message = begin;
+    do {
+      ftun_carrier_count(&carrier->last_selection_visits);
+      if (ftun_carrier_message_eligible(message, control)) {
+        owner->message_cursor = (message->slot + 1u) % carrier->max_pending_messages;
+        carrier->owner_cursor = (owner->slot + 1u) % carrier->max_owners;
+        message->last_attempt_round = carrier->process_round;
+        return message;
+      }
+      message = ftun_carrier_ready_next(carrier, message);
+      if (message == NULL || message->owner_slot != owner->slot) message = first;
+    } while (message != begin);
+    first = owner->slot + 1u < carrier->max_owners
+      ? ftun_carrier_ready_lower(carrier, root, owner->slot + 1u, 0u) : NULL;
+    if (first == NULL) first = ftun_carrier_ready_lower(carrier, root, 0u, 0u);
+  } while (first->owner_slot != first_owner);
   return NULL;
 }
 
@@ -864,30 +1189,26 @@ static ftun_status_t ftun_carrier_start_message(
   message->offered = offered;
   fragment_generation = ftun_carrier_next_generation(carrier);
   message->fragment_generation = fragment_generation;
+  ftun_carrier_ready_remove(message);
   message->state = FTUN_CARRIER_MESSAGE_STARTING;
   status = carrier->backend.send_start(
     carrier->backend.context, ftun_carrier_send_token(message), message->kind,
     owner->owner_id, flow == NULL ? 0u : flow->flow_id, offered, &accepted);
-  if (status != FTUN_OK) {
+  if (status != FTUN_OK && accepted == 0u) {
     message->state = FTUN_CARRIER_MESSAGE_QUEUED;
     message->offered = 0u;
     message->fragment_generation = 0u;
-    if (accepted != 0u) return FTUN_E_STATE_CORRUPT;
-    if (status == FTUN_E_AGAIN) return FTUN_OK;
+    if (status == FTUN_E_AGAIN) { ftun_carrier_ready_insert(message); return FTUN_OK; }
     error = ftun_carrier_error(status);
     return ftun_carrier_message_finish(message, error);
   }
-  if ((message->kind == FTUN_CARRIER_SEND_STREAM &&
+  if (status != FTUN_OK ||
+      (message->kind == FTUN_CARRIER_SEND_STREAM &&
        (accepted == 0u || accepted > offered)) ||
       (message->kind != FTUN_CARRIER_SEND_STREAM && accepted != offered)) {
-    message->state = FTUN_CARRIER_MESSAGE_CANCELLING;
-    status = carrier->backend.send_cancel(carrier->backend.context,
-                                          ftun_carrier_send_token(message));
-    message->state = FTUN_CARRIER_MESSAGE_QUEUED;
-    message->offered = 0u;
-    message->fragment_generation = 0u;
-    if (status != FTUN_OK) return status;
-    return FTUN_E_STATE_CORRUPT;
+    /* 非法接纳值不能撤销已借出的视图；保留整次 offer，交由 fail 回收。 */
+    accepted = offered;
+    status = FTUN_E_STATE_CORRUPT;
   }
   message->accepted = accepted;
   message->state = FTUN_CARRIER_MESSAGE_INFLIGHT;
@@ -897,7 +1218,11 @@ static ftun_status_t ftun_carrier_start_message(
     carrier->connection_inflight_bytes += accepted;
     flow->inflight_bytes += accepted;
   }
-  return FTUN_OK;
+  if (status == FTUN_OK && message->kind == FTUN_CARRIER_SEND_STREAM &&
+      accepted == message->payload.length - message->offset) {
+    ftun_carrier_send_unlink(message);
+  }
+  return status;
 }
 
 ftun_status_t ftun_carrier_process(ftun_carrier_t *carrier, size_t max_work,
@@ -905,18 +1230,24 @@ ftun_status_t ftun_carrier_process(ftun_carrier_t *carrier, size_t max_work,
 {
   size_t limit;
   size_t work = 0u;
+  ftun_status_t result = FTUN_OK;
   if (out_work != NULL) *out_work = 0u;
   if (carrier == NULL || max_work == 0u || out_work == NULL) {
     return FTUN_E_INVALID;
   }
+  if (carrier->processing || carrier->cancelling || carrier->failing) return FTUN_E_AGAIN;
+  ftun_carrier_work_begin(carrier);
   if (!carrier->accepting) return carrier->failed
     ? carrier->terminal_error.status : FTUN_E_CANCELLED;
   carrier->process_round++;
+  carrier->processing = 1;
   if (carrier->process_round == 0u) {
-    size_t index;
+    ftun_carrier_message_t *message;
     carrier->process_round = 1u;
-    for (index = 0u; index < carrier->max_pending_messages; index++) {
-      carrier->messages[index].last_attempt_round = 0u;
+    /* 仅清实际拥有项；空闲槽已在接纳/回收时清零，不扫描配置容量。 */
+    for (message = carrier->pending.head; message != NULL; message = message->pending_next[0]) {
+      message->last_attempt_round = 0u;
+      ftun_carrier_count(&carrier->last_cleanup_visits);
     }
   }
   limit = max_work < carrier->max_work_per_round
@@ -935,12 +1266,15 @@ ftun_status_t ftun_carrier_process(ftun_carrier_t *carrier, size_t max_work,
         ftun_error_t error = ftun_carrier_error(status);
         (void)ftun_carrier_fail(carrier, error);
       }
-      *out_work = work;
-      return status;
+      result = status;
+      break;
     }
   }
+  carrier->processing = 0;
+  carrier->last_backend_attempts = work;
+  ftun_carrier_work_end(carrier);
   *out_work = work;
-  return FTUN_OK;
+  return result;
 }
 
 ftun_status_t ftun_carrier_send_view(
@@ -1011,6 +1345,7 @@ ftun_status_t ftun_carrier_send_complete(ftun_carrier_send_token_t token,
     if (message->offset < message->payload.length) {
       message->state = FTUN_CARRIER_MESSAGE_QUEUED;
       message->fragment_generation = 0u;
+      ftun_carrier_ready_insert(message);
       return FTUN_OK;
     }
   }
@@ -1023,24 +1358,33 @@ static ftun_status_t ftun_carrier_cancel_matching(
   size_t flow_slot, uint64_t flow_generation, int match_flow)
 {
   ftun_status_t result = FTUN_OK;
-  size_t index;
-  for (index = 0u; index < carrier->max_pending_messages; index++) {
-    ftun_carrier_message_t *message = &carrier->messages[index];
+  ftun_carrier_pending_t *list;
+  size_t lane, count, inspected;
+  if (carrier->cancelling || carrier->failing) return FTUN_E_AGAIN;
+  if (!carrier->processing) ftun_carrier_work_begin(carrier);
+  carrier->cancelling = 1;
+  lane = match_flow == 2 ? 0u : (match_flow ? 2u : 1u);
+  list = lane == 0u ? &carrier->pending : lane == 1u
+    ? &carrier->owners[owner_slot].pending : &carrier->flows[flow_slot].pending;
+  count = lane == 0u ? carrier->pending_messages : lane == 1u
+    ? carrier->owners[owner_slot].pending_messages : carrier->flows[flow_slot].pending_messages;
+  for (inspected = 0u; inspected < count && list->head != NULL; inspected++) {
+    ftun_carrier_message_t *message = list->head;
     ftun_status_t status;
-    if (message->carrier != carrier ||
-        message->owner_slot != owner_slot ||
-        message->owner_generation != owner_generation ||
-        (match_flow && (message->flow_slot != flow_slot ||
-                        message->flow_generation != flow_generation)) ||
-        message->state == FTUN_CARRIER_MESSAGE_RETURNING ||
-        message->state == FTUN_CARRIER_MESSAGE_CALLBACK) continue;
-    status = ftun_operation_cancel(message->operation);
-    if (status == FTUN_OK) {
-      ftun_carrier_wake_owner(message);
-    } else if (status != FTUN_E_STALE && result == FTUN_OK) {
-      result = status;
+    ftun_carrier_pending_rotate(list, lane);
+    ftun_carrier_count(&carrier->last_cleanup_visits);
+    if (message->carrier != carrier || (lane != 0u &&
+        (message->owner_slot != owner_slot || message->owner_generation != owner_generation)) ||
+        (lane == 2u && (message->flow_slot != flow_slot || message->flow_generation != flow_generation))) {
+      result = FTUN_E_STATE_CORRUPT; break;
     }
+    if (message->state == FTUN_CARRIER_MESSAGE_RETURNING || message->state == FTUN_CARRIER_MESSAGE_CALLBACK) continue;
+    status = ftun_operation_cancel(message->operation);
+    if (status == FTUN_OK) ftun_carrier_wake_owner(message);
+    else if (status != FTUN_E_STALE && result == FTUN_OK) result = status;
   }
+  carrier->cancelling = 0;
+  if (!carrier->processing) ftun_carrier_work_end(carrier);
   return result;
 }
 
@@ -1058,15 +1402,9 @@ ftun_status_t ftun_carrier_owner_stop(ftun_carrier_owner_token_t token)
 {
   ftun_carrier_owner_t *owner = ftun_carrier_owner_resolve(token);
   ftun_carrier_t *carrier;
-  size_t index;
   if (owner == NULL) return FTUN_E_STALE;
   carrier = owner->carrier;
   owner->accepting = 0;
-  for (index = 0u; index < carrier->max_flows; index++) {
-    ftun_carrier_flow_t *flow = &carrier->flows[index];
-    if (flow->carrier == carrier && flow->owner_slot == owner->slot &&
-        flow->owner_generation == owner->generation) flow->accepting = 0;
-  }
   return ftun_carrier_cancel_matching(carrier, owner->slot,
                                       owner->generation, 0u, 0u, 0);
 }
@@ -1075,29 +1413,30 @@ ftun_status_t ftun_carrier_fail(ftun_carrier_t *carrier,
                                 ftun_error_t error)
 {
   ftun_status_t result = FTUN_OK;
-  size_t index;
+  size_t inspected, count;
   if (carrier == NULL || error.status == FTUN_OK ||
       error.status == FTUN_E_AGAIN) return FTUN_E_INVALID;
+  if (carrier->failing || carrier->cancelling) return FTUN_E_AGAIN;
+  if (!carrier->processing) ftun_carrier_work_begin(carrier);
+  carrier->failing = 1;
   if (!carrier->failed) {
     carrier->failed = 1;
     carrier->accepting = 0;
     carrier->terminal_error = error;
     carrier->generation = ftun_carrier_next_generation(carrier);
-    for (index = 0u; index < carrier->max_owners; index++) {
-      carrier->owners[index].accepting = 0;
-    }
-    for (index = 0u; index < carrier->max_flows; index++) {
-      carrier->flows[index].accepting = 0;
-    }
   }
-  for (index = 0u; index < carrier->max_pending_messages; index++) {
-    ftun_carrier_message_t *message = &carrier->messages[index];
+  count = carrier->pending_messages;
+  for (inspected = 0u; inspected < count && carrier->pending.head != NULL; inspected++) {
+    ftun_carrier_message_t *message = carrier->pending.head;
     ftun_status_t status;
+    ftun_carrier_pending_rotate(&carrier->pending, 0u);
+    ftun_carrier_count(&carrier->last_cleanup_visits);
     if (message->carrier != carrier ||
         message->state == FTUN_CARRIER_MESSAGE_RETURNING ||
         message->state == FTUN_CARRIER_MESSAGE_CALLBACK) continue;
     if (message->state == FTUN_CARRIER_MESSAGE_INFLIGHT) {
       message->state = FTUN_CARRIER_MESSAGE_CANCELLING;
+      ftun_carrier_count(&carrier->last_cleanup_visits);
       status = carrier->backend.send_cancel(
         carrier->backend.context, ftun_carrier_send_token(message));
       if (status != FTUN_OK) {
@@ -1114,28 +1453,17 @@ ftun_status_t ftun_carrier_fail(ftun_carrier_t *carrier,
     status = ftun_carrier_message_finish(message, carrier->terminal_error);
     if (status != FTUN_OK && result == FTUN_OK) result = status;
   }
+  carrier->failing = 0;
+  if (!carrier->processing) ftun_carrier_work_end(carrier);
   return result;
 }
 
 ftun_status_t ftun_carrier_stop(ftun_carrier_t *carrier)
 {
-  ftun_status_t result = FTUN_OK;
-  size_t index;
   if (carrier == NULL) return FTUN_E_INVALID;
+  if (carrier->failed) return ftun_carrier_fail(carrier, carrier->terminal_error);
   carrier->accepting = 0;
-  for (index = 0u; index < carrier->max_owners; index++) {
-    ftun_carrier_owner_t *owner = &carrier->owners[index];
-    ftun_status_t status;
-    if (owner->carrier != carrier) continue;
-    owner->accepting = 0;
-    status = ftun_carrier_cancel_matching(carrier, owner->slot,
-                                          owner->generation, 0u, 0u, 0);
-    if (status != FTUN_OK && result == FTUN_OK) result = status;
-  }
-  for (index = 0u; index < carrier->max_flows; index++) {
-    carrier->flows[index].accepting = 0;
-  }
-  return result;
+  return ftun_carrier_cancel_matching(carrier, 0u, 0u, 0u, 0u, 2);
 }
 
 ftun_status_t ftun_carrier_flow_close(ftun_carrier_flow_token_t *token)
@@ -1146,8 +1474,10 @@ ftun_status_t ftun_carrier_flow_close(ftun_carrier_flow_token_t *token)
   if (token->carrier == NULL) return FTUN_OK;
   flow = ftun_carrier_flow_resolve(*token);
   if (flow == NULL) return FTUN_E_STALE;
-  if (flow->accepting || flow->pending_messages != 0u ||
-      flow->pending_bytes != 0u || flow->inflight_bytes != 0u) {
+  if ((flow->accepting && flow->carrier->accepting &&
+       flow->carrier->owners[flow->owner_slot].accepting) || flow->pending_messages != 0u ||
+      flow->pending_bytes != 0u || flow->inflight_bytes != 0u ||
+      flow->send_head != NULL || flow->send_tail != NULL) {
     return FTUN_E_AGAIN;
   }
   owner = &flow->carrier->owners[flow->owner_slot];
@@ -1171,7 +1501,7 @@ ftun_status_t ftun_carrier_owner_close(ftun_carrier_owner_token_t *token)
   if (token->carrier == NULL) return FTUN_OK;
   owner = ftun_carrier_owner_resolve(*token);
   if (owner == NULL) return FTUN_E_STALE;
-  if (owner->accepting || owner->active_flows != 0u ||
+  if ((owner->accepting && owner->carrier->accepting) || owner->active_flows != 0u ||
       owner->pending_messages != 0u || owner->pending_bytes != 0u ||
       owner->in_callback) return FTUN_E_AGAIN;
   carrier = owner->carrier;
@@ -1205,6 +1535,13 @@ ftun_status_t ftun_carrier_get_usage(const ftun_carrier_t *carrier,
   out->failed_messages = carrier->failed_messages;
   out->cancelled_messages = carrier->cancelled_messages;
   out->rejected_messages = carrier->rejected_messages;
+  out->last_selection_visits = carrier->last_selection_visits;
+  out->selection_visits = carrier->selection_visits;
+  out->max_selection_visits = carrier->max_selection_visits;
+  out->last_work = carrier->last_work;
+  out->last_index_visits = carrier->last_index_visits;
+  out->last_cleanup_visits = carrier->last_cleanup_visits;
+  out->cleanup_visits = carrier->cleanup_visits;
   out->generation = carrier->generation;
   out->terminal_status = carrier->failed
     ? carrier->terminal_error.status
@@ -1228,7 +1565,7 @@ ftun_status_t ftun_carrier_owner_get_usage(
   out->active_flows = owner->active_flows;
   out->pending_messages = owner->pending_messages;
   out->pending_bytes = owner->pending_bytes;
-  out->accepting = owner->accepting != 0;
+  out->accepting = owner->accepting && owner->carrier->accepting;
   out->in_callback = owner->in_callback != 0;
   return FTUN_OK;
 }
@@ -1249,7 +1586,8 @@ ftun_status_t ftun_carrier_flow_get_usage(
   out->max_pending_bytes = flow->max_pending_bytes;
   out->pending_messages = flow->pending_messages;
   out->pending_bytes = flow->pending_bytes;
-  out->accepting = flow->accepting != 0;
+  out->accepting = flow->accepting && flow->carrier->accepting &&
+    flow->carrier->owners[flow->owner_slot].accepting;
   return FTUN_OK;
 }
 
@@ -1265,6 +1603,8 @@ ftun_status_t ftun_carrier_destroy(ftun_carrier_t **carrier)
       owned->active_flows != 0u || owned->pending_messages != 0u ||
       owned->pending_bytes != 0u || owned->connection_inflight_bytes != 0u ||
       owned->control_inflight_bytes != 0u) return FTUN_E_AGAIN;
+  if (owned->pending.head != NULL || owned->pending.tail != NULL ||
+      owned->ready[0] != NULL || owned->ready[1] != NULL) return FTUN_E_STATE_CORRUPT;
   reservation = owned->reservation;
   status = ftun_reservation_release(&reservation);
   if (status != FTUN_OK) return status;
