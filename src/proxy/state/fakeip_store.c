@@ -16,8 +16,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* 需求 REQ-PERSIST-001；任务 TASK-STATE-001；目标 0.3.0；验收 TEST-STATE-001。 */
-
 #define FTUN_FAKEIP_IDENTITY_BYTES 48u
 #define FTUN_FAKEIP_LOG_HEADER_BYTES 32u
 #define FTUN_FAKEIP_LOG_RECORD_BYTES 32u

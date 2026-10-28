@@ -4,7 +4,7 @@
 
 #include "proxy/runtime_state.h"
 
-/* REQ-STATE-001 / TASK-STATE-003 / TEST-STATE-003，目标 0.5.0：
+/* 
  * ftun_group_cache_save 记录配置身份且不触及 FakeIP 状态。 */
 
 #define FTUN_GROUP_CACHE_MAX_BYTES (1024u * 1024u)

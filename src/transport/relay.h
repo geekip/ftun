@@ -35,7 +35,6 @@ typedef struct {
 typedef void (*ftun_relay_progress_fn)(void *user);
 
 /* 双向背压中继。
- * 需求 REQ-PERF-001；任务 TASK-TRANSPORT-004；目标 0.2.0；验收 TEST-TRANSPORT-004。
  * 缓冲首次 READ 时才申请；达到高水位暂停源 READ，降至低水位恢复。
  * WRITE 只在未接纳数据或 half-close 返回 AGAIN 时进入 interests。
  * EOF 方向必须先排空已接纳/待接纳数据，再向另一侧 shutdown-write。
@@ -46,10 +45,6 @@ ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left,
 ftun_status_t ftun_relay_start_with_options(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
   const ftun_relay_options_t *options, ftun_relay_t **out);
-/* 内部生产路径。pool 为借用引用，其寿命必须长于 relay。 */
-ftun_status_t ftun_relay_start_with_pool(
-  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
-  ftun_buffer_pool_t *pool, ftun_relay_t **out);
 /* Pool 压力解除时 progress 只安排 owner 再推进一次，不得销毁 relay。 */
 ftun_status_t ftun_relay_start_with_pool_options(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,

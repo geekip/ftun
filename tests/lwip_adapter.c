@@ -403,9 +403,66 @@ static int test_failure_and_cancel(void)
   return 0;
 }
 
+/* 存活探测：对端静默后，lwIP 在 idle 之后发出探测；连续 count 次无应答则关闭连接。
+ * 未开启时同样的静默不产生任何输出。 */
+static int keepalive_case(bool enabled)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_lwip_t *stack = NULL;
+  ftun_lwip_spec_t spec;
+  test_context_t context;
+  uint32_t server_sequence;
+  uint64_t now_ms;
+  size_t established_outputs;
+  size_t probes = 0u;
+  size_t index;
+  memset(&context, 0, sizeof(context));
+  memset(&spec, 0, sizeof(spec));
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u, &budget) == FTUN_OK);
+  spec.budget = budget;
+  spec.mtu = 1500u;
+  spec.now_ms = 1000u;
+  spec.output = capture_output;
+  spec.accept = accept_tcp;
+  spec.tcp_event = tcp_event;
+  spec.user = &context;
+  spec.liveness.keepalive_enabled = enabled;
+  spec.liveness.idle_s = 1u;
+  spec.liveness.interval_s = 1u;
+  spec.liveness.count = 2u;
+  CHECK(ftun_lwip_create(&spec, &stack) == FTUN_OK);
+  CHECK(establish(stack, budget, &context, &server_sequence) == 0);
+  established_outputs = context.output_count;
+  /* 对端从此静默；每 250ms 推进一次定时器，共 10 秒。 */
+  for (now_ms = 1250u; now_ms <= 11000u; now_ms += 250u) {
+    CHECK(ftun_lwip_tick(stack, now_ms) == FTUN_OK);
+  }
+  for (index = established_outputs; index < context.output_count; index++) {
+    const uint8_t *packet = context.packets[index];
+    size_t ip_length = (size_t)(packet[0] & 0x0fu) * 4u;
+    /* 探测是只带 ACK、序号为 snd_nxt-1 的段，负载为 0 或 1 字节。 */
+    if ((packet[ip_length + 13u] & 0x17u) == 0x10u &&
+        context.lengths[index] <= ip_length + 20u + 1u) probes++;
+  }
+  if (enabled) {
+    CHECK(probes >= 2u);
+    CHECK(context.closed_events == 1u);
+  } else {
+    CHECK(context.output_count == established_outputs && probes == 0u);
+    CHECK(context.closed_events == 0u);
+  }
+  context.callback_failed = 0;
+  (void)context.callback_failed;
+  CHECK(ftun_lwip_destroy(&stack) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_tcp_lifecycle() == 0);
   CHECK(test_failure_and_cancel() == 0);
+  CHECK(keepalive_case(true) == 0);
+  CHECK(keepalive_case(false) == 0);
   return 0;
 }

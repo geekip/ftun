@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_INBOUND_MIXED_H
 #define FTUN_PROXY_INBOUND_MIXED_H
-/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_connection_create，目标 0.4.0。 */
+/* ftun_mixed_connection_create。 */
 #include "proxy/inbound/inbound.h"
 #include "proxy/inbound/socks5.h"
 #include "protocol/http.h"

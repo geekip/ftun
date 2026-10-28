@@ -5,11 +5,14 @@
 #include "event/event.h"
 #include "uapi.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <net/if.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/socket.h>
+#include <stdio.h>
 #include <unistd.h>
 
 #define FTUN_LINUX_ROUTE_ASYNC_MAGIC UINT32_C(0x46544152)
@@ -49,8 +52,20 @@ struct ftun_linux_route_async {
   bool running;
   bool release_requested;
   bool retained_add;
+  /* 安装前清理遗留对象：sweeping 期间逐个资源发放宽选择子的删除，直到 STALE。 */
+  bool sweep;
+  bool sweeping;
+  size_t sweep_rounds;
+  size_t strays_removed;
+  bool repairing;
+  ftun_status_t repair_result;
+  size_t repair_runs;
+  size_t repairs;
+  size_t repair_failures;
   bool system_io;
   int descriptor;
+  /* 同一路由表号的实例互斥锁；与 operation 同生命周期。 */
+  int lock_descriptor;
   ftun_event_loop_t *loop;
   ftun_event_source_t *io_source;
   ftun_event_source_t *timer_source;
@@ -535,9 +550,26 @@ static void ftun_route_async_cleanup_failed(
   operation->runnable = true;
 }
 
+/* 修复失败不撤销事务：资源保持原所有权，回到 READY 等待下次对账。 */
+static void ftun_route_async_repair_end(
+  ftun_linux_route_async_t *operation, ftun_status_t status)
+{
+  operation->repairing = false;
+  operation->repair_result = status;
+  if (status != FTUN_OK) operation->repair_failures++;
+  operation->has_current = false;
+  operation->step = FTUN_ROUTE_ASYNC_PREFLIGHT;
+  operation->state = FTUN_LINUX_ROUTE_ASYNC_READY;
+  operation->runnable = false;
+}
+
 static void ftun_route_async_apply_failed(
   ftun_linux_route_async_t *operation, ftun_status_t status)
 {
+  if (operation->repairing && !operation->release_requested) {
+    ftun_route_async_repair_end(operation, status);
+    return;
+  }
   ftun_route_async_begin_cleanup(operation, status, operation->release_requested);
 }
 
@@ -554,6 +586,9 @@ static void ftun_route_async_removed(ftun_linux_route_async_t *operation)
 
 static void ftun_route_async_applied(ftun_linux_route_async_t *operation)
 {
+  if (operation->repairing && operation->step != FTUN_ROUTE_ASYNC_PREFLIGHT) {
+    operation->repairs++;
+  }
   if (!operation->active[operation->cursor]) {
     operation->active[operation->cursor] = true;
     operation->active_count++;
@@ -571,7 +606,22 @@ static int ftun_route_async_prepare_current(
   ftun_linux_route_async_t *operation)
 {
   if (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING) {
+    while (operation->sweeping &&
+           operation->cursor < operation->resource_count &&
+           operation->resources[operation->cursor].kind ==
+             FTUN_LINUX_ROUTE_ADDRESS) {
+      operation->cursor++;
+    }
+    if (operation->sweeping && operation->cursor >= operation->resource_count) {
+      operation->sweeping = false;
+      operation->cursor = 0u;
+      operation->step = FTUN_ROUTE_ASYNC_PREFLIGHT;
+    }
     if (operation->cursor >= operation->resource_count) {
+      if (operation->repairing) {
+        ftun_route_async_repair_end(operation, FTUN_OK);
+        return 0;
+      }
       operation->state = FTUN_LINUX_ROUTE_ASYNC_READY;
       operation->runnable = false;
       return 0;
@@ -596,11 +646,38 @@ static void ftun_route_async_reply(
   const ftun_linux_route_reply_t *reply)
 {
   bool applying = operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING;
+  if (operation->sweeping) {
+    /* OK：删掉了一个遗留对象，同一资源再试一次；STALE：已经没有了。 */
+    if (reply->status == FTUN_OK) {
+      operation->strays_removed++;
+      if (++operation->sweep_rounds >= FTUN_LINUX_ROUTE_SWEEP_LIMIT) {
+        ftun_route_async_apply_failed(operation, FTUN_E_LIMIT);
+        return;
+      }
+    } else if (reply->status == FTUN_E_STALE) {
+      operation->cursor++;
+      operation->sweep_rounds = 0u;
+    } else {
+      ftun_route_async_apply_failed(operation, reply->status);
+      return;
+    }
+    operation->has_current = false;
+    operation->runnable = true;
+    return;
+  }
   if (operation->step == FTUN_ROUTE_ASYNC_PREFLIGHT) {
     if (reply->status != FTUN_OK) {
       ftun_route_async_apply_failed(operation, reply->status);
     } else if (reply->present) {
-      ftun_route_async_apply_failed(operation, FTUN_E_REJECTED);
+      /* 实例锁保证没有其他存活实例使用同一表号；协议号 186 且完全一致
+       * 的对象只能是上次崩溃遗留，原地接管并在释放时撤销。地址对象不带
+       * 协议标记，可能属于外部，仍按冲突拒绝。 */
+      if (operation->resources[operation->cursor].kind ==
+            FTUN_LINUX_ROUTE_ADDRESS && !operation->active[operation->cursor]) {
+        ftun_route_async_apply_failed(operation, FTUN_E_REJECTED);
+      } else {
+        ftun_route_async_applied(operation);
+      }
     } else {
       operation->step = FTUN_ROUTE_ASYNC_CHANGE;
       operation->runnable = true;
@@ -642,6 +719,10 @@ static void ftun_route_async_timeout(ftun_linux_route_async_t *operation)
 {
   bool applying = operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING;
   operation->timeouts++;
+  if (operation->sweeping) {
+    ftun_route_async_apply_failed(operation, FTUN_E_TIMEOUT);
+    return;
+  }
   if (operation->step == FTUN_ROUTE_ASYNC_CHANGE) {
     operation->ambiguous_result = FTUN_E_TIMEOUT;
     operation->step = FTUN_ROUTE_ASYNC_RECONCILE;
@@ -662,6 +743,7 @@ static void ftun_route_async_timeout(ftun_linux_route_async_t *operation)
 static ftun_linux_route_request_kind_t ftun_route_async_request_kind(
   const ftun_linux_route_async_t *operation)
 {
+  if (operation->sweeping) return FTUN_LINUX_ROUTE_REQUEST_REMOVE;
   if (operation->step != FTUN_ROUTE_ASYNC_CHANGE) {
     return FTUN_LINUX_ROUTE_REQUEST_QUERY;
   }
@@ -685,6 +767,7 @@ static ftun_status_t ftun_route_async_allocate_plan(
   if (operation == NULL) return FTUN_E_LIMIT;
   operation->magic = FTUN_LINUX_ROUTE_ASYNC_MAGIC;
   operation->descriptor = -1;
+  operation->lock_descriptor = -1;
   operation->io = *io;
   operation->step_timeout_ms = step_timeout_ms;
   operation->total_deadline_ms = total_deadline_ms;
@@ -697,6 +780,8 @@ static ftun_status_t ftun_route_async_allocate_plan(
   operation->resource_count = plan->resource_count;
   memcpy(operation->resources, plan->resources,
          plan->resource_count * sizeof(plan->resources[0]));
+  operation->sweep = plan->sweep;
+  operation->sweeping = plan->sweep;
   *out = operation;
   return FTUN_OK;
 }
@@ -740,7 +825,8 @@ ftun_status_t ftun_linux_route_async_start_plan_with_io(
 }
 
 static ftun_status_t ftun_route_async_start_system_plan(
-  const ftun_linux_route_plan_t *plan, ftun_event_loop_t *loop,
+  const ftun_linux_route_plan_t *plan, uint32_t lock_table,
+  ftun_event_loop_t *loop,
   uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
   ftun_linux_route_async_t **out)
 {
@@ -754,14 +840,22 @@ static ftun_status_t ftun_route_async_start_system_plan(
   if (loop == NULL || out == NULL || !ftun_linux_route_plan_valid(plan)) {
     return FTUN_E_INVALID;
   }
+  int lock_descriptor;
+  status = ftun_linux_route_lock_table(lock_table, &lock_descriptor);
+  if (status != FTUN_OK) return status;
   descriptor = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK,
                       FTUN_NETLINK_ROUTE);
-  if (descriptor < 0) return ftun_linux_route_errno(errno, false);
+  if (descriptor < 0) {
+    int error_code = errno;
+    if (lock_descriptor >= 0) (void)close(lock_descriptor);
+    return ftun_linux_route_errno(error_code, false);
+  }
   memset(&address, 0, sizeof(address));
   address.nl_family = AF_NETLINK;
   if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) < 0) {
     int error_code = errno;
     (void)close(descriptor);
+    if (lock_descriptor >= 0) (void)close(lock_descriptor);
     return ftun_linux_route_errno(error_code, false);
   }
   sequence = (uint32_t)(now_ms ^ (uint64_t)(unsigned int)descriptor);
@@ -773,10 +867,12 @@ static ftun_status_t ftun_route_async_start_system_plan(
     total_deadline_ms, sequence, &operation);
   if (status != FTUN_OK) {
     (void)close(descriptor);
+    if (lock_descriptor >= 0) (void)close(lock_descriptor);
     return status;
   }
   operation->system_io = true;
   operation->descriptor = descriptor;
+  operation->lock_descriptor = lock_descriptor;
   operation->loop = loop;
   operation->io.context = operation;
   status = ftun_event_io_start(loop,
@@ -786,6 +882,7 @@ static ftun_status_t ftun_route_async_start_system_plan(
   if (status != FTUN_OK) {
     operation->magic = 0u;
     (void)close(descriptor);
+    if (lock_descriptor >= 0) (void)close(lock_descriptor);
     free(operation);
     return status;
   }
@@ -798,7 +895,7 @@ ftun_status_t ftun_linux_route_async_start_plan(
   uint64_t now_ms, uint64_t step_timeout_ms, uint64_t total_deadline_ms,
   ftun_linux_route_async_t **out)
 {
-  return ftun_route_async_start_system_plan(plan, loop, now_ms,
+  return ftun_route_async_start_system_plan(plan, 0u, loop, now_ms,
     step_timeout_ms, total_deadline_ms, out);
 }
 
@@ -814,8 +911,10 @@ ftun_status_t ftun_linux_route_async_start(
     if (out != NULL) *out = NULL;
     return status;
   }
-  return ftun_route_async_start_system_plan(&plan, loop, now_ms,
-    step_timeout_ms, total_deadline_ms, out);
+  /* 策略事务持有表互斥锁，同表同优先级的协议号 186 对象只能是遗留。 */
+  plan.sweep = true;
+  return ftun_route_async_start_system_plan(&plan, policy->route_table, loop,
+    now_ms, step_timeout_ms, total_deadline_ms, out);
 }
 
 static ftun_status_t ftun_route_async_adopt_plan(
@@ -846,6 +945,11 @@ static void ftun_route_async_adopt_commit(ftun_route_transaction_t **source,
   ftun_reservation_t *reservation = owned->reservation;
   memcpy(operation->active, owned->active, owned->resource_count * sizeof(owned->active[0]));
   operation->active_count = owned->active_count;
+  /* 表互斥锁随资源一起转交，关闭描述符才释放。 */
+  if (owned->lock_descriptor >= 0 && operation->lock_descriptor < 0) {
+    operation->lock_descriptor = owned->lock_descriptor;
+    owned->lock_descriptor = -1;
+  }
   operation->runnable = false;
   if (!owned->retiring && operation->active_count == operation->resource_count) {
     operation->state = FTUN_LINUX_ROUTE_ASYNC_READY;
@@ -886,7 +990,7 @@ ftun_status_t ftun_linux_route_async_adopt(
   ftun_linux_route_async_t *operation = NULL;
   ftun_status_t status = ftun_route_async_adopt_plan(source, out, &plan);
   if (status != FTUN_OK) return status;
-  status = ftun_route_async_start_system_plan(&plan, loop, now_ms,
+  status = ftun_route_async_start_system_plan(&plan, 0u, loop, now_ms,
     step_timeout_ms, total_deadline_ms, &operation);
   if (status == FTUN_OK) ftun_route_async_adopt_commit(source, operation, out);
   return status;
@@ -903,6 +1007,15 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
       max_work == 0u || out_work == NULL) return FTUN_E_INVALID;
   if (operation->running) return FTUN_E_AGAIN;
   operation->running = true;
+  if (now_ms >= operation->total_deadline_ms && operation->repairing &&
+      !operation->release_requested &&
+      operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING) {
+    /* 修复期限到达：已有资源不动，迟到回复按陈旧处理，下次对账重试。 */
+    operation->timeouts++;
+    return_status = ftun_route_async_pending_clear(operation);
+    ftun_route_async_repair_end(operation, FTUN_E_TIMEOUT);
+    work++;
+  }
   if (now_ms >= operation->total_deadline_ms &&
       (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING ||
        operation->state == FTUN_LINUX_ROUTE_ASYNC_COMPENSATING ||
@@ -954,12 +1067,20 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
       request.sequence = ftun_route_async_next_sequence(operation);
       request.kind = ftun_route_async_request_kind(operation);
       request.resource = operation->resources[operation->cursor];
+      request.resource.stray = operation->sweeping;
       status = operation->io.submit(operation->io.context, &request);
       if (status == FTUN_E_AGAIN) {
         operation->runnable = false;
         /* 即使首个报文还未写入，也必须有总期限唤醒。 */
         return_status = ftun_route_async_timer_start(operation, operation->total_deadline_ms);
         break;
+      }
+      if (status == FTUN_E_STALE && request.kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE &&
+          operation->state != FTUN_LINUX_ROUTE_ASYNC_APPLYING) {
+        /* 构造请求时对象所属接口已不存在：资源已随接口消失，无需发送。 */
+        ftun_route_async_removed(operation);
+        work++;
+        continue;
       }
       if (status != FTUN_OK) {
         if (operation->state == FTUN_LINUX_ROUTE_ASYNC_APPLYING) {
@@ -1020,7 +1141,9 @@ ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
           return_status = clear_status;
           break;
         }
-        if (kind == FTUN_LINUX_ROUTE_REQUEST_ADD ||
+        if (operation->sweeping) {
+          ftun_route_async_apply_failed(operation, status);
+        } else if (kind == FTUN_LINUX_ROUTE_REQUEST_ADD ||
             kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE) {
           operation->ambiguous_result = status;
           operation->step = FTUN_ROUTE_ASYNC_RECONCILE;
@@ -1101,6 +1224,41 @@ ftun_status_t ftun_linux_route_async_get_info(
   out->timeouts = operation->timeouts;
   out->cleanup_failures = operation->cleanup_failures;
   out->runnable = operation->runnable;
+  out->repairing = operation->repairing;
+  out->repair_result = operation->repair_result;
+  out->repair_runs = operation->repair_runs;
+  out->repairs = operation->repairs;
+  out->repair_failures = operation->repair_failures;
+  out->strays_removed = operation->strays_removed;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_linux_route_async_repair(
+  ftun_linux_route_async_t *operation, uint64_t now_ms,
+  uint64_t total_deadline_ms)
+{
+  ftun_status_t status;
+  if (operation == NULL || operation->magic != FTUN_LINUX_ROUTE_ASYNC_MAGIC ||
+      total_deadline_ms <= now_ms) return FTUN_E_INVALID;
+  if (operation->running || operation->repairing) return FTUN_E_AGAIN;
+  if (operation->state != FTUN_LINUX_ROUTE_ASYNC_READY ||
+      operation->release_requested) return FTUN_E_INVALID;
+  if (operation->system_io && operation->io_source == NULL) {
+    status = ftun_event_io_start(operation->loop,
+      (ftun_native_socket_t)(unsigned int)operation->descriptor,
+      FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_route_async_io_ready,
+      operation, &operation->io_source);
+    if (status != FTUN_OK) return status;
+  }
+  operation->repairing = true;
+  operation->repair_runs++;
+  operation->repair_result = FTUN_OK;
+  operation->total_deadline_ms = total_deadline_ms;
+  operation->state = FTUN_LINUX_ROUTE_ASYNC_APPLYING;
+  operation->step = FTUN_ROUTE_ASYNC_PREFLIGHT;
+  operation->cursor = 0u;
+  operation->has_current = false;
+  operation->runnable = true;
   return FTUN_OK;
 }
 
@@ -1197,6 +1355,12 @@ ftun_status_t ftun_linux_route_async_destroy(
     descriptor = owned->descriptor;
     owned->descriptor = -1;
     if (descriptor >= 0 && close(descriptor) != 0) return FTUN_E_IO;
+    /* 关闭描述符即释放 flock。 */
+    if (owned->lock_descriptor >= 0) {
+      descriptor = owned->lock_descriptor;
+      owned->lock_descriptor = -1;
+      if (close(descriptor) != 0) return FTUN_E_IO;
+    }
   }
   owned->magic = 0u;
   memset(&owned->io, 0, sizeof(owned->io));

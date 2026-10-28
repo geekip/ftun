@@ -23,7 +23,6 @@ ftun_status_t ftun_file_lock_acquire_budget(ftun_budget_t *budget,
 ftun_status_t ftun_file_lock_release(ftun_file_lock_t **lock);
 
 /* 持久文件替换。
- * 需求 REQ-PERSIST-001；任务 TASK-PLATFORM-005；目标 0.3.0；验收 TEST-PLATFORM-005。
  * temporary 必须是普通文件且与 destination 父目录同一文件系统。函数依次
  * fsync 临时文件、rename、fsync 父目录。rename 前失败保留旧权威文件；
  * rename 后失败会返回错误，但不会把已替换文件伪报成旧文件仍然权威。

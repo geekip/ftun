@@ -44,6 +44,12 @@ typedef struct {
   bool block_submit;
   bool block_receive;
   bool block_sync_remove;
+  /* 放宽选择子的清理请求：每个资源先报告 strays_per_resource 次已删除，再报告 STALE。 */
+  size_t strays_per_resource;
+  size_t stray_requests;
+  size_t stray_streak;
+  size_t add_before_sweep_done;
+  size_t fail_stray_at;
   ftun_status_t reentrant_run_status;
   ftun_status_t reentrant_release_status;
   ftun_linux_route_async_t *operation;
@@ -125,6 +131,23 @@ static ftun_status_t async_mock_submit(
   if (mock == NULL || request == NULL || request->sequence == 0u ||
       mock->request_count >= ASYNC_REQUEST_CAPACITY) return FTUN_E_LIMIT;
   if (mock->block_submit) return FTUN_E_AGAIN;
+  if (request->resource.stray) {
+    ftun_status_t status = FTUN_E_STALE;
+    mock->requests[mock->request_count++] = *request;
+    mock->stray_requests++;
+    if (mock->fail_stray_at != 0u && mock->stray_requests == mock->fail_stray_at) {
+      status = FTUN_E_IO;
+    } else if (mock->stray_streak < mock->strays_per_resource) {
+      mock->stray_streak++;
+      status = FTUN_OK;
+    } else {
+      mock->stray_streak = 0u;
+    }
+    return async_mock_reply(mock, request->sequence, status, false) ?
+      FTUN_OK : FTUN_E_LIMIT;
+  }
+  if (request->kind == FTUN_LINUX_ROUTE_REQUEST_ADD && mock->stray_requests == 0u &&
+      mock->add_before_sweep_done != SIZE_MAX) mock->add_before_sweep_done++;
   if (mock->request_count != 0u &&
       request->sequence == mock->requests[mock->request_count - 1u].sequence) {
     return FTUN_E_STATE_CORRUPT;
@@ -443,6 +466,28 @@ static int test_conflict_and_inputs(void)
         mock.remove_calls[0] == 0u && mock.present[0]);
   mock.present[0] = false;
   CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+
+  /* 非地址对象完全一致：视为上次崩溃遗留，原地接管而不重复添加，
+   * 释放时一并撤销。 */
+  async_mock_init(&mock);
+  mock.preexisting_index = 1u;
+  io = async_mock_io(&mock);
+  now_ms = 100u;
+  CHECK(ftun_linux_route_async_start_with_io(&policy, &io, now_ms, 5u,
+    1000u, 60u, &operation) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms,
+                    FTUN_LINUX_ROUTE_ASYNC_READY, 8u));
+  CHECK(mock.add_calls[1] == 0u && mock.present[1] &&
+        async_present_count(&mock) == (int)FTUN_LINUX_ROUTE_MAX_RESOURCES);
+  CHECK(ftun_linux_route_async_release(operation, now_ms,
+                                       now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms,
+                    FTUN_LINUX_ROUTE_ASYNC_RELEASED, 8u));
+  CHECK(mock.remove_calls[1] == 1u && async_present_count(&mock) == 0);
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  async_mock_init(&mock);
+  io = async_mock_io(&mock);
+  now_ms = 100u;
 
   incomplete = io;
   incomplete.receive = NULL;
@@ -796,7 +841,7 @@ static int test_interface_async_adapter(void)
   ftun_linux_route_async_io_t io;
   ftun_linux_route_io_t sync_io = {sync_apply, sync_remove, &mock};
   ftun_interface_ops_t ops = ftun_linux_interface_ops;
-  ftun_interface_spec_t spec = {{"ftun-route0", 11u}, {10u, 77u, 0u, 1u}, 30u, 0x4654u, true, NULL};
+  ftun_interface_spec_t spec = {{"ftun-route0", 11u}, {10u, 77u, 0u, 1u}, 30u, 0x4654u, 18004u, 11000u, true, NULL};
   ftun_interface_async_options_t options = {0};
   ftun_budget_t *budget = NULL;
   ftun_core_t *core = NULL;
@@ -849,8 +894,178 @@ static int test_interface_async_adapter(void)
   return 0;
 }
 
+static int test_repair_reconcile(void)
+{
+  async_mock_t mock;
+  ftun_linux_route_async_io_t io;
+  ftun_route_policy_t policy = async_policy();
+  ftun_linux_route_async_t *operation = NULL;
+  ftun_linux_route_async_info_t info;
+  uint64_t now_ms = 1000u;
+  size_t index, first;
+  async_mock_init(&mock);
+  io = async_mock_io(&mock);
+  CHECK(ftun_linux_route_async_start_with_io(&policy, &io, now_ms, 10u,
+    100000u, 1u, &operation) == FTUN_OK);
+  mock.operation = operation;
+  /* 未就绪时不能对账。 */
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) ==
+        FTUN_E_INVALID);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  /* 全部在位：对账不发任何变更，也不重复添加。 */
+  first = mock.request_count;
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) == FTUN_E_AGAIN);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.repair_runs == 1u && info.repairs == 0u && !info.repairing &&
+        info.repair_result == FTUN_OK && info.active_count == info.resource_count);
+  for (index = first; index < mock.request_count; index++) {
+    CHECK(mock.requests[index].kind == FTUN_LINUX_ROUTE_REQUEST_QUERY);
+  }
+  /* 外部删除两项：只补回缺失项，且按计划顺序。 */
+  mock.present[1] = false;
+  mock.present[3] = false;
+  first = mock.request_count;
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.repairs == 2u && info.repair_result == FTUN_OK &&
+        info.active_count == info.resource_count);
+  CHECK(mock.add_calls[1] == 2u && mock.add_calls[3] == 2u &&
+        mock.add_calls[0] == 1u && mock.add_calls[2] == 1u);
+  CHECK(async_present_count(&mock) == (int)FTUN_LINUX_ROUTE_MAX_RESOURCES);
+  {
+    size_t previous = 0u;
+    for (index = first; index < mock.request_count; index++) {
+      size_t position = async_mock_resource(&mock, &mock.requests[index].resource);
+      if (mock.requests[index].kind != FTUN_LINUX_ROUTE_REQUEST_ADD) continue;
+      CHECK(position >= previous);
+      previous = position;
+    }
+  }
+  /* 添加失败：回到 READY 并记录原因，不撤销任何已有资源。 */
+  mock.present[2] = false;
+  mock.fail_add_index = 2u;
+  mock.fail_add_status = FTUN_E_IO;
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.repair_result == FTUN_E_IO && info.repair_failures == 1u &&
+        info.active_count == info.resource_count && !info.repairing);
+  for (index = 0u; index < FTUN_LINUX_ROUTE_MAX_RESOURCES; index++) {
+    CHECK(mock.remove_calls[index] == 0u);
+  }
+  /* 条件恢复后下一次对账补回。 */
+  mock.fail_add_index = SIZE_MAX;
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.repair_result == FTUN_OK && mock.present[2]);
+  /* 回复不到：期限到达后回到 READY，迟到回复不改变状态。 */
+  mock.block_receive = true;
+  CHECK(ftun_linux_route_async_repair(operation, now_ms, now_ms + 50u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.repair_result == FTUN_E_TIMEOUT && info.repair_failures == 2u &&
+        info.active_count == info.resource_count);
+  mock.block_receive = false;
+  /* 对账失败后事务仍可正常释放，所有资源按序撤销。 */
+  CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+  CHECK(async_present_count(&mock) == 0);
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  return 0;
+}
+
+static int test_sweep_stale_objects(void)
+{
+  async_mock_t first, mock;
+  ftun_linux_route_async_io_t io;
+  ftun_route_policy_t policy = async_policy();
+  ftun_linux_route_async_t *operation = NULL;
+  ftun_linux_route_async_info_t info;
+  ftun_linux_route_plan_t plan;
+  uint64_t now_ms = 1000u;
+  size_t index, non_address = 0u, first_add = SIZE_MAX, last_stray = 0u;
+  /* 先跑一次普通安装，取得策略计划的资源序列。 */
+  async_mock_init(&first);
+  io = async_mock_io(&first);
+  CHECK(ftun_linux_route_async_start_with_io(&policy, &io, now_ms, 10u,
+    100000u, 1u, &operation) == FTUN_OK);
+  CHECK(async_drive(operation, &first, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  memset(&plan, 0, sizeof(plan));
+  plan.resource_count = first.resource_count;
+  memcpy(plan.resources, first.resources, first.resource_count * sizeof(first.resources[0]));
+  plan.sweep = true;
+  for (index = 0u; index < plan.resource_count; index++) {
+    if (plan.resources[index].kind != FTUN_LINUX_ROUTE_ADDRESS) non_address++;
+  }
+  CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &first, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+
+  /* 每个非地址资源各有两个遗留对象：全部清理后才开始安装，地址不清理。 */
+  async_mock_init(&mock);
+  mock.strays_per_resource = 2u;
+  io = async_mock_io(&mock);
+  now_ms = 1000u;
+  CHECK(ftun_linux_route_async_start_plan_with_io(&plan, &io, now_ms, 10u,
+    100000u, 1u, &operation) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_READY, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.strays_removed == 2u * non_address && info.result == FTUN_OK &&
+        info.active_count == info.resource_count);
+  CHECK(mock.stray_requests == 3u * non_address);
+  for (index = 0u; index < mock.request_count; index++) {
+    if (mock.requests[index].resource.stray) {
+      CHECK(mock.requests[index].kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE &&
+            mock.requests[index].resource.kind != FTUN_LINUX_ROUTE_ADDRESS);
+      last_stray = index;
+    } else if (first_add == SIZE_MAX &&
+               mock.requests[index].kind == FTUN_LINUX_ROUTE_REQUEST_QUERY) {
+      first_add = index;
+    }
+  }
+  CHECK(first_add != SIZE_MAX && first_add > last_stray);
+  CHECK(ftun_linux_route_async_release(operation, now_ms, now_ms + 1000u) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_RELEASED, 1u));
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+
+  /* 清理失败：不安装任何资源，整个事务失败。 */
+  async_mock_init(&mock);
+  mock.fail_stray_at = 2u;
+  io = async_mock_io(&mock);
+  now_ms = 1000u;
+  CHECK(ftun_linux_route_async_start_plan_with_io(&plan, &io, now_ms, 10u,
+    100000u, 1u, &operation) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_FAILED, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.result == FTUN_E_IO && info.active_count == 0u);
+  for (index = 0u; index < FTUN_LINUX_ROUTE_MAX_RESOURCES; index++) {
+    CHECK(mock.add_calls[index] == 0u);
+  }
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+
+  /* 清理没有尽头（持续报告已删除）：达到上限后失败，不会无界循环。 */
+  async_mock_init(&mock);
+  mock.strays_per_resource = SIZE_MAX;
+  io = async_mock_io(&mock);
+  now_ms = 1000u;
+  CHECK(ftun_linux_route_async_start_plan_with_io(&plan, &io, now_ms, 10u,
+    100000u, 1u, &operation) == FTUN_OK);
+  CHECK(async_drive(operation, &mock, &now_ms, FTUN_LINUX_ROUTE_ASYNC_FAILED, 1u));
+  CHECK(ftun_linux_route_async_get_info(operation, &info) == FTUN_OK &&
+        info.result == FTUN_E_LIMIT &&
+        mock.stray_requests == FTUN_LINUX_ROUTE_SWEEP_LIMIT);
+  CHECK(ftun_linux_route_async_destroy(&operation) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_sweep_stale_objects() == 0);
+  CHECK(test_repair_reconcile() == 0);
   CHECK(test_cancel_pending_add() == 0);
   CHECK(test_adopt_owned_resources() == 0);
   CHECK(test_submit_backpressure_deadline() == 0);

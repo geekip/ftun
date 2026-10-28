@@ -405,6 +405,7 @@ static ftun_status_t ftun_direct_open_internal(
   context->network_generation = request->network_generation;
   context->requested_domain = request->requested_domain;
   context->protection.mark = request->protection.mark;
+  context->protection.liveness = request->protection.liveness;
   if (request->protection.interface_name.length != 0u) {
     memcpy(context->interface_name,
            request->protection.interface_name.data,
@@ -441,7 +442,7 @@ static ftun_status_t ftun_direct_open_internal(
   return FTUN_OK;
 }
 
-/* TASK-OUTBOUND-002 / TEST-OUTBOUND-002，目标 0.2.0：固定候选的受保护直连。 */
+/* 固定候选的受保护直连。 */
 ftun_status_t ftun_direct_open_with_io(ftun_core_t *core,
                                        const ftun_direct_request_t *request,
                                        const ftun_dial_io_t *io,

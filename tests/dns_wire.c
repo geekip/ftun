@@ -377,7 +377,7 @@ static int test_random_inputs(void)
   return 0;
 }
 
-/* TASK-DNS-008 / TEST-DNS-008：RFC 固定夹具、压缩边界与关联键。 */
+/* RFC 固定夹具、压缩边界与关联键。 */
 static int test_owned_budget(void)
 {
   ftun_budget_t *budget = NULL;

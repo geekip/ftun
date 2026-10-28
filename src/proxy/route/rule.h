@@ -26,6 +26,8 @@ struct ftun_rule {
   uint8_t network;
   ftun_string_t operand;
   ftun_frs_set_t *frs_set;
+  /* FRS 集合尚未就绪：规则无条件命中并拒绝新连接，直到换成就绪的快照。 */
+  bool frs_pending;
   char *owned_operand;
 };
 
@@ -50,7 +52,6 @@ ftun_status_t ftun_rule_destroy(ftun_rule_t **rule);
 ftun_status_t ftun_rule_accounted_bytes(const char *text, size_t *out);
 
 /* 共享 matcher。
- * 需求 REQ-ROUTE-001；任务 TASK-ROUTE-002；目标 0.3.0；验收 TEST-ROUTE-002。
  * 函数只读取已知元数据，不做解析或 I/O。IP/FRS-IP 在只有域名且没有真实
  * 候选时返回 needs_resolve；FakeIP 原地址永不作为真实地址参与匹配。
  */

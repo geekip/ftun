@@ -166,6 +166,7 @@ typedef struct {
   size_t feedback_suppressed;
   bool accepting;
   bool ready;
+  bool device_lost;
 } ftun_tun_service_usage_t;
 
 typedef struct {

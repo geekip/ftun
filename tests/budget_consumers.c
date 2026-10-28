@@ -153,7 +153,9 @@ static ftun_status_t destroy(void **implementation, uint64_t deadline)
 static const ftun_core_service_descriptor_t descriptor = {
   "budget-consumers", plan_prepare, plan_destroy, prepare, success,
   reload_prepare, reload_planned, reload_commit, success,
-  run_once, success, success, drain, stop, destroy
+  run_once, success, success, drain, stop, destroy,
+  NULL,
+  NULL /* network_changed */
 };
 
 static void completed(ftun_operation_t *operation, ftun_error_t error, void *user)

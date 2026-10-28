@@ -19,7 +19,7 @@ static void signal_ready(EV_P_ ev_signal *watcher, int revents)
   ev_break(loop, EVBREAK_ONE);
 }
 
-/* TASK-EVENT-002 / TEST-EVENT-002：验证所选 epoll 构建的信号和退出路径。 */
+/* 验证所选 epoll 构建的信号和退出路径。 */
 int main(void)
 {
   struct ev_loop *loop;

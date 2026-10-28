@@ -92,6 +92,7 @@ static ftun_status_t ftun_proxy_service_run_once(
   out_usage->busy_ms = usage.busy_ms;
   out_usage->deadline_lateness_ms = usage.deadline_lateness_ms;
   out_usage->quota_exhausted = usage.quota_exhausted;
+  out_usage->faults[FTUN_FAULT_SCOPE_OBJECT] = usage.object_faults;
   return status;
 }
 
@@ -132,6 +133,13 @@ static ftun_status_t ftun_proxy_service_destroy_until(
   return status;
 }
 
+static void ftun_proxy_service_network_changed(void *implementation,
+  const ftun_network_change_t *change, uint64_t now_ms)
+{
+  (void)change;
+  ftun_proxy_runtime_network_changed((ftun_proxy_runtime_t *)implementation, now_ms);
+}
+
 const ftun_core_service_descriptor_t ftun_proxy_service = {
   "proxy",
   ftun_proxy_service_plan_prepare,
@@ -147,10 +155,7 @@ const ftun_core_service_descriptor_t ftun_proxy_service = {
   ftun_proxy_service_quiesce,
   ftun_proxy_service_drain_until,
   ftun_proxy_service_stop_until,
-  ftun_proxy_service_destroy_until
+  ftun_proxy_service_destroy_until,
+  NULL /* maintain_once：尚未支持暂停 */,
+  ftun_proxy_service_network_changed
 };
-
-const ftun_core_service_descriptor_t *ftun_proxy_service_descriptor(void)
-{
-  return &ftun_proxy_service;
-}

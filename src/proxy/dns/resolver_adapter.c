@@ -109,7 +109,7 @@ static ftun_status_t ftun_resolver_validate(
   return FTUN_OK;
 }
 
-/* TASK-DNS-005 / TEST-DNS-005，目标 0.2.0：路由前 REAL 来源选择。 */
+/* 路由前 REAL 来源选择。 */
 ftun_status_t ftun_resolve_real_with_backend(
   ftun_core_t *core, const ftun_resolve_request_t *request,
   const ftun_resolver_backend_t *backend, ftun_operation_t **out)

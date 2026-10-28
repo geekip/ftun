@@ -1,4 +1,4 @@
-/* TASK-GROUP-002 / TEST-GROUP-002：ftun_url_test_choose，目标 0.4.0。 */
+/* ftun_url_test_choose。 */
 #include "url_test.h"
 #include <string.h>
 

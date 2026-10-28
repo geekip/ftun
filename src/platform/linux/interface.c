@@ -14,8 +14,8 @@ static ftun_status_t restore(void *context, const ftun_interface_spec_t *spec, v
   route.tun_interface = spec->name;
   memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
   route.tun_prefix_length = spec->prefix_length;
-  route.route_table = 51820u;
-  route.rule_priority = 11000u;
+  route.route_table = spec->route_table;
+  route.rule_priority = spec->rule_priority;
   route.protection_mark = spec->protection_mark;
   route.protection_mark_mask = UINT32_MAX;
   route.manage_local = true;
@@ -90,8 +90,8 @@ static ftun_status_t async_start(void *context, const ftun_interface_spec_t *spe
   route.tun_interface = spec->name;
   memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
   route.tun_prefix_length = spec->prefix_length;
-  route.route_table = 51820u;
-  route.rule_priority = 11000u;
+  route.route_table = spec->route_table;
+  route.rule_priority = spec->rule_priority;
   route.protection_mark = spec->protection_mark;
   route.protection_mark_mask = UINT32_MAX;
   route.manage_local = true;
@@ -167,8 +167,22 @@ static ftun_status_t async_query(void *context, const void *state,
   out->cleanup_result = info.cleanup_result;
   out->active_count = info.active_count;
   out->runnable = info.runnable;
+  out->repairing = info.repairing;
+  out->repair_result = info.repair_result;
+  out->repair_runs = info.repair_runs;
+  out->repairs = info.repairs;
+  out->repair_failures = info.repair_failures;
   return ftun_linux_route_async_next_deadline(owned->operation,
     &out->next_deadline_ms, &out->has_deadline);
+}
+
+static ftun_status_t async_repair(void *context, void *state, uint64_t now_ms,
+  uint64_t deadline_ms)
+{
+  ftun_linux_interface_async_t *owned = state;
+  (void)context;
+  return owned == NULL ? FTUN_E_INVALID :
+    ftun_linux_route_async_repair(owned->operation, now_ms, deadline_ms);
 }
 
 static ftun_status_t async_destroy(void *context, void **state)
@@ -190,5 +204,5 @@ static ftun_status_t async_destroy(void *context, void **state)
 
 const ftun_interface_ops_t ftun_linux_interface_ops = {
   restore, withdraw, NULL,
-  {async_start, async_adopt, async_withdraw, async_run, async_query, async_destroy, NULL}
+  {async_start, async_adopt, async_withdraw, async_run, async_query, async_destroy, async_repair, NULL}
 };

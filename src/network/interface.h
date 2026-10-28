@@ -9,6 +9,8 @@ typedef struct {
   uint8_t ipv4_address[4];
   uint8_t prefix_length;
   uint32_t protection_mark;
+  uint32_t route_table;
+  uint32_t rule_priority;
   bool strict_route;
   ftun_budget_t *budget;
 } ftun_interface_spec_t;
@@ -38,6 +40,12 @@ typedef struct {
   uint64_t next_deadline_ms;
   bool has_deadline;
   bool runnable;
+  /* 对账修复：repairing 期间 state 为 INSTALLING，但失败不会撤销已有资源。 */
+  bool repairing;
+  ftun_status_t repair_result;
+  size_t repair_runs;
+  size_t repairs;
+  size_t repair_failures;
 } ftun_interface_async_info_t;
 
 /* owner-loop 非阻塞事务：start/adopt 成功交付拥有句柄，spec/options 仅同步
@@ -57,6 +65,9 @@ typedef struct {
   ftun_status_t (*query)(void *context, const void *state,
     ftun_interface_async_info_t *out);
   ftun_status_t (*destroy)(void *context, void **state);
+  /* 可选。对 READY 事务逐项核验并补回缺失资源，不重建事务；NULL 表示不支持。 */
+  ftun_status_t (*repair)(void *context, void *state, uint64_t now_ms,
+    uint64_t deadline_ms);
   void *context;
 } ftun_interface_async_ops_t;
 

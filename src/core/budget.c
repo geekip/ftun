@@ -37,8 +37,7 @@ struct ftun_reservation {
   int cleanup;
 };
 
-/* ftun_budget_reserve implements TASK-CORE-004 / TEST-CORE-004, target
- * 0.2.0; typed reservations preserve the original entry point. */
+/* ftun_budget_reserve; typed reservations preserve the original entry point. */
 
 static void ftun_budget_unpack(ftun_budget_resources_t resources,
                                size_t values[FTUN_BUDGET_RESOURCE_COUNT])

@@ -51,7 +51,6 @@ ftun_status_t ftun_dns_cache_store_failure(ftun_dns_cache_t *cache,
                                            ftun_status_t failure,
                                            uint64_t suppress_ms);
 /* 策略隔离的响应缓存。
- * 需求 REQ-DNSWIRE-001；任务 TASK-DNS-006；目标 0.3.0；验收 TEST-DNS-006。
  * 实现路径：键包括问题、标志、解析策略和实际出口身份；正确递减 TTL；NXDOMAIN/NODATA 与短期失败抑制分开。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * lookup 返回拥有型 answer，并按当前单调时刻重写 ID 与递减普通 RR TTL。

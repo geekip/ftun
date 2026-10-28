@@ -60,7 +60,6 @@ typedef struct {
 } ftun_udp_flow_usage_t;
 
 /* TUN UDP flow。
- * 需求 REQ-UDP-001；任务 TASK-TUN-003；目标 0.2.0；验收 TEST-TUN-003。
  * 实现路径：按入站/源/目标建立有界表并固定 Runtime；FakeIP 回包恢复客户端原目标；idle 回收且不向另一地址重放同一包。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。进程仅允许一个活跃
  * table，创建/输入/回收/销毁均由同一 owner loop 串行调用；无并发创建契约。

@@ -17,12 +17,5 @@ struct ftun_dns_dispatcher {
 };
 
 ftun_status_t ftun_dns_query_request_validate(ftun_budget_t *budget, const ftun_dns_query_t *query);
-ftun_status_t ftun_dns_name_domain(ftun_dns_name_t name, char output[254],
-                                   size_t *out_length);
-ftun_status_t ftun_dns_local_answer(ftun_dns_dispatcher_t *dispatcher,
-                                    const ftun_dns_query_t *query,
-                                    uint16_t rcode, int with_address,
-                                    uint32_t address,
-                                    ftun_operation_t **out);
 
 #endif

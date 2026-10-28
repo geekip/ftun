@@ -9,7 +9,6 @@
 #define FTUN_CONFIG_MAX_STRING_BYTES FTUN_CONFIG_MAX_JSON_BYTES
 #define FTUN_CONFIG_MAX_PATH_BYTES 4096u
 /* JSON 到类型配置。
- * 需求 REQ-CONF-001；任务 TASK-CONFIG-002；目标 0.2.0；验收 TEST-CONFIG-002。
  * 实现路径：拒绝重复键、未知字段、深度/长度/整数溢出；解析树只在控制阶段存在；关闭 DNS 时不建立无效 DNS 选择依赖。
  * 根 $schema 是编辑器元数据：检查为字符串后忽略，不下载、不参与 Runtime 身份。
  * 字段结构与根 schema.json 保持一致；引用、环、文件等仍交 validate 校验。

@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <string.h>
 
-/* TASK-TUN-001 / TEST-TUN-001，目标 0.2.0：平台无关整包端口。 */
+/* 平台无关整包端口。 */
 ftun_status_t ftun_packet_port_open(ftun_core_t *core,
                                     const ftun_tun_spec_t *spec,
                                     ftun_packet_port_t **out)

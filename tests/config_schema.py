@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""TEST-CONFIG-SCHEMA-001: Draft 2020-12 shape/boundary checks, not FTUN runtime checks."""
+"""Draft 2020-12 shape/boundary checks, not FTUN runtime checks."""
 import copy
 import json
 import sys
@@ -17,9 +17,16 @@ SCHEMA = json.loads((ROOT / 'schema.json').read_text(encoding='utf-8'))
 VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 
 
+DEVICE = {'interface': 'ftun0', 'ipv4': {'address': '172.19.0.1/30'}}
+
+
 def tun(**values):
-    return dict(type='tun', name='tun-in', interface={'name': 'ftun0'},
-                ipv4={'address': '172.19.0.1/30'}, **values)
+    return dict(type='tun', name='tun-in', **values)
+
+
+def tun_config(inbound=None, **device):
+    """顶层 tun 设备加一个 TUN inbound；设备字段通过 device 覆盖。"""
+    return {'tun': dict(DEVICE, **device), 'inbounds': [inbound or tun()]}
 
 
 def node(**values):
@@ -68,7 +75,7 @@ class ConfigSchemaTest(unittest.TestCase):
         self.valid({'base': {}, 'dns': {}, 'frs': {}, 'sniff': {}, 'rules': []})
         self.valid({'base': {'capacity': {'tcp-flows': 1000, 'udp-flows': 1000,
                                           'udp-associations': 1000}}})
-        original = {'inbounds': [tun()]}
+        original = tun_config()
         value = copy.deepcopy(original)
         self.valid(value)
         self.assertEqual(value, original)  # JSON Schema defaults must not mutate the config.
@@ -149,7 +156,7 @@ class ConfigSchemaTest(unittest.TestCase):
         self.valid({'dns': {'enable': False, 'default-server': 'missing',
                            'listeners': [{'listen': '127.0.0.1:53', 'server': 'missing'}]},
                     'outbounds': [node(**{'dns-server': 'missing'})], 'frs': {'dns-server': 'missing'},
-                    'inbounds': [tun(**{'dns-hijack': True})]})
+                    'tun': DEVICE, 'inbounds': [tun(**{'dns-hijack': True})]})
         self.valid({'dns': {'listeners': [{'listen': '127.0.0.1:53'},
                                          {'listen': '127.0.0.1:5353', 'server': ''}]}})
         for value in [{'dns': {'servers': [{'name': 'd', 'type': 'udp', 'address': []}]}},
@@ -159,30 +166,43 @@ class ConfigSchemaTest(unittest.TestCase):
             self.invalid(value)
 
     def test_tun_constraints_and_omitted_defaults(self):
-        for value in [tun(), tun(tcp=False), tun(udp=False),
-                      tun(**{'strict-route': True, 'auto-route': True})]:
-            self.valid({'inbounds': [value]})
-        for value in [tun(tcp=False, udp=False), tun(**{'strict-route': True}),
-                      tun(**{'strict-route': True, 'auto-route': False}), tun(users={}),
-                      tun(listen='127.0.0.1:80'), dict(tun(), stack='gvisor'),
-                      dict(tun(), interface={'name': 'ftun0', 'mtu': 0}),
-                      dict(tun(), ipv4={}), dict(tun(), interface={})]:
-            with self.subTest(value=value): self.invalid({'inbounds': [value]})
-        self.invalid({'inbounds': [tun(), dict(tun(), name='tun2')]})
+        for value in [tun(), tun(tcp=False), tun(udp=False)]:
+            self.valid({'tun': DEVICE, 'inbounds': [value]})
+        for value in [tun(tcp=False, udp=False), tun(users={}),
+                      tun(listen='127.0.0.1:80'), dict(tun(), stack='gvisor')]:
+            with self.subTest(value=value):
+                self.invalid({'tun': DEVICE, 'inbounds': [value]})
+        # 设备字段只允许出现在顶层 tun，TUN inbound 下出现即视为未知字段。
+        for field in ['interface', 'ipv4', 'auto-route', 'strict-route']:
+            with self.subTest(field=field):
+                self.invalid({'tun': DEVICE, 'inbounds': [dict(tun(), **{field: True})]})
+        self.invalid({'tun': DEVICE, 'inbounds': [tun(), dict(tun(), name='tun2')]})
 
-    def test_canonical_tun_and_legacy_compatibility(self):
-        device = {'interface': 'ftun0', 'mtu': 1420,
-                  'ipv4': {'address': '172.19.0.1/30'},
-                  'auto-route': True, 'strict-route': True}
-        self.valid({'tun': device,
-                    'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
-        legacy = tun(**{'auto-route': True, 'strict-route': True})
-        legacy['interface']['mtu'] = 1420
-        self.valid({'tun': device, 'inbounds': [legacy]})
-        self.invalid({'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
-        self.invalid({'tun': dict(device, **{'strict-route': True,
-                                             'auto-route': False}),
-                      'inbounds': [{'type': 'tun', 'name': 'tun-in'}]})
+    def test_canonical_tun_device(self):
+        device = dict(DEVICE, mtu=1420, **{'auto-route': True, 'strict-route': True})
+        self.valid({'tun': device, 'inbounds': [tun()]})
+        self.invalid({'inbounds': [tun()]})
+        self.invalid({'tun': dict(device, **{'auto-route': False}), 'inbounds': [tun()]})
+        self.invalid({'tun': dict(DEVICE, mtu=0), 'inbounds': [tun()]})
+        self.invalid({'tun': dict(DEVICE, ipv4={}), 'inbounds': [tun()]})
+
+    def test_timeouts(self):
+        self.valid({'base': {'timeouts': {}}})
+        self.valid({'base': {'timeouts': {
+            'handshake': '10s', 'connect': '500ms', 'reply': '5s',
+            'tcp-keepalive': {'idle': '30s', 'interval': '15s', 'count': 4},
+            'write-progress': '120s', 'tcp-idle': '10m', 'udp-idle': '120s'}}})
+        self.valid({'base': {'timeouts': {'tcp-keepalive': False, 'tcp-idle': None}}})
+        self.valid({'inbounds': [{'type': 'socks5', 'name': 'in', 'listen': '127.0.0.1:80',
+                                 'tcp-idle': '30s'}]})
+        for value in [{'handshake': '10'}, {'handshake': 10}, {'handshake': '0s'},
+                      {'tcp-keepalive': True}, {'tcp-keepalive': {'count': 0}},
+                      {'tcp-keepalive': {'count': 21}}, {'tcp-keepalive': {'unknown': 1}},
+                      {'tcp-idle': 0}, {'unknown': '1s'}]:
+            with self.subTest(value=value):
+                self.invalid({'base': {'timeouts': value}})
+        self.invalid({'inbounds': [{'type': 'socks5', 'name': 'in', 'listen': '127.0.0.1:80',
+                                   'tcp-idle': None}]})
 
     def test_cidr_limits(self):
         for cidr in ['0.0.0.0/0', '198.18.0.0/15', '255.255.255.255/32']:

@@ -56,7 +56,6 @@ typedef struct {
 } ftun_stream_usage_t;
 
 /* 可保留引用的字节流。
- * 需求 REQ-CORE-001；任务 TASK-TRANSPORT-002；目标 0.2.0；验收 TEST-TRANSPORT-002。
  * 同步未接纳不保留 BufferSlice；接纳后 Stream clone 前缀并持有到 operation
  * completion 回调开始。backend 只有在真实消费、写失败或 ACK 后调用 complete，
  * 排入 backend 队列本身不表示原缓冲可释放。write token 按值复制并带 generation；
@@ -74,6 +73,21 @@ ftun_status_t ftun_stream_write_ref(ftun_stream_t *stream,
                                     const ftun_buffer_slice_t *slice,
                                     size_t *accepted,
                                     ftun_operation_t **out);
+/* 写入返回 LIMIT 的来源，决定该等什么：STREAM 是这条流自己的在途写满了
+ * （等它自己的写完成）；OPERATIONS 是全局 Operation 队列满（用
+ * ftun_operation_queue_wait 等额度）；BACKEND 是 backend 资源不足。 */
+typedef enum {
+  FTUN_STREAM_LIMIT_NONE = 0,
+  FTUN_STREAM_LIMIT_STREAM,
+  FTUN_STREAM_LIMIT_OPERATIONS,
+  FTUN_STREAM_LIMIT_BACKEND
+} ftun_stream_limit_t;
+ftun_status_t ftun_stream_write_ref_ex(
+  ftun_stream_t *stream, const ftun_buffer_slice_t *slice,
+  ftun_completion_fn completion, void *completion_user,
+  size_t *accepted, ftun_operation_t **out, ftun_stream_limit_t *reason);
+/* 借用创建时给定的 Operation 队列。 */
+ftun_operation_queue_t *ftun_stream_operations(const ftun_stream_t *stream);
 ftun_status_t ftun_stream_write_ref_with_completion(
   ftun_stream_t *stream, const ftun_buffer_slice_t *slice,
   ftun_completion_fn completion, void *completion_user,

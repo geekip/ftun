@@ -312,7 +312,7 @@ static ftun_status_t ftun_dns_parse_sections(
   return FTUN_OK;
 }
 
-/* TASK-DNS-008 / TEST-DNS-008，目标 0.2.0：有界 DNS wire parser。 */
+/* 有界 DNS wire parser。 */
 ftun_status_t ftun_dns_message_parse_with_budget(ftun_budget_t *budget, ftun_bytes_t wire,
                                      ftun_dns_message_t **out)
 {

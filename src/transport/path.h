@@ -17,6 +17,9 @@ typedef struct {
   void *context;
   /* 可选本地端点查询；没有物理地址的通道返回 UNSUPPORTED。 */
   ftun_status_t (*local_endpoint)(void *context, ftun_endpoint_t *out);
+  /* 可选发送确认进展（见 ftun_socket_send_progress）；没有物理 TCP 连接的通道
+   * 返回 UNSUPPORTED。 */
+  ftun_status_t (*send_progress)(void *context, uint64_t *acked, uint32_t *queued);
 } ftun_path_driver_t;
 
 typedef struct {
@@ -74,6 +77,8 @@ ftun_status_t ftun_path_revoke(ftun_path_t *path);
 ftun_status_t ftun_path_destroy(ftun_path_t **path);
 ftun_status_t ftun_path_resume(ftun_path_t *path);
 ftun_status_t ftun_path_local_endpoint(ftun_path_t *path, ftun_endpoint_t *out);
+ftun_status_t ftun_path_send_progress(ftun_path_t *path, uint64_t *acked,
+  uint32_t *queued);
 
 #define FTUN_PATH_READABLE 1u
 #define FTUN_PATH_WRITABLE 2u

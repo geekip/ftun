@@ -768,6 +768,7 @@ static ftun_status_t ftun_bootstrap_explicit(
   }
   context->network_generation = request->network_generation;
   context->protection.mark = request->protection.mark;
+  context->protection.liveness = request->protection.liveness;
   if (request->protection.interface_name.length != 0u) {
     memcpy(context->interface_name, request->protection.interface_name.data,
            request->protection.interface_name.length);
@@ -842,7 +843,7 @@ static ftun_status_t ftun_bootstrap_resolve_internal(
   return ftun_bootstrap_explicit(core, request, dial_io, io, out);
 }
 
-/* TASK-DNS-004 / TEST-DNS-004，目标 0.2.0：基础真实解析。 */
+/* 基础真实解析。 */
 ftun_status_t ftun_bootstrap_resolve(
   ftun_core_t *core, const ftun_bootstrap_request_t *request,
   ftun_operation_t **out)

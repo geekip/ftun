@@ -1,195 +1,16 @@
 #define _POSIX_C_SOURCE 200809L
 
-#include "core/core.h"
-#include "app/cleanup.h"
-#include "app/control.h"
-#include "app/runtime_support.h"
+#include "app/runtime_internal.h"
 
-#include "config/config.h"
-#include "config/compile.h"
-#include "config/model.h"
-#include "config/parser.h"
-#include "core/budget.h"
-#include "core/operation.h"
-#include "core/worker.h"
-#include "util/logger.h"
-#include "util/event_log.h"
-#include "core/context.h"
-#include "util/time.h"
 
-#include <stddef.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <pthread.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <sys/resource.h>
-#include <time.h>
-#include <unistd.h>
-
-#define FTUN_CORE_DEFAULT_MEMORY (64u * 1024u * 1024u)
-#define FTUN_CORE_DEFAULT_OPERATIONS 1024u
-#define FTUN_CORE_MIN_OPERATIONS 4u
-#define FTUN_CORE_MAX_OPERATIONS 4096u
-#define FTUN_CORE_DEFAULT_RETAINED 4u
-#define FTUN_CORE_DEFAULT_DESCRIPTORS 4096u
-#define FTUN_CORE_DEFAULT_QUEUE_SLOTS 4096u
-#define FTUN_CORE_MIN_MEMORY (1024u * 1024u)
-#define FTUN_CORE_MIN_DESCRIPTORS 16u
-#define FTUN_CORE_MIN_QUEUE_SLOTS 64u
-#define FTUN_CORE_CONTROL_STRING 4096u
-#define FTUN_CORE_RELOAD_WORK_MAGIC UINT32_C(0x4654524c)
-#define FTUN_CORE_OPERATION_DISPATCH_QUOTA 32u
-#define FTUN_CORE_STATE_WORKER_CAPACITY 4u
-
-typedef enum {
-  FTUN_CONTROL_POST = 1,
-  FTUN_CONTROL_RELOAD,
-  FTUN_CONTROL_SELECT
-} ftun_control_kind_t;
-
-typedef struct {
-  char *value;
-  ftun_reservation_t *reservation;
-} ftun_core_owned_path_t;
-
-typedef struct ftun_control_task {
-  ftun_core_t *core;
-  ftun_operation_t *operation;
-  ftun_operation_token_t completion_token;
-  ftun_completion_fn completion;
-  ftun_app_command_completion_fn command_completion;
-  ftun_app_generation_guard_t expected;
-  uint64_t result_generation;
-  void *completion_user;
-  char *first;
-  char *second;
-  ftun_control_kind_t kind;
-  ftun_operation_t *prepare_operation;
-  ftun_reservation_t *reservation;
-  pthread_mutex_t mutex;
-  int cancelled;
-  int ring_consumed;
-  int callback_complete;
-  int async_started;
-  int async_complete;
-  int control_priority;
-  bool reload_event_recorded; /* 只由 owner 的完成/取消派发使用。 */
-  void *reload_transaction;
-} ftun_control_task_t;
-
-typedef struct {
-  uint32_t magic;
-  uint32_t socket_mark;
-  bool allow_system_resolver;
-  uint64_t base_generation;
-  uint64_t maximum_bytes;
-  uintptr_t service_descriptor;
-  uintptr_t owner;
-  uintptr_t log_ledger;
-  uintptr_t plan_budget;
-  uint32_t path_length;
-} ftun_core_reload_work_t;
-
-typedef struct {
-  uint64_t base_generation;
-  uintptr_t owner;
-  ftun_status_t status;
-  uintptr_t config;
-  uintptr_t attachment;
-  ftun_core_service_plan_t service_plan;
-  uintptr_t logger;
-  ftun_core_owned_path_t source_path;
-  bool publish_required;
-  ftun_config_trace_t config_trace;
-} ftun_core_reload_result_t;
-
-typedef struct {
-  ftun_config_t *config;
-  ftun_app_runtime_candidate_t *candidate;
-  ftun_core_service_plan_t service_plan;
-  ftun_logger_t *next_logger;
-  ftun_core_owned_path_t next_path;
-  ftun_reservation_t *reservation;
-  uint64_t next_generation;
-  bool replace_logger;
-  bool service_prepared;
-} ftun_core_reload_transaction_t;
-
-typedef struct {
-  pthread_mutex_t mutex;
-  pthread_cond_t condition;
-  pthread_t owner;
-  ftun_budget_t *root_budget;
-  ftun_budget_t *budget;
-  ftun_budget_t *data_budget;
-  ftun_reservation_t *reservation;
-  size_t bootstrap_bytes;
-  ftun_operation_queue_t *operations;
-  ftun_logger_t *logger;
-  ftun_logger_t *retired_logger;
-  const ftun_core_service_descriptor_t *service_descriptor;
-  ftun_core_service_t service;
-  ftun_core_t *core;
-  ftun_worker_t *reload_worker;
-  ftun_worker_t *state_worker;
-  ftun_core_reload_result_t retired_result;
-  ftun_core_reload_transaction_t *retired_transaction;
-  const ftun_app_runtime_support_t *support;
-  ftun_config_t *active_config;
-  ftun_config_t *startup_config;
-  ftun_app_runtime_candidate_t *startup_candidate;
-  ftun_logger_t *startup_logger;
-  ftun_event_log_t *events;
-  ftun_log_ledger_t *log_ledger;
-  bool lifecycle_started;
-  bool runtime_stopped;
-  bool run_returned;
-  ftun_status_t run_result;
-  ftun_config_trace_t config_trace;
-  uint64_t config_trace_generation;
-  ftun_control_task_t **tasks;
-  ftun_core_owned_path_t config_path;
-  ftun_core_owned_path_t startup_path;
-  size_t task_capacity;
-  size_t task_head;
-  size_t task_tail;
-  size_t task_count;
-  size_t normal_task_count;
-  size_t task_control_reserve;
-  uint64_t generation;
-  uint64_t owner_rounds;
-  uint64_t owner_max_busy_ms;
-  uint64_t owner_max_deadline_lateness_ms;
-  uint64_t stop_deadline_ms;
-  size_t owner_max_work;
-  uint64_t owner_quota_exhaustions;
-  ftun_core_state_t state;
-  int owner_valid;
-  int stop_requested;
-  int reload_pending;
-  bool callbacks_enabled;
-  bool service_stopped;
-  bool state_save_done;
-  bool state_save_submitted;
-  bool retired_busy;
-  ftun_status_t first_error;
-  ftun_status_t cleanup_error;
-} ftun_core_control_t;
-
-static int ftun_control_task_cancelled(ftun_control_task_t *task);
-static void ftun_control_task_destroy(ftun_control_task_t *task);
-static void ftun_control_task_consumed(ftun_control_task_t *task);
-
-static ftun_app_cleanup_t ftun_core_cleanup(ftun_core_control_t *control)
+ftun_app_cleanup_t ftun_core_cleanup(ftun_core_control_t *control)
 {
   ftun_app_cleanup_t cleanup = {&control->mutex, &control->stop_deadline_ms,
                                &control->cleanup_error};
   return cleanup;
 }
 
-static ftun_status_t ftun_core_control(ftun_core_t *core,
+ftun_status_t ftun_core_control(ftun_core_t *core,
                                        ftun_core_control_t **out)
 {
   void *value = NULL;
@@ -202,17 +23,50 @@ static ftun_status_t ftun_core_control(ftun_core_t *core,
   return FTUN_OK;
 }
 
-static void ftun_core_event(ftun_core_control_t *control,
+/* 运行配置代次唯一保存在 Core 上下文，宿主不再维护影子计数。 */
+uint64_t ftun_core_generation_now(const ftun_core_control_t *control)
+{
+  uint64_t generation = 0u;
+  (void)ftun_core_context_generation(control->core, &generation);
+  return generation;
+}
+
+/* 宿主事务以 Core 上下文自身为预留持有者。业务提交可能已消费该预留
+ * （Proxy Runtime 提交即发布）；仍持有时由宿主发布。两种情况结束后当前
+ * 代次都必须等于 next。 */
+ftun_status_t ftun_core_generation_settle(ftun_core_t *core,
+                                                 uint64_t next)
+{
+  uint64_t held = 0u;
+  uint64_t current = 0u;
+  ftun_status_t status = ftun_core_context_generation_held(core, core, &held);
+  if (status == FTUN_OK && held == next) {
+    status = ftun_core_context_generation_publish(core, core, next);
+  } else if (status == FTUN_E_STALE) {
+    status = FTUN_OK;
+  }
+  if (status == FTUN_OK) status = ftun_core_context_generation(core, &current);
+  if (status == FTUN_OK && current != next) status = FTUN_E_STATE_CORRUPT;
+  return status;
+}
+
+void ftun_core_event(ftun_core_control_t *control,
   ftun_lifecycle_kind_t kind, uint64_t generation, ftun_status_t status)
 {
   ftun_lifecycle_event_t item = {0};
   item.kind = kind;
   item.generation = generation;
   item.status = status;
+  /* 同一次 reload 的请求/提交/拒绝/取消事件共用一个关联 ID。 */
+  if (kind == FTUN_LIFECYCLE_RELOAD_REQUESTED) control->reload_correlation = ftun_correlation_next();
+  if (kind == FTUN_LIFECYCLE_RELOAD_REQUESTED || kind == FTUN_LIFECYCLE_RELOAD_COMMITTED ||
+      kind == FTUN_LIFECYCLE_RELOAD_REJECTED || kind == FTUN_LIFECYCLE_RELOAD_CANCELLED) {
+    item.correlation = control->reload_correlation;
+  }
   (void)ftun_lifecycle_emit(control->core, &item);
 }
 
-static void ftun_core_config_trace(ftun_core_control_t *control,
+void ftun_core_config_trace(ftun_core_control_t *control,
   const ftun_config_trace_t *trace, uint64_t generation)
 {
   (void)pthread_mutex_lock(&control->mutex);
@@ -235,7 +89,7 @@ static char *ftun_core_copy_string(const char *value)
 }
 
 /* 路径副本随候选和活动配置转移；任务内已计量的字符串仍用原复制函数。 */
-static ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
+ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
   const char *value, ftun_core_owned_path_t *out)
 {
   ftun_reservation_t *reservation = NULL;
@@ -259,7 +113,7 @@ static ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path)
+ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path)
 {
   ftun_status_t status;
   if (path == NULL) return FTUN_E_INVALID;
@@ -270,7 +124,7 @@ static ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path)
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_core_prepare_parent(const char *path)
+ftun_status_t ftun_core_prepare_parent(const char *path)
 {
   char *copy;
   char *cursor;
@@ -305,7 +159,7 @@ static ftun_status_t ftun_core_prepare_parent(const char *path)
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
+ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
                                               ftun_log_ledger_t *ledger,
                                               ftun_logger_t **out)
 {
@@ -322,20 +176,23 @@ static ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
   memset(&options, 0, sizeof(options));
   options.level = level;
   options.path = config->log.file;
+  options.max_size = config->log.max_size;
+  options.max_files = config->log.max_files;
   options.queue_capacity = 128u;
+  options.stamp = true;
   options.line_capacity = 1024u;
   options.ledger = ledger;
   return ftun_logger_create(&options, out);
 }
 
-static ftun_status_t ftun_core_logger_reap(ftun_core_control_t *control,
+ftun_status_t ftun_core_logger_reap(ftun_core_control_t *control,
                                            uint64_t deadline_ms)
 {
   if (control == NULL) return FTUN_E_INVALID;
   return ftun_logger_destroy_until(&control->retired_logger, deadline_ms);
 }
 
-static ftun_status_t ftun_core_logger_retire(ftun_core_control_t *control,
+ftun_status_t ftun_core_logger_retire(ftun_core_control_t *control,
                                              ftun_logger_t **logger)
 {
   ftun_status_t status;
@@ -346,943 +203,6 @@ static ftun_status_t ftun_core_logger_retire(ftun_core_control_t *control,
   *logger = NULL;
   status = ftun_logger_stop(control->retired_logger);
   return status;
-}
-
-static int ftun_core_string_equal(const char *left, const char *right)
-{
-  if (left == NULL || right == NULL) return left == right;
-  return strcmp(left, right) == 0;
-}
-
-static int ftun_core_tun_device_equal(const ftun_config_t *left,
-                                      const ftun_config_t *right)
-{
-  if (left == NULL || right == NULL) return 0;
-  return left->tun.present == right->tun.present &&
-    (!left->tun.present ||
-      (ftun_core_string_equal(left->tun.interface_name,
-                              right->tun.interface_name) &&
-       ftun_core_string_equal(left->tun.ipv4_address,
-                              right->tun.ipv4_address) &&
-       left->tun.mtu == right->tun.mtu &&
-       left->tun.auto_route == right->tun.auto_route &&
-       left->tun.strict_route == right->tun.strict_route));
-}
-
-static ftun_status_t ftun_core_reload_compatible(const ftun_config_t *active,
-                                                  const ftun_config_t *next)
-{
-  if (active == NULL || next == NULL) return FTUN_E_INVALID;
-  if (active->plan == NULL || next->plan == NULL) return FTUN_E_INVALID;
-  if (((active->plan->required_modules ^ next->plan->required_modules) &
-       (FTUN_BUILD_MODULE_PROXY | FTUN_BUILD_MODULE_DNS |
-        FTUN_BUILD_MODULE_TUN)) != 0u) {
-    return FTUN_E_RESTART_REQUIRED;
-  }
-  if ((active->plan->required_modules & FTUN_BUILD_MODULE_TUN) != 0u &&
-      !ftun_core_tun_device_equal(active, next)) {
-    return FTUN_E_RESTART_REQUIRED;
-  }
-  return FTUN_OK;
-}
-
-static void ftun_core_log_status(ftun_core_t *core, ftun_status_t status,
-                                 uint32_t stage, ftun_diagnostic_kind_t kind, const char *message)
-{
-  ftun_error_t error = {0};
-  uint64_t generation = 0u;
-  /* 这些生产入口只由 owner 调用；提交前使用当前生效代次。 */
-  (void)ftun_core_context_generation(core, &generation);
-  error.status = status;
-  error.stage = stage;
-  (void)ftun_diagnostic_report(core, kind, generation, error, message);
-}
-
-static void ftun_core_state_completed(ftun_operation_t *operation,
-                                      ftun_error_t error,
-                                      ftun_bytes_t result, void *user)
-{
-  ftun_core_control_t *control = (ftun_core_control_t *)user;
-  (void)operation;
-  (void)result;
-  if (control != NULL && error.status != FTUN_OK &&
-      error.status != FTUN_E_CANCELLED) {
-    ftun_core_log_status(control->core, error.status,
-      FTUN_STAGE_STATE_RESTORE, FTUN_DIAGNOSTIC_STATE_SAVE, control->support->state_failure_message);
-  }
-}
-
-static ftun_status_t ftun_core_state_schedule(
-  ftun_core_t *core, ftun_core_control_t *control, const char *path,
-  uint64_t deadline_ms)
-{
-  ftun_worker_job_t job;
-  ftun_reservation_t *input_reservation = NULL;
-  ftun_operation_t *operation = NULL;
-  ftun_status_t status;
-  if (control->support == NULL || control->state_worker == NULL) return FTUN_OK;
-  memset(&job, 0, sizeof(job));
-  status = control->support->state_job(core, control->budget, path, deadline_ms, &job, &input_reservation);
-  if (status != FTUN_OK) return status;
-  status = ftun_worker_submit(control->state_worker, &job,
-    ftun_core_state_completed, control, &operation);
-  free((void *)job.input.data);
-  (void)ftun_reservation_release(&input_reservation);
-  return status;
-}
-
-static ftun_status_t ftun_core_reload_result_release(
-  ftun_core_reload_result_t *result, uint64_t deadline)
-{
-  const ftun_app_runtime_support_t *support = ftun_app_runtime_support();
-  ftun_config_t *config;
-  ftun_app_runtime_candidate_t *attachment;
-  ftun_logger_t *logger;
-  ftun_status_t status;
-  if (result == NULL) return FTUN_OK;
-  config = (ftun_config_t *)result->config;
-  attachment = (ftun_app_runtime_candidate_t *)result->attachment;
-  logger = (ftun_logger_t *)result->logger;
-  status = ftun_core_service_plan_destroy(&result->service_plan);
-  if (status != FTUN_OK) return status;
-  if (attachment != NULL) {
-    if (support == NULL) return FTUN_E_STATE_CORRUPT;
-    status = support->release(NULL, &attachment);
-    result->attachment = (uintptr_t)attachment;
-    if (status != FTUN_OK) return status;
-  }
-  status = ftun_logger_destroy_until(&logger, deadline);
-  result->logger = (uintptr_t)logger;
-  if (status != FTUN_OK) return status;
-  status = ftun_config_destroy(&config);
-  result->config = (uintptr_t)config;
-  if (status != FTUN_OK) return status;
-  status = ftun_core_owned_path_destroy(&result->source_path);
-  if (status != FTUN_OK) return status;
-  memset(result, 0, sizeof(*result));
-  return FTUN_OK;
-}
-
-static void ftun_core_reload_result_retire(ftun_core_reload_result_t *result)
-{
-  ftun_core_control_t *control;
-  ftun_app_cleanup_t cleanup;
-  ftun_status_t status;
-  uint64_t now = 0u;
-  if (result == NULL || result->owner == 0u) return;
-  control = (ftun_core_control_t *)result->owner;
-  cleanup = ftun_core_cleanup(control);
-  (void)ftun_monotonic_now(&now);
-  status = ftun_core_reload_result_release(result, now);
-  if (status == FTUN_OK) return;
-  ftun_app_cleanup_record(&cleanup, status);
-  /* 一个 reload 的接纳门保持到 Worker、候选与退休对象全部释放。
-   * 因而该固定槽在接收本次唯一结果时必为空，不需要分配清理队列。 */
-  control->retired_result = *result;
-  memset(result, 0, sizeof(*result));
-}
-
-static ftun_status_t ftun_core_reload_result_cleanup(ftun_bytes_t bytes)
-{
-  ftun_core_reload_result_t result;
-  if (bytes.data == NULL || bytes.length != sizeof(result)) return FTUN_E_INVALID;
-  memcpy(&result, bytes.data, sizeof(result));
-  ftun_core_reload_result_retire(&result);
-  memcpy((void *)(uintptr_t)bytes.data, &result, sizeof(result));
-  return FTUN_OK;
-}
-
-static ftun_status_t ftun_core_reload_execute(
-  ftun_bytes_t input, uint8_t *output, size_t output_capacity,
-  size_t *out_output_size)
-{
-  const ftun_core_reload_work_t *work;
-  const char *path;
-  ftun_core_reload_result_t result;
-  ftun_config_t *config = NULL;
-  const ftun_app_runtime_support_t *support = ftun_app_runtime_support();
-  ftun_app_runtime_candidate_t *attachment = NULL;
-  ftun_core_service_plan_t service_plan;
-  ftun_logger_t *logger = NULL;
-  ftun_core_owned_path_t source_path = {0};
-  ftun_status_t status;
-  memset(&service_plan, 0, sizeof(service_plan));
-  if (out_output_size != NULL) *out_output_size = 0u;
-  if (input.data == NULL || input.length < sizeof(*work) || output == NULL ||
-      output_capacity < sizeof(result) || out_output_size == NULL) {
-    return FTUN_E_INVALID;
-  }
-  work = (const ftun_core_reload_work_t *)input.data;
-  if (work->magic != FTUN_CORE_RELOAD_WORK_MAGIC || work->path_length == 0u ||
-      work->service_descriptor == 0u || work->plan_budget == 0u ||
-      input.length != sizeof(*work) + (size_t)work->path_length + 1u ||
-      input.data[input.length - 1u] != 0u) return FTUN_E_INVALID;
-  path = (const char *)(input.data + sizeof(*work));
-  memset(&result, 0, sizeof(result));
-  status = ftun_config_load_budget_traced((ftun_budget_t *)work->plan_budget, path, &config, &result.config_trace);
-  if (status != FTUN_OK) goto done;
-  if (support != NULL) {
-    ftun_app_prepare_context_t context = {work->base_generation + 1u,
-      work->socket_mark, work->allow_system_resolver};
-    status = support->prepare((ftun_budget_t *)work->plan_budget,
-                              config, work->maximum_bytes, &context,
-                              &attachment, &result.publish_required);
-    if (status != FTUN_OK) goto done;
-  }
-  status = ftun_core_service_plan_prepare(
-    (const ftun_core_service_descriptor_t *)work->service_descriptor,
-    (ftun_budget_t *)work->plan_budget, config, work->socket_mark, &service_plan);
-  if (status == FTUN_OK) status = ftun_core_logger_create(config,
-    (ftun_log_ledger_t *)work->log_ledger, &logger);
-  if (status == FTUN_OK) {
-    status = ftun_core_owned_path_copy((ftun_budget_t *)work->plan_budget,
-      config->source_path == NULL ? path : config->source_path, &source_path);
-  }
-  if (status == FTUN_OK && support != NULL) support->load_state(attachment);
-
-done:
-  result.owner = work->owner;
-  result.status = status;
-  result.base_generation = work->base_generation;
-  result.config = (uintptr_t)config;
-  result.attachment = (uintptr_t)attachment;
-  result.service_plan = service_plan;
-  result.logger = (uintptr_t)logger;
-  result.source_path = source_path;
-  /* 即使 prepare 失败，拥有型结果也必须交给 owner 清理。 */
-  memcpy(output, &result, sizeof(result));
-  *out_output_size = sizeof(result);
-  return FTUN_OK;
-}
-
-static ftun_status_t ftun_core_transaction(ftun_core_t *core,
-                                           ftun_core_control_t *control,
-                                           const char *path,
-                                           uint32_t *out_stage)
-{
-  ftun_config_t *config = NULL;
-  ftun_app_runtime_candidate_t *candidate = NULL;
-  ftun_logger_t *next_logger = NULL;
-  ftun_core_service_t next_service;
-  ftun_core_owned_path_t next_path = {0};
-  uint64_t next_generation = 0u;
-  ftun_status_t status;
-  ftun_config_trace_t trace;
-  memset(&next_service, 0, sizeof(next_service));
-  if (out_stage != NULL) *out_stage = FTUN_STAGE_CONFIG_READ;
-  if (control->generation == UINT64_MAX) return FTUN_E_LIMIT;
-  next_generation = control->generation + 1u;
-  status = ftun_config_load_budget_traced(control->budget, path, &config, &trace);
-  ftun_core_config_trace(control, &trace, next_generation);
-  if (status != FTUN_OK) return status;
-  if (out_stage != NULL) *out_stage = FTUN_STAGE_CONFIG_PREPARE;
-  status = ftun_core_logger_create(config, control->log_ledger, &next_logger);
-  if (status != FTUN_OK) goto done;
-  /* 启动附件及模块准备前发布已配置 sink；失败仍由 startup_logger 拥有。
-   * 普通日志接纳不改变事务结果，输出失败由日志 usage 表达。 */
-  (void)ftun_core_context_publish_logger(core, next_logger, next_logger == NULL);
-  status = ftun_core_owned_path_copy(control->budget,
-    config->source_path == NULL ? path : config->source_path, &next_path);
-  if (status != FTUN_OK) goto done;
-  if (control->support != NULL) {
-    status = control->support->start(core, control->budget, config,
-                                      next_generation, &candidate, out_stage);
-    if (status != FTUN_OK) goto done;
-  }
-  if (out_stage != NULL) *out_stage = FTUN_STAGE_COMMIT;
-  status = ftun_core_service_prepare(&next_service,
-    control->service_descriptor, core, control->data_budget,
-    control->operations, NULL, config, next_generation);
-  if (status != FTUN_OK) goto done;
-  if (control->support != NULL) {
-    status = control->support->stage(core, candidate, next_generation);
-    if (status != FTUN_OK) goto done;
-  }
-  status = ftun_core_service_activate(&next_service);
-  if (status != FTUN_OK) goto done;
-  /* 服务激活后发布业务候选，随后切换宿主拥有的配置与代次。 */
-  if (control->support != NULL) {
-    status = control->support->commit(core, candidate);
-    if (status != FTUN_OK) goto done;
-  }
-  control->active_config = config;
-  config = NULL;
-  control->service = next_service;
-  memset(&next_service, 0, sizeof(next_service));
-  (void)pthread_mutex_lock(&control->mutex);
-  control->generation = next_generation;
-  (void)ftun_core_context_set_generation(core, next_generation);
-  {
-    ftun_core_owned_path_t previous = control->config_path;
-    control->config_path = next_path;
-    next_path = previous;
-  }
-  (void)pthread_mutex_unlock(&control->mutex);
-  control->logger = next_logger;
-  next_logger = NULL;
-  (void)ftun_core_context_set_logger(core, control->logger);
-  if (control->support != NULL) {
-    control->support->committed(core, candidate);
-    /* 启动附件已经发布，release 只释放其空壳；失败仍保留给清理驱动。 */
-    (void)control->support->release(core, &candidate);
-    control->startup_candidate = candidate;
-  }
-
-done:
-  {
-    ftun_status_t cleanup_status = ftun_core_owned_path_destroy(&next_path);
-    if (cleanup_status != FTUN_OK) {
-      ftun_app_cleanup_t cleanup = ftun_core_cleanup(control);
-      control->startup_path = next_path;
-      ftun_app_cleanup_record(&cleanup, cleanup_status);
-    }
-  }
-  if (status != FTUN_OK) {
-    /* prepare 的清理实例继续借用配置和候选，交给统一 stop 驱动回收。 */
-    control->service = next_service;
-    control->startup_config = config;
-    control->startup_candidate = candidate;
-    control->startup_logger = next_logger;
-  } else {
-    (void)ftun_config_destroy(&config);
-  }
-  return status;
-}
-
-static ftun_status_t ftun_core_reload_transaction_cleanup(
-  ftun_core_t *core, ftun_core_control_t *control,
-  ftun_core_reload_transaction_t **transaction, uint64_t deadline)
-{
-  ftun_core_reload_transaction_t *owned;
-  ftun_status_t status;
-  if (transaction == NULL || *transaction == NULL) return FTUN_OK;
-  owned = *transaction;
-  if (owned->service_prepared) {
-    status = ftun_core_service_reload_abort(&control->service);
-    if (status != FTUN_OK) return status;
-    owned->service_prepared = false;
-  }
-  status = ftun_core_service_plan_destroy(&owned->service_plan);
-  if (status != FTUN_OK) return status;
-  if (owned->candidate != NULL) {
-    status = control->support->release(core, &owned->candidate);
-    if (status != FTUN_OK) return status;
-  }
-  status = ftun_logger_destroy_until(&owned->next_logger, deadline);
-  if (status != FTUN_OK) return status;
-  status = ftun_config_destroy(&owned->config);
-  if (status != FTUN_OK) return status;
-  status = ftun_core_owned_path_destroy(&owned->next_path);
-  if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
-  free(owned);
-  *transaction = NULL;
-  return FTUN_OK;
-}
-
-static void ftun_core_reload_transaction_release(
-  ftun_core_t *core, ftun_core_control_t *control,
-  ftun_core_reload_transaction_t **transaction)
-{
-  uint64_t now = 0u;
-  ftun_status_t status;
-  ftun_app_cleanup_t cleanup = ftun_core_cleanup(control);
-  (void)ftun_monotonic_now(&now);
-  status = ftun_core_reload_transaction_cleanup(core, control, transaction, now);
-  if (status == FTUN_OK) return;
-  ftun_app_cleanup_record(&cleanup, status);
-  control->retired_transaction = *transaction;
-  *transaction = NULL;
-}
-
-/* 退休槽与预算覆盖整个 reload，而不是仅覆盖 Worker 回调的栈帧。 */
-static ftun_status_t ftun_core_reload_reap(ftun_core_control_t *control,
-                                           uint64_t deadline)
-{
-  ftun_status_t status;
-  ftun_worker_usage_t usage;
-  bool pending;
-  status = ftun_core_reload_transaction_cleanup(control->core, control,
-    &control->retired_transaction, deadline);
-  if (status != FTUN_OK) return status;
-  status = ftun_core_reload_result_release(&control->retired_result, deadline);
-  if (status != FTUN_OK) return status;
-  status = ftun_core_logger_reap(control, deadline);
-  if (status != FTUN_OK) return status;
-  memset(&usage, 0, sizeof(usage));
-  if (control->reload_worker != NULL) {
-    status = ftun_worker_get_usage(control->reload_worker, &usage);
-    if (status != FTUN_OK) return status;
-  }
-  (void)pthread_mutex_lock(&control->mutex);
-  pending = control->reload_pending != 0;
-  (void)pthread_mutex_unlock(&control->mutex);
-  if (!pending && usage.tasks == 0u) {
-    (void)pthread_mutex_lock(&control->mutex);
-    control->retired_busy = false;
-    (void)pthread_mutex_unlock(&control->mutex);
-  }
-  return FTUN_OK;
-}
-
-static ftun_status_t ftun_core_reload_prepare_transaction(
-  ftun_core_t *core, ftun_core_control_t *control,
-  ftun_core_reload_result_t *prepared,
-  ftun_core_reload_transaction_t **out, uint32_t *out_stage)
-{
-  const ftun_config_t *active;
-  ftun_core_reload_transaction_t *transaction = NULL;
-  ftun_reservation_t *reservation = NULL;
-  uint64_t now_ms = 0u;
-  ftun_status_t status;
-  if (out != NULL) *out = NULL;
-  if (core == NULL || control == NULL || prepared == NULL || out == NULL) {
-    return FTUN_E_INVALID;
-  }
-  active = control->active_config;
-  status = ftun_budget_reserve(control->budget, sizeof(*transaction), &reservation);
-  if (status != FTUN_OK) return status;
-  transaction = (ftun_core_reload_transaction_t *)calloc(
-    1u, sizeof(*transaction));
-  if (transaction == NULL) {
-    (void)ftun_reservation_release(&reservation);
-    return FTUN_E_LIMIT;
-  }
-  transaction->reservation = reservation;
-  transaction->candidate = (ftun_app_runtime_candidate_t *)prepared->attachment;
-  transaction->service_plan = prepared->service_plan;
-  transaction->config = (ftun_config_t *)prepared->config;
-  transaction->next_logger = (ftun_logger_t *)prepared->logger;
-  transaction->next_path = prepared->source_path;
-  prepared->config = 0u;
-  prepared->attachment = 0u;
-  memset(&prepared->service_plan, 0, sizeof(prepared->service_plan));
-  prepared->logger = 0u;
-  memset(&prepared->source_path, 0, sizeof(prepared->source_path));
-  if (out_stage != NULL) *out_stage = FTUN_STAGE_CONFIG_PREPARE;
-  status = transaction->config == NULL || transaction->next_path.value == NULL
-    ? FTUN_E_STATE_CORRUPT : FTUN_OK;
-  if (status == FTUN_OK) {
-    status = ftun_core_reload_compatible(active, transaction->config);
-  }
-  if (status == FTUN_OK && control->support != NULL) {
-    status = control->support->compatible(active, transaction->config);
-  }
-  if (status == FTUN_OK && control->generation != prepared->base_generation) {
-    status = FTUN_E_STALE;
-  }
-  if (status == FTUN_OK) {
-    transaction->replace_logger =
-      !ftun_core_string_equal(active->log.level,
-                              transaction->config->log.level) ||
-      !ftun_core_string_equal(active->log.file,
-                              transaction->config->log.file);
-    status = ftun_monotonic_now(&now_ms);
-  }
-  /* Worker 创建的 logger 无论是否采用都必须有一个有界退休槽。 */
-  if (status == FTUN_OK && control->retired_logger != NULL) {
-    status = ftun_core_logger_reap(control, now_ms);
-    if (status == FTUN_E_TIMEOUT) status = FTUN_E_AGAIN;
-  }
-  if (status == FTUN_OK && control->support != NULL) {
-    status = control->support->adopt(core, transaction->candidate, now_ms, out_stage);
-  }
-  if (status == FTUN_OK && out_stage != NULL) *out_stage = FTUN_STAGE_COMMIT;
-  if (status == FTUN_OK) {
-    if (control->generation == UINT64_MAX) status = FTUN_E_LIMIT;
-    else transaction->next_generation = control->generation + 1u;
-  }
-  if (status == FTUN_OK) {
-    transaction->service_prepared = true;
-    status = ftun_core_service_reload_prepare_planned(&control->service,
-      transaction->config, transaction->next_generation, &transaction->service_plan);
-  }
-  if (status == FTUN_OK && control->support != NULL) {
-    status = control->support->stage(core, transaction->candidate,
-                                      transaction->next_generation);
-  }
-  if (status != FTUN_OK) {
-    ftun_core_reload_transaction_release(core, control, &transaction);
-    return status;
-  }
-  *out = transaction;
-  return FTUN_OK;
-}
-
-static ftun_status_t ftun_core_reload_commit_transaction(
-  ftun_core_t *core, ftun_core_control_t *control,
-  ftun_core_reload_transaction_t *transaction)
-{
-  ftun_logger_t *old_logger = NULL;
-  ftun_status_t status;
-  if (core == NULL || control == NULL || transaction == NULL ||
-      !transaction->service_prepared) {
-    return FTUN_E_INVALID;
-  }
-  if (control->support != NULL) {
-    status = control->support->inherit(core, transaction->candidate);
-    if (status != FTUN_OK) return status;
-  }
-  status = ftun_core_service_reload_commit(&control->service,
-                                           transaction->next_generation);
-  if (status != FTUN_OK) return status;
-  transaction->service_prepared = false;
-  /* stage 已完成业务候选的可失败准备；owner 串行发布后接管新配置。 */
-  if (control->support != NULL) {
-    status = control->support->commit(core, transaction->candidate);
-    if (status != FTUN_OK) return status;
-  }
-  {
-    ftun_config_t *previous = control->active_config;
-    control->active_config = transaction->config;
-    transaction->config = previous;
-  }
-  (void)pthread_mutex_lock(&control->mutex);
-  control->generation = transaction->next_generation;
-  (void)ftun_core_context_set_generation(core, transaction->next_generation);
-  {
-    ftun_core_owned_path_t previous = control->config_path;
-    control->config_path = transaction->next_path;
-    transaction->next_path = previous;
-  }
-  (void)pthread_mutex_unlock(&control->mutex);
-  if (transaction->replace_logger) {
-    old_logger = control->logger;
-    control->logger = transaction->next_logger;
-    transaction->next_logger = NULL;
-    (void)ftun_core_context_publish_logger(core, control->logger, control->logger == NULL);
-  }
-  if (old_logger != NULL) {
-    (void)ftun_core_logger_retire(control, &old_logger);
-  }
-  if (control->support != NULL) {
-    control->support->committed(core, transaction->candidate);
-  }
-  return FTUN_OK;
-}
-
-static void ftun_core_reload_event(ftun_control_task_t *task,
-  ftun_core_control_t *control, ftun_status_t status)
-{
-  if (task->reload_event_recorded) return;
-  task->reload_event_recorded = true;
-  ftun_core_event(control, status == FTUN_OK ? FTUN_LIFECYCLE_RELOAD_COMMITTED :
-    (status == FTUN_E_CANCELLED ? FTUN_LIFECYCLE_RELOAD_CANCELLED : FTUN_LIFECYCLE_RELOAD_REJECTED),
-    control->generation, status);
-}
-
-static void ftun_core_reload_finish(ftun_control_task_t *task,
-                                    ftun_core_control_t *control,
-                                    ftun_error_t result)
-{
-  int destroy;
-  if (control != NULL) {
-    ftun_core_reload_event(task, control, result.status);
-    if (result.status != FTUN_OK && result.status != FTUN_E_CANCELLED) {
-      ftun_core_log_status(task->core, result.status, result.stage,
-                           FTUN_DIAGNOSTIC_CONTROL, "control operation failed");
-    }
-    (void)pthread_mutex_lock(&control->mutex);
-    control->reload_pending = 0;
-    (void)pthread_mutex_unlock(&control->mutex);
-  }
-  task->result_generation = control->generation;
-  if (!ftun_control_task_cancelled(task)) {
-    (void)ftun_operation_complete(task->completion_token, result);
-  }
-  (void)pthread_mutex_lock(&task->mutex);
-  task->async_complete = 1;
-  destroy = task->ring_consumed && task->callback_complete;
-  (void)pthread_mutex_unlock(&task->mutex);
-  if (destroy) ftun_control_task_destroy(task);
-}
-
-static void ftun_core_reload_publish_completed(
-  ftun_operation_t *operation, ftun_error_t error, ftun_bytes_t bytes,
-  void *user)
-{
-  ftun_control_task_t *task = (ftun_control_task_t *)user;
-  ftun_core_control_t *control = NULL;
-  ftun_core_reload_transaction_t *transaction;
-  const ftun_app_publish_result_t *published = NULL;
-  ftun_error_t result = error;
-  ftun_status_t durability_status = FTUN_OK;
-  (void)operation;
-  result.stage = FTUN_STAGE_COMMIT;
-  (void)pthread_mutex_lock(&task->mutex);
-  task->prepare_operation = NULL;
-  transaction = (ftun_core_reload_transaction_t *)task->reload_transaction;
-  task->reload_transaction = NULL;
-  (void)pthread_mutex_unlock(&task->mutex);
-  if (ftun_core_control(task->core, &control) != FTUN_OK) {
-    result.status = FTUN_E_STATE_CORRUPT;
-  }
-  if (result.status == FTUN_OK) {
-    if (bytes.data == NULL || bytes.length != sizeof(*published)) {
-      result.status = FTUN_E_PROTOCOL;
-    } else {
-      published = (const ftun_app_publish_result_t *)bytes.data;
-      result.status = published->status;
-      if (result.status != FTUN_OK && published->published) {
-        durability_status = result.status;
-        result.status = FTUN_OK;
-      }
-    }
-  }
-  if (result.status == FTUN_OK && !ftun_control_task_cancelled(task)) {
-    result.status = ftun_core_reload_commit_transaction(task->core, control,
-                                                        transaction);
-  } else if (result.status == FTUN_OK) {
-    result.status = FTUN_E_CANCELLED;
-  }
-  if (result.status == FTUN_OK && durability_status != FTUN_OK) {
-    ftun_core_log_status(task->core, durability_status, FTUN_STAGE_COMMIT,
-      FTUN_DIAGNOSTIC_RELOAD_PUBLISH, control->support->publish_warning_message);
-  }
-  ftun_core_reload_transaction_release(task->core, control, &transaction);
-  ftun_core_reload_finish(task, control, result);
-}
-
-static ftun_status_t ftun_core_reload_publish_schedule(
-  ftun_core_control_t *control, ftun_control_task_t *task,
-  ftun_core_reload_transaction_t *transaction)
-{
-  ftun_worker_job_t job;
-  ftun_reservation_t *input_reservation = NULL;
-  ftun_operation_t *operation = NULL;
-  ftun_status_t status;
-  if (control->support == NULL) return FTUN_E_UNSUPPORTED;
-  memset(&job, 0, sizeof(job));
-  status = control->support->publish_job(transaction->candidate, &job, &input_reservation);
-  if (status != FTUN_OK) return status;
-  (void)pthread_mutex_lock(&task->mutex);
-  task->reload_transaction = transaction;
-  (void)pthread_mutex_unlock(&task->mutex);
-  status = ftun_worker_submit(control->reload_worker, &job,
-    ftun_core_reload_publish_completed, task, &operation);
-  free((void *)job.input.data);
-  (void)ftun_reservation_release(&input_reservation);
-  if (status != FTUN_OK) {
-    (void)pthread_mutex_lock(&task->mutex);
-    task->reload_transaction = NULL;
-    (void)pthread_mutex_unlock(&task->mutex);
-    return status;
-  }
-  (void)pthread_mutex_lock(&task->mutex);
-  task->prepare_operation = operation;
-  {
-    int cancelled = task->cancelled;
-    (void)pthread_mutex_unlock(&task->mutex);
-    if (cancelled) (void)ftun_operation_cancel(operation);
-  }
-  return FTUN_OK;
-}
-
-static void ftun_core_reload_worker_completed(
-  ftun_operation_t *operation, ftun_error_t error, ftun_bytes_t bytes,
-  void *user)
-{
-  ftun_control_task_t *task = (ftun_control_task_t *)user;
-  ftun_core_control_t *control = NULL;
-  ftun_core_reload_result_t prepared;
-  ftun_core_reload_transaction_t *transaction = NULL;
-  ftun_error_t result;
-  uint32_t stage = FTUN_STAGE_CONFIG_READ;
-  bool publish_required = false;
-  memset(&prepared, 0, sizeof(prepared));
-  memset(&result, 0, sizeof(result));
-  (void)operation;
-  (void)pthread_mutex_lock(&task->mutex);
-  task->prepare_operation = NULL;
-  (void)pthread_mutex_unlock(&task->mutex);
-  result.status = error.status;
-  result.stage = stage;
-  if (result.status == FTUN_OK && bytes.data != NULL &&
-      bytes.length == sizeof(prepared)) {
-    memcpy(&prepared, bytes.data, sizeof(prepared));
-    publish_required = prepared.publish_required;
-    result.status = prepared.status;
-  } else if (result.status == FTUN_OK) {
-    result.status = FTUN_E_STATE_CORRUPT;
-  }
-  if (ftun_core_control(task->core, &control) != FTUN_OK) {
-    result.status = FTUN_E_STATE_CORRUPT;
-  }
-  if (control != NULL && bytes.data != NULL && bytes.length == sizeof(prepared)) {
-    ftun_core_config_trace(control, &prepared.config_trace,
-      prepared.base_generation == UINT64_MAX ? UINT64_MAX : prepared.base_generation + 1u);
-  }
-  if (result.status == FTUN_OK && !ftun_control_task_cancelled(task)) {
-    result.status = ftun_core_reload_prepare_transaction(task->core, control,
-      &prepared, &transaction, &stage);
-    result.stage = stage;
-  } else if (result.status == FTUN_OK) {
-    result.status = FTUN_E_CANCELLED;
-  }
-  ftun_core_reload_result_retire(&prepared);
-  if (bytes.data != NULL && bytes.length == sizeof(prepared)) {
-    memset((void *)bytes.data, 0, bytes.length);
-  }
-  if (result.status == FTUN_OK && publish_required) {
-    result.status = ftun_core_reload_publish_schedule(control, task,
-                                                      transaction);
-    if (result.status == FTUN_OK) return;
-  }
-  if (result.status == FTUN_OK) {
-    if (ftun_control_task_cancelled(task)) result.status = FTUN_E_CANCELLED;
-    else result.status = ftun_core_reload_commit_transaction(
-      task->core, control, transaction);
-  }
-  ftun_core_reload_transaction_release(task->core, control, &transaction);
-  ftun_core_reload_finish(task, control, result);
-}
-
-static ftun_status_t ftun_core_reload_schedule(ftun_core_control_t *control,
-                                               ftun_control_task_t *task)
-{
-  ftun_core_reload_work_t *work;
-  ftun_worker_job_t job;
-  ftun_budget_usage_t usage;
-  uint8_t *input;
-  ftun_operation_t *prepare_operation = NULL;
-  ftun_reservation_t *input_reservation = NULL;
-  size_t path_length = strlen(task->first);
-  size_t input_length;
-  ftun_status_t status;
-  uint64_t now_ms;
-  if (control->generation == UINT64_MAX) return FTUN_E_LIMIT;
-  status = ftun_monotonic_now(&now_ms);
-  if (status == FTUN_OK && control->retired_logger != NULL) {
-    status = ftun_core_logger_reap(control, now_ms);
-    if (status == FTUN_E_TIMEOUT) status = FTUN_E_AGAIN;
-  }
-  if (status != FTUN_OK) return status;
-  if (path_length > UINT32_MAX || path_length > SIZE_MAX - sizeof(*work) - 1u) {
-    return FTUN_E_LIMIT;
-  }
-  status = ftun_budget_get_usage(control->budget, &usage);
-  if (status != FTUN_OK || usage.normal_available < 512u * 1024u) {
-    return status == FTUN_OK ? FTUN_E_LIMIT : status;
-  }
-  input_length = sizeof(*work) + path_length + 1u;
-  status = ftun_budget_reserve(control->budget, input_length, &input_reservation);
-  if (status != FTUN_OK) return status;
-  input = (uint8_t *)calloc(1u, input_length);
-  if (input == NULL) {
-    (void)ftun_reservation_release(&input_reservation);
-    return FTUN_E_LIMIT;
-  }
-  work = (ftun_core_reload_work_t *)input;
-  work->magic = FTUN_CORE_RELOAD_WORK_MAGIC;
-  work->maximum_bytes = usage.normal_available / 2u;
-  work->service_descriptor = (uintptr_t)control->service_descriptor;
-  work->owner = (uintptr_t)control;
-  /* 独立线程安全计数器，不借 Core/logger；App 在全部 Worker 及其拥有型
-   * 结果回收后才销毁 ledger。候选即使取消，也由同一计数器保留关闭结果。 */
-  work->log_ledger = (uintptr_t)control->log_ledger;
-  work->plan_budget = (uintptr_t)control->budget;
-  work->path_length = (uint32_t)path_length;
-  memcpy(input + sizeof(*work), task->first, path_length + 1u);
-  work->base_generation = control->generation;
-  work->allow_system_resolver = true;
-  if (control->active_config != NULL) {
-    size_t index;
-    for (index = 0u; index < control->active_config->inbound_count; index++) {
-      const ftun_config_inbound_t *inbound = &control->active_config->inbounds[index];
-      if (inbound->kind == FTUN_CONFIG_INBOUND_TUN && inbound->auto_route) {
-        work->allow_system_resolver = false;
-      }
-    }
-  }
-  if (control->active_config != NULL && control->active_config->plan != NULL &&
-      (control->active_config->plan->required_modules & FTUN_BUILD_MODULE_TUN) != 0u) {
-    work->socket_mark = UINT32_C(0x4654);
-  }
-  memset(&job, 0, sizeof(job));
-  job.execute = ftun_core_reload_execute;
-  job.input.data = input;
-  job.input.length = input_length;
-  job.result_capacity = sizeof(ftun_core_reload_result_t);
-  /* 候选、文件及附件按各自拥有期准入；maximum_bytes只限制业务输入，
-   * 不再重复预留同一批对象的总占位。接纳门仍保持至全部结果回收。 */
-  (void)pthread_mutex_lock(&control->mutex);
-  control->retired_busy = true;
-  (void)pthread_mutex_unlock(&control->mutex);
-  job.result_cleanup = ftun_core_reload_result_cleanup;
-  (void)pthread_mutex_lock(&task->mutex);
-  task->async_started = 1;
-  (void)pthread_mutex_unlock(&task->mutex);
-  status = ftun_worker_submit(control->reload_worker, &job,
-    ftun_core_reload_worker_completed, task, &prepare_operation);
-  free(input);
-  (void)ftun_reservation_release(&input_reservation);
-  if (status != FTUN_OK) {
-    (void)pthread_mutex_lock(&task->mutex);
-    task->async_started = 0;
-    (void)pthread_mutex_unlock(&task->mutex);
-  } else {
-    int cancelled;
-    (void)pthread_mutex_lock(&task->mutex);
-    task->prepare_operation = prepare_operation;
-    cancelled = task->cancelled;
-    (void)pthread_mutex_unlock(&task->mutex);
-    if (cancelled) (void)ftun_operation_cancel(prepare_operation);
-  }
-  return status;
-}
-
-static void ftun_core_reload_wakeup(void *user)
-{
-  ftun_core_control_t *control = (ftun_core_control_t *)user;
-  if (control == NULL) return;
-  /* 与 owner 进入 STOPPING 的边界串行化。停止期间服务可修改或释放
-   * 内部对象，迟到 Worker 不再穿透服务；清理驱动使用自身期限推进。 */
-  (void)pthread_mutex_lock(&control->mutex);
-  if (control->state == FTUN_CORE_RUNNING &&
-      control->service.implementation != NULL) {
-    (void)ftun_core_service_wakeup(&control->service);
-  }
-  (void)pthread_mutex_unlock(&control->mutex);
-}
-
-static ftun_status_t ftun_core_cleanup_step(void *context, bool may_wait,
-                                            bool *complete, bool *progress)
-{
-  ftun_core_control_t *control = (ftun_core_control_t *)context;
-  ftun_app_cleanup_t cleanup = ftun_core_cleanup(control);
-  bool reload_done = false, state_done = false, operations_done = false;
-  ftun_status_t status;
-  size_t count;
-  uint64_t now = 0u;
-  *complete = false;
-  for (count = 0u; count < FTUN_APP_CLEANUP_QUOTA; count++) {
-    ftun_control_task_t *task;
-    (void)pthread_mutex_lock(&control->mutex);
-    if (control->task_count == 0u) {
-      (void)pthread_mutex_unlock(&control->mutex);
-      break;
-    }
-    task = control->tasks[control->task_head];
-    control->tasks[control->task_head] = NULL;
-    control->task_head = (control->task_head + 1u) % control->task_capacity;
-    control->task_count--;
-    if (!task->control_priority) control->normal_task_count--;
-    if (task->kind == FTUN_CONTROL_RELOAD) control->reload_pending = 0;
-    (void)pthread_mutex_unlock(&control->mutex);
-    ftun_control_task_consumed(task);
-    *progress = true;
-  }
-  status = ftun_app_cleanup_worker(control->reload_worker,
-    ftun_app_cleanup_slice(&cleanup, may_wait), &reload_done, progress);
-  ftun_app_cleanup_record(&cleanup, status);
-
-  (void)ftun_monotonic_now(&now);
-  if (!control->state_save_done) {
-    ftun_worker_usage_t usage;
-    size_t callbacks = 0u;
-    memset(&usage, 0, sizeof(usage));
-    if (!may_wait || now >= ftun_app_cleanup_deadline(&cleanup) ||
-        control->state_worker == NULL) {
-      control->state_save_done = true;
-    } else {
-      status = ftun_worker_poll(control->state_worker,
-                                 FTUN_APP_CLEANUP_QUOTA, &callbacks);
-      if (callbacks != 0u) *progress = true;
-      if (status == FTUN_OK) {
-        status = ftun_worker_get_usage(control->state_worker, &usage);
-      }
-      ftun_app_cleanup_record(&cleanup, status);
-      if (status != FTUN_OK) control->state_save_done = true;
-      else if (usage.tasks == 0u) {
-        const ftun_config_t *active = control->active_config;
-        if (!control->state_save_submitted && active != NULL &&
-            active->base.state_cache) {
-          control->state_save_submitted = true;
-          status = ftun_core_state_schedule(control->core, control,
-            active->base.cache_file, ftun_app_cleanup_deadline(&cleanup));
-          ftun_app_cleanup_record(&cleanup, status);
-          if (status != FTUN_OK) control->state_save_done = true;
-          *progress = true;
-        } else control->state_save_done = true;
-      }
-    }
-  }
-  if (control->state_save_done) {
-    status = ftun_app_cleanup_worker(control->state_worker,
-      ftun_app_cleanup_slice(&cleanup, may_wait), &state_done, progress);
-    ftun_app_cleanup_record(&cleanup, status);
-  }
-  if (reload_done) {
-    status = ftun_core_reload_reap(control,
-      ftun_app_cleanup_slice(&cleanup, may_wait));
-    ftun_app_cleanup_record(&cleanup, status);
-  }
-  if (control->service.implementation != NULL && !control->service_stopped) {
-    status = ftun_core_service_stop_until(&control->service,
-      ftun_app_cleanup_slice(&cleanup, may_wait));
-    ftun_app_cleanup_record(&cleanup, status);
-    if (status == FTUN_OK) {
-      control->service_stopped = true;
-      *progress = true;
-    }
-  }
-  status = ftun_app_cleanup_operations(control->operations, &operations_done,
-                                        progress);
-  ftun_app_cleanup_record(&cleanup, status);
-  if (reload_done && state_done && operations_done &&
-      control->task_count == 0u && !control->retired_busy &&
-      (control->service_stopped || control->service.implementation == NULL)) {
-    status = ftun_core_service_destroy_until(&control->service,
-      ftun_app_cleanup_slice(&cleanup, may_wait));
-    ftun_app_cleanup_record(&cleanup, status);
-    if (status == FTUN_OK) {
-      status = control->startup_candidate == NULL ? FTUN_OK
-        : control->support->release(control->core, &control->startup_candidate);
-      ftun_app_cleanup_record(&cleanup, status);
-      if (status == FTUN_OK) {
-        status = ftun_config_destroy(&control->startup_config);
-        ftun_app_cleanup_record(&cleanup, status);
-      }
-      status = ftun_core_owned_path_destroy(&control->startup_path);
-      ftun_app_cleanup_record(&cleanup, status);
-      status = ftun_worker_destroy(&control->reload_worker);
-      ftun_app_cleanup_record(&cleanup, status);
-      status = ftun_worker_destroy(&control->state_worker);
-      ftun_app_cleanup_record(&cleanup, status);
-      if (control->startup_candidate == NULL && control->startup_config == NULL &&
-          control->startup_path.value == NULL && control->startup_path.reservation == NULL &&
-          control->reload_worker == NULL && control->state_worker == NULL) {
-        bool terminal_event;
-        (void)pthread_mutex_lock(&control->mutex);
-        terminal_event = control->lifecycle_started && !control->runtime_stopped;
-        if (terminal_event) control->runtime_stopped = true;
-        (void)pthread_mutex_unlock(&control->mutex);
-        if (terminal_event) {
-          ftun_lifecycle_event_t event = {0};
-          event.kind = FTUN_LIFECYCLE_STOPPED;
-          event.generation = control->generation;
-          event.status = control->first_error != FTUN_OK ? control->first_error : control->cleanup_error;
-          event.reason = FTUN_LIFECYCLE_REASON_LOG_DRAINING;
-          (void)ftun_core_context_finish_logging(control->core, &event);
-        } else (void)ftun_core_context_finish_logging(control->core, NULL);
-        status = ftun_logger_destroy_until(&control->startup_logger,
-          ftun_app_cleanup_slice(&cleanup, may_wait));
-        ftun_app_cleanup_record(&cleanup, status);
-        status = ftun_logger_destroy_until(&control->logger,
-          ftun_app_cleanup_slice(&cleanup, may_wait));
-        ftun_app_cleanup_record(&cleanup, status);
-      }
-    }
-  }
-  *complete = operations_done && control->task_count == 0u &&
-    control->service.implementation == NULL && !control->retired_busy &&
-    control->reload_worker == NULL && control->state_worker == NULL &&
-    control->startup_config == NULL && control->startup_candidate == NULL &&
-    control->startup_path.value == NULL && control->startup_path.reservation == NULL &&
-    control->startup_logger == NULL && control->logger == NULL &&
-    control->retired_logger == NULL;
-  return FTUN_OK;
 }
 
 static size_t ftun_core_default_descriptor_limit(void)
@@ -1529,7 +449,7 @@ static ftun_status_t ftun_control_task_cancel(void *user)
   return FTUN_OK;
 }
 
-static void ftun_control_task_destroy(ftun_control_task_t *task)
+void ftun_control_task_destroy(ftun_control_task_t *task)
 {
   ftun_reservation_t *reservation;
   if (task == NULL) return;
@@ -1542,7 +462,7 @@ static void ftun_control_task_destroy(ftun_control_task_t *task)
   (void)ftun_reservation_release(&reservation);
 }
 
-static void ftun_control_task_consumed(ftun_control_task_t *task)
+void ftun_control_task_consumed(ftun_control_task_t *task)
 {
   int destroy;
   if (task == NULL) return;
@@ -1580,7 +500,7 @@ static void ftun_control_task_complete(ftun_operation_t *operation,
     value.generation = task->result_generation;
     if (value.generation == 0u) {
       (void)pthread_mutex_lock(&control->mutex);
-      value.generation = control->generation;
+      value.generation = ftun_core_generation_now(control);
       (void)pthread_mutex_unlock(&control->mutex);
     }
     task->command_completion(operation, value, task->completion_user);
@@ -1672,7 +592,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
     status = FTUN_E_STALE;
     goto fail;
   }
-  if (task->expected.present && task->expected.generation != control->generation) {
+  if (task->expected.present && task->expected.generation != ftun_core_generation_now(control)) {
     (void)pthread_mutex_unlock(&control->mutex);
     status = FTUN_E_STALE;
     goto fail;
@@ -1713,7 +633,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
   if (!task->control_priority) control->normal_task_count++;
   if (kind == FTUN_CONTROL_RELOAD) {
     control->reload_pending = 1;
-    ftun_core_event(control, FTUN_LIFECYCLE_RELOAD_REQUESTED, control->generation, FTUN_OK);
+    ftun_core_event(control, FTUN_LIFECYCLE_RELOAD_REQUESTED, ftun_core_generation_now(control), FTUN_OK);
   }
   if (control->service.implementation != NULL) {
     (void)ftun_core_service_wakeup(&control->service);
@@ -1746,7 +666,7 @@ static ftun_status_t ftun_core_reload_admission(ftun_core_t *core, ftun_status_t
     /* 接纳入口可跨线程；代次与发布在 control 锁内捕获。 */
     (void)pthread_mutex_lock(&control->mutex);
     if (control->lifecycle_started) {
-      event.generation = control->generation;
+      event.generation = ftun_core_generation_now(control);
       (void)ftun_lifecycle_emit(core, &event);
     }
     (void)pthread_mutex_unlock(&control->mutex);
@@ -1786,7 +706,7 @@ ftun_status_t ftun_app_control_submit(ftun_core_t *core,
   return command->kind == FTUN_APP_COMMAND_RELOAD ? ftun_core_reload_admission(core, status) : status;
 }
 
-static int ftun_control_task_cancelled(ftun_control_task_t *task)
+int ftun_control_task_cancelled(ftun_control_task_t *task)
 {
   int cancelled;
   (void)pthread_mutex_lock(&task->mutex);
@@ -1811,7 +731,7 @@ static void ftun_core_process_task(ftun_core_t *core,
     }
     return;
   }
-  if (task->expected.present && task->expected.generation != control->generation) {
+  if (task->expected.present && task->expected.generation != ftun_core_generation_now(control)) {
     status = FTUN_E_STALE;
     goto completed;
   }
@@ -1844,7 +764,7 @@ static void ftun_core_process_task(ftun_core_t *core,
     }
   }
 completed:
-  task->result_generation = control->generation;
+  task->result_generation = ftun_core_generation_now(control);
   if (status != FTUN_OK) {
     ftun_core_log_status(core, status, stage, FTUN_DIAGNOSTIC_CONTROL, "control operation failed");
   }
@@ -1857,6 +777,147 @@ completed:
     (void)pthread_mutex_unlock(&control->mutex);
   }
   (void)ftun_operation_complete(task->completion_token, result);
+}
+
+/* 服务级故障后的恢复门：尝试即“允许恢复运行”，同步结束。 */
+/* 看门狗线程调用：不得阻塞也不得等待 control->mutex。拿不到锁说明 owner
+ * 正在处理或已卡住，跳过这次唤醒即可，心跳判定不依赖唤醒成功。 */
+static void ftun_core_watchdog_wake(void *user)
+{
+  ftun_core_control_t *control = (ftun_core_control_t *)user;
+  if (pthread_mutex_trylock(&control->mutex) != 0) return;
+  if (control->state == FTUN_CORE_RUNNING &&
+      control->service.implementation != NULL) {
+    (void)ftun_core_service_wakeup(&control->service);
+  }
+  (void)pthread_mutex_unlock(&control->mutex);
+}
+
+static ftun_status_t ftun_core_watchdog_open(ftun_core_control_t *control)
+{
+  ftun_watchdog_spec_t spec;
+  ftun_watchdog_owner_t owner;
+  ftun_status_t status;
+  memset(&spec, 0, sizeof(spec));
+  spec.timeout_ms = control->active_config->base.watchdog_ms;
+  spec.stop_ms = FTUN_CORE_WATCHDOG_STOP_MS;
+  spec.grace_ms = FTUN_CORE_WATCHDOG_GRACE_MS;
+  spec.arm_alarm = true;
+  spec.diagnostic_fd = STDERR_FILENO;
+  status = ftun_watchdog_create(&spec, &control->watchdog);
+  if (status != FTUN_OK || control->watchdog == NULL) return status;
+  owner.wake = ftun_core_watchdog_wake;
+  owner.context = control;
+  status = ftun_watchdog_register(control->watchdog, &owner,
+                                  &control->watchdog_slot);
+  if (status != FTUN_OK) (void)ftun_watchdog_destroy(&control->watchdog);
+  return status;
+}
+
+static ftun_status_t ftun_core_recovery_attempt(void *user, ftun_recovery_id_t id)
+{
+  ftun_core_control_t *control = (ftun_core_control_t *)user;
+  uint64_t now_ms = 0u;
+  (void)ftun_monotonic_now(&now_ms);
+  return ftun_recovery_attempt_finish(control->recovery, id, now_ms, FTUN_OK,
+                                      FTUN_RECOVERY_FAULT_NETWORK);
+}
+
+static ftun_status_t ftun_core_recovery_open(ftun_core_control_t *control)
+{
+  ftun_recovery_policy_t policy;
+  ftun_recovery_spec_t spec;
+  uint64_t now_ms = 0u;
+  ftun_status_t status;
+  if (control->service_descriptor == NULL ||
+      control->service_descriptor->maintain_once == NULL) return FTUN_OK;
+  (void)ftun_monotonic_now(&now_ms);
+  memset(&policy, 0, sizeof(policy));
+  policy.initial_ms = FTUN_CORE_SERVICE_RETRY_INITIAL_MS;
+  policy.maximum_ms = FTUN_CORE_SERVICE_RETRY_MAXIMUM_MS;
+  policy.stable_ms = FTUN_CORE_SERVICE_RETRY_STABLE_MS;
+  policy.jitter_permille = 200u;
+  policy.auth_retry_ms = FTUN_CORE_SERVICE_RETRY_MAXIMUM_MS;
+  policy.seed = now_ms;
+  memset(&spec, 0, sizeof(spec));
+  spec.kind = 1u;
+  spec.attempt = ftun_core_recovery_attempt;
+  spec.user = control;
+  status = ftun_recovery_scheduler_create(control->budget, 1u, &policy,
+                                          &control->recovery);
+  if (status == FTUN_OK) {
+    status = ftun_recovery_entity_register(control->recovery, &spec, now_ms,
+                                           &control->recovery_id);
+  }
+  if (status != FTUN_OK) {
+    (void)ftun_recovery_scheduler_destroy(&control->recovery);
+  }
+  return status;
+}
+
+static void ftun_core_recovery_close(ftun_core_control_t *control)
+{
+  if (control->recovery == NULL) return;
+  ftun_recovery_scheduler_stop(control->recovery);
+  (void)ftun_recovery_scheduler_destroy(&control->recovery);
+}
+
+/* 一轮服务运行。只有 STATE_CORRUPT 或 usage.fatal 返回错误让宿主停机；
+ * 其他错误都是服务级故障：计数、记录，并在服务支持时暂停新业务，
+ * 由 maintain_once 继续驱动恢复，按 A0 退避后再恢复 run_once。 */
+static ftun_status_t ftun_core_service_round(ftun_core_t *core,
+  ftun_core_control_t *control, bool may_block, uint64_t now_ms,
+  ftun_core_service_run_usage_t *usage)
+{
+  ftun_recovery_info_t info;
+  size_t resumed = 0u;
+  bool paused = false;
+  ftun_status_t status;
+  size_t scope;
+  if (control->recovery != NULL) {
+    (void)ftun_recovery_run(control->recovery, now_ms, 1u, &resumed);
+    paused = ftun_recovery_query(control->recovery, 0u, &info) == FTUN_OK &&
+             info.state != FTUN_RECOVERY_AVAILABLE;
+  }
+  (void)pthread_mutex_lock(&control->mutex);
+  control->service_paused = paused;
+  (void)pthread_mutex_unlock(&control->mutex);
+  status = paused
+    ? ftun_core_service_maintain_once(&control->service, now_ms,
+                                      FTUN_CORE_MAINTAIN_QUOTA, usage)
+    : ftun_core_service_run_once(&control->service, may_block, usage);
+  (void)pthread_mutex_lock(&control->mutex);
+  for (scope = 0u; scope < FTUN_FAULT_SCOPE_COUNT; scope++) {
+    control->service_faults[scope] += usage->faults[scope];
+  }
+  if (status != FTUN_OK && !ftun_core_service_run_fatal(status, usage)) {
+    control->service_faults[FTUN_FAULT_SCOPE_SERVICE]++;
+  }
+  (void)pthread_mutex_unlock(&control->mutex);
+  if (ftun_core_service_run_fatal(status, usage)) {
+    ftun_core_log_status(core, status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status,
+      FTUN_STAGE_CONTROL, FTUN_DIAGNOSTIC_SERVICE_RUN,
+      "production data plane failed");
+    return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
+  }
+  if (status != FTUN_OK) {
+    const struct timespec pause = {0, 1000 * 1000};
+    ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
+      FTUN_DIAGNOSTIC_SERVICE_FAULT, "service fault; continuing");
+    if (control->recovery != NULL && !paused) {
+      (void)ftun_recovery_report_failure(control->recovery,
+        control->recovery_id, now_ms, FTUN_RECOVERY_FAULT_NETWORK);
+      (void)pthread_mutex_lock(&control->mutex);
+      control->service_pauses++;
+      (void)pthread_mutex_unlock(&control->mutex);
+    }
+    /* 失败的服务不会阻塞，避免空转占满 CPU。 */
+    (void)nanosleep(&pause, NULL);
+  } else if (paused) {
+    const struct timespec pause = {0, 2 * 1000 * 1000};
+    (void)nanosleep(&pause, NULL);
+  }
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
@@ -1890,7 +951,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   control->run_result = FTUN_OK;
   (void)pthread_mutex_unlock(&control->mutex);
   (void)ftun_event_log_begin(control->events);
-  ftun_core_event(control, FTUN_LIFECYCLE_STARTING, control->generation, FTUN_OK);
+  ftun_core_event(control, FTUN_LIFECYCLE_STARTING, ftun_core_generation_now(control), FTUN_OK);
   /* Create owner-side workers only after the caller has entered run().  The
    * CLI blocks its control signals immediately before this call, so workers
    * inherit the same mask and SIGHUP remains dedicated to sigwait(). */
@@ -1910,14 +971,17 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     status = ftun_worker_set_wakeup(control->state_worker,
                                     ftun_core_reload_wakeup, control);
   }
+  if (status == FTUN_OK) status = ftun_core_recovery_open(control);
   if (status == FTUN_OK) {
     status = ftun_core_transaction(core, control, path, &stage);
   }
+  if (status == FTUN_OK) status = ftun_core_watchdog_open(control);
   if (status != FTUN_OK) {
     ftun_status_t cleanup_status;
+    ftun_core_recovery_close(control);
     control->first_error = status;
     control->state_save_done = true;
-    ftun_core_event(control, FTUN_LIFECYCLE_ROLLBACK, control->generation, status);
+    ftun_core_event(control, FTUN_LIFECYCLE_ROLLBACK, ftun_core_generation_now(control), status);
     (void)pthread_mutex_lock(&control->mutex);
     control->state = FTUN_CORE_STOPPING;
     (void)pthread_mutex_unlock(&control->mutex);
@@ -1925,7 +989,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     cleanup_status = ftun_app_cleanup_drive(&cleanup, ftun_core_cleanup_step,
                                              control, true);
     if (cleanup_status != FTUN_OK) {
-      ftun_core_event(control, FTUN_LIFECYCLE_STOP_FAILED, control->generation, cleanup_status);
+      ftun_core_event(control, FTUN_LIFECYCLE_STOP_FAILED, ftun_core_generation_now(control), cleanup_status);
     }
     if (cleanup_status == FTUN_OK) {
       cleanup_status = ftun_operation_queue_reopen(control->operations);
@@ -1944,7 +1008,8 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   }
   (void)pthread_mutex_lock(&control->mutex);
   control->state = FTUN_CORE_RUNNING;
-  ftun_core_event(control, FTUN_LIFECYCLE_RUNNING, control->generation, FTUN_OK);
+  ftun_core_event(control, FTUN_LIFECYCLE_RUNNING, ftun_core_generation_now(control), FTUN_OK);
+  ftun_watchdog_ready(control->watchdog);
   while (!control->stop_requested) {
     ftun_core_service_run_usage_t service_usage;
     ftun_control_task_t *task = NULL;
@@ -1962,6 +1027,10 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     bool quota_exhausted = false;
     bool cleanup_retry = false;
     memset(&service_usage, 0, sizeof(service_usage));
+    if (ftun_watchdog_stop_requested(control->watchdog)) {
+      control->stop_requested = 1;
+      control->watchdog_fired = true;
+    }
     if (control->stop_requested) break;
     if (control->task_count != 0u) {
       task = control->tasks[control->task_head];
@@ -1985,6 +1054,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     if (status != FTUN_OK) {
       ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
                            FTUN_DIAGNOSTIC_RELOAD_WORKER, "reload worker failed");
+      if (status != FTUN_E_STATE_CORRUPT) status = FTUN_OK;
     }
     if (status == FTUN_OK && control->state_worker != NULL) {
       status = ftun_worker_poll(control->state_worker, 1u,
@@ -1994,6 +1064,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
       if (status != FTUN_OK) {
         ftun_core_log_status(core, status, FTUN_STAGE_STATE_RESTORE,
                              FTUN_DIAGNOSTIC_STATE_WORKER, "state worker failed");
+        if (status != FTUN_E_STATE_CORRUPT) status = FTUN_OK;
       }
     }
     if (status == FTUN_OK && control->retired_busy) {
@@ -2014,12 +1085,8 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
       !cleanup_retry;
     (void)ftun_monotonic_now(&before_engine_ms);
     if (status == FTUN_OK) {
-      status = ftun_core_service_run_once(&control->service, may_block,
-                                          &service_usage);
-      if (status != FTUN_OK) {
-        ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
-                             FTUN_DIAGNOSTIC_SERVICE_RUN, "production data plane failed");
-      }
+      status = ftun_core_service_round(core, control, may_block,
+                                       before_engine_ms, &service_usage);
     }
     (void)ftun_monotonic_now(&after_engine_ms);
     round_work += service_usage.work;
@@ -2030,6 +1097,11 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     if (status == FTUN_OK) {
       status = ftun_operation_dispatch(control->operations,
         FTUN_CORE_OPERATION_DISPATCH_QUOTA, &dispatched);
+      if (status != FTUN_OK && status != FTUN_E_STATE_CORRUPT) {
+        ftun_core_log_status(core, status, FTUN_STAGE_CONTROL,
+                             FTUN_DIAGNOSTIC_SERVICE_FAULT, "operation dispatch failed");
+        status = FTUN_OK;
+      }
     }
     round_work += dispatched;
     if (dispatched == FTUN_CORE_OPERATION_DISPATCH_QUOTA) {
@@ -2048,6 +1120,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     if (round_finished_ms >= after_engine_ms) {
       round_busy_ms += round_finished_ms - after_engine_ms;
     }
+    ftun_watchdog_ack(control->watchdog, control->watchdog_slot);
     (void)pthread_mutex_lock(&control->mutex);
     if (control->owner_rounds != UINT64_MAX) control->owner_rounds++;
     if (round_busy_ms > control->owner_max_busy_ms) {
@@ -2068,13 +1141,15 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   control->state = FTUN_CORE_STOPPING;
   control->first_error = status;
   (void)pthread_mutex_unlock(&control->mutex);
-  ftun_core_event(control, FTUN_LIFECYCLE_STOPPING, control->generation, status);
+  ftun_watchdog_stopping(control->watchdog);
+  ftun_core_recovery_close(control);
+  ftun_core_event(control, FTUN_LIFECYCLE_STOPPING, ftun_core_generation_now(control), status);
   ftun_app_cleanup_begin(&cleanup);
   {
     ftun_status_t cleanup_status = ftun_app_cleanup_drive(&cleanup,
       ftun_core_cleanup_step, control, true);
     if (cleanup_status != FTUN_OK) {
-      ftun_core_event(control, FTUN_LIFECYCLE_STOP_FAILED, control->generation, cleanup_status);
+      ftun_core_event(control, FTUN_LIFECYCLE_STOP_FAILED, ftun_core_generation_now(control), cleanup_status);
     }
     if (cleanup_status == FTUN_E_TIMEOUT || status == FTUN_OK) {
       status = cleanup_status;
@@ -2090,6 +1165,8 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     (void)pthread_cond_broadcast(&control->condition);
     (void)pthread_mutex_unlock(&control->mutex);
   }
+  if (ftun_watchdog_fired(control->watchdog)) control->watchdog_fired = true;
+  (void)ftun_watchdog_destroy(&control->watchdog);
   return status;
 }
 
@@ -2106,11 +1183,11 @@ static ftun_status_t ftun_core_stop_request(ftun_core_t *core, uint64_t deadline
   if (deadline_ms < now_ms) return FTUN_E_TIMEOUT;
   (void)pthread_mutex_lock(&control->mutex);
   if (out != NULL) {
-    out->generation = control->generation;
+    out->generation = ftun_core_generation_now(control);
     out->phase = control->state == FTUN_CORE_STOPPED ?
       FTUN_APP_COMMAND_COMPLETED : FTUN_APP_COMMAND_REQUESTED;
   }
-  if (expected != NULL && expected->present && expected->generation != control->generation) {
+  if (expected != NULL && expected->present && expected->generation != ftun_core_generation_now(control)) {
     (void)pthread_mutex_unlock(&control->mutex);
     return FTUN_E_STALE;
   }
@@ -2186,12 +1263,15 @@ ftun_status_t ftun_app_control_query(ftun_core_t *core,
     memcpy(out->config_path, control->config_path.value, length + 1u);
   }
   out->core.state = control->state;
-  out->core.generation = control->generation;
+  out->core.generation = ftun_core_generation_now(control);
   out->core.owner_rounds = control->owner_rounds;
   out->core.owner_max_busy_ms = control->owner_max_busy_ms;
   out->core.owner_max_deadline_lateness_ms = control->owner_max_deadline_lateness_ms;
   out->core.owner_max_work = control->owner_max_work;
   out->core.owner_quota_exhaustions = control->owner_quota_exhaustions;
+  memcpy(out->service_faults, control->service_faults, sizeof(out->service_faults));
+  out->service_pauses = control->service_pauses;
+  out->service_paused = control->service_paused;
   out->build_modules = ftun_build_capabilities()->builtins;
   out->commands = FTUN_APP_CONTROL_RELOAD | FTUN_APP_CONTROL_STOP;
   if (control->support != NULL && control->support->select != NULL) out->commands |= FTUN_APP_CONTROL_SELECT;
@@ -2221,6 +1301,17 @@ ftun_status_t ftun_app_control_query(ftun_core_t *core,
   return status;
 }
 
+bool ftun_app_control_watchdog_fired(ftun_core_t *core)
+{
+  ftun_core_control_t *control = NULL;
+  bool fired;
+  if (ftun_core_control(core, &control) != FTUN_OK) return false;
+  (void)pthread_mutex_lock(&control->mutex);
+  fired = control->watchdog_fired;
+  (void)pthread_mutex_unlock(&control->mutex);
+  return fired;
+}
+
 ftun_status_t ftun_core_get_info(ftun_core_t *core, ftun_core_info_t *out)
 {
   ftun_core_control_t *control = NULL;
@@ -2232,7 +1323,7 @@ ftun_status_t ftun_core_get_info(ftun_core_t *core, ftun_core_info_t *out)
   if (status != FTUN_OK) return status;
   (void)pthread_mutex_lock(&control->mutex);
   out->state = control->state;
-  out->generation = control->generation;
+  out->generation = ftun_core_generation_now(control);
   out->owner_rounds = control->owner_rounds;
   out->owner_max_busy_ms = control->owner_max_busy_ms;
   out->owner_max_deadline_lateness_ms =

@@ -486,7 +486,7 @@ static int ftun_tun_spec_valid(const ftun_tun_ingress_spec_t *spec)
   return 1;
 }
 
-/* TASK-INBOUND-005 / TEST-INBOUND-005，目标 0.2.0：PacketPort 到统一传输。 */
+/* PacketPort 到统一传输。 */
 ftun_status_t ftun_tun_ingress_bind(
   const ftun_tun_ingress_spec_t *spec, ftun_tun_ingress_context_t **out)
 {
@@ -533,6 +533,7 @@ ftun_status_t ftun_tun_ingress_bind(
   lwip.udp_accept = spec->udp ? ftun_tun_udp_accept : NULL;
   lwip.udp_receive = spec->udp ? ftun_tun_udp_receive : NULL;
   lwip.packet_source_id = spec->inbound_id;
+  lwip.liveness = spec->liveness;
   lwip.user = context;
   status = ftun_lwip_create(&lwip, &context->stack);
   if (status != FTUN_OK) {
@@ -654,14 +655,6 @@ ftun_status_t ftun_tun_ingress_stream_ready(
   }
   if (bridge == NULL || bridge->flow == NULL) return FTUN_E_STALE;
   return ftun_lwip_tcp_ready(bridge->flow, readable, writable);
-}
-
-ftun_status_t ftun_tun_ingress_set_generation(
-  ftun_tun_ingress_context_t *context, uint64_t generation)
-{
-  if (context == NULL) return FTUN_E_INVALID;
-  return ftun_tun_ingress_set_identity(context, generation,
-                                       context->inbound_id);
 }
 
 ftun_status_t ftun_tun_ingress_set_identity(

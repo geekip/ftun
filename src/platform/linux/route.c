@@ -4,6 +4,9 @@
 #include "route_internal.h"
 #include "uapi.h"
 #include <errno.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <stdio.h>
 #include <net/if.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -32,6 +35,25 @@ ftun_status_t ftun_linux_route_errno(int error_code, bool removing)
       error_code == ENOSYS || error_code == ENODEV) return FTUN_E_UNSUPPORTED;
   if (error_code == EINVAL) return FTUN_E_UNSUPPORTED;
   return FTUN_E_IO;
+}
+
+ftun_status_t ftun_linux_route_lock_table(uint32_t table, int *out)
+{
+  char path[64];
+  int descriptor;
+  *out = -1;
+  if (table == 0u) return FTUN_OK;
+  (void)snprintf(path, sizeof(path), "/run/ftun-net-%u.lock", (unsigned)table);
+  descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+  if (descriptor < 0) return ftun_linux_route_errno(errno, false);
+  if (flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
+    int error_code = errno;
+    (void)close(descriptor);
+    return error_code == EWOULDBLOCK ? FTUN_E_REJECTED :
+      ftun_linux_route_errno(error_code, false);
+  }
+  *out = descriptor;
+  return FTUN_OK;
 }
 
 static int ftun_route_name_valid(ftun_string_t name, bool optional)
@@ -375,7 +397,8 @@ static ftun_status_t ftun_netlink_address(ftun_netlink_message_t *message,
 {
   struct ftun_ifaddrmsg *address;
   unsigned int interface_index = if_nametoindex(resource->interface_name);
-  if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
+  /* 接口已不存在（例如设备被外部删除）：地址随接口消失，删除视为已完成。 */
+  if (interface_index == 0u) return add ? FTUN_E_UNSUPPORTED : FTUN_E_STALE;
   message->header.nlmsg_type = add ? FTUN_RTM_NEWADDR : FTUN_RTM_DELADDR;
   message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
   if (add) message->header.nlmsg_flags |= FTUN_NLM_F_CREATE | FTUN_NLM_F_EXCL;
@@ -395,9 +418,11 @@ static ftun_status_t ftun_netlink_address(ftun_netlink_message_t *message,
   return FTUN_OK;
 }
 
+/* stray 只用于删除：仅以家族、优先级与协议号选择对象，其余选择子全部放宽，
+ * 内核删除第一条匹配项，用于清理上次崩溃遗留的过期对象。 */
 static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                                        const ftun_linux_route_resource_t *resource,
-                                       bool add)
+                                       bool add, bool stray)
 {
   struct ftun_fib_rule_hdr *rule;
   uint8_t table_byte;
@@ -408,7 +433,7 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
   rule = (struct ftun_fib_rule_hdr *)FTUN_NLMSG_DATA(&message->header);
   memset(rule, 0, sizeof(*rule));
   rule->family = (uint8_t)resource->family;
-  if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE) {
+  if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE && !stray) {
     rule->dst_len = resource->prefix_length;
   }
   rule->action = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
@@ -417,12 +442,17 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                (uint8_t)FTUN_RT_TABLE_UNSPEC;
   rule->table = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
                 (uint8_t)FTUN_RT_TABLE_UNSPEC : table_byte;
+  if (stray) {
+    rule->action = 0u;
+    rule->table = (uint8_t)FTUN_RT_TABLE_UNSPEC;
+  }
   if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_FRA_PRIORITY, &resource->priority,
                                   sizeof(resource->priority)) ||
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_FRA_PROTOCOL, &resource->protocol,
                                   sizeof(resource->protocol))) return FTUN_E_LIMIT;
+  if (stray) return FTUN_OK;
   if (resource->kind != FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_FRA_TABLE,
@@ -454,15 +484,16 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
 
 static ftun_status_t ftun_netlink_route(
   ftun_netlink_message_t *message,
-  const ftun_linux_route_resource_t *resource, bool add)
+  const ftun_linux_route_resource_t *resource, bool add, bool stray)
 {
   struct ftun_rtmsg *route;
   unsigned int interface_index = 0u;
   uint8_t table_byte;
   bool unreachable = resource->kind == FTUN_LINUX_ROUTE_UNREACHABLE;
-  if (!unreachable) {
+  if (!unreachable && !stray) {
     interface_index = if_nametoindex(resource->interface_name);
-    if (interface_index == 0u) return FTUN_E_UNSUPPORTED;
+    /* 同上：路由随接口消失，删除视为已完成。 */
+    if (interface_index == 0u) return add ? FTUN_E_UNSUPPORTED : FTUN_E_STALE;
   }
   message->header.nlmsg_type = add ? FTUN_RTM_NEWROUTE : FTUN_RTM_DELROUTE;
   message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_ACK;
@@ -479,6 +510,10 @@ static ftun_status_t ftun_netlink_route(
   route->rtm_scope = unreachable ? FTUN_RT_SCOPE_UNIVERSE :
                                    FTUN_RT_SCOPE_LINK;
   route->rtm_type = unreachable ? FTUN_RTN_UNREACHABLE : FTUN_RTN_UNICAST;
+  if (stray) {
+    route->rtm_scope = FTUN_RT_SCOPE_NOWHERE;
+    route->rtm_type = 0u;
+  }
   if (!ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_RTA_TABLE,
                                   &resource->table, sizeof(resource->table))) {
@@ -489,6 +524,7 @@ static ftun_status_t ftun_netlink_route(
                                   FTUN_RTA_DST, resource->address, 4u)) {
     return FTUN_E_LIMIT;
   }
+  if (stray) return FTUN_OK;
   if (!unreachable &&
       !ftun_netlink_add_attribute(&message->header, sizeof(*message),
                                   FTUN_RTA_OIF, &interface_index,
@@ -504,17 +540,18 @@ ftun_status_t ftun_netlink_build(ftun_netlink_message_t *message,
                                  const ftun_linux_route_resource_t *resource,
                                  bool add)
 {
+  bool stray = resource->stray && !add;
   memset(message, 0, sizeof(*message));
   message->header.nlmsg_seq = 1u;
   if (resource->kind == FTUN_LINUX_ROUTE_ADDRESS) {
-    return ftun_netlink_address(message, resource, add);
+    return stray ? FTUN_E_INVALID : ftun_netlink_address(message, resource, add);
   }
   if (resource->kind == FTUN_LINUX_ROUTE_DEFAULT ||
       resource->kind == FTUN_LINUX_ROUTE_OVERLAY ||
       resource->kind == FTUN_LINUX_ROUTE_UNREACHABLE) {
-    return ftun_netlink_route(message, resource, add);
+    return ftun_netlink_route(message, resource, add, stray);
   }
-  return ftun_netlink_rule(message, resource, add);
+  return ftun_netlink_rule(message, resource, add, stray);
 }
 
 static ftun_status_t ftun_netlink_exchange(ftun_netlink_message_t *message,
@@ -572,6 +609,9 @@ static ftun_status_t ftun_netlink_exchange(ftun_netlink_message_t *message,
       if (header->nlmsg_len < FTUN_NLMSG_LENGTH(sizeof(*error))) {
         return FTUN_E_IO;
       }
+      /* 添加时对象已存在（EXCL 冲突）：以 STALE 告知调用方“已存在”，是否接管由
+       * 事务按资源类型决定。 */
+      if (!removing && error->error == -EEXIST) return FTUN_E_STALE;
       return error->error == 0 ? FTUN_OK :
              ftun_linux_route_errno(-error->error, removing);
     }
@@ -630,14 +670,17 @@ static ftun_status_t ftun_route_remove_active(
   return first;
 }
 
-/* TASK-PLATFORM-002 / TEST-PLATFORM-002，目标 0.2.0：有所有权的路由事务。 */
-ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
+/* 有所有权的路由事务。 */
+/* sweep 仅用于真实系统接口：先取得表互斥锁，再清理上次崩溃遗留的同表同优先级
+ * 协议号 186 对象（可能与本次计划选择子不同），之后才安装。 */
+static ftun_status_t ftun_route_prepare(ftun_budget_t *budget,
   const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
-  ftun_route_transaction_t **out)
+  bool sweep, ftun_route_transaction_t **out)
 {
   ftun_route_transaction_t *transaction = NULL;
   ftun_reservation_t *reservation = NULL, *descriptor = NULL;
   ftun_status_t status;
+  int lock_descriptor = -1;
   size_t index;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_route_policy_valid(policy) || io == NULL ||
@@ -648,8 +691,13 @@ ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
       (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
     if (status != FTUN_OK) goto fail;
   }
+  if (sweep) {
+    status = ftun_linux_route_lock_table(policy->route_table, &lock_descriptor);
+    if (status != FTUN_OK) goto fail;
+  }
   transaction = (ftun_route_transaction_t *)calloc(1u, sizeof(*transaction));
   if (transaction == NULL) { status = FTUN_E_LIMIT; goto fail; }
+  transaction->lock_descriptor = lock_descriptor;
   transaction->magic = FTUN_LINUX_ROUTE_MAGIC;
   transaction->budget = budget;
   transaction->reservation = reservation;
@@ -658,9 +706,27 @@ ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
     status = FTUN_E_LIMIT;
     goto fail;
   }
+  for (index = 0u; sweep && index < transaction->resource_count; index++) {
+    ftun_linux_route_resource_t stray = transaction->resources[index];
+    size_t removed;
+    if (stray.kind == FTUN_LINUX_ROUTE_ADDRESS) continue;
+    stray.stray = true;
+    for (removed = 0u; removed < FTUN_LINUX_ROUTE_SWEEP_LIMIT; removed++) {
+      status = transaction->io.remove(transaction->io.context, &stray);
+      if (status != FTUN_OK) break;
+    }
+    if (status == FTUN_OK) status = FTUN_E_LIMIT;
+    if (status != FTUN_E_STALE) goto fail;
+  }
   for (index = 0u; index < transaction->resource_count; index++) {
     status = transaction->io.apply(transaction->io.context,
                                    &transaction->resources[index]);
+    /* 已存在：实例锁保证没有存活实例使用同一表号，非地址对象只能是上次崩溃遗留，
+     * 原地接管并由本事务撤销；地址对象可能属于外部，仍按冲突失败。 */
+    if (status == FTUN_E_STALE &&
+        transaction->resources[index].kind != FTUN_LINUX_ROUTE_ADDRESS) {
+      status = FTUN_OK;
+    }
     if (status != FTUN_OK) {
       ftun_status_t rollback = ftun_route_remove_active(transaction);
       if (rollback != FTUN_OK) {
@@ -677,10 +743,18 @@ ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
   (void)ftun_reservation_release(&descriptor);
   return FTUN_OK;
 fail:
+  if (lock_descriptor >= 0) (void)close(lock_descriptor);
   free(transaction);
   (void)ftun_reservation_release(&descriptor);
   (void)ftun_reservation_release(&reservation);
   return status;
+}
+
+ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
+  const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
+  ftun_route_transaction_t **out)
+{
+  return ftun_route_prepare(budget, policy, io, false, out);
 }
 
 ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy,
@@ -692,7 +766,7 @@ ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy
 ftun_status_t ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
   const ftun_route_policy_t *policy, ftun_route_transaction_t **out)
 {
-  return ftun_linux_route_prepare_with_io_and_budget(budget, policy, &ftun_system_route_io, out);
+  return ftun_route_prepare(budget, policy, &ftun_system_route_io, true, out);
 }
 
 ftun_status_t ftun_linux_route_prepare(const ftun_route_policy_t *policy,
@@ -736,6 +810,8 @@ ftun_status_t ftun_linux_route_release(
   owned->magic = 0u;
   memset(&owned->io, 0, sizeof(owned->io));
   reservation = owned->reservation;
+  /* 关闭描述符即释放表互斥锁。 */
+  if (owned->lock_descriptor >= 0) (void)close(owned->lock_descriptor);
   free(owned);
   *transaction = NULL;
   return ftun_reservation_release(&reservation);

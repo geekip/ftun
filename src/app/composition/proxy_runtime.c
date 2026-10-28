@@ -108,161 +108,25 @@ static void ftun_core_log_status(ftun_core_t *core, ftun_status_t status,
   (void)ftun_diagnostic_report(core, kind, generation, error, message);
 }
 
-static int ftun_core_string_equal(const char *left, const char *right)
-{
-  if (left == NULL || right == NULL) return left == right;
-  return strcmp(left, right) == 0;
-}
-
-static int ftun_core_tun_equal(const ftun_config_inbound_t *left,
-                               const ftun_config_inbound_t *right)
-{
-  return left->kind == right->kind &&
-    ftun_core_string_equal(left->name, right->name) &&
-    ftun_core_string_equal(left->interface_name, right->interface_name) &&
-    ftun_core_string_equal(left->stack, right->stack) &&
-    ftun_core_string_equal(left->ipv4_address, right->ipv4_address) &&
-    left->mtu == right->mtu && left->tcp == right->tcp &&
-    left->udp == right->udp && left->auto_route == right->auto_route &&
-    left->strict_route == right->strict_route &&
-    left->dns_hijack == right->dns_hijack;
-}
-
-static ftun_status_t ftun_core_reload_compatible(const ftun_config_t *active,
-                                                  const ftun_config_t *next)
-{
-  size_t left_index;
-  if (active == NULL || next == NULL) return FTUN_E_INVALID;
-  if (active->plan == NULL || next->plan == NULL) return FTUN_E_INVALID;
-  if (active->dns.fake_ip.persist != next->dns.fake_ip.persist ||
-      !ftun_core_string_equal(active->dns.fake_ip.range,
-                              next->dns.fake_ip.range) ||
-      ((active->dns.fake_ip.persist || next->dns.fake_ip.persist) &&
-       !ftun_core_string_equal(active->base.cache_file,
-                               next->base.cache_file))) {
-    return FTUN_E_RESTART_REQUIRED;
-  }
-  if (active->inbound_count != next->inbound_count) {
-    return FTUN_E_RESTART_REQUIRED;
-  }
-  for (left_index = 0u; left_index < active->inbound_count; left_index++) {
-    const ftun_config_inbound_t *left = &active->inbounds[left_index];
-    const ftun_config_inbound_t *right = NULL;
-    size_t right_index;
-    for (right_index = 0u; right_index < next->inbound_count; right_index++) {
-      if (ftun_core_string_equal(left->name, next->inbounds[right_index].name)) {
-        right = &next->inbounds[right_index];
-        break;
-      }
-    }
-    if (right == NULL || left->kind != right->kind) {
-      return FTUN_E_RESTART_REQUIRED;
-    }
-    if (left->kind == FTUN_CONFIG_INBOUND_TUN) {
-      if (!ftun_core_tun_equal(left, right)) return FTUN_E_RESTART_REQUIRED;
-    } else if (!ftun_core_string_equal(left->listen, right->listen) ||
-               left->udp != right->udp) {
-      return FTUN_E_RESTART_REQUIRED;
-    }
-  }
-  return FTUN_OK;
-}
-
 static ftun_status_t ftun_core_runtime_prepare(
   ftun_core_t *core, ftun_budget_t *budget,
   const ftun_config_t *config, uint64_t generation, ftun_runtime_t **out)
 {
 #if defined(FTUN_HAVE_MODULE_FRS)
   struct stat info;
-  ftun_budget_usage_t usage;
-  ftun_http_fetch_spec_t fetch_spec;
-  ftun_http_fetch_result_t fetched;
-  ftun_frs_view_t *view = NULL;
-  ftun_core_file_publish_t publish;
-  uint64_t now_ms;
-  ftun_status_t status;
+  /* 本地规则文件存在就直接使用（无网络也能启动）。文件缺失且开启自动更新时
+   * 不再同步下载：FRS 以 NOT_READY 启动，命中其规则的新连接被拒绝，后台
+   * 下载成功后经正常发布入口切换。 */
   if (config != NULL && config->frs.active && config->frs.path != NULL &&
       stat(config->frs.path, &info) != 0 && errno == ENOENT &&
       config->frs.auto_update && config->frs.url != NULL &&
       config->frs.url[0] != '\0') {
-    memset(&fetch_spec, 0, sizeof(fetch_spec));
-    memset(&fetched, 0, sizeof(fetched));
-    memset(&publish, 0, sizeof(publish));
-    status = ftun_budget_get_usage(budget, &usage);
-    if (status == FTUN_OK && usage.normal_available <= 2u * 1024u * 1024u) {
-      status = FTUN_E_LIMIT;
-    }
-    if (status == FTUN_OK) status = ftun_monotonic_now(&now_ms);
-    if (status == FTUN_OK && now_ms > UINT64_MAX - UINT64_C(30000)) {
-      status = FTUN_E_LIMIT;
-    }
-    if (status == FTUN_OK) {
-      size_t inbound_index;
-      uint32_t socket_mark = 0u;
-      for (inbound_index = 0u; inbound_index < config->inbound_count;
-           inbound_index++) {
-        if (config->inbounds[inbound_index].kind == FTUN_CONFIG_INBOUND_TUN) {
-          socket_mark = UINT32_C(0x4654);
-          break;
-        }
-      }
-      fetch_spec.budget = budget;
-      fetch_spec.url.data = config->frs.url;
-      fetch_spec.url.length = strlen(config->frs.url);
-      fetch_spec.maximum_bytes = usage.normal_available -
-        1024u * 1024u;
-      fetch_spec.deadline_ms = now_ms + UINT64_C(30000);
-      fetch_spec.socket_mark = socket_mark;
-      fetch_spec.generation = generation;
-      /* start 尚未 prepare/activate TUN 服务，隐藏 libc socket 不经过本实例捕获。 */
-      fetch_spec.allow_system_resolver = true;
-      fetch_spec.path.open = ftun_socket_path_open;
-      {
-        ftun_string_t resolver = {NULL, 0u};
-        if (config->frs.dns_server != NULL &&
-            config->frs.dns_server[0] != '\0') {
-          resolver.data = config->frs.dns_server;
-          resolver.length = strlen(config->frs.dns_server);
-        }
-        status = ftun_http_fetch_resolver(config, NULL, resolver,
-                                          &fetch_spec);
-      }
-      if (status == FTUN_OK) {
-        status = ftun_http_fetch_route(config, NULL,
-                                        config->frs.update_outbound,
-                                        &fetch_spec);
-      }
-    }
-    if (status == FTUN_OK) status = ftun_http_fetch(&fetch_spec, &fetched);
-    if (status == FTUN_OK && fetched.status != 200u) {
-      status = FTUN_E_PROTOCOL;
-    }
-    if (status == FTUN_OK) {
-      status = ftun_frs_open_bytes_budget(budget,
-        (ftun_bytes_t){fetched.data, fetched.length}, &view);
-    }
-    if (status == FTUN_OK) {
-      status = ftun_runtime_prepare_with_frs(core, config, view, out);
-    }
-    if (status == FTUN_OK) {
-      status = ftun_runtime_can_commit(core, *out);
-    }
-    if (status == FTUN_OK) {
-      status = ftun_file_write_atomic_budget(budget, config->frs.path,
-        (ftun_bytes_t){fetched.data, fetched.length}, 0644u,
-        ftun_core_file_stage, &publish);
-      if (status != FTUN_OK && publish.reached >= FTUN_FILE_STAGE_RENAMED) {
-        ftun_core_log_status(core, status, FTUN_STAGE_COMMIT,
-          FTUN_DIAGNOSTIC_STARTUP_PUBLISH, "FRS startup publish succeeded but directory durability is uncertain");
-        status = FTUN_OK;
-      }
-    }
-    if (status != FTUN_OK && out != NULL && *out != NULL) {
-      (void)ftun_runtime_abort(core, out);
-    }
-    (void)ftun_frs_view_release(&view);
-    ftun_http_fetch_release(&fetched);
-    return status;
+    (void)budget;
+    (void)generation;
+    ftun_core_log_status(core, FTUN_OK, FTUN_STAGE_STATE_RESTORE,
+      FTUN_DIAGNOSTIC_STARTUP_PUBLISH,
+      "FRS rule file is missing; starting NOT_READY and downloading in background");
+    return ftun_runtime_prepare_frs_pending(core, config, out);
   }
 #else
   (void)budget;
@@ -528,7 +392,8 @@ static ftun_status_t ftun_proxy_support_inherit(ftun_core_t *core,
 static ftun_status_t ftun_proxy_support_commit(ftun_core_t *core,
   ftun_app_runtime_candidate_t *attachment)
 {
-  return ftun_runtime_commit(core, &attachment->candidate);
+  /* 宿主事务已以 Core 上下文为持有者预留代次。 */
+  return ftun_runtime_commit_reserved(core, &attachment->candidate, core);
 }
 
 static void ftun_proxy_support_committed(ftun_core_t *core,
@@ -781,7 +646,6 @@ const ftun_app_runtime_support_t ftun_proxy_runtime_support = {
   ftun_runtime_manager_attach,
   ftun_runtime_manager_clear,
   ftun_proxy_support_check,
-  ftun_core_reload_compatible,
   ftun_proxy_support_start,
   ftun_proxy_support_prepare,
   ftun_proxy_support_load_state,

@@ -486,7 +486,7 @@ static int test_libc_localhost(void)
   return 0;
 }
 
-/* TASK-PLATFORM-004 / TEST-PLATFORM-004：Worker、路径门禁和 libc/NSS。 */
+/* Worker、路径门禁和 libc/NSS。 */
 int main(void)
 {
   CHECK(test_results_and_failures() == 0);

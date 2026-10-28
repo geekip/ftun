@@ -3,6 +3,7 @@
 
 #include "internal/contracts.h"
 #include "transport/datagram.h"
+#include "network/socket_policy.h"
 
 #define FTUN_LWIP_MIN_MTU 576u
 #define FTUN_LWIP_MAX_MTU 65535u
@@ -56,6 +57,8 @@ typedef struct {
   ftun_lwip_udp_accept_fn udp_accept;
   ftun_lwip_udp_receive_fn udp_receive;
   uint32_t packet_source_id;
+  /* 接纳的每条 TCP 连接按此打开存活探测；全零表示不设置。 */
+  ftun_socket_liveness_t liveness;
   void *user;
 } ftun_lwip_spec_t;
 
@@ -71,7 +74,6 @@ typedef struct {
 } ftun_lwip_usage_t;
 
 /* lwIP raw API 移植。
- * 需求 REQ-CORE-001；任务 TASK-TUN-002；目标 0.2.0；验收 TEST-TUN-002。
  * lwIP 全局协议状态与分配钩子限定进程仅有一个活跃实例，由创建方的同一个
  * owner loop 串行调用（包括创建/销毁，不支持并发创建）。重复创建返回
  * INVALID 且 out=NULL，不能用另一个预算或 Core 绕过；创建方拥有 stack，

@@ -5,8 +5,8 @@
 #include "util/time.h"
 #include <string.h>
 
-/* REQ-STATE-001 / TASK-CORE-003 / TEST-CORE-003，目标 0.5.0：
- * ftun_state_restore 按配置身份恢复可丢弃的 Group/Health 状态。 */
+/* 
+ * ftun_state_restore_at 按配置身份恢复可丢弃的 Group/Health 状态。 */
 
 static ftun_status_t ftun_state_restore_target(
   ftun_core_t *core, const ftun_config_t *config, uint64_t now_ms,
@@ -72,14 +72,6 @@ static ftun_status_t ftun_state_apply_snapshot(
   }
   if (out != NULL) *out = info;
   return FTUN_OK;
-}
-
-ftun_status_t ftun_state_restore(ftun_core_t *core, const ftun_config_t *config)
-{
-  uint64_t now_ms;
-  ftun_status_t status = ftun_monotonic_now(&now_ms);
-  if (status != FTUN_OK) return status;
-  return ftun_state_restore_at(core, config, now_ms, 15u * 60u * 1000u, NULL);
 }
 
 ftun_status_t ftun_state_restore_at(ftun_core_t *core,

@@ -102,6 +102,8 @@ struct ftun_tun_service {
   bool network_paused;
   bool rebuild_paused;
   bool rebuild_port_ready;
+  /* 设备被外部删除或失效；重建成功后清除，owner 据此退避重试。 */
+  bool device_lost;
 };
 
 ftun_tun_service_consumer_t *ftun_tun_service_lease_consumer(

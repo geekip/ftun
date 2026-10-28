@@ -219,8 +219,54 @@ static int test_first_match_differential(void)
   return 0;
 }
 
+static ftun_status_t bind_not_ready(uint16_t kind, ftun_string_t label,
+                                    ftun_frs_set_t **out, void *user)
+{
+  (void)kind;
+  (void)label;
+  (void)user;
+  *out = NULL;
+  return FTUN_E_AGAIN;
+}
+
+/* FRS 集合尚未就绪：排在它前面的规则照常匹配；第一条引用未就绪
+ * 集合的规则直接拒绝新连接，不需要地址解析；它后面的规则不再被求值。 */
+static int test_frs_not_ready(void)
+{
+  static const char *const rules[] = {
+    "DOMAIN,direct.test,DIRECT", "FRS-IP,CN,DIRECT", "FRS-DOMAIN,CN,proxy",
+    "MATCH,proxy"
+  };
+  ftun_route_table_t *table = NULL;
+  ftun_route_result_t result;
+  ftun_metadata_t metadata;
+  CHECK(ftun_route_table_create_with_frs(5u, rules, 4u, outbound, NULL,
+    bind_not_ready, NULL, &table) == FTUN_OK);
+  /* 前面的规则命中：不受未就绪集合影响。 */
+  metadata = domain_metadata("direct.test", 5u);
+  CHECK(ftun_route_table_evaluate(table, &metadata, 0u, &result) == FTUN_OK);
+  CHECK(result.kind == FTUN_ROUTE_READY && result.rule_index == 0u &&
+        result.outbound_id == FTUN_OUTBOUND_ID_DIRECT && !result.frs_not_ready);
+  /* 其余域名：只有域名、没有真实地址，也不进入 NEED_RESOLVE，直接拒绝。 */
+  metadata = domain_metadata("other.test", 5u);
+  CHECK(ftun_route_table_evaluate(table, &metadata, 0u, &result) == FTUN_OK);
+  CHECK(result.kind == FTUN_ROUTE_DENY && result.rule_index == 1u &&
+        result.outbound_id == FTUN_OUTBOUND_ID_REJECT && result.frs_not_ready);
+  CHECK(ftun_route_table_evaluate_known(table, &metadata, &result) == FTUN_OK);
+  CHECK(result.kind == FTUN_ROUTE_DENY && result.frs_not_ready);
+  /* 真实地址同样被拒绝。 */
+  memset(&metadata, 0, sizeof(metadata));
+  metadata.generation = 5u;
+  metadata.original_target = ipv4(203u, 0u, 113u, 5u, 443u);
+  CHECK(ftun_route_table_evaluate(table, &metadata, 0u, &result) == FTUN_OK);
+  CHECK(result.kind == FTUN_ROUTE_DENY && result.frs_not_ready);
+  CHECK(ftun_route_table_destroy(&table) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_frs_not_ready() == 0);
   CHECK(test_order_suspend_resume_and_subset() == 0);
   CHECK(test_runtime_owned_table() == 0);
   CHECK(test_first_match_differential() == 0);

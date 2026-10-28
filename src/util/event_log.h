@@ -24,6 +24,7 @@ typedef enum {
   FTUN_DIAGNOSTIC_FRS_UPDATE,
   FTUN_DIAGNOSTIC_FRS_PUBLISH,
   FTUN_DIAGNOSTIC_FRS_SCHEDULE,
+  FTUN_DIAGNOSTIC_SERVICE_FAULT,
   FTUN_DIAGNOSTIC_COUNT
 } ftun_diagnostic_kind_t;
 
@@ -60,6 +61,10 @@ typedef enum {
   FTUN_LIFECYCLE_STOPPED, /* runtime.stopped：诊断自身排空另由 Core/ledger 表示。 */
   FTUN_LIFECYCLE_STOP_FAILED,
   FTUN_LIFECYCLE_RELOAD_CANCELLED,
+  /* 非 reload 来源（如 FRS 更新）发布了新的运行配置代次。 */
+  FTUN_LIFECYCLE_CONFIG_PUBLISHED,
+  /* 网络变化事件源交付了一批合并后的变化；status 为 LIMIT 表示变化过于频繁。 */
+  FTUN_LIFECYCLE_NETWORK_CHANGED,
   FTUN_LIFECYCLE_COUNT
 } ftun_lifecycle_kind_t;
 
@@ -85,6 +90,7 @@ typedef enum {
   FTUN_LIFECYCLE_REASON_RELOAD_PREPARE,
   FTUN_LIFECYCLE_REASON_RELOAD_COMMIT,
   FTUN_LIFECYCLE_REASON_RELOAD_ABORT,
+  FTUN_LIFECYCLE_REASON_FRS_UPDATE,
   FTUN_LIFECYCLE_REASON_COUNT
 } ftun_lifecycle_reason_t;
 
@@ -96,6 +102,8 @@ typedef struct {
   uint64_t generation;
   ftun_status_t status;
   ftun_lifecycle_reason_t reason;
+  /* 同一操作（例如一次 reload）的事件共用的关联 ID；0 表示没有。 */
+  uint64_t correlation;
 } ftun_lifecycle_event_t;
 
 typedef struct ftun_event_log ftun_event_log_t;

@@ -66,7 +66,6 @@ struct ftun_feature_plan {
   size_t lazy_health_count;
 };
 /* 依赖闭包与资源计划。
- * 需求 REQ-CONF-001；任务 TASK-CONFIG-004；目标 0.2.0；验收 TEST-CONFIG-004。
  * 实现路径：从监听、路由、DNS、探测及历史引用求闭包；区分 compiled/prepare/lazy/active/retained；不重排 rules。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；返回计划独立拥有索引数组，不转移配置所有权。

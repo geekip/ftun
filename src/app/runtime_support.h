@@ -29,7 +29,6 @@ typedef struct {
   ftun_status_t (*attach)(ftun_core_t *, size_t, size_t);
   ftun_status_t (*clear)(ftun_core_t *);
   ftun_status_t (*check)(ftun_core_t *, const ftun_config_t *, bool);
-  ftun_status_t (*compatible)(const ftun_config_t *, const ftun_config_t *);
   ftun_status_t (*start)(ftun_core_t *, ftun_budget_t *, const ftun_config_t *, uint64_t,
     ftun_app_runtime_candidate_t **, uint32_t *);
   ftun_status_t (*prepare)(ftun_budget_t *, const ftun_config_t *, uint64_t, const ftun_app_prepare_context_t *,

@@ -349,13 +349,17 @@ static ftun_status_t destroy_until(void **implementation,
 static const ftun_core_service_descriptor_t service_a = {
   "a", plan_prepare_a, plan_destroy_a, prepare_a, activate,
   reload_prepare, reload_prepare_planned, reload_commit, reload_abort,
-  run_once, wakeup, quiesce, drain_until, stop_until, destroy_until
+  run_once, wakeup, quiesce, drain_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static const ftun_core_service_descriptor_t service_b = {
   "b", plan_prepare_b, plan_destroy_b, prepare_b, activate,
   reload_prepare, reload_prepare_planned, reload_commit, reload_abort,
-  run_once, wakeup, quiesce, drain_until, stop_until, destroy_until
+  run_once, wakeup, quiesce, drain_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static const ftun_core_module_descriptor_t modules[] = {

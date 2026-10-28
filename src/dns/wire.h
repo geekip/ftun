@@ -98,7 +98,6 @@ struct ftun_dns_message {
 };
 
 /* DNS 有界报文解析。
- * 需求 REQ-DNSWIRE-001；任务 TASK-DNS-008；目标 0.2.0；验收 TEST-DNS-008。
  * 只接纳一个 Question；名称展开后最多 255 octet，压缩指针必须向后且
  * 不得成环。成功 message 拥有 wire、名称和 RR 数组；未知普通 RR 的
  * RDATA 原样保留。OPT 只允许唯一 additional root 记录，TTL 位域单独解析。

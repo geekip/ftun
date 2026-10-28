@@ -122,7 +122,7 @@ static ftun_status_t ftun_buffer_pool_pressure_trim(ftun_buffer_pool_t *pool)
   return FTUN_OK;
 }
 
-/* TASK-UTIL-002 / TEST-UTIL-002，目标 0.2.0：分档、有界闲置与所有者引用。 */
+/* 分档、有界闲置与所有者引用。 */
 static ftun_status_t ftun_buffer_class(size_t requested, size_t *out)
 {
   size_t capacity = FTUN_BUFFER_MIN_CLASS;
@@ -838,16 +838,6 @@ ftun_status_t ftun_buffer_slice_data(const ftun_buffer_slice_t *slice, ftun_byte
   }
   out->data = slice->owner->data + slice->offset;
   out->length = slice->length;
-  return FTUN_OK;
-}
-
-ftun_status_t ftun_buffer_slice_budget(const ftun_buffer_slice_t *slice,
-                                       ftun_budget_t **out)
-{
-  if (out != NULL) *out = NULL;
-  if (slice == NULL || out == NULL || slice->owner == NULL ||
-      slice->owner->references == 0u) return FTUN_E_INVALID;
-  *out = slice->owner->budget;
   return FTUN_OK;
 }
 

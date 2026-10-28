@@ -1,6 +1,6 @@
 #include "format.h"
 
-/* TASK-FRS-005 / TEST-FRS-005：FRS 1.0 二进制格式验证，目标 0.4.0。 */
+/* FRS 1.0 二进制格式验证。 */
 
 #include <stdlib.h>
 #include <string.h>
@@ -37,12 +37,6 @@ uint64_t ftun_frs_read_u64(const uint8_t *data)
 {
   return (uint64_t)ftun_frs_read_u32(data) |
          ((uint64_t)ftun_frs_read_u32(data + 4u) << 32u);
-}
-
-void ftun_frs_write_u16(uint8_t *data, uint16_t value)
-{
-  data[0] = (uint8_t)value;
-  data[1] = (uint8_t)(value >> 8u);
 }
 
 void ftun_frs_write_u32(uint8_t *data, uint32_t value)

@@ -27,6 +27,7 @@ required = (
     proxy / "service.h",
     proxy / "runtime.c",
     proxy / "runtime.h",
+    proxy / "engine_internal.h",
     proxy / "runtime_state.h",
     root / "src" / "dns" / "service.c",
     root / "src" / "dns" / "service.h",
@@ -81,7 +82,7 @@ for token in ("plan_prepare", "prepare", "activate", "reload_commit",
     if token not in service_header:
         fail(f"generic service lifecycle is missing {token}")
 
-runtime = (proxy / "runtime.c").read_text()
+runtime = (proxy / "engine_internal.h").read_text()
 for token in ("struct ftun_proxy_runtime", "ftun_proxy_runtime_listener_t",
               "ftun_proxy_runtime_flow_t", "ftun_proxy_runtime_udp_slot_t"):
     if token not in runtime:

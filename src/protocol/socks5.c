@@ -7,7 +7,7 @@
 #define FTUN_SOCKS5_ATYP_DOMAIN 0x03u
 #define FTUN_SOCKS5_ATYP_IPV6 0x04u
 
-/* ftun_socks5_decode 及同文件细分入口实现 TASK-PROTOCOL-001（0.2.0）。
+/* ftun_socks5_decode 及同文件细分入口。
  * 纯函数只解释 RFC 1928/1929 字节，不持有调用方认证状态。 */
 
 static ftun_status_t validate_input(ftun_bytes_t input)
@@ -90,8 +90,11 @@ static ftun_status_t encode_endpoint(const ftun_endpoint_t *endpoint,
   return FTUN_OK;
 }
 
+/* allow_ipv6 只用于回复中的 BND 信息字段：完整解析 16 字节地址，由调用方
+ * 决定是否使用；请求目标和 UDP 封装仍按 IPv6 能力未开放拒绝。 */
 static ftun_status_t decode_endpoint(ftun_bytes_t input, size_t offset,
-                                     ftun_endpoint_t *out, size_t *consumed)
+                                     bool allow_ipv6, ftun_endpoint_t *out,
+                                     size_t *consumed)
 {
   uint8_t atyp;
   size_t required;
@@ -100,7 +103,17 @@ static ftun_status_t decode_endpoint(ftun_bytes_t input, size_t offset,
   *consumed = 0u;
   if (input.length <= offset) return FTUN_E_AGAIN;
   atyp = input.data[offset];
-  if (atyp == FTUN_SOCKS5_ATYP_IPV6) return FTUN_E_UNSUPPORTED;
+  if (atyp == FTUN_SOCKS5_ATYP_IPV6) {
+    if (!allow_ipv6) return FTUN_E_UNSUPPORTED;
+    required = offset + 19u;
+    if (input.length < required) return FTUN_E_AGAIN;
+    out->kind = FTUN_ADDRESS_IPV6_RESERVED;
+    memcpy(out->address, input.data + offset + 1u, 16u);
+    out->port = (uint16_t)(((uint16_t)input.data[offset + 17u] << 8u) |
+                           (uint16_t)input.data[offset + 18u]);
+    *consumed = required;
+    return FTUN_OK;
+  }
   if (atyp == FTUN_SOCKS5_ATYP_IPV4) {
     required = offset + 7u;
     if (input.length < required) return FTUN_E_AGAIN;
@@ -308,7 +321,7 @@ ftun_status_t ftun_socks5_decode_request(
   if (status != FTUN_OK) return status;
   if (input.length < 3u) return FTUN_E_AGAIN;
   if (input.data[2] != 0u) return FTUN_E_PROTOCOL;
-  status = decode_endpoint(input, 3u, &endpoint, &frame_length);
+  status = decode_endpoint(input, 3u, false, &endpoint, &frame_length);
   if (status != FTUN_OK) return status;
   out->command = (ftun_socks5_command_t)input.data[1];
   out->endpoint = endpoint;
@@ -358,7 +371,7 @@ ftun_status_t ftun_socks5_decode_reply(
   if (input.data[0] != FTUN_SOCKS5_VERSION) return FTUN_E_PROTOCOL;
   if (input.length < 3u) return FTUN_E_AGAIN;
   if (input.data[2] != 0u) return FTUN_E_PROTOCOL;
-  status = decode_endpoint(input, 3u, &endpoint, &frame_length);
+  status = decode_endpoint(input, 3u, true, &endpoint, &frame_length);
   if (status != FTUN_OK) return status;
   out->reply = input.data[1];
   out->endpoint = endpoint;
@@ -406,7 +419,7 @@ ftun_status_t ftun_socks5_decode_udp_datagram(
   if (input.data[0] != 0u || input.data[1] != 0u) return FTUN_E_PROTOCOL;
   if (input.length < 3u) return FTUN_E_AGAIN;
   if (input.data[2] != 0u) return FTUN_E_UNSUPPORTED;
-  status = decode_endpoint(input, 3u, &endpoint, &payload_offset);
+  status = decode_endpoint(input, 3u, false, &endpoint, &payload_offset);
   if (status != FTUN_OK) return status;
   out->endpoint = endpoint;
   out->payload.data = input.data + payload_offset;

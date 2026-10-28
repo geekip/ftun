@@ -11,10 +11,5 @@ bool ftun_blocking_socket_wait(int descriptor, short events,
                                uint64_t deadline_ms);
 bool ftun_blocking_socket_send_all(int descriptor, const uint8_t *data,
                                    size_t length, uint64_t deadline_ms);
-bool ftun_blocking_socket_recv_all(int descriptor, uint8_t *data,
-                                   size_t length, uint64_t deadline_ms);
-ftun_status_t ftun_blocking_socket_connect_ipv4(
-  int type, const uint8_t address[4], uint16_t port, uint32_t mark,
-  uint64_t deadline_ms, int *out);
 
 #endif

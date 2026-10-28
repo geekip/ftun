@@ -1,6 +1,6 @@
 #ifndef FTUN_TLS_TLS_H
 #define FTUN_TLS_TLS_H
-/* TASK-TLS-001 / TEST-TLS-001：ftun_tls_client_open，目标 0.4.0。 */
+/* ftun_tls_client_open。 */
 #include "internal/contracts.h"
 
 typedef struct ftun_tls_client ftun_tls_client_t;
@@ -34,7 +34,7 @@ typedef struct {
   bool wants_write;
 } ftun_tls_info_t;
 
-/* TASK-TLS-001 / TEST-TLS-001：同步推进的非阻塞 TLS 客户端。底层 IO 的
+/* 同步推进的非阻塞 TLS 客户端。底层 IO 的
  * AGAIN 被精确映射为 wants_read/wants_write；不允许关闭 peer/hostname 验证。
  * budget 为借用且必须比 client 长寿；准入会为包装对象、主机名和有界
  * 明文工作量保留逻辑预算；maximum_plaintext 限制单次 read/write，

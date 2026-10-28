@@ -1,4 +1,4 @@
-/* TASK-INBOUND-002 / TEST-INBOUND-002：ftun_mixed_connection_create，目标 0.4.0。 */
+/* ftun_mixed_connection_create。 */
 #include "mixed.h"
 #include "proxy/inbound/socks5.h"
 #include "protocol/http.h"

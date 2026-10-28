@@ -20,6 +20,9 @@ import time
 import tty
 
 
+# 插桩构建（TSan）整体更慢：停止期限类断言允许额外的余量，普通构建为 0。
+SLACK = float(os.environ.get("FTUN_TEST_SLACK_SECONDS", "0"))
+
 def receive(sock, count):
     data = b""
     while len(data) < count:
@@ -217,10 +220,10 @@ def run_reserved_case(binary, directory, kind, proxy, upstream, echo_port, reser
             stream = None
         start = time.monotonic()
         process.send_signal(signal.SIGTERM)
-        code = process.wait(timeout=12)
+        code = process.wait(timeout=12 + SLACK)
         elapsed = time.monotonic() - start
         assert code == 0, f"{kind}: exit {code}"
-        assert elapsed < (11 if kind == "blocked" else 2), (kind, elapsed)
+        assert elapsed < (11 if kind == "blocked" else 2) + SLACK, (kind, elapsed)
         assert fcntl.fcntl(writer, fcntl.F_GETFL) == flags
         print(json.dumps({"sink": kind, "proxy": proxy, "reload_signals": rounds,
                           "dns_responses": rounds + 2,

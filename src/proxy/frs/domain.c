@@ -1,6 +1,6 @@
 #include "domain.h"
 
-/* TASK-FRS-003 / TEST-FRS-003：域名 radix 与关键词查询，目标 0.4.0。 */
+/* 域名 radix 与关键词查询。 */
 
 #include <string.h>
 

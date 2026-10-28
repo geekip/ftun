@@ -3,7 +3,7 @@
 
 #include "proxy/frs/format.h"
 
-/* TASK-FRS-001 / TEST-FRS-001：只读 FRS 视图与集合绑定，目标 0.4.0。 */
+/* 只读 FRS 视图与集合绑定。 */
 
 typedef enum {
   FTUN_FRS_STORAGE_MEMORY = 1,

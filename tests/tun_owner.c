@@ -450,7 +450,9 @@ static const ftun_core_service_descriptor_t proxy_service = {
   proxy_quiesce,
   proxy_drain_until,
   proxy_stop_until,
-  proxy_destroy_until
+  proxy_destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static void set_config(ftun_config_t *config, ftun_feature_plan_t *plan,
@@ -480,6 +482,8 @@ static void set_config(ftun_config_t *config, ftun_feature_plan_t *plan,
   config->tun.ipv4_address = inbound->ipv4_address;
   config->tun.auto_route = inbound->auto_route;
   config->tun.strict_route = inbound->strict_route;
+  config->tun.route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
+  config->tun.rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
   plan->required_modules |= FTUN_BUILD_MODULE_TUN;
 }
 
@@ -634,6 +638,80 @@ static ftun_status_t async_receive(void *context, ftun_linux_route_reply_t *repl
   return FTUN_OK;
 }
 
+/* 网络变化触发对账：外部删除一项自有资源后，owner 只补回缺失项；
+ * 现状完好时不发任何变更。 */
+static int test_network_changed_repair(ftun_core_t *core, ftun_budget_t *budget,
+  ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
+  host_state_t *host)
+{
+  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  const ftun_interface_ops_t *previous = binding->network;
+  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
+  ftun_config_t config;
+  ftun_feature_plan_t plan;
+  ftun_config_inbound_t inbound;
+  ftun_core_service_run_usage_t run;
+  ftun_network_change_t change = {FTUN_NETWORK_CHANGE_ALL, {0}, 0u, 1u, false};
+  ftun_budget_usage_t baseline, final;
+  void *owner = NULL;
+  uint64_t now_ms;
+  size_t round, installed, applies, removes, requests;
+  ftun_status_t status;
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  network.context = previous->context;
+  network.async.context = &io;
+  binding->network = &network;
+  set_config(&config, &plan, &inbound, true);
+  CHECK(ftun_tun_owner_service.network_changed != NULL);
+  CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
+    &config, 1u, &owner) == FTUN_OK);
+  CHECK(ftun_tun_owner_service.activate(owner) == FTUN_OK);
+  installed = host->resource_count;
+  CHECK(installed >= 3u);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  /* 现状完好：只有核验查询，没有任何添加或删除。 */
+  applies = host->applies;
+  removes = host->removes;
+  requests = host->async_requests;
+  ftun_tun_owner_service.network_changed(owner, &change, now_ms);
+  for (round = 0u; round < 64u; round++) {
+    CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+  }
+  CHECK(host->async_requests > requests && host->applies == applies &&
+        host->removes == removes && host->resource_count == installed);
+  /* 外部删除一项（保护规则之后的路由）：补回且只补这一项。 */
+  host->resources[1] = host->resources[--host->resource_count];
+  CHECK(host->resource_count == installed - 1u);
+  ftun_tun_owner_service.network_changed(owner, &change, now_ms);
+  for (round = 0u; round < 64u; round++) {
+    CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+  }
+  CHECK(host->resource_count == installed && host->applies == applies + 1u &&
+        host->removes == removes);
+  /* 对账出错（添加被拒）：不撤销现有资源，退避后重试。 */
+  host->resources[1] = host->resources[--host->resource_count];
+  host->fail_apply_at = host->apply_attempts + 1u;
+  ftun_tun_owner_service.network_changed(owner, &change, now_ms);
+  for (round = 0u; round < 64u; round++) {
+    CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+  }
+  CHECK(host->resource_count == installed - 1u && host->removes == removes);
+  /* 停止仍然撤销全部剩余资源。 */
+  CHECK(ftun_tun_owner_service.quiesce(owner) == FTUN_OK);
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  for (round = 0u; round < 128u && owner != NULL; round++) {
+    status = ftun_tun_owner_service.destroy_until(&owner, now_ms + 5000u);
+    CHECK(status == FTUN_OK || status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
+  }
+  CHECK(owner == NULL && host->resource_count == 0u);
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used);
+  host->fail_apply_at = 0u;
+  host->async_requests = 0u;
+  binding->network = previous;
+  return 0;
+}
+
 static int test_async_stop(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
@@ -718,7 +796,7 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
   ftun_core_service_run_usage_t run;
   ftun_budget_usage_t baseline, final;
   ftun_tun_consumer_t consumer = {0};
-  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, false, NULL};
+  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, 18004u, 11000u, false, NULL};
   size_t scenario;
   network.context = previous->context;
   network.async.context = &io;
@@ -837,7 +915,7 @@ static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
   ftun_core_service_run_usage_t run;
   ftun_budget_usage_t baseline, final;
   ftun_tun_consumer_t consumer = {0};
-  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, false, NULL};
+  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, 18004u, 11000u, false, NULL};
   size_t scenario;
   network.context = previous->context;
   network.async.context = &io;
@@ -1279,6 +1357,7 @@ int main(void)
   CHECK(host.opens == host.closes && host.applies == host.removes);
 
   CHECK(test_network_update(core, budget, operations, &owner_binding, &host) == 0);
+  CHECK(test_network_changed_repair(core, budget, operations, &owner_binding, &host) == 0);
   CHECK(test_async_stop(core, budget, operations, &owner_binding, &host) == 0);
   CHECK(test_async_update(core, budget, operations, &owner_binding, &host) == 0);
   CHECK(test_async_rebuild(core, budget, operations, &owner_binding, &host) == 0);

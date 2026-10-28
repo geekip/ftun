@@ -10,7 +10,6 @@ typedef struct {
 } ftun_libev_info_t;
 
 /* 完整上游 libev 适配。
- * 需求 REQ-DEP-001；任务 TASK-EVENT-002；目标 0.2.0；验收 TEST-EVENT-002。
  * 固定完整上游 4.33 发布包。Linux 仅启用 epoll 后端，保留线程
  * 支持并用自有非阻塞 eventfd 唤醒单一 owner loop。所有 watcher 只存在适配层。
  * 先为 adapter/两个自有 FD 准入，source 成员与共享 FD group 分别计内存；

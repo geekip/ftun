@@ -244,7 +244,7 @@ static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
   return status;
 }
 
-/* TASK-CONFIG-001 / TEST-CONFIG-001，目标 0.2.0：有界配置加载协调。 */
+/* 有界配置加载协调。 */
 ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   const char *path, ftun_config_t **out, ftun_config_trace_t *trace)
 {

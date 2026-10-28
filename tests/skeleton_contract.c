@@ -2,7 +2,7 @@
 #include "transport/stream.h"
 #include <stddef.h>
 #include <stdio.h>
-/* TEST-INTEGRATION-005：公开 C 边界的同步拒绝与创建/销毁契约。
+/* 公开 C 边界的同步拒绝与创建/销毁契约。
  * 不用 assert，Release 的 NDEBUG 不得移除验收。 */
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "contract failed: %s\n", #x); return 1; } } while (0)
 static int callbacks;

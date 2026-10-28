@@ -3,7 +3,7 @@
 
 #include "internal/contracts.h"
 
-/* TASK-CORE-001 / TEST-CORE-001，目标 0.2.0：
+/* 
  * ftun_runtime_prepare 的不可变快照构造由 snapshot.c 实现，完整内部契约由
  * runtime_state.h 声明。 */
 /* Snapshot 构造期使用的名称到稳定出口 ID 转换，不对 Proxy 外公开。 */

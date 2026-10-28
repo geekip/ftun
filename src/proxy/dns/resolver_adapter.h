@@ -33,7 +33,6 @@ typedef struct {
 } ftun_resolver_backend_t;
 
 /* 按用途选择解析器。
- * 需求 REQ-DNS-001；任务 TASK-DNS-005；目标 0.2.0；验收 TEST-DNS-005。
  * 仅负责路由前 REAL 来源选择并原样转交子 Operation，不包装、不 fallback。
  * completion 应在 owner loop 用 ftun_session_store_resolved 把成功结果写回
  * 同一 Session，再调用 ftun_session_operation_complete；之后从原规则继续。

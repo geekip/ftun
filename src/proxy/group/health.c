@@ -1,4 +1,4 @@
-/* TASK-GROUP-003 / TEST-GROUP-003：ftun_health_probe，目标 0.4.0。 */
+/* ftun_health_probe。 */
 #include "health.h"
 #include "core/operation.h"
 #include <string.h>

@@ -5,8 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-ROUTE-001；任务 TASK-ROUTE-001；目标 0.3.0；验收 TEST-ROUTE-001。 */
-
 struct ftun_route_table {
   ftun_rule_t **rules;
   size_t rule_count;
@@ -204,6 +202,13 @@ ftun_status_t ftun_route_table_evaluate(const ftun_route_table_t *table,
     out->rule_index = index;
     out->resume_rule = index;
     out->outbound_id = rule->outbound_id;
+    if (rule->frs_pending) {
+      /* 第一条引用未就绪集合的规则直接拒绝，排在它前面的规则已照常匹配。 */
+      out->kind = FTUN_ROUTE_DENY;
+      out->outbound_id = FTUN_OUTBOUND_ID_REJECT;
+      out->frs_not_ready = true;
+      return FTUN_OK;
+    }
     if (rule->outbound_id == FTUN_OUTBOUND_ID_REJECT) {
       out->kind = FTUN_ROUTE_DENY;
       return FTUN_OK;
@@ -256,6 +261,13 @@ ftun_status_t ftun_route_table_evaluate_known(const ftun_route_table_t *table,
     out->rule_index = index;
     out->resume_rule = index;
     out->outbound_id = rule->outbound_id;
+    if (rule->frs_pending) {
+      /* 第一条引用未就绪集合的规则直接拒绝，排在它前面的规则已照常匹配。 */
+      out->kind = FTUN_ROUTE_DENY;
+      out->outbound_id = FTUN_OUTBOUND_ID_REJECT;
+      out->frs_not_ready = true;
+      return FTUN_OK;
+    }
     if (rule->outbound_id == FTUN_OUTBOUND_ID_REJECT) {
       out->kind = FTUN_ROUTE_DENY;
       return FTUN_OK;

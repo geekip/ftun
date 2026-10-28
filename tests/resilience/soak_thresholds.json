@@ -1,0 +1,12 @@
+{
+  "_basis": "2 小时五实例并行校准的实测：稳态 RSS 每小时至多增长约 100 KiB 且呈台阶状（首次遇到各类故障时堆高水位上移）、FD 稳态区间宽度至多 6、线程数恒定、最大恢复时间 7.5 秒、未授权出口计数 0。24 小时阈值取实测的数倍，开测前固定，不得看到结果后再调整。",
+  "recovery_max_s": 20.0,
+  "warmup_s": 3600.0,
+  "rss_growth_max_kib": 1024,
+  "pss_growth_max_kib": 1024,
+  "fd_spread_max": 10,
+  "thread_spread_max": 1,
+  "steady_margin_s": 30.0,
+  "egress_max_packets": 0,
+  "min_elapsed_ratio": 1.0
+}

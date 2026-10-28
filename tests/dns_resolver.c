@@ -610,7 +610,7 @@ static int test_boundaries(void)
   return 0;
 }
 
-/* TASK-DNS-005 / TEST-DNS-005：路由前解析器选择与 Session 结果复用。 */
+/* 路由前解析器选择与 Session 结果复用。 */
 int main(void)
 {
   CHECK(test_system_store_and_reuse() == 0);

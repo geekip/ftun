@@ -11,7 +11,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-PERSIST-001；任务 TASK-STATE-002；目标 0.3.0；验收 TEST-STATE-002。 */
 #include <sys/stat.h>
 #include <unistd.h>
 

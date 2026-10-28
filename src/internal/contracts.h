@@ -5,7 +5,7 @@
 #include <stddef.h>
 #include "ftun/ftun.h"
 /* 内部设计值类型，均不是磁盘/网络布局或稳定 ABI。所有借用视图带长度。
- * DEC-025：可选实现仅按构建选择静态内置；这些类型不作为动态插件 ABI。
+ * 可选实现仅按构建选择静态内置；这些类型不作为动态插件 ABI。
  * 基础参数同步借用；将来异步接纳时复制输入并 retain 依赖。
  * 完成回调统一由 owner loop 延迟投递一次，取消不提前释放 user。
  * 未交付的骨架入口返回 NOT_IMPLEMENTED/UNSUPPORTED；已交付入口以各模块头文件
@@ -40,7 +40,6 @@ typedef struct ftun_frs_view ftun_frs_view_t;
 typedef struct ftun_group_spec ftun_group_spec_t;
 typedef struct ftun_health_snapshot ftun_health_snapshot_t;
 typedef struct ftun_inbound_spec ftun_inbound_spec_t;
-typedef struct ftun_inbound ftun_inbound_t;
 typedef struct ftun_index ftun_index_t;
 typedef struct ftun_lwip ftun_lwip_t;
 typedef struct ftun_logger ftun_logger_t;
@@ -96,6 +95,24 @@ typedef struct {
   const ftun_endpoint_t *resolved;
   size_t resolved_count;
 } ftun_metadata_t;
+/* 网络变化的类型位（netmon 产生，服务通过 network_changed 接收）。 */
+#define FTUN_NETWORK_CHANGE_LINK 0x01u
+#define FTUN_NETWORK_CHANGE_ADDRESS 0x02u
+#define FTUN_NETWORK_CHANGE_ROUTE 0x04u
+#define FTUN_NETWORK_CHANGE_RULE 0x08u
+/* 事件丢失（接收缓冲溢出）：按“全部可能已经变化”处理。 */
+#define FTUN_NETWORK_CHANGE_OVERFLOW 0x10u
+#define FTUN_NETWORK_CHANGE_ALL 0x1fu
+#define FTUN_NETWORK_CHANGE_INTERFACES 8u
+typedef struct {
+  uint32_t mask;
+  uint32_t interfaces[FTUN_NETWORK_CHANGE_INTERFACES];
+  size_t interface_count;
+  /* 窗口内合并的事件数；超出接口数组容量时 interfaces 不完整。 */
+  size_t events;
+  /* 变化过于频繁（可能形成反馈环），消费方应当告警。 */
+  bool storm;
+} ftun_network_change_t;
 typedef enum { FTUN_ROUTE_UNSET=0, FTUN_ROUTE_READY, FTUN_ROUTE_NEED_RESOLVE,
                FTUN_ROUTE_DENY } ftun_route_kind_t;
 /* 与 Session 的首版解析上限一致，避免 Router 产生下游无法保存的集合。 */
@@ -107,6 +124,8 @@ typedef struct {
   uint32_t outbound_id;
   const ftun_endpoint_t *allowed;
   size_t allowed_count;
+  /* DENY 的原因是规则引用了尚未就绪的 FRS 集合。 */
+  bool frs_not_ready;
   /* IP/FRS-IP 规则可能从非连续候选中选择子集。指针指向这里时，result
    * 不得按值复制后继续使用旧 allowed 指针。 */
   ftun_endpoint_t allowed_storage[FTUN_ROUTE_MAX_CANDIDATES];
@@ -136,6 +155,8 @@ typedef struct {
   ftun_error_t error;
   ftun_string_t message;
   ftun_string_t path;
+  /* 关联 ID：非零时在带时间戳的日志行里输出 id=。0 表示没有。 */
+  uint64_t correlation;
 } ftun_diagnostic_t;
 typedef enum {
   FTUN_BUILD_MODULE_CORE = 1u << 0,

@@ -679,6 +679,20 @@ ftun_status_t ftun_path_local_endpoint(ftun_path_t *path, ftun_endpoint_t *out)
   return status;
 }
 
+ftun_status_t ftun_path_send_progress(ftun_path_t *path, uint64_t *acked,
+  uint32_t *queued)
+{
+  ftun_status_t status;
+  if (path == NULL || acked == NULL || queued == NULL) return FTUN_E_INVALID;
+  if (path->busy) return FTUN_E_AGAIN;
+  if (path->info.revoked) return FTUN_E_CANCELLED;
+  if (path->driver.send_progress == NULL) return FTUN_E_UNSUPPORTED;
+  path->busy = true;
+  status = path->driver.send_progress(path->driver.context, acked, queued);
+  path->busy = false;
+  return status;
+}
+
 static ftun_status_t ftun_path_provider_sweep(ftun_path_provider_t *provider,
   const ftun_network_view_t *view, bool all)
 {

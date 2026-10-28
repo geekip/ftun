@@ -18,12 +18,6 @@ static int ftun_outbound_endpoint_equal(const ftun_endpoint_t *left,
   return 0;
 }
 
-static int ftun_outbound_backend_valid(const ftun_outbound_backend_t *backend)
-{
-  return backend != NULL && backend->direct_open != NULL &&
-         backend->socks5_open != NULL && backend->reject_classify != NULL;
-}
-
 static ftun_status_t ftun_outbound_validate(
   const ftun_outbound_request_t *request)
 {
@@ -67,49 +61,82 @@ static ftun_status_t ftun_outbound_validate(
 }
 
 static ftun_status_t ftun_outbound_direct_open(
-  void *context, ftun_core_t *core, const ftun_direct_request_t *request,
-  ftun_operation_t **out)
+  void *context, ftun_core_t *core, const void *request, ftun_operation_t **out)
 {
   (void)context;
-  return ftun_direct_open(core, request, out);
+  return ftun_direct_open(core, (const ftun_direct_request_t *)request, out);
 }
 
 static ftun_status_t ftun_outbound_socks5_open(
-  void *context, ftun_core_t *core,
-  const ftun_socks5_connect_request_t *request, ftun_operation_t **out)
+  void *context, ftun_core_t *core, const void *request, ftun_operation_t **out)
 {
   (void)context;
-  return ftun_socks5_connect(core, request, out);
+  return ftun_socks5_connect(core, (const ftun_socks5_connect_request_t *)request,
+                             out);
 }
 
-static ftun_status_t ftun_outbound_reject_classify(
-  void *context, const ftun_metadata_t *metadata, bool dns_query,
-  ftun_reject_result_t *out)
-{
-  (void)context;
-  return ftun_reject_classify(metadata, dns_query, out);
-}
-
-static const ftun_outbound_backend_t ftun_outbound_default_backend = {
-  ftun_outbound_direct_open,
-  ftun_outbound_socks5_open,
-  ftun_outbound_reject_classify,
-  NULL
+static const ftun_connector_registry_t ftun_outbound_registry = {
+  {
+    {"direct", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP,
+     ftun_outbound_direct_open, NULL},
+    {"socks5", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP | FTUN_CONNECTOR_DOMAIN_TARGET,
+     ftun_outbound_socks5_open, NULL}
+  },
+  2u
 };
 
-/* TASK-OUTBOUND-001 / TEST-OUTBOUND-001，目标 0.2.0：固定叶子分派。 */
-ftun_status_t ftun_outbound_open_with_backend(
+const ftun_connector_registry_t *ftun_outbound_default_registry(void)
+{
+  return &ftun_outbound_registry;
+}
+
+/* 叶子类型对应的 Connector 名字；REJECT 与组不是 Connector。 */
+static const char *ftun_outbound_connector_kind(ftun_outbound_leaf_kind_t kind)
+{
+  return kind == FTUN_OUTBOUND_LEAF_DIRECT ? "direct" :
+         kind == FTUN_OUTBOUND_LEAF_SOCKS5 ? "socks5" : NULL;
+}
+
+/* 固定叶子分派。 */
+ftun_status_t ftun_outbound_open_with_registry(
   ftun_core_t *core, const ftun_outbound_request_t *request,
-  const ftun_outbound_backend_t *backend,
+  const ftun_connector_registry_t *registry,
   ftun_reject_result_t *reject_result, ftun_operation_t **out)
 {
+  const ftun_connector_ops_t *connector;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (reject_result != NULL) memset(reject_result, 0, sizeof(*reject_result));
-  if (out == NULL || reject_result == NULL ||
-      !ftun_outbound_backend_valid(backend)) return FTUN_E_INVALID;
+  if (out == NULL || reject_result == NULL || registry == NULL) {
+    return FTUN_E_INVALID;
+  }
   status = ftun_outbound_validate(request);
   if (status != FTUN_OK) return status;
+  if (request->leaf->kind == FTUN_OUTBOUND_LEAF_REJECT) {
+    if (request->direct != NULL || request->socks5 != NULL ||
+        request->metadata == NULL ||
+        request->metadata->generation != request->route->generation) {
+      return request->metadata != NULL &&
+             request->metadata->generation != request->route->generation ?
+             FTUN_E_STALE : FTUN_E_INVALID;
+    }
+    if ((request->metadata->known_fields & FTUN_META_NETWORK) == 0u ||
+        request->metadata->network !=
+          (request->transport == FTUN_DIAL_TCP ? 1u : 2u)) {
+      return FTUN_E_INVALID;
+    }
+    status = ftun_reject_classify(request->metadata, false, reject_result);
+    return status != FTUN_OK ? status : FTUN_E_REJECTED;
+  }
+  connector = ftun_connector_lookup(registry,
+    ftun_outbound_connector_kind(request->leaf->kind));
+  if (connector == NULL ||
+      (request->transport == FTUN_DIAL_TCP &&
+       (connector->capabilities & FTUN_CONNECTOR_TCP) == 0u) ||
+      (request->transport == FTUN_DIAL_UDP &&
+       (connector->capabilities & FTUN_CONNECTOR_UDP) == 0u)) {
+    return FTUN_E_UNSUPPORTED;
+  }
   if (request->leaf->kind == FTUN_OUTBOUND_LEAF_DIRECT) {
     ftun_direct_request_t direct;
     if (request->direct == NULL || request->socks5 != NULL ||
@@ -117,39 +144,16 @@ ftun_status_t ftun_outbound_open_with_backend(
     direct = *request->direct;
     direct.target = request->target;
     direct.transport = request->transport;
-    return backend->direct_open(backend->context, core, &direct, out);
-  }
-  if (request->leaf->kind == FTUN_OUTBOUND_LEAF_SOCKS5) {
+    return connector->open(connector->context, core, &direct, out);
+  } else {
     ftun_socks5_connect_request_t socks5;
     if (request->socks5 == NULL || request->direct != NULL ||
         request->metadata != NULL) return FTUN_E_INVALID;
     socks5 = *request->socks5;
     socks5.target = request->target;
     socks5.transport = request->transport;
-    return backend->socks5_open(backend->context, core, &socks5, out);
+    return connector->open(connector->context, core, &socks5, out);
   }
-  if (request->direct != NULL || request->socks5 != NULL ||
-      request->metadata == NULL ||
-      request->metadata->generation != request->route->generation) {
-    return request->metadata != NULL &&
-           request->metadata->generation != request->route->generation ?
-           FTUN_E_STALE : FTUN_E_INVALID;
-  }
-  if ((request->metadata->known_fields & FTUN_META_NETWORK) == 0u ||
-      request->metadata->network !=
-        (request->transport == FTUN_DIAL_TCP ? 1u : 2u)) {
-    return FTUN_E_INVALID;
-  }
-  status = backend->reject_classify(backend->context, request->metadata,
-                                    false, reject_result);
-  if (status != FTUN_OK) return status;
-  if (reject_result->terminal_status != FTUN_E_REJECTED ||
-      (reject_result->action != FTUN_REJECT_TCP_REFUSE &&
-       reject_result->action != FTUN_REJECT_UDP_DROP)) {
-    memset(reject_result, 0, sizeof(*reject_result));
-    return FTUN_E_STATE_CORRUPT;
-  }
-  return FTUN_E_REJECTED;
 }
 
 ftun_status_t ftun_outbound_open(ftun_core_t *core,
@@ -157,7 +161,6 @@ ftun_status_t ftun_outbound_open(ftun_core_t *core,
                                   ftun_reject_result_t *reject_result,
                                   ftun_operation_t **out)
 {
-  return ftun_outbound_open_with_backend(core, request,
-                                         &ftun_outbound_default_backend,
-                                         reject_result, out);
+  return ftun_outbound_open_with_registry(core, request,
+    ftun_outbound_default_registry(), reject_result, out);
 }

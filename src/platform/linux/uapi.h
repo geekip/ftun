@@ -74,6 +74,21 @@ struct ftun_ifaddrmsg {
   uint32_t ifa_index;
 };
 
+struct ftun_ifinfomsg {
+  uint8_t ifi_family;
+  uint8_t ifi_pad;
+  uint16_t ifi_type;
+  int32_t ifi_index;
+  uint32_t ifi_flags;
+  uint32_t ifi_change;
+};
+
+/* 兼容的多播组位掩码（bind 的 nl_groups）。 */
+#define FTUN_RTMGRP_LINK 0x1u
+#define FTUN_RTMGRP_IPV4_IFADDR 0x10u
+#define FTUN_RTMGRP_IPV4_ROUTE 0x40u
+#define FTUN_RTMGRP_IPV4_RULE 0x80u
+
 #define FTUN_IFA_ADDRESS 1
 #define FTUN_IFA_LOCAL 2
 
@@ -102,6 +117,8 @@ struct ftun_rtmsg {
   unsigned int rtm_flags;
 };
 
+#define FTUN_RTM_NEWLINK 16
+#define FTUN_RTM_DELLINK 17
 #define FTUN_RTM_NEWADDR 20
 #define FTUN_RTM_DELADDR 21
 #define FTUN_RTM_GETADDR 22
@@ -115,6 +132,7 @@ struct ftun_rtmsg {
 #define FTUN_RTN_UNREACHABLE 7
 #define FTUN_RT_SCOPE_UNIVERSE 0
 #define FTUN_RT_SCOPE_LINK 253
+#define FTUN_RT_SCOPE_NOWHERE 255
 #define FTUN_RT_TABLE_UNSPEC 0u
 #define FTUN_RT_TABLE_DEFAULT 253u
 #define FTUN_RT_TABLE_MAIN 254u

@@ -68,7 +68,6 @@ typedef struct {
 } ftun_dial_io_t;
 
 /* 唯一物理拨号入口。
- * 需求 REQ-GUARD-001；任务 TASK-TRANSPORT-001；目标 0.2.0；验收 TEST-TRANSPORT-001。
  * 实现路径：先核验 endpoint 属于 allowed 集合并通过 NetworkView 收窄
  * Underlay/Overlay，再做 resource admission、必要的 socket protection 和异步
  * 建连。Overlay 不设置 Underlay 绕行标记；受保护但不可达的目标明确拒绝。

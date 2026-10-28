@@ -34,7 +34,6 @@ typedef struct {
 typedef ftun_status_t (*ftun_operation_cancel_hook_fn)(void *user);
 
 /* 异步接纳与取消。
- * 需求 REQ-CORE-001；任务 TASK-CORE-005；目标 0.2.0；验收 TEST-CORE-005。
  * 队列接纳与完成由内部锁仲裁；cancel/hook/reject/dispatch 属于 owner loop。
  * 接纳时预留终结槽位和预算，
  * 因此完成/取消不再分配。回调由 dispatch 延迟执行且恰好一次；
@@ -97,4 +96,24 @@ ftun_status_t ftun_operation_queue_get_usage(const ftun_operation_queue_t *queue
 ftun_status_t ftun_operation_queue_budget(ftun_operation_queue_t *queue,
                                           ftun_budget_t **out);
 ftun_status_t ftun_operation_queue_destroy(ftun_operation_queue_t **queue);
+
+/* 队列满时的等待：调用方自带节点（不分配），排队后在某次 dispatch 回收出
+ * 额度时恰好通知一次 ready（owner 线程，不持队列锁），除非先 cancel。
+ * ready 只是“可以重试”的提示，不为等待者保留额度。每次 dispatch 至多通知
+ * FTUN_OPERATION_WAKE_QUOTA 个，按排队顺序。节点在排队期间必须保持有效，
+ * 队列在仍有等待者时不能 destroy。 */
+#define FTUN_OPERATION_WAKE_QUOTA 16u
+typedef void (*ftun_operation_ready_fn)(void *user);
+typedef struct ftun_operation_waiter {
+  struct ftun_operation_waiter *previous;
+  struct ftun_operation_waiter *next;
+  ftun_operation_queue_t *queue;
+  ftun_operation_ready_fn ready;
+  void *user;
+} ftun_operation_waiter_t;
+/* OK 已排队（重复排队幂等）；AGAIN 当前有额度，直接重试；CANCELLED 队列已停止。 */
+ftun_status_t ftun_operation_queue_wait(ftun_operation_queue_t *queue,
+  ftun_operation_waiter_t *waiter, ftun_operation_ready_fn ready, void *user);
+/* OK 已撤销；STALE 没有排队（已通知或从未排队）。 */
+ftun_status_t ftun_operation_queue_wait_cancel(ftun_operation_waiter_t *waiter);
 #endif

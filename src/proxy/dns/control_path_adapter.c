@@ -3,31 +3,21 @@
 #if defined(FTUN_HAVE_MODULE_DNS)
 
 #include "dns/wire.h"
-#include "protocol/socks5.h"
+#include "protocol/socks5_client.h"
 #include <string.h>
 
 #define FTUN_PROXY_DNS_CONTROL_TIMEOUT_MS UINT64_C(5000)
 
-static ftun_status_t ftun_proxy_dns_socks_reply(
-  ftun_control_channel_t *channel, ftun_socks5_reply_t *reply)
+static ftun_status_t ftun_proxy_dns_socks_write(void *context, const uint8_t *data,
+                                                size_t length)
 {
-  uint8_t frame[262];
-  size_t length = 4u, offset = 4u, consumed = 0u;
-  ftun_status_t status = ftun_control_channel_read_exact(channel, frame, 4u);
-  if (status != FTUN_OK) return status;
-  if (frame[3] == 1u) length = 10u;
-  else if (frame[3] == 4u) length = 22u;
-  else if (frame[3] == 3u) {
-    status = ftun_control_channel_read_exact(channel, frame + 4u, 1u);
-    if (status != FTUN_OK) return status;
-    length = 7u + frame[4];
-    offset = 5u;
-  } else return FTUN_E_PROTOCOL;
-  if (length > sizeof(frame)) return FTUN_E_LIMIT;
-  status = ftun_control_channel_read_exact(channel, frame + offset, length - offset);
-  if (status == FTUN_OK) status = ftun_socks5_decode_reply(
-    (ftun_bytes_t){frame, length}, reply, &consumed);
-  return status;
+  return ftun_control_channel_write_all((ftun_control_channel_t *)context, data, length);
+}
+
+static ftun_status_t ftun_proxy_dns_socks_read(void *context, uint8_t *data,
+                                               size_t length)
+{
+  return ftun_control_channel_read_exact((ftun_control_channel_t *)context, data, length);
 }
 
 static ftun_status_t ftun_proxy_dns_socks_open(
@@ -36,9 +26,7 @@ static ftun_status_t ftun_proxy_dns_socks_open(
   ftun_control_channel_t **control, ftun_control_channel_t **data,
   ftun_endpoint_t *relay)
 {
-  uint8_t frame[513], response[2];
-  ftun_socks5_reply_t reply;
-  size_t written = 0u;
+  ftun_socks5_client_result_t result;
   ftun_status_t status;
   *control = NULL;
   *data = NULL;
@@ -47,37 +35,27 @@ static ftun_status_t ftun_proxy_dns_socks_open(
   if (status == FTUN_OK) status = ftun_control_channel_connect(*control,
     &query->proxy, query->direct.socket_mark, execution->purpose);
   if (status != FTUN_OK) return status;
-  frame[0] = FTUN_SOCKS5_VERSION;
-  frame[1] = 1u;
-  frame[2] = query->proxy_username.length == 0u
-    ? FTUN_SOCKS5_METHOD_NO_AUTH : FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
-  status = ftun_control_channel_write_all(*control, frame, 3u);
-  if (status == FTUN_OK) status = ftun_control_channel_read_exact(*control, response, sizeof(response));
-  if (status != FTUN_OK) return status;
-  if (response[0] != FTUN_SOCKS5_VERSION || response[1] != frame[2]) return FTUN_E_REJECTED;
-  if (response[1] == FTUN_SOCKS5_METHOD_USERNAME_PASSWORD) {
-    status = ftun_socks5_encode_credentials(
-      (ftun_bytes_t){(const uint8_t *)query->proxy_username.data, query->proxy_username.length},
-      (ftun_bytes_t){(const uint8_t *)query->proxy_password.data, query->proxy_password.length},
-      frame, sizeof(frame), &written);
-    if (status == FTUN_OK) status = ftun_control_channel_write_all(*control, frame, written);
-    if (status == FTUN_OK) status = ftun_control_channel_read_exact(*control, response, sizeof(response));
+  {
+    ftun_socks5_client_t client;
+    ftun_socks5_client_options_t options = {0};
+    ftun_socks5_client_io_t io = {ftun_proxy_dns_socks_write, ftun_proxy_dns_socks_read, *control};
+    options.username = (ftun_bytes_t){(const uint8_t *)query->proxy_username.data,
+                                      query->proxy_username.length};
+    options.password = (ftun_bytes_t){(const uint8_t *)query->proxy_password.data,
+                                      query->proxy_password.length};
+    options.command = query->direct.tcp ? FTUN_SOCKS5_COMMAND_CONNECT
+                                        : FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE;
+    options.target = query->direct.upstream;
+    status = ftun_socks5_client_init(&client, &options);
+    if (status == FTUN_OK) status = ftun_socks5_client_run(&client, &io, &result);
     if (status != FTUN_OK) return status;
-    if (response[0] != 1u || response[1] != 0u) return FTUN_E_REJECTED;
   }
-  status = ftun_socks5_encode_request(
-    query->direct.tcp ? FTUN_SOCKS5_COMMAND_CONNECT : FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE,
-    &query->direct.upstream, frame, sizeof(frame), &written);
-  if (status == FTUN_OK) status = ftun_control_channel_write_all(*control, frame, written);
-  if (status == FTUN_OK) status = ftun_proxy_dns_socks_reply(*control, &reply);
-  if (status != FTUN_OK) return status;
-  if (reply.reply != FTUN_SOCKS5_REPLY_SUCCEEDED) return FTUN_E_REJECTED;
   if (query->direct.tcp) {
     *data = *control;
     return FTUN_OK;
   }
-  if (reply.endpoint.kind != FTUN_ADDRESS_IPV4 || reply.endpoint.port == 0u) return FTUN_E_PROTOCOL;
-  *relay = reply.endpoint;
+  if (result.bound.kind != FTUN_ADDRESS_IPV4 || result.bound.port == 0u) return FTUN_E_PROTOCOL;
+  *relay = result.bound;
   if (relay->address[0] == 0u && relay->address[1] == 0u &&
       relay->address[2] == 0u && relay->address[3] == 0u) {
     memcpy(relay->address, query->proxy.address, 4u);

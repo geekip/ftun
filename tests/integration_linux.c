@@ -29,6 +29,7 @@
 #include "util/buffer.h"
 #include "util/time.h"
 
+#include <stdatomic.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -75,7 +76,8 @@
 #define INBOUND_ID 41u
 #define UDP_SLOTS 8u
 
-static volatile sig_atomic_t peer_stopping;
+/* 信号处理函数写、对端线程读；无锁原子可在信号处理函数中使用。 */
+static atomic_int peer_stopping;
 static pthread_mutex_t peer_threads_mutex = PTHREAD_MUTEX_INITIALIZER;
 static size_t peer_threads;
 static const char *peer_frs_path;
@@ -4018,19 +4020,14 @@ static int integration_start(integration_t *integration)
   for (index = 0u; index < 3u; index++) {
     ftun_route_policy_t probe_policy = route_policy;
     ftun_linux_route_async_t *duplicate_routes = NULL;
-    ftun_linux_route_async_info_t duplicate_info;
     if (index >= 1u) probe_policy.tun_ipv4[2] = 1u;
     if (index >= 2u) probe_policy.protection_mark = UINT32_C(0x46000002);
+    /* 同表号的第二个实例在改动网络之前就被实例锁拒绝，不留下任何对象。 */
     if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
         ftun_linux_route_async_start(&probe_policy, integration->loop,
           integration->now_ms, 250u, integration->now_ms + 5000u,
-          &duplicate_routes) != FTUN_OK ||
-        integration_route_drive(integration, duplicate_routes,
-          FTUN_LINUX_ROUTE_ASYNC_FAILED, integration->now_ms + 5000u) != 0 ||
-        ftun_linux_route_async_get_info(duplicate_routes, &duplicate_info) !=
-          FTUN_OK || duplicate_info.result != FTUN_E_REJECTED ||
-        duplicate_info.active_count != 0u ||
-        ftun_linux_route_async_destroy(&duplicate_routes) != FTUN_OK) return 1;
+          &duplicate_routes) != FTUN_E_REJECTED ||
+        duplicate_routes != NULL) return 1;
   }
 
   memset(&flow_spec, 0, sizeof(flow_spec));
@@ -4451,7 +4448,7 @@ static int owner_recovery_main(void)
   ftun_config_t config = {0};
   ftun_budget_usage_t baseline, final;
   ftun_tun_network_update_result_t result;
-  ftun_interface_spec_t candidate = {{"ftun-own-it0", 12u}, {10u, 79u, 1u, 1u}, 24u, PROTECTION_MARK, false, NULL};
+  ftun_interface_spec_t candidate = {{"ftun-own-it0", 12u}, {10u, 79u, 1u, 1u}, 24u, PROTECTION_MARK, 18004u, 11000u, false, NULL};
   void *owner = NULL;
   uint64_t now_ms, deadline;
   unsigned int old_index;
@@ -4471,6 +4468,8 @@ static int owner_recovery_main(void)
   config.tun.mtu = TUN_MTU;
   config.tun.auto_route = true;
   config.tun.strict_route = true;
+  config.tun.route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
+  config.tun.rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
   CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
   CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
     &config, 1u, &owner) == FTUN_OK);

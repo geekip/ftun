@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_GROUP_URL_TEST_H
 #define FTUN_PROXY_GROUP_URL_TEST_H
-/* TASK-GROUP-002 / TEST-GROUP-002：ftun_url_test_choose，目标 0.4.0。 */
+/* ftun_url_test_choose。 */
 #include "internal/contracts.h"
 
 typedef struct {
@@ -31,7 +31,7 @@ struct ftun_group_spec {
   uint32_t tolerance_ms;
 };
 
-/* TASK-GROUP-002 / TEST-GROUP-002：只比较同代新鲜成功样本；容差与保持
+/* 只比较同代新鲜成功样本；容差与保持
  * 时间抑制抖动。全失败保留上次合法成员（否则 default）并标 degraded。 */
 ftun_status_t ftun_url_test_choose(const ftun_group_spec_t *group, const ftun_health_snapshot_t *health, ftun_group_choice_t *out);
 #endif

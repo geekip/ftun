@@ -27,7 +27,6 @@ typedef struct {
 } ftun_linux_tun_info_t;
 
 /* Linux TUN 设备。
- * 需求 REQ-PLAT-001；任务 TASK-PLATFORM-001；目标 0.2.0；验收 TEST-PLATFORM-001。
  * 实现路径：显式权限检查和非阻塞设备接入；处理 MTU、整包边界和关闭；初版不宣称支持未实现的 offload。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * spec 仅在调用期间借用；成功后 port 独占 fd，必须由 close 终结。

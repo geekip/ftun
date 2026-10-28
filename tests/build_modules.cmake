@@ -84,9 +84,9 @@ endif()
 file(GLOB_RECURSE core_objects
   "${core_layer_dir}/CMakeFiles/ftun_core.dir/*.o")
 list(LENGTH core_objects core_object_count)
-if(NOT core_object_count EQUAL 7)
+if(NOT core_object_count EQUAL 8)
   message(FATAL_ERROR
-    "core layer should contain exactly 7 objects, found ${core_object_count}")
+    "core layer should contain exactly 8 objects, found ${core_object_count}")
 endif()
 file(GLOB_RECURSE forbidden_core_objects
   "${core_layer_dir}/CMakeFiles/ftun_proxy.dir/*.o"
@@ -215,7 +215,7 @@ endif()
 file(READ "${proxy_socket_dir}/compile_commands.json" core_commands)
 foreach(source
     src/dns/dispatcher.c src/dns/service.c src/dns/core_service.c
-    src/dns/server.c src/dns/listener.c src/dns/bootstrap.c
+    src/dns/server.c src/dns/upstream_set.c src/dns/listener.c src/dns/bootstrap.c
     src/dns/cache.c src/dns/wire.c src/proxy/dns/fakeip.c tests/dns_service.c
     src/proxy/state/fakeip_store.c src/proxy/state/fakeip_snapshot.c
     src/proxy/tun/ingress.c src/proxy/tun/lwip_adapter.c
@@ -224,7 +224,7 @@ foreach(source
     src/platform/linux/route.c src/platform/linux/route_async.c
     tests/tun_shared.c tests/tun_path.c tests/platform_linux_route_async.c
     src/proxy/frs/format.c src/proxy/frs/frs.c src/proxy/frs/ip.c
-    src/proxy/frs/domain.c src/proxy/frs/update.c)
+    src/proxy/frs/domain.c)
   string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
   if(NOT found EQUAL -1)
     message(FATAL_ERROR "OFF module source entered Proxy socket-only build: ${source}")
@@ -236,7 +236,7 @@ if(NOT lwip_found EQUAL -1)
   message(FATAL_ERROR "TUN-only lwIP entered core-only build")
 endif()
 foreach(source src/proxy/dns/resolver_adapter.c src/platform/system_resolver.c
-               src/transport/carrier.c src/transport/datagram.c
+               src/transport/datagram.c
                src/protocol/socks5.c
                src/proxy/udp/session.c)
   string(FIND "${core_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
@@ -284,7 +284,7 @@ foreach(source src/dns/dispatcher.c src/dns/service.c src/dns/core_service.c
                src/proxy/state/fakeip_store.c src/proxy/state/fakeip_snapshot.c
                src/proxy/tun/ingress.c src/proxy/tun/lwip_adapter.c
                src/proxy/frs/format.c src/proxy/frs/frs.c src/proxy/frs/ip.c
-               src/proxy/frs/domain.c src/proxy/frs/update.c)
+               src/proxy/frs/domain.c)
   string(FIND "${builtin_commands}" "${FTUN_SOURCE_DIR}/${source}" found)
   if(found EQUAL -1)
     message(FATAL_ERROR "BUILTIN module source is missing: ${source}")
@@ -387,7 +387,7 @@ function(ftun_check_variant name dns fakeip tun frs excluded_source)
     message(FATAL_ERROR "${name} retained disabled source: ${excluded_source}")
   endif()
   foreach(source src/proxy/inbound/socks5.c src/protocol/socks5.c
-                 src/transport/carrier.c src/transport/datagram.c
+                 src/transport/datagram.c
                  src/platform/system_resolver.c)
     string(FIND "${commands}" "${FTUN_SOURCE_DIR}/${source}" found)
     if(found EQUAL -1)

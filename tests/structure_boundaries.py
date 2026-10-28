@@ -260,10 +260,39 @@ def observed_forbidden_includes(
     return observed, errors
 
 
+def private_header_violations(
+    root: Path, injected: list[tuple[str, str]] | None = None
+) -> list[str]:
+    """私有头（internal.h、*_internal.h）只允许所在目录自身包含。"""
+    errors = []
+    pairs = list(injected or [])
+    for path in sorted(p for p in (root / "src").rglob("*") if p.suffix in {".c", ".h"}):
+        source = path.relative_to(root).as_posix()
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"cannot scan {source}: {exc}")
+            continue
+        for line in lines:
+            match = INCLUDE_RE.match(line)
+            if match:
+                pairs.append((source, match.group(1)))
+    for source, include in pairs:
+        name = include.rsplit("/", 1)[-1]
+        if name != "internal.h" and not name.endswith("_internal.h"):
+            continue
+        header_dir = "src/" + include.rsplit("/", 1)[0]
+        source_dir = source.rsplit("/", 1)[0]
+        if header_dir != source_dir:
+            errors.append(f"private header include: {source} -> {include}")
+    return errors
+
+
 def validate_includes(
     root: Path, policy: dict, injected: list[tuple[str, str]] | None = None
 ) -> list[str]:
     observed, errors = observed_forbidden_includes(root, policy, injected)
+    errors.extend(private_header_violations(root, injected))
     waivers = policy.get("migration_include_waivers", [])
     waiver_pairs = []
     for waiver in waivers:
@@ -425,7 +454,14 @@ def main() -> int:
         )
         if not any("forbidden business include" in error for error in injected_errors):
             fail("illegal include injection was not rejected")
-        print("structure boundary self-test: illegal include rejected")
+        private_errors = validate_includes(
+            root,
+            policy,
+            [("src/proxy/snapshot.c", "core/context_internal.h")],
+        )
+        if not any("private header include" in error for error in private_errors):
+            fail("cross-directory private header injection was not rejected")
+        print("structure boundary self-test: illegal include and private header rejected")
         return 0
 
     print(

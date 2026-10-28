@@ -40,7 +40,7 @@ cleanup()
     kill -TERM "$local_pid" >/dev/null 2>&1 || true
     wait "$local_pid" >/dev/null 2>&1 || true
   fi
-  ip rule del priority 11002 iif lan0 lookup 51820 >/dev/null 2>&1 || true
+  ip rule del priority 11002 iif lan0 lookup 18004 >/dev/null 2>&1 || true
   ip netns del ftun-lan >/dev/null 2>&1 || true
   ip netns del ftun-peer >/dev/null 2>&1 || true
   if [ "$status" -ne 0 ]; then
@@ -121,18 +121,19 @@ cat >"$temporary/config.json" <<EOF
       {"name":"fake","type":"udp","address":["192.0.2.53:53"],"outbound":"DIRECT","fake-ip":true}
     ]
   },
+  "tun": {
+    "interface":"ftun-prod0","mtu":1400,
+    "ipv4":{"address":"10.77.0.1/30"},
+    "auto-route":true,"strict-route":true
+  },
   "inbounds": [
     {"name":"release-socks","type":"socks5","listen":"127.0.0.1:11081","udp":true},
     {"name":"release-mixed","type":"mixed","listen":"127.0.0.1:11082","udp":true},
     {
       "name":"release-tun",
       "type":"tun",
-      "interface":{"name":"ftun-prod0","mtu":1400},
-      "ipv4":{"address":"10.77.0.1/30"},
       "tcp":true,
       "udp":true,
-      "auto-route":true,
-      "strict-route":true,
       "dns-hijack":true
     }
   ],
@@ -185,6 +186,18 @@ while ! ip link show ftun-prod0 >/dev/null 2>&1; do
   sleep 0.01
 done
 
+# 本地规则文件缺失：服务不等待下载，以 NOT_READY 启动；后台下载成功并发布新
+# 快照后才继续（此前的第一条 FRS 规则会拒绝新连接）。
+attempt=0
+while ! grep -q 'config.published.*reason=frs-update' /tmp/ftun-release.log; do
+  attempt=$((attempt + 1))
+  if [ "$attempt" -ge 500 ] || ! kill -0 "$ftun_pid" 2>/dev/null; then
+    echo "FRS background download did not publish" >&2
+    sed -n '1,200p' "$temporary/ftun.log" >&2
+    exit 1
+  fi
+  sleep 0.02
+done
 if [ ! -s "$temporary/rules.frs" ] ||
    ! cmp -s "$temporary/source.frs" "$temporary/rules.frs"; then
   echo "FRS startup download was not atomically published" >&2
@@ -196,7 +209,7 @@ if ! grep -q 'http-rules-redirect' "$temporary/peer.log"; then
 fi
 
 # LAN 转发路由由部署者显式提供；FTUN 的保护 mark 规则优先绕过捕获表。
-ip rule add priority 11002 iif lan0 lookup 51820
+ip rule add priority 11002 iif lan0 lookup 18004
 
 attempt=0
 while ! grep -q 'http-health' "$temporary/peer.log"; do
@@ -461,18 +474,29 @@ if "$ftun_binary" run -c "$temporary/config.json" \
   exit 1
 fi
 
-# A genuinely missing local FRS may bootstrap only from a successful update;
-# download failure must not start a partial Runtime.
+# 本地规则文件缺失且下载失败：不再启动失败（断网不退出），服务以 NOT_READY
+# 持续运行并按退避重试，不产生半成品规则文件；SIGTERM 能正常停止。
 stage=missing-frs-download-failure
 rm -f "$temporary/rules.frs"
 sed 's#http://frs.release.test:18082/redirect#http://frs.release.test:9/unavailable#' \
   "$temporary/config.json" >"$temporary/config.next"
 mv "$temporary/config.next" "$temporary/config.json"
-if "$ftun_binary" run -c "$temporary/config.json" \
-    >"$temporary/ftun.log" 2>&1; then
-  echo "failed FRS startup download unexpectedly started" >&2
+"$ftun_binary" run -c "$temporary/config.json" \
+  >"$temporary/ftun.log" 2>&1 &
+ftun_pid=$!
+sleep 3
+if ! kill -0 "$ftun_pid" 2>/dev/null; then
+  echo "FRS download failure must not stop the service" >&2
+  sed -n '1,200p' "$temporary/ftun.log" >&2
   exit 1
 fi
+if [ -e "$temporary/rules.frs" ]; then
+  echo "failed FRS download left a rule file" >&2
+  exit 1
+fi
+kill -TERM "$ftun_pid"
+wait "$ftun_pid"
+ftun_pid=
 
 # With FTUN DNS disabled, a required local DIRECT resolution uses the bounded
 # SystemResolver path.  No TUN route is active in this scenario, so libc/NSS

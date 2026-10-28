@@ -1,6 +1,6 @@
 #ifndef FTUN_PROXY_INBOUND_SOCKS5_H
 #define FTUN_PROXY_INBOUND_SOCKS5_H
-/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_server_create，目标 0.4.0。 */
+/* ftun_socks5_server_create。 */
 #include "proxy/inbound/inbound.h"
 #include "protocol/socks5.h"
 
@@ -21,7 +21,7 @@ typedef struct {
   ftun_endpoint_t target; /* DOMAIN 借用 server。 */
 } ftun_socks5_server_event_t;
 
-/* TASK-INBOUND-003 / TEST-INBOUND-003：每个连接独立持有有界增量状态与认证
+/* 每个连接独立持有有界增量状态与认证
  * 副本。feed 每次最多产生一个事件；REQUEST 不含成功响应，必须等下游连接
  * 结果后调用 finish_request。BIND/禁用的 UDP 明确返回
  * 0x07，IPv6 返回 0x08；REQUEST.preread 不丢失握手后字节。 */

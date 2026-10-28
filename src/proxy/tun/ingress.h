@@ -5,6 +5,7 @@
 #include "transport/datagram.h"
 #include "transport/stream.h"
 #include "proxy/tun/lwip_adapter.h"
+#include "network/socket_policy.h"
 #include "util/buffer.h"
 
 typedef struct ftun_tun_ingress_context ftun_tun_ingress_context_t;
@@ -45,6 +46,7 @@ typedef struct {
   ftun_tun_stream_event_fn stream_event;
   ftun_tun_datagram_receive_fn datagram_receive;
   ftun_tun_output_fn output;
+  ftun_socket_liveness_t liveness;
   void *user;
 } ftun_tun_ingress_spec_t;
 
@@ -56,7 +58,6 @@ typedef struct {
 } ftun_tun_ingress_usage_t;
 
 /* TUN 到协议栈入口。
- * 需求 REQ-IN-001；任务 TASK-INBOUND-005；目标 0.2.0；验收 TEST-INBOUND-005。
  * 实现路径：保留来源、设备身份及完整 IP 包；仅支持 IPv4 TCP/UDP；将包交 lwIP，生成统一 Stream/Datagram。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * bind 创建 owner-loop 消费者上下文；输入同步借用，lwIP 在返回前取得独立
@@ -84,9 +85,6 @@ ftun_status_t ftun_tun_ingress_abort_stream(
 ftun_status_t ftun_tun_ingress_stream_ready(
   ftun_tun_ingress_context_t *context, ftun_stream_t *stream,
   bool *readable, bool *writable);
-/* 事务重载提交后只影响后续新 flow；已有 Stream/Datagram 已固定旧代。 */
-ftun_status_t ftun_tun_ingress_set_generation(
-  ftun_tun_ingress_context_t *context, uint64_t generation);
 ftun_status_t ftun_tun_ingress_set_identity(
   ftun_tun_ingress_context_t *context, uint64_t generation,
   uint32_t inbound_id);

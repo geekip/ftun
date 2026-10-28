@@ -66,12 +66,14 @@ ftun_status_t ftun_runtime_manager_destroy(ftun_core_t **core);
 /* 只释放快照扩展，保留通用 Core 供宿主完成其他可重试清理。 */
 ftun_status_t ftun_runtime_manager_clear(ftun_core_t *core);
 /* 编译结果的准备与快照生命周期。
- * 需求 REQ-CONF-001；任务 TASK-CORE-001；目标 0.2.0；验收 TEST-CORE-001。
  * 实现路径：引用配置计划，检查 active/candidate/retained 总预算；准备必需对象；由 loop 提交，旧代按引用回收。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；成功后 candidate 保留 config，调用者用 commit 转移或 abort 回滚。
  */
 ftun_status_t ftun_runtime_prepare(ftun_core_t *core, const ftun_config_t *config, ftun_runtime_t **out);
+/* FRS 本地文件缺失且开启自动更新时的启动：不阻塞下载，FRS 规则处于 NOT_READY，
+ * 命中它们的新连接被拒绝，直到后台下载成功并发布新快照。 */
+ftun_status_t ftun_runtime_prepare_frs_pending(ftun_core_t *core, const ftun_config_t *config, ftun_runtime_t **out);
 /* FRS 更新事务使用已完整校验的候选 view 重新准备同一配置；Runtime 成功
  * 后拥有 view 引用。普通启动必须调用 ftun_runtime_prepare。 */
 ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
@@ -98,7 +100,12 @@ ftun_status_t ftun_runtime_prepared_release(ftun_runtime_t **prepared);
 ftun_status_t ftun_runtime_accounted_bytes(const ftun_config_t *config,
                                             size_t *out);
 /* commit 不分配；成功清空 candidate 句柄并由 manager 持有 active。 */
+/* 不带预留的提交：存在任何代次预留时返回 AGAIN；否则自行预留并发布下一代次。 */
 ftun_status_t ftun_runtime_commit(ftun_core_t *core, ftun_runtime_t **candidate);
+/* 消费 owner 已在 Core 上下文持有的代次预留并发布；预留不属于
+ * owner 时返回 STALE，候选与预留均保持不变。 */
+ftun_status_t ftun_runtime_commit_reserved(ftun_core_t *core,
+  ftun_runtime_t **candidate, const void *owner);
 /* 持久化先于指针切换的事务可先执行只读提交门禁；成功后到 commit 之间不得
  * 穿插其他 Runtime 操作。 */
 ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,

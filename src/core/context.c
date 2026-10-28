@@ -22,6 +22,7 @@ ftun_status_t ftun_core_context_create(ftun_budget_t *budget,
     (void)ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
+  atomic_init(&core->generation, 0u);
   core->context_magic = FTUN_CORE_CONTEXT_MAGIC;
   core->budget = budget;
   core->reservation = reservation;
@@ -48,7 +49,7 @@ ftun_status_t ftun_core_context_extension(const ftun_core_t *core,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_core_context_budget(ftun_core_t *core,
+ftun_status_t ftun_core_context_budget(const ftun_core_t *core,
                                        ftun_budget_t **out)
 {
   if (out != NULL) *out = NULL;
@@ -57,12 +58,87 @@ ftun_status_t ftun_core_context_budget(ftun_core_t *core,
   return FTUN_OK;
 }
 
+bool ftun_core_context_is_valid(const ftun_core_t *core)
+{
+  return ftun_core_context_valid(core) != 0;
+}
+
 ftun_status_t ftun_core_context_generation(const ftun_core_t *core,
                                            uint64_t *out)
 {
   if (out != NULL) *out = 0u;
   if (!ftun_core_context_valid(core) || out == NULL) return FTUN_E_INVALID;
-  *out = core->generation;
+  *out = atomic_load_explicit(&((ftun_core_t *)core)->generation,
+                              memory_order_acquire);
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_core_context_generation_reserve(ftun_core_t *core,
+  const void *owner, uint64_t *out_next)
+{
+  uint64_t current;
+  if (out_next != NULL) *out_next = 0u;
+  if (!ftun_core_context_valid(core) || owner == NULL || out_next == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (core->reserved_generation != 0u) return FTUN_E_AGAIN;
+  current = atomic_load_explicit(&core->generation, memory_order_relaxed);
+  if (current == UINT64_MAX) return FTUN_E_LIMIT;
+  core->reserved_generation = current + 1u;
+  core->reserved_owner = owner;
+  *out_next = core->reserved_generation;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_core_context_generation_publish(ftun_core_t *core,
+  const void *owner, uint64_t next)
+{
+  if (!ftun_core_context_valid(core) || owner == NULL || next == 0u) {
+    return FTUN_E_INVALID;
+  }
+  if (core->reserved_generation != next || core->reserved_owner != owner) {
+    return FTUN_E_STALE;
+  }
+  atomic_store_explicit(&core->generation, next, memory_order_release);
+  core->reserved_generation = 0u;
+  core->reserved_owner = NULL;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_core_context_generation_release(ftun_core_t *core,
+  const void *owner, uint64_t next)
+{
+  if (!ftun_core_context_valid(core) || owner == NULL || next == 0u) {
+    return FTUN_E_INVALID;
+  }
+  if (core->reserved_generation != next || core->reserved_owner != owner) {
+    return FTUN_E_STALE;
+  }
+  core->reserved_generation = 0u;
+  core->reserved_owner = NULL;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_core_context_generation_held(const ftun_core_t *core,
+  const void *owner, uint64_t *out_next)
+{
+  if (out_next != NULL) *out_next = 0u;
+  if (!ftun_core_context_valid(core) || owner == NULL || out_next == NULL) {
+    return FTUN_E_INVALID;
+  }
+  if (core->reserved_generation == 0u || core->reserved_owner != owner) {
+    return FTUN_E_STALE;
+  }
+  *out_next = core->reserved_generation;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_core_context_generation_reserved(const ftun_core_t *core,
+                                                    uint64_t *out)
+{
+  if (out != NULL) *out = 0u;
+  if (!ftun_core_context_valid(core) || out == NULL) return FTUN_E_INVALID;
+  *out = core->reserved_generation;
   return FTUN_OK;
 }
 
@@ -72,14 +148,6 @@ ftun_status_t ftun_core_context_set_budget(ftun_core_t *core,
   if (!ftun_core_context_valid(core) || budget == NULL) return FTUN_E_INVALID;
   if (core->extension != NULL) return FTUN_E_AGAIN;
   core->budget = budget;
-  return FTUN_OK;
-}
-
-ftun_status_t ftun_core_context_set_generation(ftun_core_t *core,
-                                               uint64_t generation)
-{
-  if (!ftun_core_context_valid(core)) return FTUN_E_INVALID;
-  core->generation = generation;
   return FTUN_OK;
 }
 

@@ -86,7 +86,7 @@ static int memory_contract(void)
     CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
   }
   memcpy(wire, response, sizeof(response));
-  CHECK(ftun_http_parse_response(observed_budget, wire, sizeof(response) - 1u,
+  CHECK(ftun_http_fetch_parse_response(observed_budget, wire, sizeof(response) - 1u,
     1024u, &result, &text, &reservation) == FTUN_OK);
   CHECK(strcmp(result.etag, "second") == 0 && strcmp(text, "/b") == 0);
   CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
@@ -95,7 +95,7 @@ static int memory_contract(void)
   observed_free(text); text = NULL;
   CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
   memcpy(wire, last_etag, sizeof(last_etag));
-  CHECK(ftun_http_parse_response(observed_budget, wire, sizeof(last_etag) - 1u,
+  CHECK(ftun_http_fetch_parse_response(observed_budget, wire, sizeof(last_etag) - 1u,
     1024u, &result, &text, &reservation) == FTUN_OK);
   CHECK(strcmp(result.etag, "complete") == 0 && text == NULL && reservation == NULL);
   ftun_http_fetch_release(&result);
@@ -109,7 +109,7 @@ static int memory_contract(void)
   CHECK(ftun_http_redirect_url(observed_budget,
     (ftun_string_t){base, sizeof(base) - 1u}, "/a", &text, &reservation) == FTUN_E_LIMIT);
   memcpy(wire, response, sizeof(response));
-  CHECK(ftun_http_parse_response(observed_budget, wire, sizeof(response) - 1u,
+  CHECK(ftun_http_fetch_parse_response(observed_budget, wire, sizeof(response) - 1u,
     1024u, &result, &text, &reservation) == FTUN_E_LIMIT);
   CHECK(calls == allocation_calls && result.etag == NULL && reservation == NULL);
   ftun_http_fetch_release(&result);

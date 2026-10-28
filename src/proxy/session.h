@@ -30,7 +30,6 @@ typedef struct {
 } ftun_session_info_t;
 
 /* 统一业务会话。
- * 需求 REQ-CORE-001；任务 TASK-CORE-002；目标 0.2.0；验收 TEST-CORE-002。
  * submit 在返回前复制 Metadata 及其域名/候选，保留 active Runtime 和 inbound
  * Stream，并把 generation 固定到接纳时快照。成功后调用方不得销毁 Stream，
  * 直到 Session CLOSED 且 destroy 已释放保留引用。

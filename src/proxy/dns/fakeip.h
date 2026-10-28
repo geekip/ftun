@@ -37,7 +37,6 @@ ftun_status_t ftun_fakeip_service_get_info(const ftun_fakeip_service_t *service,
                                            ftun_fakeip_service_info_t *out);
 
 /* 全局 FakeIP 身份服务。
- * 需求 REQ-FAKE-001；任务 TASK-DNS-007；目标 0.3.0；验收 TEST-DNS-007。
  * 域名规范化为小写并移除单个尾点。重复域名返回同一地址；新域名只使用
  * 已耐久预留范围，容量/条目满时拒绝，释放 handle 也不回收或跨域复用。
  */

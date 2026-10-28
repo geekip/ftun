@@ -569,7 +569,7 @@ static int wakeup_coalescing(void)
   return 0;
 }
 
-/* TASK-EVENT-002 / TEST-EVENT-002：epoll I/O、timer 与跨线程 ev_async。 */
+/* epoll I/O、timer 与跨线程 ev_async。 */
 int main(void)
 {
   ftun_event_loop_t *loop = NULL;

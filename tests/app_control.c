@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <time.h>
 #include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "app control failed at %d: %s\n", __LINE__, #x); return 1; } } while (0)
@@ -182,7 +183,9 @@ static ftun_status_t destroy_until(void **instance, uint64_t deadline)
 }
 static const ftun_core_service_descriptor_t descriptor = {
   "control-test", plan_prepare, plan_destroy, prepare, success, reload_prepare, reload_planned,
-  reload_commit, success, run_once, success, success, stop_until, stop_until, destroy_until
+  reload_commit, success, run_once, success, success, stop_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 static void *reader(void *unused)
 {
@@ -235,6 +238,11 @@ int main(void)
   CHECK(pthread_create(&thread, NULL, reader, NULL) == 0);
   test.deadline = now() + 5000u;
   CHECK(ftun_core_run(test.core, test.paths[0]) == FTUN_OK);
+  /* 运行很短，负载高（如 TSan）时读取线程可能还没被调度；至少等它查询一次再停止。 */
+  for (i = 0u; i < 5000u && atomic_load(&test.reader_queries) == 0u; i++) {
+    struct timespec pause = {0, 1000000L};
+    (void)nanosleep(&pause, NULL);
+  }
   atomic_store(&test.reader_stop, true);
   CHECK(pthread_join(thread, NULL) == 0);
   CHECK(test.step == 3u && !test.failed && test.reload_done == 1u && test.cancel_done == 1u);

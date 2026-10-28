@@ -50,7 +50,8 @@ static const char *const ftun_event_names[FTUN_LIFECYCLE_COUNT] = {
   "module.preparing", "module.prepared", "module.active", "module.quiesced",
   "module.drained", "module.stopped", "module.failed", "rollback", "running",
   "reload.requested", "reload.committed", "reload.rejected", "stopping",
-  "runtime.stopped", "stop.failed", "reload.cancelled"
+  "runtime.stopped", "stop.failed", "reload.cancelled", "config.published",
+  "network.changed"
 };
 static const char *const ftun_event_modules[FTUN_EVENT_MODULES] = {
   "app", "core", "dns", "tun", "frs", "fakeip", "proxy"
@@ -58,7 +59,8 @@ static const char *const ftun_event_modules[FTUN_EVENT_MODULES] = {
 static const char *const ftun_event_reasons[FTUN_LIFECYCLE_REASON_COUNT] = {
   "none", "required", "dependency", "optional", "not-selected", "not-built", "not-registered",
   "read", "parse", "paths", "validate", "compile", "log-draining", "admission",
-  "run", "quiesce", "drain", "destroy", "reload-prepare", "reload-commit", "reload-abort"
+  "run", "quiesce", "drain", "destroy", "reload-prepare", "reload-commit", "reload-abort",
+  "frs-update"
 };
 
 static void ftun_event_count(uint64_t *counter, uint64_t amount)
@@ -103,6 +105,7 @@ static ftun_status_t ftun_event_forward(ftun_event_log_t *log,
     event->generation, ftun_event_reasons[event->reason], suppressed);
   if (length < 0 || (size_t)length >= sizeof(message)) return FTUN_E_LIMIT;
   memset(&diagnostic, 0, sizeof(diagnostic));
+  diagnostic.correlation = event->correlation;
   diagnostic.error.status = event->status;
   diagnostic.error.stage = (event->kind == FTUN_LIFECYCLE_CONFIG_READ ||
     (event->kind == FTUN_LIFECYCLE_CONFIG_FAILED &&

@@ -119,7 +119,7 @@ static int real_smoke(void)
   return 0;
 }
 
-/* TASK-TUN-001 / TEST-TUN-001：平台委托、MTU、整包和关闭。 */
+/* 平台委托、MTU、整包和关闭。 */
 int main(int argc, char **argv)
 {
   port_mock_t mock;

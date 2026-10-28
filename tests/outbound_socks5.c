@@ -485,6 +485,35 @@ static int test_tcp_candidates_partial_and_copy(void)
   return 0;
 }
 
+/* 上游 CONNECT 成功但 BND.ADDR 为 IPv6：必须按 22 字节完整读取并报告成功，
+ * 不能误判为协议或命令失败。逐字节接收覆盖长度推导。 */
+static int test_ipv6_bound_reply(void)
+{
+  fixture_t fixture;
+  ftun_operation_t *operation = NULL;
+  uint8_t selection[2] = {FTUN_SOCKS5_VERSION, FTUN_SOCKS5_METHOD_NO_AUTH};
+  uint8_t reply[22];
+  CHECK(fixture_start(&fixture, 65536u, 6u) == 0);
+  fixture.protocol.max_receive = 1u;
+  memset(reply, 0, sizeof(reply));
+  reply[0] = FTUN_SOCKS5_VERSION;
+  reply[1] = FTUN_SOCKS5_REPLY_SUCCEEDED;
+  reply[3] = 0x04u;
+  reply[4] = 0x20u;
+  reply[21] = 0x50u;
+  CHECK(append_server(&fixture, selection, sizeof(selection)) == 0);
+  CHECK(append_server(&fixture, reply, sizeof(reply)) == 0);
+  CHECK(ftun_socks5_connect_with_io(NULL, &fixture.request,
+                                    &fixture.dial_io, &fixture.protocol_io,
+                                    &operation) == FTUN_OK);
+  CHECK(drive(&fixture) == 0);
+  CHECK(fixture.completion.calls == 1 &&
+        fixture.completion.error.status == FTUN_OK &&
+        fixture.completion.connection != NULL);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 static int test_authenticated_domain(void)
 {
   fixture_t fixture;
@@ -808,6 +837,7 @@ static int test_synchronous_boundaries(void)
 int main(void)
 {
   if (test_tcp_candidates_partial_and_copy() != 0) return 1;
+  if (test_ipv6_bound_reply() != 0) return 1;
   if (test_authenticated_domain() != 0) return 1;
   if (test_udp_associate_and_source() != 0) return 1;
   if (test_overlay_udp_domain_sticky() != 0) return 1;

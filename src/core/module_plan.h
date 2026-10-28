@@ -82,6 +82,10 @@ ftun_status_t ftun_core_module_runtime_reload_abort(
 ftun_status_t ftun_core_module_runtime_run_once(
   ftun_core_module_runtime_t *runtime, bool may_block,
   ftun_core_service_run_usage_t *out_usage);
+/* 把网络变化转交给每个已准备的服务（它们的 network_changed 钩子）。 */
+void ftun_core_module_runtime_network_changed(
+  ftun_core_module_runtime_t *runtime, const ftun_network_change_t *change,
+  uint64_t now_ms);
 ftun_status_t ftun_core_module_runtime_wakeup(
   ftun_core_module_runtime_t *runtime);
 ftun_status_t ftun_core_module_runtime_quiesce(

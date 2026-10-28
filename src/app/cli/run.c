@@ -6,6 +6,7 @@
 
 #include "config/config.h"
 #include "config/parser.h"
+#include "util/logger.h"
 #include "util/time.h"
 
 #include <pthread.h>
@@ -16,6 +17,10 @@
 #include <unistd.h>
 
 #define FTUN_CLI_STOP_TIMEOUT_MS UINT64_C(10000)
+/* 退出码：0 正常停止，1 配置或启动失败，2 用法错误（见 dispatch），
+ * 3 运行时致命错误，4 看门狗触发。 */
+#define FTUN_CLI_EXIT_FATAL 3
+#define FTUN_CLI_EXIT_WATCHDOG 4
 
 typedef struct {
   ftun_core_t *core;
@@ -49,6 +54,7 @@ static void *ftun_cli_signal_waiter(void *user)
   (void)sigaddset(&signals, SIGHUP);
   (void)sigaddset(&signals, SIGINT);
   (void)sigaddset(&signals, SIGTERM);
+  (void)sigaddset(&signals, SIGUSR1);
   for (;;) {
     int signal_number = 0;
     int done;
@@ -57,7 +63,10 @@ static void *ftun_cli_signal_waiter(void *user)
     done = context->done;
     (void)pthread_mutex_unlock(&context->mutex);
     if (done) break;
-    if (signal_number == SIGHUP) {
+    if (signal_number == SIGUSR1) {
+      /* 外部 logrotate 改走了日志文件：重新打开，之后的日志写进新文件。 */
+      (void)ftun_log_reopen(context->core);
+    } else if (signal_number == SIGHUP) {
       ftun_operation_t *operation = NULL;
       ftun_cli_result_ticket_t *ticket = NULL;
       ftun_status_t status = ftun_cli_result_reserve(context->results, &ticket);
@@ -131,7 +140,6 @@ int ftun_cli_run(const char *path)
     }
     return ftun_cli_error("run preflight", status);
   }
-  ftun_cli_warn_deprecated_config(checked.config);
   status = ftun_cli_core_create(checked.config, &core);
   {
     ftun_status_t cleanup_status = ftun_cli_checked_config_destroy(&checked);
@@ -151,6 +159,7 @@ int ftun_cli_run(const char *path)
   (void)sigaddset(&signals, SIGHUP);
   (void)sigaddset(&signals, SIGINT);
   (void)sigaddset(&signals, SIGTERM);
+  (void)sigaddset(&signals, SIGUSR1);
   if (pthread_sigmask(SIG_BLOCK, &signals, &previous) != 0) {
     status = FTUN_E_IO;
     goto done;
@@ -171,7 +180,10 @@ int ftun_cli_run(const char *path)
   (void)pthread_kill(signal_thread, SIGTERM);
   (void)pthread_join(signal_thread, NULL);
   thread_started = 0;
-  if (status == FTUN_OK) exit_code = 0;
+  /* 看门狗触发后即使 owner 随后正常停止，也要让服务管理器重启进程。 */
+  if (ftun_app_control_watchdog_fired(core)) exit_code = FTUN_CLI_EXIT_WATCHDOG;
+  else if (status == FTUN_OK) exit_code = 0;
+  else if (status == FTUN_E_STATE_CORRUPT) exit_code = FTUN_CLI_EXIT_FATAL;
 
 done:
   if (thread_started) {
@@ -183,7 +195,7 @@ done:
   }
   if (ftun_core_destroy(&core) != FTUN_OK && status == FTUN_OK) {
     status = FTUN_E_STATE_CORRUPT;
-    exit_code = 1;
+    exit_code = FTUN_CLI_EXIT_FATAL;
   }
   if (status != FTUN_OK && context.results != NULL) {
     ftun_cli_result_ticket_t *ticket = NULL;

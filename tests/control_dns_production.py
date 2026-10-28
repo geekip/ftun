@@ -87,8 +87,13 @@ class SOCKS(socketserver.BaseRequestHandler):
             header = receive(client, 4)
             assert header[:1] == b'\5' and header[2:] == b'\0\1', header
             target = receive(client, 6)
-            assert socket.inet_ntoa(target[:4]) == '127.0.0.1'
-            self.server.targets.append((header[1], struct.unpack('!H', target[4:])[0]))
+            if header[1] == 1:
+                assert socket.inet_ntoa(target[:4]) == '127.0.0.1'
+                self.server.targets.append((1, struct.unpack('!H', target[4:])[0]))
+            else:
+                # UDP ASSOCIATE 的 DST 是客户端期望的发送地址，未知时为全零（RFC 1928）；
+                # DNS 上游地址出现在随后的 UDP 数据报里。
+                assert target == b'\0' * 6, target
             if header[1] == 1:
                 client.sendall(b'\5\0\0\1' + b'\0' * 6)
                 size = struct.unpack('!H', receive(client, 2))[0]
@@ -104,7 +109,8 @@ class SOCKS(socketserver.BaseRequestHandler):
                     # 零地址必须规范化为代理端点 IP，不能当作独立解析目标。
                     client.sendall(b'\5\0\0\1' + b'\0' * 4 + struct.pack('!H', relay.getsockname()[1]))
                     wire, peer = relay.recvfrom(65536)
-                    assert wire[:4] == b'\0\0\0\1' and wire[4:10] == target, wire[:10]
+                    assert wire[:4] == b'\0\0\0\1' and socket.inet_ntoa(wire[4:8]) == '127.0.0.1', wire[:10]
+                    self.server.targets.append((3, struct.unpack('!H', wire[8:10])[0]))
                     response = answer(self.server, wire[10:])
                     prefix = wire[:10]
                     if self.server.mode == 'wrong-source':

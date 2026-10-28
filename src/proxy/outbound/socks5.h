@@ -66,7 +66,6 @@ typedef struct {
 } ftun_socks5_io_t;
 
 /* SOCKS5 出站。
- * 需求 REQ-OUT-001；任务 TASK-OUTBOUND-004；目标 0.2.0；验收 TEST-OUTBOUND-004。
  * 代理节点必须先成为本次真实 IPv4 候选，再由受保护 Dialer
  * 建立控制 TCP。目标已有真实 allowed 候选时发送 IPv4，只有完全
  * 没有真实候选时才允许发送 DOMAIN。UDP 关联同时保留控制 TCP
@@ -97,10 +96,6 @@ ftun_status_t ftun_socks5_connection_decode_udp(
   const ftun_socks5_connection_t *connection,
   const ftun_endpoint_t *physical_source, ftun_bytes_t input,
   ftun_socks5_udp_datagram_t *out, size_t *consumed);
-/* TCP 成功后把已协商的数据 socket 转移给统一 Relay，并消费 connection。
- * UDP association 不能经此入口拆分控制/数据 socket。 */
-ftun_status_t ftun_socks5_connection_take_tcp(
-  ftun_socks5_connection_t **connection, ftun_native_socket_t *out);
 /* 拥有型 TCP 成功后的借用 Path，生命期由 connection 保证；不能转移或
  * 单独 destroy。Relay 等额外 Stream 引用必须先释放，再 close connection。 */
 ftun_status_t ftun_socks5_connection_path(ftun_socks5_connection_t *connection,

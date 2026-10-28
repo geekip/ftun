@@ -39,6 +39,23 @@
       }
     },
     {
+      "name": "tsan",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/tsan",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "FTUN_OPTIMIZATION": "balanced",
+        "FTUN_SANITIZERS": false,
+        "FTUN_LTO": false,
+        "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
+        "FTUN_MODULE_TUN": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "FTUN_TSAN": true
+      }
+    },
+    {
       "name": "release",
       "generator": "Unix Makefiles",
       "binaryDir": "${sourceDir}/build/release",
@@ -140,6 +157,10 @@
       "configurePreset": "sanitize"
     },
     {
+      "name": "tsan",
+      "configurePreset": "tsan"
+    },
+    {
       "name": "release",
       "configurePreset": "release"
     },
@@ -177,6 +198,17 @@
       "configurePreset": "sanitize",
       "output": {
         "outputOnFailure": true
+      }
+    },
+    {
+      "name": "tsan",
+      "configurePreset": "tsan",
+      "output": {
+        "outputOnFailure": true
+      },
+      "environment": {
+        "TSAN_OPTIONS": "halt_on_error=1:second_deadlock_stack=1",
+        "FTUN_TEST_SLACK_SECONDS": "3"
       }
     },
     {

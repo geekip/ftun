@@ -156,12 +156,21 @@ static int transactions(void)
   CHECK(ftun_budget_reserve(budget, sizeof(*transaction), &transaction->reservation) == FTUN_OK);
   CHECK(ftun_core_owned_path_copy(budget, text, &transaction->next_path) == FTUN_OK);
   transaction->service_prepared = true;
-  transaction->next_generation = 2u;
+  /* 代次只经 Core 上下文预留与发布。 */
+  CHECK(ftun_core_context_generation_reserve(core, core, &transaction->next_generation) == FTUN_OK);
+  transaction->generation_reserved = true;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
   accept_commit = true;
   CHECK(ftun_core_reload_commit_transaction(core, &control, transaction) == FTUN_OK);
   accept_commit = false;
-  CHECK(memory(budget, usage.used) == 0 && control.generation == 2u);
+  {
+    uint64_t generation = 0u, reserved = 99u;
+    CHECK(ftun_core_context_generation(core, &generation) == FTUN_OK &&
+          ftun_core_context_generation_reserved(core, &reserved) == FTUN_OK);
+    CHECK(memory(budget, usage.used) == 0 &&
+          generation == transaction->next_generation && reserved == 0u &&
+          !transaction->generation_reserved);
+  }
   CHECK(strcmp(control.config_path.value, text) == 0 && strcmp(transaction->next_path.value, "/old.json") == 0);
   CHECK(ftun_core_reload_transaction_cleanup(core, &control, &transaction, 1u) == FTUN_OK);
   CHECK(memory(budget, baseline + sizeof(text)) == 0);

@@ -523,6 +523,7 @@ ftun_status_t ftun_tun_service_rebuild(ftun_tun_service_t *service)
     service->accepting = true;
     status = ftun_tun_service_interests(service);
   }
+  if (status == FTUN_OK) service->device_lost = false;
   if (status != FTUN_OK) {
     service->accepting = false;
     /* 已恢复但 watcher 更新失败时也撤销；失败句柄仍由 service 保留。 */
@@ -663,6 +664,7 @@ ftun_status_t ftun_tun_service_network_finish(
     if (status == FTUN_OK) {
       service->network_generation++;
       service->accepting = true;
+      if (service->rebuild_paused) service->device_lost = false;
     }
   }
   ftun_tun_service_broadcast(service, status == FTUN_OK
@@ -742,6 +744,7 @@ ftun_status_t ftun_tun_service_get_usage(
   out->feedback_suppressed = service->feedback_suppressed;
   out->accepting = service->accepting;
   out->ready = service->events != 0u;
+  out->device_lost = service->device_lost;
   for (index = 0u; index < service->consumer_capacity; index++) {
     const ftun_tun_service_consumer_t *consumer = &service->consumers[index];
     if (consumer->lease.service != service) continue;

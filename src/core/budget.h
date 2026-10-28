@@ -37,8 +37,7 @@ typedef struct {
   size_t metadata_bytes;
 } ftun_budget_usage_t;
 
-/* ftun_budget_reserve implements TASK-CORE-004 / TEST-CORE-004, target
- * 0.2.0; Core v1.0 extends the same admission contract to typed resources. */
+/* ftun_budget_reserve; Core v1.0 extends the same admission contract to typed resources. */
 /* Hierarchical resource admission.  Each resource is checked independently.
  * A child's guarantee is protected at its parent while unused; the child can
  * consume that share first and borrow only genuinely shared capacity.  A

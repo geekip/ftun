@@ -176,7 +176,7 @@ static ftun_error_t ftun_datagram_cancelled(void)
   return error;
 }
 
-/* TASK-TRANSPORT-003 / TEST-TRANSPORT-003，目标 0.2.0：整包所有权。 */
+/* 整包所有权。 */
 ftun_status_t ftun_packet_init(ftun_packet_t *packet,
                                const ftun_buffer_slice_t *payload,
                                uint32_t source_id)

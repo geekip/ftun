@@ -129,6 +129,9 @@ static int users(void)
   flow.listener = &listener;
   flow.budget = budget;
   engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
   listener.inbound_id = 1u;
   config.kind = FTUN_CONFIG_INBOUND_SOCKS5;
   config.name = "auth";
@@ -174,6 +177,9 @@ static int health_scratch(void)
   CHECK(ftun_runtime_prepare(engine.core, config, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(engine.core, &candidate) == FTUN_OK);
   engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
   CHECK(ftun_proxy_runtime_health_prepare(&engine, config, 1u,
     &engine.health_groups, &engine.health_group_count, &engine.health_slots,
     &engine.health_slot_count, &engine.health_reservation) == FTUN_OK);
@@ -310,6 +316,9 @@ static int flow_admission(void)
   engine.core = core;
   engine.budget = budget;
   engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
   engine.flow_capacity = engine.tcp_capacity = 2u;
   listener.engine = &engine;
   listener.name = "auth";
@@ -350,6 +359,190 @@ static int flow_admission(void)
       usage.used_resources.descriptors == baseline.used_resources.descriptors &&
       usage.used_resources.queue_slots == baseline.used_resources.queue_slots);
   }
+  CHECK(ftun_proxy_slot_pool_destroy(&engine.flow_pool) == FTUN_OK);
+  CHECK(ftun_event_loop_stop(engine.loop) == FTUN_OK);
+  CHECK(ftun_libev_detach(engine.loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&engine.loop) == FTUN_OK);
+  CHECK(ftun_operation_queue_destroy(&engine.operations) == FTUN_OK);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(memory(budget, 0u) == 0 && ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
+/* 收尾失败只隔离这一条流：继续占用自己的槽位，到点重试，成功后才释放。 */
+static ftun_status_t adapter_destroy_failure = FTUN_OK;
+ftun_status_t __real_ftun_inbound_adapter_destroy(ftun_inbound_adapter_t **adapter);
+ftun_status_t __wrap_ftun_inbound_adapter_destroy(ftun_inbound_adapter_t **adapter)
+{
+  if (adapter_destroy_failure != FTUN_OK) return adapter_destroy_failure;
+  return __real_ftun_inbound_adapter_destroy(adapter);
+}
+
+static int flow_quarantine(void)
+{
+  const char text[] = "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false},"
+    "\"inbounds\":[{\"name\":\"auth\",\"type\":\"socks5\",\"listen\":\"127.0.0.1:1080\"}],"
+    "\"rules\":[\"MATCH,DIRECT\"]}";
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_config_t *config = NULL;
+  ftun_runtime_t *candidate = NULL;
+  ftun_proxy_runtime_t engine = {0};
+  ftun_proxy_runtime_listener_t listener = {0};
+  ftun_proxy_runtime_flow_t *flow = NULL;
+  size_t work = 0u;
+  int pair[2];
+  CHECK(ftun_budget_create(NULL, 2u * 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 2u, 1024u * 1024u) == FTUN_OK);
+  CHECK(ftun_config_parse((ftun_bytes_t){(const uint8_t *)text, strlen(text)}, &config) == FTUN_OK);
+  CHECK(ftun_config_compile(config, &config->plan) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+  engine.core = core;
+  engine.budget = budget;
+  engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
+  engine.flow_capacity = engine.tcp_capacity = 2u;
+  listener.engine = &engine;
+  listener.name = "auth";
+  listener.inbound_id = 1u;
+  listener.kind = FTUN_CONFIG_INBOUND_SOCKS5;
+  CHECK(ftun_operation_queue_create(budget, 16u, &engine.operations) == FTUN_OK);
+  CHECK(ftun_event_loop_create_with_capacity(core, 16u, &engine.loop) == FTUN_OK);
+  CHECK(ftun_libev_attach(engine.loop) == FTUN_OK);
+  CHECK(ftun_proxy_slot_pool_create(budget, sizeof(*flow), 2u, 2u, 1u, &engine.flow_pool) == FTUN_OK);
+  CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+  CHECK(ftun_proxy_runtime_flow_create(&engine, &listener, pair[0], NULL) == FTUN_OK);
+  flow = ftun_proxy_runtime_flow_at(&engine, 0u);
+  if (flow == NULL || !flow->active) flow = ftun_proxy_runtime_flow_at(&engine, 1u);
+  CHECK(flow != NULL && flow->active && flow->protocol != NULL);
+
+  /* 共享状态损坏照常升级，不隔离。 */
+  adapter_destroy_failure = FTUN_E_STATE_CORRUPT;
+  flow->state = FTUN_PROXY_RUNTIME_FLOW_CLOSING;
+  CHECK(ftun_proxy_runtime_flow_settle(flow) == FTUN_E_STATE_CORRUPT);
+  CHECK(engine.quarantined_flows == 0u && flow->state == FTUN_PROXY_RUNTIME_FLOW_CLOSING);
+
+  /* 普通失败：转入隔离，槽位与 fd 继续被占用，不返回错误。 */
+  adapter_destroy_failure = FTUN_E_IO;
+  CHECK(ftun_proxy_runtime_flow_settle(flow) == FTUN_OK);
+  CHECK(flow->state == FTUN_PROXY_RUNTIME_FLOW_QUARANTINED && flow->active);
+  CHECK(engine.quarantined_flows == 1u && engine.object_faults == 1u &&
+        ftun_proxy_runtime_quarantined(&engine) == 1u);
+  CHECK(fcntl(pair[0], F_GETFD) >= 0);
+  /* 隔离流不再响应事件，重复关闭不改变状态。 */
+  CHECK(ftun_proxy_runtime_flow_drive(flow, FTUN_EVENT_READ, 0u) == FTUN_OK);
+  ftun_proxy_runtime_flow_close(flow, FTUN_E_IO);
+  CHECK(flow->state == FTUN_PROXY_RUNTIME_FLOW_QUARANTINED && engine.quarantined_flows == 1u);
+
+  /* 未到重试时间不尝试；到点但仍失败则继续留在隔离区，并推迟下一次。 */
+  engine.quarantine_due_ms = 1000u;
+  CHECK(ftun_proxy_runtime_quarantine_run(&engine, 999u, &work) == FTUN_OK && work == 0u);
+  CHECK(ftun_proxy_runtime_quarantine_run(&engine, 1000u, &work) == FTUN_OK && work == 1u);
+  CHECK(engine.quarantined_flows == 1u && flow->state == FTUN_PROXY_RUNTIME_FLOW_QUARANTINED);
+  CHECK(engine.quarantine_due_ms == 1000u + FTUN_PROXY_RUNTIME_QUARANTINE_RETRY_MS);
+  CHECK(ftun_proxy_runtime_quarantine_run(&engine, 1099u, &work) == FTUN_OK && work == 0u);
+  {
+    uint64_t deadline = 0u;
+    bool present = false;
+    CHECK(ftun_proxy_runtime_next_deadline(&engine, &deadline, &present) == FTUN_OK &&
+          present && deadline <= engine.quarantine_due_ms);
+  }
+
+  /* 故障消除后重试成功：槽位与 fd 一并释放。 */
+  adapter_destroy_failure = FTUN_OK;
+  CHECK(ftun_proxy_runtime_quarantine_run(&engine, 1100u, &work) == FTUN_OK && work == 1u);
+  CHECK(engine.quarantined_flows == 0u);
+  CHECK(fcntl(pair[0], F_GETFD) < 0 && errno == EBADF);
+  CHECK(close(pair[1]) == 0);
+  CHECK(ftun_proxy_slot_pool_destroy(&engine.flow_pool) == FTUN_OK);
+  CHECK(ftun_event_loop_stop(engine.loop) == FTUN_OK);
+  CHECK(ftun_libev_detach(engine.loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&engine.loop) == FTUN_OK);
+  CHECK(ftun_operation_queue_destroy(&engine.operations) == FTUN_OK);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(memory(budget, 0u) == 0 && ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
+/* 空闲回收：默认关闭；只回收已进入转发且两个方向都没有活动的流；入站的 tcp-idle
+ * 覆盖全局值；每秒最多扫描一轮。 */
+static int flow_idle(void)
+{
+  const char text[] = "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false},"
+    "\"inbounds\":[{\"name\":\"auth\",\"type\":\"socks5\",\"listen\":\"127.0.0.1:1080\"}],"
+    "\"rules\":[\"MATCH,DIRECT\"]}";
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_config_t *config = NULL;
+  ftun_runtime_t *candidate = NULL;
+  ftun_proxy_runtime_t engine = {0};
+  ftun_proxy_runtime_listener_t listener = {0};
+  ftun_proxy_runtime_flow_t *flow = NULL;
+  int pair[2];
+  CHECK(ftun_budget_create(NULL, 2u * 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(core, 2u, 1024u * 1024u) == FTUN_OK);
+  CHECK(ftun_config_parse((ftun_bytes_t){(const uint8_t *)text, strlen(text)}, &config) == FTUN_OK);
+  CHECK(ftun_config_compile(config, &config->plan) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+  engine.core = core;
+  engine.budget = budget;
+  engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
+  engine.flow_capacity = engine.tcp_capacity = 2u;
+  listener.engine = &engine;
+  listener.name = "auth";
+  listener.inbound_id = 1u;
+  listener.kind = FTUN_CONFIG_INBOUND_SOCKS5;
+  CHECK(ftun_operation_queue_create(budget, 16u, &engine.operations) == FTUN_OK);
+  CHECK(ftun_event_loop_create_with_capacity(core, 16u, &engine.loop) == FTUN_OK);
+  CHECK(ftun_libev_attach(engine.loop) == FTUN_OK);
+  CHECK(ftun_proxy_slot_pool_create(budget, sizeof(*flow), 2u, 2u, 1u, &engine.flow_pool) == FTUN_OK);
+  CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
+  CHECK(ftun_proxy_runtime_flow_create(&engine, &listener, pair[0], NULL) == FTUN_OK);
+  flow = ftun_proxy_runtime_flow_at(&engine, 0u);
+  if (flow == NULL || !flow->active) flow = ftun_proxy_runtime_flow_at(&engine, 1u);
+  CHECK(flow != NULL && flow->active && flow->listener == &listener);
+  flow->state = FTUN_PROXY_RUNTIME_FLOW_RELAY;
+  flow->last_activity_ms = 0u;
+
+  /* 默认关闭：没有任何空闲回收。 */
+  CHECK(!ftun_proxy_runtime_idle_possible(&engine));
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 1000000u) == 0u &&
+        flow->state == FTUN_PROXY_RUNTIME_FLOW_RELAY);
+
+  /* 全局 tcp-idle=1s：未到期不回收；每秒最多扫描一轮；到期后关闭。 */
+  engine.tcp_idle_ms = 1000u;
+  CHECK(ftun_proxy_runtime_idle_possible(&engine));
+  engine.idle_next_ms = 0u;
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 999u) == 0u &&
+        flow->state == FTUN_PROXY_RUNTIME_FLOW_RELAY);
+  CHECK(engine.idle_next_ms == 999u + FTUN_PROXY_RUNTIME_IDLE_SCAN_MS);
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 1500u) == 0u);   /* 距上次扫描不足一秒 */
+  /* 有活动就推迟回收。 */
+  flow->last_activity_ms = 1900u;
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 2000u) == 0u &&
+        flow->state == FTUN_PROXY_RUNTIME_FLOW_RELAY);
+  /* 入站的 tcp-idle 覆盖全局值：5s，所以 2s 空闲不回收。 */
+  listener.tcp_idle_ms = 5000u;
+  flow->last_activity_ms = 0u;
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 3100u) == 0u &&
+        flow->state == FTUN_PROXY_RUNTIME_FLOW_RELAY);
+  CHECK(ftun_proxy_runtime_idle_scan(&engine, 5100u) == 1u &&
+        flow->state == FTUN_PROXY_RUNTIME_FLOW_CLOSING);
+  /* 握手阶段的流不属于空闲回收。 */
+  CHECK(ftun_proxy_runtime_flow_settle(flow) == FTUN_OK);
+
+  CHECK(close(pair[1]) == 0);
   CHECK(ftun_proxy_slot_pool_destroy(&engine.flow_pool) == FTUN_OK);
   CHECK(ftun_event_loop_stop(engine.loop) == FTUN_OK);
   CHECK(ftun_libev_detach(engine.loop) == FTUN_OK);
@@ -458,6 +651,9 @@ static int publish_ownership(void)
   CHECK(ftun_runtime_prepare(engine.core, config, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(engine.core, &candidate) == FTUN_OK);
   engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
   resolver.budget = engine.budget;
   resolver.generation = 1u;
   resolver.ops.start = resolve_unused;
@@ -471,9 +667,15 @@ static int publish_ownership(void)
   CHECK(ftun_proxy_runtime_replace_etag(&engine, (const uint8_t *)"old", 3u) == FTUN_OK);
   for (round = 0u; round < 2u; round++) {
     CHECK(ftun_runtime_prepare(engine.core, config, &engine.frs_candidate) == FTUN_OK);
-    CHECK(ftun_proxy_runtime_reload_prepare(&engine, config, 2u) == FTUN_OK);
+    /* 生产路径中 FRS 更新以 FRS 为持有者准备。 */
+    CHECK(ftun_proxy_runtime_reload_prepare_owned(&engine, config, 2u, NULL,
+          FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_OK);
     engine.frs_enabled = true;
     engine.frs_operation_generation = 1u;
+    /* 生产路径在 frs_completed 中以引擎为持有者预留下一代次。 */
+    CHECK(ftun_core_context_generation_reserve(engine.core, &engine,
+      &engine.frs_reserved_generation) == FTUN_OK &&
+      engine.frs_reserved_generation == 2u);
     CHECK(ftun_proxy_runtime_copy_etag(engine.budget, (const uint8_t *)"candidate", 9u,
       &engine.frs_candidate_etag, &engine.frs_candidate_etag_reservation) == FTUN_OK);
     CHECK(ftun_budget_reserve(engine.budget, sizeof(*engine.frs_group_records),
@@ -491,9 +693,97 @@ static int publish_ownership(void)
       engine.frs_candidate_etag_reservation == NULL && engine.frs_group_records == NULL &&
       engine.frs_group_records_reservation == NULL && !engine.reload_pending);
     CHECK(engine.generation == (round == 0u ? 1u : 2u));
+    {
+      /* 失败轮释放预留、代次不变；成功轮由提交消费预留并发布代次 2。 */
+      uint64_t value = 99u;
+      CHECK(engine.frs_reserved_generation == 0u);
+      CHECK(ftun_core_context_generation_reserved(engine.core, &value) == FTUN_OK &&
+            value == 0u);
+      CHECK(ftun_core_context_generation(engine.core, &value) == FTUN_OK &&
+            value == (round == 0u ? 1u : 2u));
+    }
     CHECK(strcmp(engine.frs_etag, round == 0u ? "old" : "candidate") == 0);
     CHECK(memory(engine.budget, baseline.used + (round == 0u ? 4u : 10u)) == 0);
   }
+  CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK);
+  CHECK(ftun_resolver_provider_stop_until(engine.resolver_provider, UINT64_MAX) == FTUN_OK);
+  CHECK(ftun_path_provider_stop_until(engine.path_provider, UINT64_MAX) == FTUN_OK);
+  CHECK(ftun_resolver_provider_destroy(&engine.resolver_provider) == FTUN_OK);
+  CHECK(ftun_path_provider_destroy(&engine.path_provider) == FTUN_OK);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(ftun_runtime_manager_destroy(&engine.core) == FTUN_OK);
+  CHECK(memory(engine.budget, 0u) == 0 && ftun_budget_destroy(&engine.budget) == FTUN_OK);
+  return 0;
+}
+
+/* 宿主 reload 已准备并等待发布时，FRS 下载失败的清理不得撤销它。
+ * 准备状态记录持有者：另一方持有时 prepare 返回 AGAIN，各方只撤销自己的。 */
+static int reload_owner_isolation(void)
+{
+  const char text[] = "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false},\"rules\":[\"MATCH,DIRECT\"]}";
+  ftun_proxy_runtime_t engine = {0};
+  ftun_config_t *config = NULL;
+  ftun_runtime_t *candidate = NULL;
+  ftun_resolver_provider_spec_t resolver = {0};
+  ftun_path_provider_spec_t path = {0};
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &engine.budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(engine.budget, &engine.core) == FTUN_OK);
+  CHECK(ftun_runtime_manager_attach(engine.core, 2u, 1024u * 1024u) == FTUN_OK);
+  CHECK(ftun_config_parse((ftun_bytes_t){(const uint8_t *)text, strlen(text)}, &config) == FTUN_OK);
+  CHECK(ftun_config_compile(config, &config->plan) == FTUN_OK);
+  CHECK(ftun_runtime_prepare(engine.core, config, &candidate) == FTUN_OK);
+  CHECK(ftun_runtime_commit(engine.core, &candidate) == FTUN_OK);
+  engine.generation = 1u;
+  engine.handshake_ms = 10000u;
+  engine.connect_ms = 10000u;
+  engine.reply_ms = 5000u;
+  resolver.budget = engine.budget;
+  resolver.generation = 1u;
+  resolver.ops.start = resolve_unused;
+  CHECK(ftun_resolver_provider_create(&resolver, &engine.resolver_provider) == FTUN_OK);
+  path.budget = engine.budget;
+  path.generation = 1u;
+  path.ops.start = dial_unused;
+  path.max_pending = path.max_paths = 1u;
+  CHECK(ftun_path_provider_create(&path, &engine.path_provider) == FTUN_OK);
+
+  /* 宿主事务已准备（等待异步文件发布）。 */
+  CHECK(ftun_proxy_runtime_reload_prepare(&engine, config, 2u) == FTUN_OK);
+  CHECK(engine.reload_prepared && engine.reload_pending &&
+        engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_HOST);
+  /* 另一方（FRS）此时不能准备，也不能提交或撤销宿主的准备。 */
+  CHECK(ftun_proxy_runtime_reload_prepare_owned(&engine, config, 3u, NULL,
+        FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_E_AGAIN);
+  CHECK(ftun_proxy_runtime_reload_commit_owned(&engine, 2u,
+        FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_E_INVALID);
+  CHECK(ftun_proxy_runtime_reload_abort_owned(&engine,
+        FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_OK);
+  CHECK(engine.reload_prepared && engine.reload_pending &&
+        engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_HOST);
+  /* 正在进行的 FRS 下载失败（如 HTTP 500）：完成回调的清理不碰宿主准备。 */
+  engine.frs_enabled = true;
+  engine.frs_operation_generation = 1u;
+  ftun_proxy_runtime_frs_completed(NULL, (ftun_error_t){FTUN_E_IO, 0u, 0},
+                                   (ftun_bytes_t){NULL, 0u}, &engine);
+  CHECK(engine.reload_prepared && engine.reload_pending &&
+        engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_HOST);
+  /* 宿主提交仍然成功并释放持有者。 */
+  CHECK(ftun_proxy_runtime_reload_commit(&engine, 2u) == FTUN_OK);
+  CHECK(engine.generation == 2u && !engine.reload_prepared &&
+        !engine.reload_pending && engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_NONE);
+
+  /* 对称：FRS 持有时，宿主不能撤销，但宿主 prepare 失败后的 abort 保持无害。 */
+  CHECK(ftun_proxy_runtime_reload_prepare_owned(&engine, config, 3u, NULL,
+        FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_OK);
+  CHECK(ftun_proxy_runtime_reload_prepare(&engine, config, 4u) == FTUN_E_AGAIN);
+  CHECK(ftun_proxy_runtime_reload_abort(&engine) == FTUN_OK);
+  CHECK(engine.reload_prepared && engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_FRS);
+  CHECK(ftun_proxy_runtime_reload_commit(&engine, 3u) == FTUN_E_INVALID);
+  CHECK(ftun_proxy_runtime_reload_abort_owned(&engine,
+        FTUN_PROXY_RELOAD_OWNER_FRS) == FTUN_OK);
+  CHECK(!engine.reload_prepared && !engine.reload_pending &&
+        engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_NONE);
+
   CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK);
   CHECK(ftun_resolver_provider_stop_until(engine.resolver_provider, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_path_provider_stop_until(engine.path_provider, UINT64_MAX) == FTUN_OK);
@@ -681,8 +971,89 @@ static int blocked_pool_work(void)
   return 0;
 }
 
+/* SOCKS5 UDP 出口退避由 A0 实体承载：失败进入等待并拒绝新 association；到期后恢复可用；
+ * 网络变化把等待提前到现在；同时 url-test 的下一次探测被提前（合并，在途探测不动）。 */
+static int udp_outbound_backoff(void)
+{
+  ftun_proxy_runtime_t engine = {0};
+  ftun_recovery_policy_t policy = {0};
+  ftun_proxy_runtime_udp_backoff_t entries[2] = {{0}};
+  ftun_proxy_runtime_health_slot_t slots[2] = {{0}};
+  ftun_budget_t *budget = NULL;
+  uint64_t now_ms = 0u;
+  size_t work = 0u;
+  CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
+  CHECK(ftun_budget_create(NULL, 64u * 1024u, 0u, &budget) == FTUN_OK);
+  policy.initial_ms = 100u;
+  policy.maximum_ms = 30000u;
+  policy.stable_ms = 60000u;
+  policy.auth_retry_ms = 30000u;
+  policy.seed = 1u;
+  CHECK(ftun_recovery_scheduler_create(budget, 4u, &policy, &engine.recovery) == FTUN_OK);
+  engine.udp_backoff = entries;
+  engine.udp_backoff_capacity = 2u;
+  engine.health_slots = slots;
+  engine.health_slot_count = 2u;
+  /* 从未失败的出口：允许。 */
+  CHECK(ftun_proxy_runtime_udp_backoff_allowed(&engine, 7u));
+  ftun_proxy_runtime_udp_backoff_failed(&engine, 7u);
+  CHECK(!ftun_proxy_runtime_udp_backoff_allowed(&engine, 7u));
+  CHECK(ftun_proxy_runtime_udp_backoff_allowed(&engine, 8u)); /* 其他出口不受影响 */
+  /* 退避到期：恢复可用（只是“可以再试”，没有任何主动动作）。 */
+  CHECK(ftun_recovery_run(engine.recovery, now_ms + 5000u, 4u, &work) == FTUN_OK && work != 0u);
+  CHECK(ftun_proxy_runtime_udp_backoff_allowed(&engine, 7u));
+  /* 再次失败，网络变化把等待提前到现在。 */
+  ftun_proxy_runtime_udp_backoff_failed(&engine, 7u);
+  CHECK(!ftun_proxy_runtime_udp_backoff_allowed(&engine, 7u));
+  slots[0].schedule.next_due_ms = now_ms + 60000u;
+  slots[1].schedule.next_due_ms = now_ms + 60000u;
+  slots[1].operation = (ftun_operation_t *)(uintptr_t)1; /* 在途探测 */
+  ftun_proxy_runtime_network_changed(&engine, now_ms + 10u);
+  CHECK(ftun_recovery_run(engine.recovery, now_ms + 10u, 4u, &work) == FTUN_OK && work != 0u);
+  CHECK(ftun_proxy_runtime_udp_backoff_allowed(&engine, 7u));
+  CHECK(slots[0].schedule.next_due_ms == now_ms + 10u);
+  CHECK(slots[1].schedule.next_due_ms == now_ms + 60000u);
+  /* 容量用尽时不再登记新实体：失败不记录，也就不阻塞。 */
+  ftun_proxy_runtime_udp_backoff_failed(&engine, 8u);
+  ftun_proxy_runtime_udp_backoff_failed(&engine, 9u);
+  CHECK(!ftun_proxy_runtime_udp_backoff_allowed(&engine, 8u));
+  CHECK(ftun_proxy_runtime_udp_backoff_allowed(&engine, 9u));
+  CHECK(ftun_recovery_scheduler_destroy(&engine.recovery) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
+/* 写进展判定：有积压且确认不前进才计时；确认增长或积压清空即重置；取不到进展不判定。 */
+static int test_write_progress(void)
+{
+  ftun_proxy_runtime_progress_t progress = {0};
+  /* 积压为零：从不停滞。 */
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 10u, 0u, 1000u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 10u, 0u, 5000u, 500u));
+  /* 出现积压：首次观察开始计时，期限内不判定，到期判定。 */
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 10u, 100u, 6000u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 10u, 100u, 6499u, 500u));
+  CHECK(ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 10u, 100u, 6500u, 500u));
+  /* 慢但有进展：确认字节增长就重置，即使积压一直存在。 */
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 11u, 100u, 7000u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 11u, 100u, 7400u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 7800u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 8200u, 500u));
+  CHECK(ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 8300u, 500u));
+  /* 积压清空后重新计时。 */
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 0u, 9000u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 9100u, 500u));
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 9500u, 500u));
+  /* 取不到进展（不是 TCP 等）：不判定，也不改状态。 */
+  CHECK(!ftun_proxy_runtime_write_stalled(&progress, FTUN_E_UNSUPPORTED, 12u, 100u, 99999u, 500u));
+  CHECK(ftun_proxy_runtime_write_stalled(&progress, FTUN_OK, 12u, 100u, 9600u, 500u));
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_write_progress() == 0);
+  CHECK(udp_outbound_backoff() == 0);
   CHECK(health_deadline_scaling() == 0);
   CHECK(blocked_pool_work() == 0);
   CHECK(pending_tokens() == 0);
@@ -690,10 +1061,13 @@ int main(void)
   CHECK(http_input() == 0);
   CHECK(health_scratch() == 0);
   CHECK(flow_admission() == 0);
+  CHECK(flow_quarantine() == 0);
+  CHECK(flow_idle() == 0);
 #if defined(FTUN_HAVE_MODULE_FRS)
   CHECK(etags() == 0);
   CHECK(publish_budget() == 0);
   CHECK(publish_ownership() == 0);
+  CHECK(reload_owner_isolation() == 0);
 #endif
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
   CHECK(fakeip_path() == 0);

@@ -545,7 +545,7 @@ static ftun_status_t ftun_udp_flow_reap(ftun_udp_flow_table_t *table,
   return FTUN_OK;
 }
 
-/* TASK-TUN-003 / TEST-TUN-003，目标 0.2.0：有界四元组 UDP flow。 */
+/* 有界四元组 UDP flow。 */
 ftun_status_t ftun_udp_flow_table_create(
   const ftun_udp_flow_table_spec_t *spec, ftun_udp_flow_table_t **out)
 {

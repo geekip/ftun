@@ -2,7 +2,7 @@
 #define FTUN_PROXY_RUNTIME_INTERNAL_H
 
 #include "config/model.h"
-#include "core/context_internal.h"
+#include "core/context.h"
 #include "proxy/route/router.h"
 #include "proxy/runtime_state.h"
 
@@ -66,12 +66,36 @@ typedef struct {
   size_t retained_bytes_limit;
 } ftun_snapshot_manager_t;
 
-#define FTUN_MANAGER(core) ((ftun_snapshot_manager_t *)(core)->extension)
+/* Proxy 只经 Core 上下文的公开接口取得扩展、预算与代次，不读写其私有布局。 */
+static inline ftun_snapshot_manager_t *ftun_runtime_manager_of(
+  const ftun_core_t *core)
+{
+  void *extension = NULL;
+  return ftun_core_context_extension(core, &extension) == FTUN_OK
+    ? (ftun_snapshot_manager_t *)extension : NULL;
+}
+
+#define FTUN_MANAGER(core) ftun_runtime_manager_of(core)
+
+static inline ftun_budget_t *ftun_runtime_core_budget(const ftun_core_t *core)
+{
+  ftun_budget_t *budget = NULL;
+  (void)ftun_core_context_budget(core, &budget);
+  return budget;
+}
+
+static inline uint64_t ftun_runtime_core_generation(const ftun_core_t *core)
+{
+  uint64_t generation = 0u;
+  (void)ftun_core_context_generation(core, &generation);
+  return generation;
+}
 
 static inline int ftun_runtime_core_valid(const ftun_core_t *core)
 {
-  return ftun_core_context_valid(core) && core->extension != NULL &&
-         FTUN_MANAGER(core)->runtime_magic == FTUN_RUNTIME_MANAGER_MAGIC;
+  const ftun_snapshot_manager_t *manager = ftun_runtime_manager_of(core);
+  return manager != NULL &&
+         manager->runtime_magic == FTUN_RUNTIME_MANAGER_MAGIC;
 }
 
 #endif

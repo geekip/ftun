@@ -395,7 +395,35 @@ static int test_request_failures(void)
         &consumed) == FTUN_E_PROTOCOL);
   frame[2] = 0u;
   frame[3] = 0x04u;
+  /* 回复的 BND 字段允许 IPv6：不足 22 字节等待更多输入，完整时解析成功。 */
   CHECK(ftun_socks5_decode_reply(bytes(frame, 4u), &reply,
+        &consumed) == FTUN_E_AGAIN && consumed == 0u);
+  {
+    uint8_t ipv6_reply[23];
+    memset(ipv6_reply, 0, sizeof(ipv6_reply));
+    ipv6_reply[0] = 0x05u;
+    ipv6_reply[3] = 0x04u;
+    ipv6_reply[4] = 0x20u;
+    ipv6_reply[19] = 0x01u;
+    ipv6_reply[20] = 0x1fu;
+    ipv6_reply[21] = 0x90u;
+    ipv6_reply[22] = 0x77u;
+    CHECK(ftun_socks5_decode_reply(bytes(ipv6_reply, 21u), &reply,
+          &consumed) == FTUN_E_AGAIN && consumed == 0u);
+    CHECK(ftun_socks5_decode_reply(bytes(ipv6_reply, sizeof(ipv6_reply)),
+          &reply, &consumed) == FTUN_OK);
+    CHECK(consumed == 22u && reply.reply == 0u &&
+          reply.endpoint.kind == FTUN_ADDRESS_IPV6_RESERVED &&
+          reply.endpoint.address[0] == 0x20u &&
+          reply.endpoint.address[15] == 0x01u &&
+          reply.endpoint.port == 8080u);
+    ipv6_reply[1] = 0x05u;
+    CHECK(ftun_socks5_decode_reply(bytes(ipv6_reply, 22u), &reply,
+          &consumed) == FTUN_OK && reply.reply == 0x05u);
+  }
+  /* 请求目标中的 IPv6 仍未开放，入站据此回复 ADDRESS_UNSUPPORTED。 */
+  frame[1] = 0x01u;
+  CHECK(ftun_socks5_decode_request(bytes(frame, 4u), &request,
         &consumed) == FTUN_E_UNSUPPORTED);
 
   memset(output, 0xa5, sizeof(output));

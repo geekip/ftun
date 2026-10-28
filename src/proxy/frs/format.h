@@ -3,7 +3,7 @@
 
 #include "internal/contracts.h"
 
-/* TASK-FRS-005 / TEST-FRS-005：FRS 1.0 二进制格式验证，目标 0.4.0。 */
+/* FRS 1.0 二进制格式验证。 */
 
 #define FTUN_FRS_HEADER_BYTES 64u
 #define FTUN_FRS_DIRECTORY_ENTRY_BYTES 40u
@@ -75,7 +75,6 @@ typedef struct {
 uint16_t ftun_frs_read_u16(const uint8_t *data);
 uint32_t ftun_frs_read_u32(const uint8_t *data);
 uint64_t ftun_frs_read_u64(const uint8_t *data);
-void ftun_frs_write_u16(uint8_t *data, uint16_t value);
 void ftun_frs_write_u32(uint8_t *data, uint32_t value);
 void ftun_frs_write_u64(uint8_t *data, uint64_t value);
 uint64_t ftun_frs_xxh64(ftun_bytes_t bytes, uint64_t seed);

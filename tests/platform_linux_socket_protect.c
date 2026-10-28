@@ -155,7 +155,7 @@ static int real_smoke(void)
   return 0;
 }
 
-/* TASK-PLATFORM-003 / TEST-PLATFORM-003：冲突、失败回滚和真实 socket 选项。 */
+/* 冲突、失败回滚和真实 socket 选项。 */
 int main(int argc, char **argv)
 {
   protect_mock_t mock;

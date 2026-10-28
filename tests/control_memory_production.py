@@ -41,7 +41,8 @@ def main():
                     assert time.monotonic() < deadline, log_path.read_text()
                     time.sleep(0.01)
             try:
-                wait(lambda text: 'purpose=6 ' in text)
+                # 先等 FRS 后台下载发布（出现第 2 代的周期更新）：此前命中 FRS 规则的新连接会被拒绝。
+                wait(lambda text: 'purpose=6 generation=2 ' in text)
                 def consume_group():
                     with socket.create_connection(('127.0.0.1', port), timeout=3) as client:
                         client.sendall(b'\x05\x01\x00\x05\x01\x00\x01\xcb\x00\x71\x09\x00\x50')
@@ -55,10 +56,11 @@ def main():
                     except ConnectionRefusedError:
                         assert time.monotonic() < deadline
                         time.sleep(0.01)
-                wait(lambda text: text.count('purpose=6 generation=1 transport=1') >= 2 and
-                     'purpose=5 generation=1 transport=1' in text)
+                # 本地规则文件缺失：以 NOT_READY 在第 1 代启动，后台下载发布后进入第 2 代。
+                wait(lambda text: 'purpose=6 generation=1 transport=1' in text and
+                     'purpose=5 generation=2 transport=1' in text)
                 assert 'purpose=6 generation=1 transport=2' in log_path.read_text()
-                assert 'purpose=5 generation=1 transport=2' in log_path.read_text()
+                assert 'purpose=5 generation=2 transport=2' in log_path.read_text()
                 assert (root / 'rules.frs').stat().st_size > 100
                 first = (root / 'rules.frs').read_bytes()
                 config['outbounds'][0]['url'] = 'http://health.test/health-next'
@@ -67,10 +69,10 @@ def main():
                 process.send_signal(signal.SIGHUP)
                 wait(lambda text: 'reload committed' in text)
                 consume_group()
-                wait(lambda text: 'reload committed' in text and 'purpose=5 generation=2 transport=1' in text)
-                assert 'purpose=5 generation=2 transport=2' in log_path.read_text()
+                wait(lambda text: 'reload committed' in text and 'purpose=5 generation=3 transport=1' in text)
+                assert 'purpose=5 generation=3 transport=2' in log_path.read_text()
                 text = log_path.read_text()
-                for purpose, generation in ((6, 1), (5, 1), (5, 2)):
+                for purpose, generation in ((6, 1), (5, 2), (5, 3)):
                     assert f'control resolver purpose={purpose} generation={generation} source=1' in text, text
                 wait(lambda text: 'control memory dns negative' in text)
                 assert (root / 'rules.frs').read_bytes() == first

@@ -4,7 +4,7 @@
 
 #define FTUN_DNS_RCODE_REFUSED 5u
 
-/* TASK-OUTBOUND-003 / TEST-OUTBOUND-003，目标 0.2.0：纯策略终结映射。 */
+/* 纯策略终结映射。 */
 ftun_status_t ftun_reject_classify(const ftun_metadata_t *metadata,
                                    bool dns_query,
                                    ftun_reject_result_t *out)

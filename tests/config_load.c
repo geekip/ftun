@@ -47,7 +47,7 @@ static int make_path(char *out, size_t capacity, const char *left,
   return result >= 0 && (size_t)result < capacity;
 }
 
-/* TASK-CONFIG-001 / TEST-CONFIG-001：有界读取、路径固定和失败清理。 */
+/* 有界读取、路径固定和失败清理。 */
 int main(void)
 {
   static const char valid[] =

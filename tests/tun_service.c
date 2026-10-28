@@ -24,6 +24,7 @@ typedef struct {
   size_t open_attempts;
   size_t close_count;
   ftun_status_t write_status;
+  ftun_status_t read_status;
   bool fail_open;
 } fake_device_t;
 
@@ -79,6 +80,7 @@ static ftun_status_t fake_read(void *user, ftun_packet_port_t *port,
   if (out_length != NULL) *out_length = 0u;
   if (device == NULL || port != (ftun_packet_port_t *)device ||
       buffer == NULL || out_length == NULL) return FTUN_E_INVALID;
+  if (device->read_status != FTUN_OK) return device->read_status;
   if (device->read_index == device->read_count) return FTUN_E_AGAIN;
   index = device->read_index;
   if (device->read_lengths[index] > capacity) return FTUN_E_LIMIT;
@@ -265,10 +267,11 @@ static int test_service_lifecycle(void)
   device.write_status = FTUN_E_AGAIN;
   CHECK(ftun_tun_service_write(
           lease, (ftun_bytes_t){output_d, sizeof(output_d)}) == FTUN_OK);
-  device.write_status = FTUN_E_IO;
+  /* 内部状态错误仍是服务故障；设备 IO 错误按设备丢失处理（见 test_device_loss）。 */
+  device.write_status = FTUN_E_STATE_CORRUPT;
   CHECK(ftun_tun_service_notify(service, FTUN_EVENT_WRITE) == FTUN_OK);
-  CHECK(ftun_tun_service_run(service, &work) == FTUN_E_IO && work == 0u &&
-        state.failed == 1u && state.failure_status == FTUN_E_IO);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_E_STATE_CORRUPT && work == 0u &&
+        state.failed == 1u && state.failure_status == FTUN_E_STATE_CORRUPT);
 
   /* 旧设备读取但消费者背压留下的包，不能在重建后继续交付。 */
   state.stall = true;
@@ -328,8 +331,91 @@ static int test_service_lifecycle(void)
   return 0;
 }
 
+/* 设备被外部删除：读写 IO 错误或 ERROR 事件不是宿主故障，服务重建设备；
+ * 重建失败时停止收发、保留 device_lost 供 owner 退避重试，run 本身不报错。 */
+static int test_device_loss(void)
+{
+  fake_device_t device;
+  consumer_state_t state;
+  ftun_budget_t *budget = NULL;
+  ftun_buffer_pool_t *buffers = NULL;
+  ftun_event_loop_t *loop = NULL;
+  ftun_tun_service_t *service = NULL;
+  ftun_tun_service_spec_t spec;
+  ftun_tun_device_ops_t ops;
+  ftun_tun_consumer_t consumer;
+  ftun_tun_lease_t lease;
+  ftun_tun_service_usage_t usage;
+  size_t work = 0u;
+  memset(&device, 0, sizeof(device));
+  memset(&state, 0, sizeof(state));
+  memset(&spec, 0, sizeof(spec));
+  memset(&ops, 0, sizeof(ops));
+  memset(&consumer, 0, sizeof(consumer));
+  memset(&lease, 0, sizeof(lease));
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 4096u, &budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create(budget, 4096u, 4u, &buffers) == FTUN_OK);
+  CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
+  spec.budget = budget;
+  spec.loop = loop;
+  spec.buffers = buffers;
+  spec.device.name.data = "ftun-ts0";
+  spec.device.name.length = 8u;
+  spec.device.mtu = TEST_MTU;
+  spec.output_capacity = 2u;
+  spec.read_quota = 2u;
+  spec.write_quota = 2u;
+  ops.open = fake_open;
+  ops.get_info = fake_get_info;
+  ops.read = fake_read;
+  ops.write = fake_write;
+  ops.close = fake_close;
+  ops.user = &device;
+  CHECK(ftun_tun_service_create_with_ops(&spec, &ops, &service) == FTUN_OK);
+  consumer.packet = consume_packet;
+  consumer.event = consume_event;
+  consumer.user = &state;
+  CHECK(ftun_tun_service_acquire(service, &consumer, &lease) == FTUN_OK);
+  state.expected = lease;
+
+  /* 读取 IO 错误：重建成功，run 不报错，代次递增，丢失标记清除。 */
+  device.read_status = FTUN_E_IO;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_READ) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.device_generation == 2u && usage.accepting && !usage.device_lost &&
+        state.rebuilt == 1u && device.close_count == 1u);
+  /* ERROR 事件同样处理。 */
+  device.read_status = FTUN_OK;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_ERROR) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.device_generation == 3u && !usage.device_lost && state.rebuilt == 2u);
+  /* 重建失败：不是服务故障，停止收发并保留丢失标记。 */
+  device.fail_open = true;
+  CHECK(ftun_tun_service_notify(service, FTUN_EVENT_ERROR) == FTUN_OK);
+  CHECK(ftun_tun_service_run(service, &work) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        usage.device_lost && !usage.accepting && state.rebuilt == 2u &&
+        state.failed >= 1u);
+  /* 条件恢复后再次重建（owner 退避重试的入口）。 */
+  device.fail_open = false;
+  CHECK(ftun_tun_service_rebuild(service) == FTUN_OK);
+  CHECK(ftun_tun_service_get_usage(service, &usage) == FTUN_OK &&
+        !usage.device_lost && usage.accepting && state.rebuilt == 3u);
+  CHECK(ftun_tun_service_release(&lease) == FTUN_OK);
+  CHECK(ftun_tun_service_quiesce(service) == FTUN_OK);
+  CHECK(ftun_tun_service_destroy(&service) == FTUN_OK);
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_device_loss() == 0);
   CHECK(ftun_tun_service_create(NULL, NULL) == FTUN_E_INVALID);
   CHECK(test_service_lifecycle() == 0);
   return 0;

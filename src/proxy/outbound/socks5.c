@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "socks5.h"
+#include "protocol/socks5_client.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -63,6 +64,7 @@ struct ftun_socks5_connection {
   size_t output_length;
   uint8_t input[FTUN_SOCKS5_FRAME_BYTES];
   size_t input_length;
+  ftun_socks5_client_t client;
   uint64_t deadline_ms;
   ftun_dial_transport_t transport;
   ftun_native_socket_t control_socket;
@@ -583,56 +585,29 @@ static ftun_status_t ftun_socks5_watch(
                              &connection->io_source);
 }
 
-static ftun_status_t ftun_socks5_prepare_method(
+/* 握手由共享的 SOCKS5 客户端状态机推进：这里只负责把它要发送的整帧放进输出
+ * 缓冲，并把写状态与状态机的阶段对应起来。 */
+static ftun_status_t ftun_socks5_prepare_output(
   ftun_socks5_connection_t *connection)
 {
-  uint8_t method;
-  ftun_bytes_t methods;
-  method = connection->username_length == 0u ?
-           FTUN_SOCKS5_METHOD_NO_AUTH :
-           FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
-  methods.data = &method;
-  methods.length = 1u;
+  ftun_status_t status;
   connection->output_offset = 0u;
-  return ftun_socks5_encode_method_offer(methods, connection->output,
-                                         sizeof(connection->output),
-                                         &connection->output_length);
-}
-
-static ftun_status_t ftun_socks5_prepare_auth(
-  ftun_socks5_connection_t *connection)
-{
-  ftun_bytes_t username;
-  ftun_bytes_t password;
-  username.data = connection->username;
-  username.length = connection->username_length;
-  password.data = connection->password;
-  password.length = connection->password_length;
-  connection->output_offset = 0u;
-  return ftun_socks5_encode_credentials(username, password,
-                                        connection->output,
-                                        sizeof(connection->output),
-                                        &connection->output_length);
-}
-
-static ftun_status_t ftun_socks5_prepare_request(
-  ftun_socks5_connection_t *connection)
-{
-  ftun_endpoint_t endpoint;
-  ftun_socks5_command_t command;
-  if (connection->transport == FTUN_DIAL_TCP) {
-    endpoint = connection->target;
-    command = FTUN_SOCKS5_COMMAND_CONNECT;
-  } else {
-    memset(&endpoint, 0, sizeof(endpoint));
-    endpoint.kind = FTUN_ADDRESS_IPV4;
-    command = FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE;
+  status = ftun_socks5_client_output(&connection->client, connection->output,
+                                     sizeof(connection->output),
+                                     &connection->output_length);
+  if (status != FTUN_OK) return status;
+  switch (connection->client.phase) {
+    case FTUN_SOCKS5_CLIENT_METHOD_OUT:
+      connection->state = FTUN_SOCKS5_STATE_WRITE_METHOD;
+      break;
+    case FTUN_SOCKS5_CLIENT_AUTH_OUT:
+      connection->state = FTUN_SOCKS5_STATE_WRITE_AUTH;
+      break;
+    default:
+      connection->state = FTUN_SOCKS5_STATE_WRITE_REQUEST;
+      break;
   }
-  connection->output_offset = 0u;
-  return ftun_socks5_encode_request(command, &endpoint,
-                                    connection->output,
-                                    sizeof(connection->output),
-                                    &connection->output_length);
+  return FTUN_OK;
 }
 
 static ftun_status_t ftun_socks5_begin_handshake(
@@ -643,47 +618,19 @@ static ftun_status_t ftun_socks5_begin_handshake(
                                   ftun_socks5_timer_ready, connection,
                                   &connection->timer_source);
   if (status != FTUN_OK) return status;
-  status = ftun_socks5_prepare_method(connection);
+  {
+    ftun_socks5_client_options_t options = {0};
+    options.username = (ftun_bytes_t){connection->username, connection->username_length};
+    options.password = (ftun_bytes_t){connection->password, connection->password_length};
+    options.command = connection->transport == FTUN_DIAL_TCP
+      ? FTUN_SOCKS5_COMMAND_CONNECT : FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE;
+    options.target = connection->target;
+    status = ftun_socks5_client_init(&connection->client, &options);
+  }
   if (status != FTUN_OK) return status;
-  connection->state = FTUN_SOCKS5_STATE_WRITE_METHOD;
+  status = ftun_socks5_prepare_output(connection);
+  if (status != FTUN_OK) return status;
   return ftun_socks5_watch(connection, FTUN_EVENT_WRITE);
-}
-
-static size_t ftun_socks5_input_needed(
-  const ftun_socks5_connection_t *connection)
-{
-  if (connection->state == FTUN_SOCKS5_STATE_READ_METHOD ||
-      connection->state == FTUN_SOCKS5_STATE_READ_AUTH) return 2u;
-  if (connection->state != FTUN_SOCKS5_STATE_READ_REPLY) return 0u;
-  if (connection->input_length < 4u) return 4u;
-  if (connection->input[3] == 0x01u) return 10u;
-  if (connection->input[3] == 0x03u) {
-    if (connection->input_length < 5u) return 5u;
-    return 7u + connection->input[4];
-  }
-  return 4u;
-}
-
-static ftun_status_t ftun_socks5_reply_status(uint8_t reply)
-{
-  switch (reply) {
-    case FTUN_SOCKS5_REPLY_SUCCEEDED:
-      return FTUN_OK;
-    case FTUN_SOCKS5_REPLY_TTL_EXPIRED:
-      return FTUN_E_TIMEOUT;
-    case FTUN_SOCKS5_REPLY_COMMAND_UNSUPPORTED:
-    case FTUN_SOCKS5_REPLY_ADDRESS_UNSUPPORTED:
-      return FTUN_E_UNSUPPORTED;
-    case FTUN_SOCKS5_REPLY_NOT_ALLOWED:
-    case FTUN_SOCKS5_REPLY_NETWORK_UNREACHABLE:
-    case FTUN_SOCKS5_REPLY_HOST_UNREACHABLE:
-    case FTUN_SOCKS5_REPLY_CONNECTION_REFUSED:
-      return FTUN_E_REJECTED;
-    case FTUN_SOCKS5_REPLY_GENERAL_FAILURE:
-      return FTUN_E_IO;
-    default:
-      return FTUN_E_PROTOCOL;
-  }
 }
 
 static int ftun_socks5_ipv4_unspecified(const ftun_endpoint_t *endpoint)
@@ -755,62 +702,29 @@ static ftun_status_t ftun_socks5_start_udp(
   return ftun_dial_start(connection->core, &request, &connection->child);
 }
 
-static ftun_status_t ftun_socks5_handle_frame(
-  ftun_socks5_connection_t *connection)
+/* 把刚读到的字节交给握手状态机。AGAIN 表示握手还没完成：轮到发送下一帧，
+ * 或继续等待读取。 */
+static ftun_status_t ftun_socks5_handle_input(
+  ftun_socks5_connection_t *connection, size_t length)
 {
-  ftun_bytes_t input;
+  ftun_socks5_client_result_t result;
   size_t consumed = 0u;
-  ftun_status_t status;
-  input.data = connection->input;
-  input.length = connection->input_length;
-  if (connection->state == FTUN_SOCKS5_STATE_READ_METHOD) {
-    uint8_t method = 0u;
-    uint8_t expected = connection->username_length == 0u ?
-                       FTUN_SOCKS5_METHOD_NO_AUTH :
-                       FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
-    status = ftun_socks5_decode_method_selection(input, &method, &consumed);
+  ftun_status_t status = ftun_socks5_client_input(&connection->client,
+    (ftun_bytes_t){connection->input, length}, &consumed, &result);
+  if (status == FTUN_E_AGAIN) {
+    if (!ftun_socks5_client_wants_output(&connection->client)) return FTUN_OK;
+    status = ftun_socks5_prepare_output(connection);
     if (status != FTUN_OK) return status;
-    if (method == FTUN_SOCKS5_METHOD_NONE_ACCEPTABLE) return FTUN_E_REJECTED;
-    if (method != expected) return FTUN_E_PROTOCOL;
-    connection->input_length = 0u;
-    if (method == FTUN_SOCKS5_METHOD_USERNAME_PASSWORD) {
-      status = ftun_socks5_prepare_auth(connection);
-      if (status != FTUN_OK) return status;
-      connection->state = FTUN_SOCKS5_STATE_WRITE_AUTH;
-    } else {
-      status = ftun_socks5_prepare_request(connection);
-      if (status != FTUN_OK) return status;
-      connection->state = FTUN_SOCKS5_STATE_WRITE_REQUEST;
-    }
     return ftun_socks5_watch(connection, FTUN_EVENT_WRITE);
   }
-  if (connection->state == FTUN_SOCKS5_STATE_READ_AUTH) {
-    uint8_t auth_status = 0u;
-    status = ftun_socks5_decode_auth_result(input, &auth_status, &consumed);
-    if (status != FTUN_OK) return status;
-    if (auth_status != 0u) return FTUN_E_REJECTED;
-    connection->input_length = 0u;
-    status = ftun_socks5_prepare_request(connection);
-    if (status != FTUN_OK) return status;
-    connection->state = FTUN_SOCKS5_STATE_WRITE_REQUEST;
-    return ftun_socks5_watch(connection, FTUN_EVENT_WRITE);
+  if (status != FTUN_OK) return status;
+  if (connection->transport == FTUN_DIAL_TCP) {
+    connection->state = FTUN_SOCKS5_STATE_READY;
+    connection->data_socket = connection->control_socket;
+    return ftun_socks5_finish(connection,
+      ftun_socks5_error(FTUN_OK, FTUN_SOCKS5_STAGE_REQUEST));
   }
-  if (connection->state == FTUN_SOCKS5_STATE_READ_REPLY) {
-    ftun_socks5_reply_t reply;
-    status = ftun_socks5_decode_reply(input, &reply, &consumed);
-    if (status != FTUN_OK) return status;
-    status = ftun_socks5_reply_status(reply.reply);
-    if (status != FTUN_OK) return status;
-    connection->input_length = 0u;
-    if (connection->transport == FTUN_DIAL_TCP) {
-      connection->state = FTUN_SOCKS5_STATE_READY;
-      connection->data_socket = connection->control_socket;
-      return ftun_socks5_finish(connection,
-        ftun_socks5_error(FTUN_OK, FTUN_SOCKS5_STAGE_REQUEST));
-    }
-    return ftun_socks5_start_udp(connection, &reply.endpoint);
-  }
-  return FTUN_E_STATE_CORRUPT;
+  return ftun_socks5_start_udp(connection, &result.bound);
 }
 
 static ftun_status_t ftun_socks5_process_write(
@@ -861,6 +775,9 @@ static ftun_status_t ftun_socks5_process_write(
     if (connection->output_offset != connection->output_length) return FTUN_OK;
   }
   connection->input_length = 0u;
+  if (ftun_socks5_client_output_done(&connection->client) != FTUN_OK) {
+    return FTUN_E_STATE_CORRUPT;
+  }
   if (connection->state == FTUN_SOCKS5_STATE_WRITE_METHOD) {
     connection->state = FTUN_SOCKS5_STATE_READ_METHOD;
   } else if (connection->state == FTUN_SOCKS5_STATE_WRITE_AUTH) {
@@ -876,34 +793,26 @@ static ftun_status_t ftun_socks5_process_write(
 static ftun_status_t ftun_socks5_process_read(
   ftun_socks5_connection_t *connection)
 {
-  size_t needed = ftun_socks5_input_needed(connection);
+  /* 只读完成当前帧所需的字节，不会多读到隧道数据；部分字节由状态机自己保留。 */
+  size_t needed = ftun_socks5_client_needed(&connection->client);
   size_t received = 0u;
   ftun_status_t status;
-  if (needed == 0u || needed > sizeof(connection->input) ||
-      connection->input_length > needed) return FTUN_E_STATE_CORRUPT;
-  if (connection->input_length < needed) {
-    if (connection->scope != NULL) {
-      status = ftun_stream_read(connection->control_stream,
-        connection->input + connection->input_length, needed - connection->input_length, &received);
-    } else {
-      status = connection->protocol_io.receive_socket(
-        connection->protocol_io.context, connection->control_socket,
-        connection->input + connection->input_length,
-        needed - connection->input_length, &received);
-    }
-    if (status == FTUN_E_AGAIN) return connection->scope != NULL ? FTUN_E_AGAIN : FTUN_OK;
-    if (status == FTUN_E_EOF) return FTUN_E_IO;
-    if (status != FTUN_OK) return status;
-    if (received == 0u || received > needed - connection->input_length) {
-      return FTUN_E_STATE_CORRUPT;
-    }
-    connection->input_length += received;
-    needed = ftun_socks5_input_needed(connection);
-    if (needed == 0u || needed > sizeof(connection->input) ||
-        connection->input_length > needed) return FTUN_E_STATE_CORRUPT;
-    if (connection->input_length < needed) return FTUN_OK;
+  if (needed == 0u || needed > sizeof(connection->input)) {
+    return FTUN_E_STATE_CORRUPT;
   }
-  return ftun_socks5_handle_frame(connection);
+  if (connection->scope != NULL) {
+    status = ftun_stream_read(connection->control_stream, connection->input,
+                              needed, &received);
+  } else {
+    status = connection->protocol_io.receive_socket(
+      connection->protocol_io.context, connection->control_socket,
+      connection->input, needed, &received);
+  }
+  if (status == FTUN_E_AGAIN) return connection->scope != NULL ? FTUN_E_AGAIN : FTUN_OK;
+  if (status == FTUN_E_EOF) return FTUN_E_IO;
+  if (status != FTUN_OK) return status;
+  if (received == 0u || received > needed) return FTUN_E_STATE_CORRUPT;
+  return ftun_socks5_handle_input(connection, received);
 }
 
 static uint32_t ftun_socks5_state_stage(
@@ -1445,6 +1354,7 @@ static ftun_status_t ftun_socks5_connect_internal(
            connection->password_length);
   }
   connection->protection.mark = request->protection.mark;
+  connection->protection.liveness = request->protection.liveness;
   if (request->protection.interface_name.length != 0u) {
     memcpy(connection->interface_name,
            request->protection.interface_name.data,
@@ -1488,7 +1398,7 @@ static ftun_status_t ftun_socks5_connect_internal(
   return FTUN_OK;
 }
 
-/* TASK-OUTBOUND-004 / TEST-OUTBOUND-004，目标 0.2.0：SOCKS5 出站阶段机。 */
+/* SOCKS5 出站阶段机。 */
 ftun_status_t ftun_socks5_connect_with_io(
   ftun_core_t *core, const ftun_socks5_connect_request_t *request,
   const ftun_dial_io_t *dial_io, const ftun_socks5_io_t *protocol_io,
@@ -1603,27 +1513,4 @@ ftun_status_t ftun_socks5_connection_resume(ftun_socks5_connection_t *connection
   if (connection == NULL) return FTUN_E_INVALID;
   if (!connection->ready || connection->data_path == NULL) return FTUN_E_AGAIN;
   return ftun_path_resume(connection->data_path);
-}
-
-ftun_status_t ftun_socks5_connection_take_tcp(
-  ftun_socks5_connection_t **connection, ftun_native_socket_t *out)
-{
-  ftun_socks5_connection_t *owned;
-  ftun_native_socket_t socket;
-  if (out != NULL) *out = FTUN_INVALID_SOCKET;
-  if (connection == NULL || out == NULL) return FTUN_E_INVALID;
-  owned = *connection;
-  if (owned == NULL || !owned->ready || owned->operation != NULL ||
-      owned->child != NULL || owned->io_source != NULL ||
-      owned->timer_source != NULL || owned->transport != FTUN_DIAL_TCP ||
-      owned->control_socket == FTUN_INVALID_SOCKET ||
-      owned->data_socket != owned->control_socket) return FTUN_E_AGAIN;
-  socket = owned->data_socket;
-  owned->data_socket = FTUN_INVALID_SOCKET;
-  owned->control_socket = FTUN_INVALID_SOCKET;
-  owned->ready = 0;
-  ftun_socks5_release_context(owned);
-  *connection = NULL;
-  *out = socket;
-  return FTUN_OK;
 }

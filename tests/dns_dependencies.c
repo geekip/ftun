@@ -329,7 +329,7 @@ static int prepare_case(bootstrap_t *server, const char *label,
 
 static int basic_cases(bootstrap_t *server)
 {
-  const char *domain[] = {"dns.example"};
+  const char *both[] = {"dns.example", "unused.example"};
   static const char reject_server[] =
     ",\"servers\":[{\"name\":\"s\",\"type\":\"udp\",\"address\":[\"127.0.0.1:9\"],"
     "\"outbound\":\"REJECT\"}]";
@@ -352,10 +352,11 @@ static int basic_cases(bootstrap_t *server)
     "", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "disabled", "[]", "", "", false,
     "", FTUN_OK, NULL, 0u) == 0);
-  CHECK(prepare_case(server, "first-address-bootstrap", "[]",
+  /* 多地址服务器的每个地址都要解析（配置顺序即优先级）。 */
+  CHECK(prepare_case(server, "all-address-bootstrap", "[]",
     ",\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
     "\"address\":[\"dns.example:53\",\"unused.example:53\"],\"outbound\":\"DIRECT\"}]",
-    "", true, "unused.example", FTUN_OK, domain, 1u) == 0);
+    "", true, "", FTUN_OK, both, 2u) == 0);
   return 0;
 }
 

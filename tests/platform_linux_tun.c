@@ -263,7 +263,7 @@ static int real_smoke(void)
   return 0;
 }
 
-/* TASK-PLATFORM-001 / TEST-PLATFORM-001：权限、MTU、整包 I/O 和关闭。 */
+/* 权限、MTU、整包 I/O 和关闭。 */
 static int budget_admission(void)
 {
   ftun_budget_options_t options = {0};

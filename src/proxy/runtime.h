@@ -14,6 +14,8 @@ typedef struct {
   uint64_t busy_ms;
   uint64_t deadline_lateness_ms;
   bool quota_exhausted;
+  /* 本轮新增的对象级故障（流收尾失败转入隔离）。 */
+  size_t object_faults;
 } ftun_proxy_runtime_run_usage_t;
 
 typedef struct {
@@ -54,17 +56,22 @@ ftun_status_t ftun_proxy_runtime_reload_prepare_planned(
 ftun_status_t ftun_proxy_runtime_reload_commit(ftun_proxy_runtime_t *engine,
                                         uint64_t generation);
 ftun_status_t ftun_proxy_runtime_reload_abort(ftun_proxy_runtime_t *engine);
+/* 处于等待恢复（socket 已关闭、尚未重新 bind）的监听数。 */
+size_t ftun_proxy_runtime_listeners_waiting(const ftun_proxy_runtime_t *engine);
+/* 当前被隔离（收尾失败、仍占用槽位）的流数。 */
+size_t ftun_proxy_runtime_quarantined(const ftun_proxy_runtime_t *engine);
 ftun_status_t ftun_proxy_runtime_run_once(ftun_proxy_runtime_t *engine, bool may_block,
                                    ftun_proxy_runtime_run_usage_t *out_usage);
 ftun_status_t ftun_proxy_runtime_get_capacity_info(
   ftun_proxy_runtime_t *engine, ftun_proxy_runtime_capacity_info_t *out);
 ftun_status_t ftun_proxy_runtime_wakeup(ftun_proxy_runtime_t *engine);
+/* 网络变化：把等待恢复的监听提前到 now_ms，并让 NOT_READY 的 FRS 立刻重试下载。 */
+void ftun_proxy_runtime_network_changed(ftun_proxy_runtime_t *engine, uint64_t now_ms);
 ftun_status_t ftun_proxy_runtime_quiesce(ftun_proxy_runtime_t *engine);
 ftun_status_t ftun_proxy_runtime_drain_until(ftun_proxy_runtime_t *engine,
                                              uint64_t deadline_ms);
 ftun_status_t ftun_proxy_runtime_stop_until(ftun_proxy_runtime_t *engine,
                                      uint64_t deadline_ms);
-ftun_status_t ftun_proxy_runtime_stop(ftun_proxy_runtime_t *engine);
 ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
                                         uint64_t deadline_ms);
 ftun_status_t ftun_proxy_runtime_destroy(ftun_proxy_runtime_t **engine);

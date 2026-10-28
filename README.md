@@ -2,7 +2,7 @@
 
 FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明代理和嵌入式宿主集成。它提供独立命令行程序和稳定的 C API，通过规则、DNS、FakeIP、FRS 规则集合与代理组处理 TCP/UDP 流量。
 
-当前版本为 **1.0.3**，正式支持 Linux x86_64 IPv4。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
+当前版本为 **1.0.4**，正式支持 Linux x86_64 IPv4。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
 
 ## 主要能力
 
@@ -46,11 +46,14 @@ TUN 与自动路由需要 root 或相应网络能力。只使用 SOCKS5/Mixed �
 
 ## 配置与集成
 
-- [配置 JSON Schema](schema.json)
+- [配置 JSON Schema](schema.json) 与[配置参考](docs/configuration.md)（字段、默认值、取值范围）
 - [可运行配置样例](examples/)
 - [公开 C API](include/ftun/ftun.h)
+- [部署与运维手册](docs/operations.md)：权限、网络标识、服务管理、日志、断网恢复行为
+- [实现符合度矩阵](docs/conformance.md)：各项能力实现到什么程度、有哪些测试佐证
+- [变更记录](CHANGELOG.md)
 
-默认预设内置 DNS、FakeIP、TUN 和 FRS。可通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 依赖 DNS。构建生成的 `ftun-build-modules.txt` 记录实际模块组合。
+默认预设（`CMakePresets.json`）内置 DNS、FakeIP、TUN 和 FRS；不使用预设直接配置 CMake 时这四个模块默认关闭。可通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 依赖 DNS。构建生成的 `ftun-build-modules.txt` 记录实际模块组合。
 
 完整样例包含需要替换的测试地址、端点和探测 URL。运行前先阅读 [样例说明](examples/README.md)，再准备网络权限、CA、FRS 文件和 FakeIP 状态。
 

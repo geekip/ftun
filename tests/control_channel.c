@@ -1,8 +1,11 @@
 #include "transport/control_channel.h"
 #include "util/time.h"
 
+#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "control channel failed %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
@@ -134,8 +137,40 @@ static int run(bool hold_open)
   return 0;
 }
 
+/* 文件描述符耗尽时创建通道：事件后端建不起来，创建必须干净地失败并返回。
+ * 此前清理会去轮询没有后端的事件循环，永远得到 UNSUPPORTED，把调用它的
+ * Worker 线程永久卡在清理循环里。alarm 让退化为死循环时测试失败而不是挂起。 */
+static int descriptor_exhaustion(void)
+{
+  struct rlimit original;
+  struct rlimit limited;
+  ftun_budget_t *budget = NULL;
+  ftun_control_channel_t *channel = NULL;
+  ftun_status_t status;
+  uint64_t now;
+  int highest = 2;
+  int descriptor;
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 128u, &budget) == FTUN_OK);
+  CHECK(ftun_monotonic_now(&now) == FTUN_OK);
+  for (descriptor = 3; descriptor < 1024; descriptor++) {
+    if (fcntl(descriptor, F_GETFD) != -1) highest = descriptor;
+  }
+  CHECK(getrlimit(RLIMIT_NOFILE, &original) == 0);
+  limited = original;
+  limited.rlim_cur = (rlim_t)highest + 1u;
+  alarm(15u);
+  CHECK(setrlimit(RLIMIT_NOFILE, &limited) == 0);
+  status = ftun_control_channel_create(budget, 7u, now + 1000u, &channel);
+  CHECK(setrlimit(RLIMIT_NOFILE, &original) == 0);
+  alarm(0u);
+  CHECK(status != FTUN_OK && channel == NULL);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(descriptor_exhaustion() == 0);
   CHECK(run(true) == 0);
   CHECK(run(false) == 0);
   puts("control channel failed cancellation retains open/write state until owner completion");

@@ -400,8 +400,165 @@ static int test_cache_binding(void)
   return 0;
 }
 
+/* 多地址服务器的被动健康：网络类失败记入退避并换一个地址；退避到期后
+ * 刚恢复的地址只获得较短的试探期限；全部在退避中时立即失败。 */
+static int test_upstream_failover(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_operation_queue_t *operations = NULL;
+  ftun_core_t *core = NULL;
+  ftun_recovery_scheduler_t *scheduler = NULL;
+  ftun_upstream_set_t *set = NULL;
+  ftun_dns_server_t *server = NULL;
+  ftun_dns_server_options_t options;
+  ftun_dns_query_t query;
+  ftun_operation_t *operation = NULL;
+  ftun_recovery_policy_t policy;
+  ftun_endpoint_t endpoints[2];
+  transport_t transport;
+  completion_t completion;
+  uint8_t request[29];
+  uint8_t response[45];
+  uint64_t now = 10000u;
+  size_t work = 0u;
+  memset(&options, 0, sizeof(options));
+  memset(&transport, 0, sizeof(transport));
+  memset(&completion, 0, sizeof(completion));
+  memset(&policy, 0, sizeof(policy));
+  memset(endpoints, 0, sizeof(endpoints));
+  endpoints[0].kind = endpoints[1].kind = FTUN_ADDRESS_IPV4;
+  endpoints[0].port = endpoints[1].port = 53u;
+  memcpy(endpoints[0].address, (uint8_t[]){192u, 0u, 2u, 53u}, 4u);
+  memcpy(endpoints[1].address, (uint8_t[]){192u, 0u, 2u, 54u}, 4u);
+  policy.initial_ms = 1000u;
+  policy.maximum_ms = 30000u;
+  policy.stable_ms = 60000u;
+  policy.auth_retry_ms = 30000u;
+  policy.seed = 1u;
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_operation_queue_create(budget, 4u, &operations) == FTUN_OK);
+  CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
+  CHECK(ftun_recovery_scheduler_create(budget, 4u, &policy, &scheduler) == FTUN_OK);
+  CHECK(ftun_upstream_set_create(budget, scheduler, endpoints, 2u, fake_now,
+                                 &now, &set) == FTUN_OK);
+  options.budget = budget;
+  options.operations = operations;
+  options.upstream = endpoints[0];
+  options.upstream_set = set;
+  options.outbound_id = 42u;
+  options.fingerprint = 99u;
+  options.transport = FTUN_DNS_TRANSPORT_UDP;
+  options.tcp_fallback = true;
+  options.max_response_bytes = 512u;
+  options.query_transport.select = transport_select;
+  options.query_transport.submit = transport_submit;
+  options.query_transport.cancel = transport_cancel;
+  options.query_transport.context = &transport;
+  options.now = fake_now;
+  options.now_user = &now;
+  CHECK(ftun_dns_server_create(&options, &server) == FTUN_OK);
+  response_init(response, 0x8180u, 0x1234u);
+
+  /* 首选地址超时：第一次尝试只占剩余期限的一半，随后换到备用地址。 */
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 53u &&
+        transport.deadline == now + 2000u);
+  CHECK(transport_deliver(&transport, FTUN_E_TIMEOUT, NULL, 0u));
+  CHECK(transport.pending && transport.upstream.address[3] == 54u &&
+        transport.deadline == now + 4000u);
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.calls == 1u &&
+        completion.status == FTUN_OK);
+
+  /* 首选地址在退避中：直接用备用地址，期限不再缩短。 */
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 54u &&
+        transport.deadline == now + 4000u);
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
+
+  /* 退避到期：首选地址恢复，但只有不超过 1 秒的试探期限；试探失败改发
+   * 备用地址，且不占用换地址的限额。 */
+  now += 3000u;
+  CHECK(ftun_recovery_run(scheduler, now, 8u, &work) == FTUN_OK && work != 0u);
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 53u &&
+        transport.deadline == now + 1000u);
+  CHECK(transport_deliver(&transport, FTUN_E_IO, NULL, 0u));
+  CHECK(transport.pending && transport.upstream.address[3] == 54u &&
+        transport.deadline == now + 4000u);
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
+
+  /* 备用地址也超时：没有可换的地址，如实失败；之后全部在退避中，
+   * 查询立即失败，不提交任何传输。 */
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 54u &&
+        transport.deadline == now + 4000u);
+  CHECK(transport_deliver(&transport, FTUN_E_TIMEOUT, NULL, 0u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_E_TIMEOUT);
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  {
+    unsigned int submits = transport.submits;
+    CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+    CHECK(!transport.pending && transport.submits == submits);
+    CHECK(dispatch_one(operations) && completion.status == FTUN_E_IO);
+  }
+
+  /* 上游自己返回的 SERVFAIL 是应答，原样转发，不记失败。 */
+  now += 40000u;
+  CHECK(ftun_recovery_run(scheduler, now, 8u, &work) == FTUN_OK);
+  response_init(response, 0x8182u, 0x1234u);
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 53u);
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
+
+  /* 应答对不上（ID 不匹配）或无法解析：这个地址不健康，换备用地址。 */
+  response_init(response, 0x8180u, 0x1234u);
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 53u);
+  response[0] ^= 0xFFu;
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(transport.pending && transport.upstream.address[3] == 54u);
+  response[0] ^= 0xFFu;
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
+  now += 40000u;
+  CHECK(ftun_recovery_run(scheduler, now, 8u, &work) == FTUN_OK);
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, now + 4000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(transport.pending && transport.upstream.address[3] == 53u);
+  CHECK(transport_deliver(&transport, FTUN_OK, (const uint8_t *)"garbage-not-dns", 15u));
+  CHECK(transport.pending && transport.upstream.address[3] == 54u);
+  CHECK(transport_deliver(&transport, FTUN_OK, response, 45u));
+  CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
+
+  CHECK(ftun_dns_server_destroy(&server) == FTUN_OK);
+  CHECK(ftun_upstream_set_destroy(&set) == FTUN_OK);
+  CHECK(ftun_recovery_scheduler_destroy(&scheduler) == FTUN_OK);
+  CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
+  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  if (test_upstream_failover() != 0) return 1;
   ftun_budget_t *budget = NULL;
   ftun_operation_queue_t *operations = NULL;
   ftun_core_t *core = NULL;

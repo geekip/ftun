@@ -52,7 +52,7 @@ static ftun_status_t ftun_socket_rollback(const ftun_linux_socket_io_t *io,
   return result;
 }
 
-/* TASK-PLATFORM-003 / TEST-PLATFORM-003，目标 0.2.0：物理 socket 保护。 */
+/* 物理 socket 保护。 */
 ftun_status_t ftun_linux_socket_protect_with_io(
   ftun_native_socket_t socket, const ftun_socket_policy_t *policy,
   const ftun_linux_socket_io_t *io)

@@ -174,7 +174,10 @@ static ftun_status_t ftun_tun_service_flush(
       status = service->ops.write(service->ops.user, service->port,
                                   data, entry->length);
       if (status == FTUN_E_AGAIN) return FTUN_OK;
-      if (status != FTUN_OK) return status;
+      if (status != FTUN_OK) {
+        if (status == FTUN_E_IO) service->device_lost = true;
+        return status;
+      }
       consumer->output_bytes -= entry->length;
       service->queued_output_bytes -= entry->length;
       status = ftun_buffer_release(&entry->buffer);
@@ -334,7 +337,10 @@ static ftun_status_t ftun_tun_service_read(
       service->ops.user, service->port, service->input, service->mtu,
       &length);
     if (status == FTUN_E_AGAIN) return FTUN_OK;
-    if (status != FTUN_OK) return status;
+    if (status != FTUN_OK) {
+      if (status == FTUN_E_IO) service->device_lost = true;
+      return status;
+    }
     if (length == 0u || length > service->mtu) return FTUN_E_PROTOCOL;
     packet.data = service->input;
     packet.length = length;
@@ -398,14 +404,29 @@ ftun_status_t ftun_tun_service_run(
   }
   events = service->events;
   service->events = 0u;
-  status = (events & FTUN_EVENT_ERROR) != 0u ? FTUN_E_IO : FTUN_OK;
-  if (status == FTUN_OK && (events & FTUN_EVENT_WRITE) != 0u &&
+  status = FTUN_OK;
+  if ((events & FTUN_EVENT_ERROR) != 0u) service->device_lost = true;
+  if (!service->device_lost && (events & FTUN_EVENT_WRITE) != 0u &&
       service->queued_outputs != 0u) {
     status = ftun_tun_service_flush(service, out_work);
   }
-  if (status == FTUN_OK && (events & FTUN_EVENT_READ) != 0u &&
+  if (!service->device_lost && status == FTUN_OK && (events & FTUN_EVENT_READ) != 0u &&
       service->accepting && service->active_leases != 0u) {
     status = ftun_tun_service_read(service, out_work);
+  }
+  if (service->device_lost && (status == FTUN_OK || status == FTUN_E_IO)) {
+    /* 设备被外部删除或失效不是宿主故障：立即发起重建；重建没有生效时撤销
+     * watcher（电平触发的就绪会空转），由 owner 退避重试。 */
+    (void)ftun_tun_service_rebuild(service);
+    status = FTUN_OK;
+    if (service->device_lost && !service->rebuilding && service->source != NULL) {
+      service->accepting = false;
+      status = ftun_event_source_cancel(&service->source);
+    }
+    if (status != FTUN_OK) {
+      ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_FAILED, status);
+    }
+    return status;
   }
   if (status == FTUN_OK && service->source != NULL) {
     status = ftun_tun_service_interests(service);

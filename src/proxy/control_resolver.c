@@ -2,6 +2,8 @@
 
 #include "proxy/control_resolver.h"
 
+#include "network/address.h"
+
 #include "proxy/dns/control_path_adapter.h"
 #if defined(FTUN_HAVE_MODULE_DNS)
 #include "dns/wire.h"
@@ -32,31 +34,23 @@ ftun_status_t ftun_control_parse_endpoint(
   const char *text, uint16_t default_port, ftun_endpoint_t *out,
   char domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES])
 {
-  const char *colon;
+  ftun_host_port_t value;
   char host[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
-  char *tail = NULL;
-  unsigned long port = default_port;
   size_t length;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (domain != NULL) domain[0] = '\0';
   if (text == NULL || text[0] == '\0' || default_port == 0u || out == NULL) {
     return FTUN_E_INVALID;
   }
-  colon = strrchr(text, ':');
-  length = colon == NULL ? strlen(text) : (size_t)(colon - text);
-  if (length == 0u || length > 253u || length >= sizeof(host)) {
+  if (!ftun_host_port_split(text, strlen(text), &value) || value.bracketed ||
+      value.host_length > 253u || value.host_length >= sizeof(host)) {
     return FTUN_E_INVALID;
   }
-  memcpy(host, text, length);
+  length = value.host_length;
+  memcpy(host, value.host, length);
   host[length] = '\0';
-  if (colon != NULL) {
-    errno = 0;
-    port = strtoul(colon + 1u, &tail, 10);
-    if (errno != 0 || tail == colon + 1u || *tail != '\0' ||
-        port == 0u || port > UINT16_MAX) return FTUN_E_INVALID;
-  }
-  out->port = (uint16_t)port;
-  if (inet_pton(AF_INET, host, out->address) == 1) {
+  out->port = value.has_port ? value.port : default_port;
+  if (ftun_ipv4_parse(host, length, out->address)) {
     out->kind = FTUN_ADDRESS_IPV4;
     return FTUN_OK;
   }
@@ -223,12 +217,12 @@ static ftun_status_t ftun_control_system(const ftun_control_execution_t *executi
   memcpy(host, domain.data, domain.length);
   host[domain.length] = '\0';
   {
-    struct in_addr numeric;
-    if (inet_pton(AF_INET, host, &numeric) == 1) {
+    uint8_t numeric[4];
+    if (ftun_ipv4_parse(host, domain.length, numeric)) {
       memset(out, 0, sizeof(*out));
       out->kind = FTUN_ADDRESS_IPV4;
       out->port = port;
-      memcpy(out->address, &numeric.s_addr, 4u);
+      memcpy(out->address, numeric, 4u);
       return FTUN_OK;
     }
   }

@@ -819,6 +819,7 @@ ftun_status_t ftun_core_module_runtime_reload_abort(
 static void ftun_core_module_usage_add(ftun_core_service_run_usage_t *target,
                                        const ftun_core_service_run_usage_t *add)
 {
+  size_t index;
   target->work = add->work > SIZE_MAX - target->work
     ? SIZE_MAX : target->work + add->work;
   target->busy_ms = add->busy_ms > UINT64_MAX - target->busy_ms
@@ -827,6 +828,10 @@ static void ftun_core_module_usage_add(ftun_core_service_run_usage_t *target,
     target->deadline_lateness_ms = add->deadline_lateness_ms;
   }
   target->quota_exhausted = target->quota_exhausted || add->quota_exhausted;
+  target->fatal = target->fatal || add->fatal;
+  for (index = 0u; index < FTUN_FAULT_SCOPE_COUNT; index++) {
+    target->faults[index] += add->faults[index];
+  }
 }
 
 ftun_status_t ftun_core_module_runtime_run_once(
@@ -836,6 +841,7 @@ ftun_status_t ftun_core_module_runtime_run_once(
   size_t active_services = 0u;
   size_t index;
   ftun_status_t status = FTUN_OK;
+  ftun_status_t first_fault = FTUN_OK;
   if (out_usage != NULL) memset(out_usage, 0, sizeof(*out_usage));
   if (runtime == NULL || out_usage == NULL || !runtime->activated ||
       runtime->rolled_back || runtime->cleanup_only) return FTUN_E_INVALID;
@@ -858,7 +864,8 @@ ftun_status_t ftun_core_module_runtime_run_once(
       }
     }
   }
-  for (index = 0u; status == FTUN_OK && index < runtime->service_count; index++) {
+  /* 非致命故障只记录第一个，其余服务本轮照常运行；致命故障立即返回。 */
+  for (index = 0u; index < runtime->service_count; index++) {
     ftun_core_service_run_usage_t usage;
     ftun_core_module_entry_t *entry =
       &runtime->entries[runtime->service_entries[index]];
@@ -866,13 +873,18 @@ ftun_status_t ftun_core_module_runtime_run_once(
     status = ftun_core_service_run_once(&entry->service, false, &usage);
     if (status != FTUN_OK) ftun_core_module_event(runtime, entry->descriptor->capability,
       FTUN_LIFECYCLE_MODULE_FAILED, status, FTUN_LIFECYCLE_REASON_RUN);
-    if (status == FTUN_OK) ftun_core_module_usage_add(out_usage, &usage);
+    ftun_core_module_usage_add(out_usage, &usage);
+    if (ftun_core_service_run_fatal(status, &usage)) {
+      return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
+    }
+    if (status != FTUN_OK && first_fault == FTUN_OK) first_fault = status;
   }
+  status = FTUN_OK;
   /* 共享 Event 的非阻塞轮询可能消费跨线程唤醒；本轮须先返回宿主，
    * 让控制请求被观察。检查之后到达的唤醒由后续唯一阻塞等待接收。 */
   if (atomic_exchange_explicit(&runtime->wake_pending, false,
         memory_order_acq_rel)) may_block = false;
-  if (status == FTUN_OK && may_block && out_usage->work == 0u &&
+  if (first_fault == FTUN_OK && may_block && out_usage->work == 0u &&
       !out_usage->quota_exhausted) {
     size_t target = runtime->block_cursor++ % active_services;
     size_t ordinal = 0u;
@@ -885,11 +897,15 @@ ftun_status_t ftun_core_module_runtime_run_once(
       status = ftun_core_service_run_once(&entry->service, true, &usage);
       if (status != FTUN_OK) ftun_core_module_event(runtime, entry->descriptor->capability,
         FTUN_LIFECYCLE_MODULE_FAILED, status, FTUN_LIFECYCLE_REASON_RUN);
-      if (status == FTUN_OK) ftun_core_module_usage_add(out_usage, &usage);
+      ftun_core_module_usage_add(out_usage, &usage);
+      if (ftun_core_service_run_fatal(status, &usage)) {
+        return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
+      }
+      if (status != FTUN_OK) first_fault = status;
       break;
     }
   }
-  return status;
+  return first_fault;
 }
 
 ftun_status_t ftun_core_module_runtime_wakeup(
@@ -908,6 +924,21 @@ ftun_status_t ftun_core_module_runtime_wakeup(
     if (status != FTUN_OK && result == FTUN_OK) result = status;
   }
   return result;
+}
+
+void ftun_core_module_runtime_network_changed(
+  ftun_core_module_runtime_t *runtime, const ftun_network_change_t *change,
+  uint64_t now_ms)
+{
+  size_t index;
+  if (runtime == NULL || change == NULL || runtime->rolled_back ||
+      runtime->cleanup_only) return;
+  for (index = 0u; index < runtime->entry_count; index++) {
+    ftun_core_module_entry_t *entry = &runtime->entries[index];
+    if (entry->descriptor->service == NULL ||
+        entry->service.implementation == NULL) continue;
+    ftun_core_service_network_changed(&entry->service, change, now_ms);
+  }
 }
 
 ftun_status_t ftun_core_module_runtime_quiesce(

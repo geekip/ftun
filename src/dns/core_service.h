@@ -26,6 +26,5 @@ ftun_status_t ftun_dns_service_slot_get(
   const ftun_dns_service_slot_t *slot, ftun_dns_runtime_t **out);
 
 extern const ftun_core_service_descriptor_t ftun_dns_core_service;
-const ftun_core_service_descriptor_t *ftun_dns_service_descriptor(void);
 
 #endif

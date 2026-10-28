@@ -5,8 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-FAKE-001；任务 TASK-DNS-007；目标 0.3.0；验收 TEST-DNS-007。 */
-
 typedef struct {
   char *domain;
   size_t domain_length;

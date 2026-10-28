@@ -158,7 +158,7 @@ static int real_smoke(void)
   return 0;
 }
 
-/* TASK-PLATFORM-002 / TEST-PLATFORM-002：冲突、反序回滚和所有权清理。 */
+/* 冲突、反序回滚和所有权清理。 */
 static int owned_budget(void)
 {
   ftun_budget_options_t options = {0};
@@ -244,6 +244,23 @@ int main(int argc, char **argv)
                    sizeof(mock.removed[removed_index])) == 0);
     }
   }
+
+  /* 添加时对象已存在（STALE）：非地址对象是崩溃遗留，原地接管并在释放时撤销；
+   * 地址对象可能属于外部，仍然失败并回滚。 */
+  memset(&mock, 0, sizeof(mock));
+  mock.fail_apply_call = 3u;
+  mock.fail_apply_status = FTUN_E_STALE;
+  io = mock_io(&mock);
+  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+        info.active_count == 7u && mock.apply_calls == 7u);
+  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && mock.remove_calls == 7u);
+  memset(&mock, 0, sizeof(mock));
+  mock.fail_apply_call = 1u;
+  mock.fail_apply_status = FTUN_E_STALE;
+  io = mock_io(&mock);
+  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_E_STALE &&
+        transaction == NULL && mock.remove_calls == 0u);
 
   memset(&mock, 0, sizeof(mock));
   mock.fail_apply_call = 5u;

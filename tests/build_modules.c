@@ -138,9 +138,9 @@ int main(void)
     "\"default-server\":\"f\"}}",
     expect_proxy && expect_dns && expect_fakeip) == 0);
   CHECK(check_config_capability(
-    "{\"dns\":{\"enable\":false},\"inbounds\":[{\"name\":\"t\","
-    "\"type\":\"tun\",\"interface\":{\"name\":\"t0\"},"
-    "\"ipv4\":{\"address\":\"10.0.0.1/30\"}}]}",
+    "{\"dns\":{\"enable\":false},\"tun\":{\"interface\":\"t0\","
+    "\"ipv4\":{\"address\":\"10.0.0.1/30\"}},"
+    "\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
     expect_proxy && expect_tun) == 0);
   CHECK(check_config_capability(
     "{\"dns\":{\"enable\":false},\"frs\":42}", 1) == 0);

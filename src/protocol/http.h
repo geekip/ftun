@@ -1,6 +1,6 @@
 #ifndef FTUN_PROTOCOL_HTTP_H
 #define FTUN_PROTOCOL_HTTP_H
-/* TASK-PROTOCOL-002 / TEST-PROTOCOL-002：ftun_http_decode，目标 0.4.0。 */
+/* ftun_http_decode。 */
 
 #include "internal/contracts.h"
 
@@ -27,7 +27,6 @@ typedef struct {
 } ftun_http_request_t;
 
 /* HTTP/1.0 与 HTTP/1.1 显式代理请求解析。
- * TASK-PROTOCOL-002 / TEST-PROTOCOL-002，目标 0.4.0。
  * 仅接纳 absolute-form http:// 与 CONNECT authority-form；拒绝 userinfo、
  * 分段/折叠头、重复 Host、TE/CL 冲突和无界数字。OK 时所有字符串同步借用
  * input，consumed 精确位于 body 首字节；AGAIN 时输出清零。 */

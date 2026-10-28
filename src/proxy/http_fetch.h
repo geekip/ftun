@@ -50,6 +50,13 @@ ftun_status_t ftun_http_fetch_resolver(const ftun_config_t *config,
                                        const ftun_runtime_t *runtime,
                                        ftun_string_t server,
                                        ftun_http_fetch_spec_t *spec);
+/* 解析一个完整的 HTTP 响应（可原地去掉分块编码，所以 wire 必须可写）。成功时
+ * 正文在 wire 开头、长度在 out->length；etag 与 location 由调用方释放。导出是为了让
+ * fuzz 目标直接喂入不可信字节，不经过网络。 */
+ftun_status_t ftun_http_fetch_parse_response(
+  ftun_budget_t *budget, uint8_t *wire, size_t wire_length, size_t maximum,
+  ftun_http_fetch_result_t *out, char **location,
+  ftun_reservation_t **location_reservation);
 void ftun_http_fetch_release(ftun_http_fetch_result_t *result);
 
 #endif

@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-DNSWIRE-001；任务 TASK-DNS-003；目标 0.3.0；验收 TEST-DNS-003。 */
-
 #define FTUN_DNS_LISTENER_MAX_TC_BYTES \
   (FTUN_DNS_HEADER_BYTES + FTUN_DNS_MAX_NAME_BYTES + 4u)
 

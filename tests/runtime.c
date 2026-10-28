@@ -38,7 +38,7 @@ static int check_budget(ftun_budget_t *budget, size_t used)
   return 0;
 }
 
-/* TASK-CORE-001 / TEST-CORE-001：候选峰值、提交、旧代引用和回收。 */
+/* 候选峰值、提交、旧代引用和回收。 */
 int main(void)
 {
   static const char first_text[] =
@@ -140,7 +140,23 @@ int main(void)
   CHECK(ftun_runtime_get_info(candidate, &runtime_info) == FTUN_OK);
   second_bytes = runtime_info.accounted_bytes;
   CHECK(check_budget(budget, manager_bytes + first_bytes + second_bytes) == 0);
-  CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK && candidate == NULL);
+  {
+    /* 代次预留属于持有者：无预留提交遇到他人预留返回 AGAIN，错误持有者
+     * 返回 STALE，候选与预留都保持不变，只有持有者能提交并发布。 */
+    int host = 0, other = 0;
+    uint64_t reserved = 0u;
+    CHECK(ftun_core_context_generation_reserve(core, &host, &reserved) == FTUN_OK &&
+          reserved == 2u);
+    CHECK(ftun_runtime_commit(core, &candidate) == FTUN_E_AGAIN && candidate != NULL);
+    CHECK(ftun_runtime_commit_reserved(core, &candidate, &other) == FTUN_E_STALE &&
+          candidate != NULL);
+    CHECK(ftun_core_context_generation_held(core, &host, &reserved) == FTUN_OK &&
+          reserved == 2u);
+    CHECK(ftun_runtime_commit_reserved(core, &candidate, &host) == FTUN_OK &&
+          candidate == NULL);
+    CHECK(ftun_core_context_generation_reserved(core, &reserved) == FTUN_OK &&
+          reserved == 0u);
+  }
   CHECK(ftun_config_destroy(&second) == FTUN_OK && second == NULL);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
   CHECK(manager_info.generation == 2u && manager_info.retained_count == 1u);

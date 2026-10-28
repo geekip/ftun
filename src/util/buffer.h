@@ -41,7 +41,6 @@ typedef void (*ftun_buffer_ready_fn)(void *user);
 typedef void (*ftun_buffer_pool_wakeup_fn)(void *user);
 
 /* 引用缓冲与池。
- * 需求 REQ-PERF-001；任务 TASK-UTIL-002；目标 0.2.0；验收 TEST-UTIL-002。
  * 按 256 字节起的 2 次幂分档申请；直接 acquire 不保留闲置对象。
  * pool 同时用字节与对象数限制闲置保留，闲置期仍占用预算。
  * slice 创建时 retain owner，释放 slice 前数据保持有效。
@@ -93,8 +92,5 @@ ftun_status_t ftun_buffer_slice(ftun_buffer_t *buffer, size_t offset, size_t len
 ftun_status_t ftun_buffer_slice_clone(const ftun_buffer_slice_t *source,
                                       ftun_buffer_slice_t *out);
 ftun_status_t ftun_buffer_slice_data(const ftun_buffer_slice_t *slice, ftun_bytes_t *out);
-/* 返回 slice 实际占用的 Budget，供跨 owner 组合器校验统一资源树。 */
-ftun_status_t ftun_buffer_slice_budget(const ftun_buffer_slice_t *slice,
-                                       ftun_budget_t **out);
 ftun_status_t ftun_buffer_slice_release(ftun_buffer_slice_t *slice);
 #endif

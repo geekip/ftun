@@ -13,6 +13,8 @@ struct ftun_relay_direction {
   ftun_buffer_t *buffer;
   ftun_operation_t *operation;
   ftun_buffer_wait_token_t buffer_wait;
+  /* Operation 队列满时的等待节点；排队期间不重试写入，也不占用 owner 配额。 */
+  ftun_operation_waiter_t operation_wait;
   size_t offset;
   size_t length;
   size_t accepted;
@@ -25,6 +27,7 @@ struct ftun_relay_direction {
   int shutdown_blocked;
   int buffer_waiting;
   int buffer_ready;
+  int operation_waiting;
 };
 
 struct ftun_relay {
@@ -84,6 +87,10 @@ static ftun_status_t ftun_relay_cancel_direction(
       memset(&direction->buffer_wait, 0, sizeof(direction->buffer_wait));
     }
   }
+  if (direction->operation_waiting) {
+    (void)ftun_operation_queue_wait_cancel(&direction->operation_wait);
+    direction->operation_waiting = 0;
+  }
   if (direction->operation != NULL) {
     ftun_status_t current = ftun_operation_cancel(direction->operation);
     if (current == FTUN_E_STALE) current = FTUN_OK;
@@ -110,6 +117,16 @@ static ftun_status_t ftun_relay_fail(ftun_relay_t *relay,
     (void)ftun_relay_cancel_direction(&relay->right_to_left);
   }
   return cleanup == FTUN_OK ? status : cleanup;
+}
+
+static void ftun_relay_operation_ready(void *user)
+{
+  ftun_relay_direction_t *direction = (ftun_relay_direction_t *)user;
+  ftun_relay_t *relay;
+  if (direction == NULL || direction->relay == NULL) return;
+  relay = direction->relay;
+  direction->operation_waiting = 0;
+  if (relay->progress != NULL) relay->progress(relay->progress_user);
 }
 
 static void ftun_relay_buffer_ready(void *user)
@@ -260,18 +277,20 @@ static ftun_status_t ftun_relay_progress_direction(
   ftun_buffer_slice_t slice;
   ftun_operation_t *operation = NULL;
   size_t accepted = 0u;
+  ftun_stream_limit_t limit = FTUN_STREAM_LIMIT_NONE;
   ftun_status_t status;
   *did_work = 0;
   if (direction->write_pending || direction->shutdown_done) return FTUN_OK;
+  if (direction->operation_waiting) return FTUN_OK;
   if (direction->length != 0u) {
     if (direction->write_blocked && !destination_writable) return FTUN_OK;
     memset(&slice, 0, sizeof(slice));
     status = ftun_buffer_slice(direction->buffer, direction->offset,
                                direction->length, &slice);
     if (status != FTUN_OK) return status;
-    status = ftun_stream_write_ref_with_completion(
+    status = ftun_stream_write_ref_ex(
       direction->destination, &slice, ftun_relay_write_completed, direction,
-      &accepted, &operation);
+      &accepted, &operation, &limit);
     (void)ftun_buffer_slice_release(&slice);
     *did_work = 1;
     if (status == FTUN_E_AGAIN) {
@@ -280,6 +299,18 @@ static ftun_status_t ftun_relay_progress_direction(
     }
     if (status == FTUN_E_LIMIT) {
       direction->write_blocked = 0;
+      /* 全局 Operation 队列满：等有额度回收再重试，而不是每轮空转。 */
+      if (limit == FTUN_STREAM_LIMIT_OPERATIONS) {
+        status = ftun_operation_queue_wait(
+          ftun_stream_operations(direction->destination),
+          &direction->operation_wait, ftun_relay_operation_ready, direction);
+        if (status == FTUN_OK) {
+          direction->operation_waiting = 1;
+          *did_work = 0;
+        } else if (status != FTUN_E_AGAIN) {
+          return status;
+        }
+      }
       return FTUN_OK;
     }
     if (status != FTUN_OK) return status;
@@ -315,6 +346,7 @@ static int ftun_relay_direction_writable(const ftun_relay_direction_t *direction
 {
   const ftun_relay_t *relay = direction->relay;
   if (relay->stopped || direction->write_pending || direction->shutdown_done) return 0;
+  if (direction->operation_waiting) return 0;
   if (direction->length != 0u) return direction->write_blocked;
   return direction->source_eof && direction->shutdown_blocked;
 }
@@ -328,7 +360,7 @@ static int ftun_relay_complete(const ftun_relay_t *relay)
          relay->right_to_left.operation == NULL;
 }
 
-/* TASK-TRANSPORT-004 / TEST-TRANSPORT-004，目标 0.2.0：双向有界背压。 */
+/* 双向有界背压。 */
 ftun_status_t ftun_relay_start_with_options(
   ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
   const ftun_relay_options_t *options, ftun_relay_t **out)
@@ -382,19 +414,6 @@ ftun_status_t ftun_relay_start(ftun_core_t *core, ftun_stream_t *left,
     FTUN_RELAY_DEFAULT_MAX_WORK
   };
   return ftun_relay_start_with_options(core, left, right, &options, out);
-}
-
-ftun_status_t ftun_relay_start_with_pool(
-  ftun_core_t *core, ftun_stream_t *left, ftun_stream_t *right,
-  ftun_buffer_pool_t *pool, ftun_relay_t **out)
-{
-  const ftun_relay_options_t options = {
-    FTUN_RELAY_DEFAULT_HIGH_WATER,
-    FTUN_RELAY_DEFAULT_LOW_WATER,
-    FTUN_RELAY_DEFAULT_MAX_WORK
-  };
-  return ftun_relay_start_with_pool_options(core, left, right, pool, &options,
-                                             NULL, NULL, out);
 }
 
 ftun_status_t ftun_relay_start_with_pool_options(

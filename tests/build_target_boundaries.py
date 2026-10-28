@@ -72,6 +72,7 @@ expected_core = {
     "src/core/budget.c",
     "src/core/operation.c",
     "src/core/worker.c",
+    "src/core/recovery.c",
 }
 actual_core = {source for source, owner in owners.items() if owner == "ftun_core"}
 if actual_core != expected_core:
@@ -79,6 +80,9 @@ if actual_core != expected_core:
 
 expected_app = {
     "src/app/runtime.c",
+    "src/app/reload_txn.c",
+    "src/app/cleanup_driver.c",
+    "src/app/watchdog.c",
     "src/app/composition/default.c",
     "src/app/cli/dispatch.c",
     "src/app/cli/run.c",
@@ -97,8 +101,6 @@ required_app_paths = {
     "src/app/main.c",
     "src/app/cli/cli.h",
     "src/app/cli/internal.h",
-    "src/app/api/api.c",
-    "src/app/api/api.h",
 } | expected_app
 required_app_paths.add("src/app/runtime_support.h")
 missing_app_paths = {
@@ -126,6 +128,12 @@ required_proxy = {
     "src/proxy/service.c",
     "src/proxy/bindings.c",
     "src/proxy/runtime.c",
+    "src/proxy/listener.c",
+    "src/proxy/tcp_flow.c",
+    "src/proxy/udp_assoc.c",
+    "src/proxy/tun_bridge.c",
+    "src/proxy/maintenance.c",
+    "src/proxy/deadline.c",
     "src/proxy/dns/dispatch_adapter.c",
     "src/proxy/dns/runtime_adapter.c",
     "src/proxy/dns/control_path_adapter.c",
@@ -133,14 +141,12 @@ required_proxy = {
     "src/proxy/runtime_state.c",
     "src/proxy/session.c",
     "src/proxy/route/router.c",
-    "src/proxy/inbound/inbound.c",
     "src/proxy/inbound/socks5.c",
     "src/proxy/inbound/mixed.c",
     "src/proxy/outbound/outbound.c",
     "src/proxy/outbound/direct.c",
     "src/proxy/outbound/reject.c",
     "src/proxy/outbound/socks5.c",
-    "src/proxy/group/select.c",
     "src/proxy/group/url_test.c",
     "src/proxy/group/health.c",
     "src/proxy/sniff/sniff.c",
@@ -163,13 +169,9 @@ else:
     if missing_proxy:
         fail(f"Proxy target lost sources: {sorted(missing_proxy)}")
 proxy_migration_paths = {
-    "src/proxy/inbound/anytls.c",
-    "src/proxy/inbound/anytls.h",
     "src/proxy/inbound/inbound.h",
     "src/proxy/inbound/mixed.h",
     "src/proxy/inbound/socks5.h",
-    "src/proxy/outbound/anytls.c",
-    "src/proxy/outbound/anytls.h",
     "src/proxy/outbound/direct.h",
     "src/proxy/outbound/outbound.h",
     "src/proxy/outbound/reject.h",
@@ -179,7 +181,6 @@ proxy_migration_paths = {
     "src/proxy/tun/lwip_port/lwipopts.h",
     "src/proxy/tun/lwip_port/arch/cc.h",
     "src/proxy/tun/lwip_port/arch/perf.h",
-    "src/proxy/group/select.h",
     "src/proxy/group/url_test.h",
     "src/proxy/group/health.h",
     "src/proxy/sniff/sniff.h",
@@ -189,7 +190,6 @@ proxy_migration_paths = {
     "src/proxy/frs/frs.h",
     "src/proxy/frs/ip.h",
     "src/proxy/frs/domain.h",
-    "src/proxy/frs/update.h",
     "src/proxy/state/fakeip_store.h",
     "src/proxy/state/fakeip_store_internal.h",
     "src/proxy/state/fakeip_snapshot.h",
@@ -211,12 +211,13 @@ if remaining_proxy_roots:
 required_shared = {
     "src/config/config.c",
     "src/event/event.c",
+    "src/network/address.c",
     "src/network/view.c",
     "src/network/resolver.c",
     "src/transport/path.c",
     "src/transport/control_channel.c",
-    "src/transport/carrier.c",
     "src/transport/stream.c",
+    "src/transport/connector.c",
     "src/dns/control_transport.c",
     "src/platform/system_resolver.c",
     "src/util/buffer.c",
@@ -231,8 +232,12 @@ if missing_shared:
 dns_sources = {
     "src/dns/dispatcher.c",
     "src/dns/service.c",
+    "src/dns/upstream.c",
+    "src/dns/plan.c",
+    "src/dns/listener_runtime.c",
     "src/dns/core_service.c",
     "src/dns/server.c",
+    "src/dns/upstream_set.c",
     "src/dns/listener.c",
     "src/dns/bootstrap.c",
     "src/dns/cache.c",
@@ -330,7 +335,6 @@ expected_optional_sources = {
         "src/proxy/frs/frs.c",
         "src/proxy/frs/ip.c",
         "src/proxy/frs/domain.c",
-        "src/proxy/frs/update.c",
     },
 }
 for module, expected in expected_optional_sources.items():
@@ -340,17 +344,6 @@ for module, expected in expected_optional_sources.items():
     actual = {source for source, owner in owners.items() if owner == target}
     if actual != expected:
         fail(f"{module} source set drifted: {sorted(actual ^ expected)}")
-
-deferred = {
-    "src/app/api/api.c",
-    "src/proxy/inbound/anytls.c",
-    "src/proxy/outbound/anytls.c",
-    "src/protocol/anytls.c",
-    "src/protocol/uot.c",
-}
-present_deferred = deferred & owners.keys()
-if present_deferred:
-    fail(f"unimplemented sources entered targets: {sorted(present_deferred)}")
 
 private_include = re.compile(r'^\s*#\s*include\s+"(?:proxy|mesh)/')
 for source in sorted(expected_core | actual_shared | actual_tun | actual_dns):

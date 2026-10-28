@@ -241,7 +241,7 @@ static int timer_index_contract(void)
   return 0;
 }
 
-/* TASK-EVENT-001 / TEST-EVENT-001：I/O、timer、wakeup 与 stop/drain。 */
+/* I/O、timer、wakeup 与 stop/drain。 */
 static int owner_tasks(void)
 {
   ftun_event_loop_t *loop = NULL;

@@ -71,7 +71,7 @@ static int compile_text(const char *text, ftun_feature_plan_t **out)
   return status == FTUN_OK && *out != NULL;
 }
 
-/* TASK-CONFIG-004 / TEST-CONFIG-004：依赖闭包、阶段和原规则顺序。 */
+/* 依赖闭包、阶段和原规则顺序。 */
 int main(int argc, char **argv)
 {
   static const char unused[] =

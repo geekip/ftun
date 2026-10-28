@@ -319,7 +319,9 @@ static ftun_status_t destroy_until(void **out, uint64_t deadline)
 static const ftun_core_service_descriptor_t descriptor = {
   "cleanup-test", plan_prepare, plan_destroy, prepare, activate,
   reload_prepare, reload_planned, reload_commit, reload_abort,
-  run_once, wakeup, success, stop_until, stop_until, destroy_until
+  run_once, wakeup, success, stop_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static void *shorten_stop(void *user)

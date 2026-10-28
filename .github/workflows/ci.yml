@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  # Debug 构建：全部单元、契约、产品和模块矩阵测试；随后以 root 运行需要私有
+  # 网络/挂载命名空间的恢复契约场景（非 root 时这些场景以 77 跳过）。
+  debug:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake make gcc python3 python3-jsonschema iproute2 nftables util-linux
+      - name: Configure and build
+        run: |
+          cmake --preset debug
+          cmake --build --preset debug --parallel
+      - name: Test
+        run: ctest --preset debug --output-on-failure --parallel 2
+      - name: Resilience scenarios (privileged)
+        run: |
+          sudo --preserve-env=PATH env "PATH=${PATH}" \
+            ctest --preset debug --output-on-failure -R '^resilience-'
+
+  # ASan + UBSan：同一组测试，恢复契约场景同样以 root 运行。
+  sanitize:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build and lab tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake make gcc python3 python3-jsonschema iproute2 nftables util-linux
+      - name: Configure and build
+        run: |
+          cmake --preset sanitize
+          cmake --build --preset sanitize --parallel
+      - name: Test
+        run: ctest --preset sanitize --output-on-failure --parallel 2 -E '^resilience-'
+      - name: Resilience scenarios (privileged)
+        run: |
+          sudo --preserve-env=PATH env "PATH=${PATH}" \
+            ctest --preset sanitize --output-on-failure -R '^resilience-'
+
+  # TSan：Worker、看门狗、A0、netmon、控制门、预算根锁、日志发布等跨线程路径。
+  tsan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            cmake make gcc python3 python3-jsonschema iproute2 nftables util-linux
+      - name: Relax address-space randomization for TSan
+        run: sudo sysctl -w vm.mmap_rnd_bits=28
+      - name: Configure and build
+        run: |
+          cmake --preset tsan
+          cmake --build --preset tsan --parallel
+      - name: Test
+        run: ctest --preset tsan --output-on-failure --parallel 2 -E '^resilience-'
+
+  # 静态 musl 发布目标：编译和单元测试（与 release 工作流使用同一预设）。
+  musl:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install musl build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            binutils cmake file make musl-tools python3
+          musl_cc="$(command -v x86_64-linux-musl-gcc || command -v musl-gcc)"
+          musl_ar="$(command -v x86_64-linux-musl-gcc-ar || command -v gcc-ar || command -v ar)"
+          musl_ranlib="$(command -v x86_64-linux-musl-gcc-ranlib || command -v gcc-ranlib || command -v ranlib)"
+          printf 'FTUN_MUSL_CC=%s\n' "${musl_cc}" >> "${GITHUB_ENV}"
+          printf 'FTUN_MUSL_AR=%s\n' "${musl_ar}" >> "${GITHUB_ENV}"
+          printf 'FTUN_MUSL_RANLIB=%s\n' "${musl_ranlib}" >> "${GITHUB_ENV}"
+      - name: Configure, build and test
+        run: |
+          cmake --preset linux-x86_64-musl
+          cmake --build --preset linux-x86_64-musl --parallel
+          ctest --preset linux-x86_64-musl --output-on-failure --parallel 2
+
+  # fuzz 冒烟：fuzz 设施（B9）落地前没有匹配的测试，--no-tests=ignore 让它先空过；
+  # 设施就绪后在这里以固定迭代次数运行，不引入新的流程改动。
+  fuzz-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y cmake make gcc python3
+      - name: Configure, build and run fuzz smoke
+        run: |
+          cmake --preset debug
+          cmake --build --preset debug --parallel
+          ctest --preset debug --output-on-failure -R '^fuzz-' --no-tests=ignore

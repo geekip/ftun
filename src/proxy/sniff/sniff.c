@@ -3,7 +3,7 @@
 #include "tls_sni.h"
 #include <string.h>
 
-/* REQ-SNIFF-001 / TASK-SNIFF-001 / TEST-SNIFF-001，目标 0.5.0：
+/* 
  * ftun_sniff_domain 只补缺失域名且不消费预读字节。 */
 
 ftun_status_t ftun_sniff_domain_with_budget(ftun_budget_t *budget, const ftun_metadata_t *metadata, ftun_bytes_t preread, ftun_sniff_result_t *out)

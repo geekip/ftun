@@ -4,6 +4,7 @@
 #include "core/budget.h"
 #include "core/operation.h"
 #include "dns/cache.h"
+#include "dns/upstream_set.h"
 
 typedef void (*ftun_dns_transport_completion_fn)(
   void *user, ftun_status_t status, ftun_dns_transport_t transport,
@@ -47,6 +48,10 @@ typedef struct {
   ftun_budget_t *budget;
   ftun_operation_queue_t *operations;
   ftun_endpoint_t upstream;
+  /* 可选，被借用：同一服务器的多个上游地址（配置顺序即优先级）及其被动健康。
+   * 提供时 upstream 必须等于集合的第一个地址；网络类失败（超时、不可达）
+   * 记入集合，并在剩余期限内最多换一个地址重试。 */
+  ftun_upstream_set_t *upstream_set;
   uint32_t outbound_id;
   uint64_t fingerprint;
   ftun_dns_transport_t transport;
@@ -74,7 +79,6 @@ ftun_status_t ftun_dns_server_get_info(const ftun_dns_server_t *server,
                                        ftun_dns_server_info_t *out);
 
 /* 真实 DNS 传输。
- * 需求 REQ-DNS-001；任务 TASK-DNS-002；目标 0.3.0；验收 TEST-DNS-002。
  * server.outbound 只固定 QueryTransport 通道，入口只接受 REAL 请求；响应按
  * ID、Question、实际端点和 transport 关联。UDP TC 在同一 server/出口和
  * 原绝对 deadline 下切 TCP，不重新进行策略选择。接纳后复制全部请求字节，

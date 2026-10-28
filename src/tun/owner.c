@@ -1,11 +1,13 @@
 #include "tun/owner.h"
 
 #include "event/event.h"
+#include "network/address.h"
 #include "util/buffer.h"
 #include "util/time.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -24,6 +26,8 @@ typedef struct {
   uint8_t prefix_length;
   uint32_t mtu;
   uint32_t protection_mark;
+  uint32_t route_table;
+  uint32_t rule_priority;
   bool auto_route;
   bool strict_route;
 } ftun_tun_owner_plan_t;
@@ -73,7 +77,20 @@ typedef struct {
   bool rebuilding_device;
   bool async_cleanup;
   bool async_release_started;
+  /* 网络对账与设备重建的重试。network_changed 只置位 repair_requested 并唤醒
+   * 循环，其余状态只由 owner-loop 访问。*/
+  _Atomic bool repair_requested;
+  bool repairing;
+  uint32_t repair_streak;
+  uint32_t device_streak;
+  uint64_t repair_due_ms;
+  uint64_t device_due_ms;
+  ftun_event_source_t *retry_timer;
 } ftun_tun_owner_t;
+
+#define FTUN_TUN_OWNER_REPAIR_DEADLINE_MS 5000u
+#define FTUN_TUN_OWNER_RETRY_MIN_MS 1000u
+#define FTUN_TUN_OWNER_RETRY_MAX_MS 30000u
 
 static bool ftun_tun_owner_async_supported(const ftun_tun_owner_t *owner);
 static ftun_status_t ftun_tun_owner_change(void *context, bool rebuild,
@@ -82,22 +99,12 @@ static ftun_status_t ftun_tun_owner_change(void *context, bool rebuild,
 static ftun_status_t ftun_tun_owner_parse_cidr(
   const char *text, uint8_t address[4], uint8_t *prefix)
 {
-  const char *slash;
-  char ip[INET_ADDRSTRLEN];
-  char *tail = NULL;
-  unsigned long value;
-  size_t length;
+  ftun_cidr_t cidr;
   if (text == NULL || address == NULL || prefix == NULL ||
-      (slash = strchr(text, '/')) == NULL) return FTUN_E_INVALID;
-  length = (size_t)(slash - text);
-  if (length == 0u || length >= sizeof(ip)) return FTUN_E_INVALID;
-  memcpy(ip, text, length);
-  ip[length] = '\0';
-  errno = 0;
-  value = strtoul(slash + 1u, &tail, 10);
-  if (errno != 0 || tail == slash + 1u || *tail != '\0' || value > 32u ||
-      inet_pton(AF_INET, ip, address) != 1) return FTUN_E_INVALID;
-  *prefix = (uint8_t)value;
+      !ftun_cidr_parse(text, strlen(text), false, &cidr) ||
+      cidr.address.family != FTUN_IP_V4) return FTUN_E_INVALID;
+  memcpy(address, cidr.address.bytes, 4u);
+  *prefix = cidr.prefix;
   return FTUN_OK;
 }
 
@@ -120,6 +127,8 @@ static ftun_status_t ftun_tun_owner_plan_build(
   out->auto_route = config->tun.auto_route;
   out->strict_route = config->tun.strict_route;
   out->protection_mark = config->tun.auto_route ? protection_mark : 0u;
+  out->route_table = config->tun.route_table;
+  out->rule_priority = config->tun.rule_priority;
   status = ftun_tun_owner_parse_cidr(
     config->tun.ipv4_address, out->address, &out->prefix_length);
   return status;
@@ -133,6 +142,8 @@ static int ftun_tun_owner_plan_equal(
     memcmp(left->address, right->address, sizeof(left->address)) == 0 &&
     left->prefix_length == right->prefix_length && left->mtu == right->mtu &&
     left->protection_mark == right->protection_mark &&
+    left->route_table == right->route_table &&
+    left->rule_priority == right->rule_priority &&
     left->auto_route == right->auto_route &&
     left->strict_route == right->strict_route;
 }
@@ -200,6 +211,8 @@ static ftun_status_t ftun_tun_owner_network_restore(void *context)
   memcpy(spec.ipv4_address, owner->network_plan.address, sizeof(spec.ipv4_address));
   spec.prefix_length = owner->network_plan.prefix_length;
   spec.protection_mark = owner->network_plan.protection_mark;
+  spec.route_table = owner->network_plan.route_table;
+  spec.rule_priority = owner->network_plan.rule_priority;
   spec.strict_route = owner->network_plan.strict_route;
   return owner->network.restore(owner->network.context, &spec, &owner->routes);
 }
@@ -355,6 +368,51 @@ static void ftun_tun_owner_update_result(ftun_tun_owner_t *owner)
   owner->network_result.pending = owner->network_updating;
 }
 
+static uint64_t ftun_tun_owner_backoff(uint32_t streak)
+{
+  uint64_t delay = FTUN_TUN_OWNER_RETRY_MIN_MS;
+  while (streak > 1u && delay < FTUN_TUN_OWNER_RETRY_MAX_MS) {
+    delay *= 2u;
+    streak--;
+  }
+  return delay > FTUN_TUN_OWNER_RETRY_MAX_MS ? FTUN_TUN_OWNER_RETRY_MAX_MS : delay;
+}
+
+static void ftun_tun_owner_retry_timer(ftun_event_source_t *source,
+  uint32_t events, void *user)
+{
+  (void)source;
+  (void)events;
+  (void)user;
+}
+
+/* 以最早的重试时刻重新登记唤醒；到期判断仍由 run_once 按单调时钟比较。 */
+static void ftun_tun_owner_arm_retry(ftun_tun_owner_t *owner)
+{
+  uint64_t due = owner->repair_due_ms;
+  if (owner->device_due_ms != 0u && (due == 0u || owner->device_due_ms < due)) {
+    due = owner->device_due_ms;
+  }
+  (void)ftun_event_source_cancel(&owner->retry_timer);
+  if (due == 0u || owner->loop == NULL) return;
+  (void)ftun_event_timer_start(owner->loop, due, ftun_tun_owner_retry_timer,
+    owner, &owner->retry_timer);
+}
+
+static void ftun_tun_owner_schedule_device(ftun_tun_owner_t *owner, uint64_t now_ms)
+{
+  if (owner->device_streak != UINT32_MAX) owner->device_streak++;
+  owner->device_due_ms = now_ms + ftun_tun_owner_backoff(owner->device_streak);
+  ftun_tun_owner_arm_retry(owner);
+}
+
+static void ftun_tun_owner_schedule_repair(ftun_tun_owner_t *owner, uint64_t now_ms)
+{
+  if (owner->repair_streak != UINT32_MAX) owner->repair_streak++;
+  owner->repair_due_ms = now_ms + ftun_tun_owner_backoff(owner->repair_streak);
+  ftun_tun_owner_arm_retry(owner);
+}
+
 static void ftun_tun_owner_update_done(ftun_tun_owner_t *owner,
   ftun_status_t status)
 {
@@ -363,6 +421,18 @@ static void ftun_tun_owner_update_done(ftun_tun_owner_t *owner,
   owner->network_timer_ready = false;
   if (status != FTUN_OK) {
     (void)ftun_tun_service_network_finish(owner->service, status);
+  }
+  if (owner->rebuilding_device) {
+    uint64_t now_ms = 0u;
+    ftun_tun_service_usage_t usage;
+    if (status == FTUN_OK) {
+      owner->device_streak = 0u;
+      owner->device_due_ms = 0u;
+    } else if (ftun_tun_service_get_usage(owner->service, &usage) == FTUN_OK &&
+               usage.device_lost && ftun_monotonic_now(&now_ms) == FTUN_OK) {
+      /* 只有设备确实丢失才退避重试；重建由调用方显式发起并失败时不自动重试。 */
+      ftun_tun_owner_schedule_device(owner, now_ms);
+    }
   }
   owner->network_updating = false;
   owner->rebuilding_device = false;
@@ -396,7 +466,7 @@ static ftun_status_t ftun_tun_owner_begin_change(ftun_tun_owner_t *owner,
   uint64_t expected_network_generation, uint64_t deadline_ms, bool rebuild)
 {
   ftun_status_t status;
-  if (owner->network_timer != NULL) return FTUN_E_AGAIN;
+  if (owner->network_timer != NULL || owner->repairing) return FTUN_E_AGAIN;
   status = ftun_event_timer_start(owner->loop, deadline_ms,
     ftun_tun_owner_deadline, owner, &owner->network_timer);
   if (status != FTUN_OK) return status;
@@ -603,6 +673,8 @@ static ftun_status_t ftun_tun_owner_update_run(
     memcpy(spec.ipv4_address, plan->address, sizeof(spec.ipv4_address));
     spec.prefix_length = plan->prefix_length;
     spec.protection_mark = plan->protection_mark;
+    spec.route_table = plan->route_table;
+    spec.rule_priority = plan->rule_priority;
     spec.strict_route = plan->strict_route;
     status = ops->start(ops->context, &spec, &options, &owner->async_routes);
     if (status != FTUN_OK) {
@@ -670,6 +742,107 @@ static ftun_status_t ftun_tun_owner_update_run(
   }
   ftun_tun_owner_update_result(owner);
   return FTUN_OK;
+}
+
+/* 网络变化后核对自有地址、规则和路由，只补回缺失项；失败退避重试，不撤销现状。 */
+static ftun_status_t ftun_tun_owner_repair_run(
+  ftun_tun_owner_t *owner, uint64_t now_ms, size_t *out_work)
+{
+  ftun_interface_async_ops_t *ops = &owner->network.async;
+  ftun_interface_async_info_t info;
+  ftun_status_t status;
+  size_t work = 0u;
+  *out_work = 0u;
+  if (!owner->active || owner->quiesced || owner->network_updating ||
+      ops->repair == NULL || !owner->network_plan.auto_route) return FTUN_OK;
+  if (!owner->repairing) {
+    bool due = owner->repair_due_ms != 0u && now_ms >= owner->repair_due_ms;
+    ftun_interface_async_options_t options = {owner->budget, owner->loop,
+      now_ms, 250u, now_ms + FTUN_TUN_OWNER_REPAIR_DEADLINE_MS};
+    if (!atomic_exchange(&owner->repair_requested, false) && !due) return FTUN_OK;
+    if (due) owner->repair_due_ms = 0u;
+    if (owner->routes != NULL) {
+      status = ftun_buffer_pool_trim(owner->buffers, 0u);
+      if (status == FTUN_OK) status = ops->adopt(ops->context, &owner->routes,
+        &options, &owner->async_routes);
+      if (status != FTUN_OK) {
+        ftun_tun_owner_schedule_repair(owner, now_ms);
+        return FTUN_OK;
+      }
+    }
+    if (owner->async_routes == NULL) return FTUN_OK;
+    status = ops->query(ops->context, owner->async_routes, &info);
+    if (status != FTUN_OK || info.state != FTUN_INTERFACE_READY) return FTUN_OK;
+    status = ops->repair(ops->context, owner->async_routes, now_ms,
+      options.deadline_ms);
+    if (status != FTUN_OK) {
+      ftun_tun_owner_schedule_repair(owner, now_ms);
+      return FTUN_OK;
+    }
+    owner->repairing = true;
+    *out_work = 1u;
+  }
+  status = ops->run(ops->context, owner->async_routes, now_ms,
+    FTUN_TUN_OWNER_IO_QUOTA, &work);
+  *out_work += work;
+  if (status != FTUN_OK) return status;
+  status = ops->query(ops->context, owner->async_routes, &info);
+  if (status != FTUN_OK) return status;
+  if (info.repairing && info.state == FTUN_INTERFACE_INSTALLING) return FTUN_OK;
+  owner->repairing = false;
+  if (info.state != FTUN_INTERFACE_READY) return FTUN_OK;
+  if (info.repair_result == FTUN_OK) {
+    owner->repair_streak = 0u;
+  } else {
+    ftun_tun_owner_schedule_repair(owner, now_ms);
+  }
+  return FTUN_OK;
+}
+
+/* 设备丢失（被外部删除）后的重建重试：已在重建则等待其结果，否则按退避重新发起。 */
+static void ftun_tun_owner_device_run(ftun_tun_owner_t *owner, uint64_t now_ms)
+{
+  ftun_tun_service_usage_t usage;
+  if (!owner->active || owner->quiesced || owner->network_updating) return;
+  if (ftun_tun_service_get_usage(owner->service, &usage) != FTUN_OK) return;
+  if (!usage.device_lost) {
+    owner->device_streak = 0u;
+    owner->device_due_ms = 0u;
+    return;
+  }
+  if (owner->device_due_ms > now_ms) return;
+  owner->device_due_ms = 0u;
+  (void)ftun_tun_service_rebuild(owner->service);
+  if (owner->network_updating) return;
+  if (ftun_tun_service_get_usage(owner->service, &usage) == FTUN_OK &&
+      !usage.device_lost) {
+    owner->device_streak = 0u;
+    return;
+  }
+  ftun_tun_owner_schedule_device(owner, now_ms);
+}
+
+static void ftun_tun_owner_network_changed(void *implementation,
+  const ftun_network_change_t *change, uint64_t now_ms)
+{
+  ftun_tun_owner_t *owner = (ftun_tun_owner_t *)implementation;
+  (void)change;
+  (void)now_ms;
+  if (owner == NULL) return;
+  atomic_store(&owner->repair_requested, true);
+  if (owner->loop != NULL) (void)ftun_event_loop_wakeup(owner->loop);
+}
+
+static bool ftun_tun_owner_repair_runnable(ftun_tun_owner_t *owner)
+{
+  ftun_interface_async_info_t info;
+  if (atomic_load(&owner->repair_requested)) return true;
+  if (!owner->repairing) return false;
+  if (owner->async_routes == NULL ||
+      owner->network.async.query(owner->network.async.context, owner->async_routes, &info) != FTUN_OK) {
+    return true;
+  }
+  return info.runnable || !info.repairing;
 }
 
 static bool ftun_tun_owner_update_runnable(ftun_tun_owner_t *owner)
@@ -852,7 +1025,8 @@ static ftun_status_t ftun_tun_owner_run_once(
   if (status != FTUN_OK) return status;
   status = ftun_tun_service_get_usage(owner->service, &service_usage);
   if (status != FTUN_OK) return status;
-  block = may_block && !service_usage.ready && !ftun_tun_owner_update_runnable(owner);
+  block = may_block && !service_usage.ready && !ftun_tun_owner_update_runnable(owner) &&
+    !ftun_tun_owner_repair_runnable(owner);
   status = ftun_monotonic_now(&before_event_ms);
   if (status != FTUN_OK) return status;
   status = ftun_event_loop_run_once(
@@ -867,8 +1041,14 @@ static ftun_status_t ftun_tun_owner_run_once(
   if (status != FTUN_OK) return status;
   after_event_ms = now_ms;
   if (status == FTUN_OK) status = ftun_tun_owner_update_run(owner, now_ms, &network_work);
+  if (status == FTUN_OK) {
+    size_t repair_work = 0u;
+    status = ftun_tun_owner_repair_run(owner, now_ms, &repair_work);
+    network_work += repair_work;
+  }
   if (status == FTUN_OK) status = ftun_tun_service_run(owner->service, &work);
   if (status != FTUN_OK) return status;
+  ftun_tun_owner_device_run(owner, now_ms);
   status = ftun_event_loop_get_usage(owner->loop, &event_usage);
   if (status != FTUN_OK) return status;
   out_usage->work = event_usage.last_work > SIZE_MAX - work ? SIZE_MAX : event_usage.last_work + work;
@@ -915,6 +1095,11 @@ static ftun_status_t ftun_tun_owner_quiesce(void *implementation)
   status = ftun_event_source_cancel(&owner->network_timer);
   if (status != FTUN_OK) return status;
   owner->network_timer_ready = false;
+  status = ftun_event_source_cancel(&owner->retry_timer);
+  if (status != FTUN_OK) return status;
+  owner->repairing = false;
+  owner->repair_due_ms = 0u;
+  owner->device_due_ms = 0u;
   if (owner->reload_prepared) {
     status = ftun_tun_owner_reload_abort(owner);
     if (status != FTUN_OK) return status;
@@ -1055,5 +1240,7 @@ const ftun_core_service_descriptor_t ftun_tun_owner_service = {
   ftun_tun_owner_quiesce,
   ftun_tun_owner_drain_until,
   ftun_tun_owner_stop_until,
-  ftun_tun_owner_destroy_until
+  ftun_tun_owner_destroy_until,
+  NULL, /* maintain_once：尚未支持暂停 */
+  ftun_tun_owner_network_changed
 };

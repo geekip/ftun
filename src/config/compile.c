@@ -545,7 +545,7 @@ ftun_status_t ftun_feature_plan_destroy(ftun_feature_plan_t **plan)
   return FTUN_OK;
 }
 
-/* TASK-CONFIG-004 / TEST-CONFIG-004，目标 0.2.0：依赖闭包与资源计划。 */
+/* 依赖闭包与资源计划。 */
 ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan_t **out)
 {
   ftun_feature_plan_t *plan;

@@ -1,6 +1,6 @@
 #include "ip.h"
 
-/* TASK-FRS-002 / TEST-FRS-002：IPv4 合并区间查询，目标 0.4.0。 */
+/* IPv4 合并区间查询。 */
 
 ftun_status_t ftun_frs_ip_contains(const ftun_frs_set_t *set,
                                    const uint8_t ipv4[4], bool *out)

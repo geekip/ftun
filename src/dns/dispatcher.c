@@ -3,8 +3,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-DNS-001；任务 TASK-DNS-001；目标 0.3.0；验收 TEST-DNS-001。 */
-
 typedef struct {
   ftun_dns_dispatcher_t *dispatcher;
   ftun_operation_t *operation;
@@ -232,6 +230,53 @@ ftun_status_t ftun_dns_dispatcher_get_info(
   if (dispatcher == NULL || out == NULL) return FTUN_E_INVALID;
   out->server_count = dispatcher->server_count;
   out->inflight_local = dispatcher->inflight_local;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_dns_dispatcher_validate(
+  const ftun_dns_dispatcher_t *dispatcher, const ftun_dns_query_t *query)
+{
+  if (dispatcher == NULL) return FTUN_E_INVALID;
+  return ftun_dns_query_request_validate(dispatcher->budget, query);
+}
+
+const ftun_config_t *ftun_dns_dispatcher_config_scope(
+  const ftun_dns_dispatcher_t *dispatcher)
+{
+  return dispatcher == NULL ? NULL : dispatcher->config_scope;
+}
+
+ftun_status_t ftun_dns_dispatcher_select(
+  const ftun_dns_dispatcher_t *dispatcher, uint32_t outbound_id,
+  size_t *out_server)
+{
+  if (out_server != NULL) *out_server = 0u;
+  if (dispatcher == NULL || out_server == NULL ||
+      dispatcher->select_server == NULL) return FTUN_E_INVALID;
+  return dispatcher->select_server(outbound_id, out_server,
+                                   dispatcher->select_user);
+}
+
+ftun_status_t ftun_dns_dispatcher_select_named(
+  const ftun_dns_dispatcher_t *dispatcher, ftun_string_t name,
+  size_t *out_server)
+{
+  if (out_server != NULL) *out_server = 0u;
+  if (dispatcher == NULL || out_server == NULL) return FTUN_E_INVALID;
+  if (dispatcher->select_named_server == NULL) return FTUN_E_UNSUPPORTED;
+  return dispatcher->select_named_server(name, out_server,
+                                         dispatcher->select_user);
+}
+
+ftun_status_t ftun_dns_dispatcher_server(
+  const ftun_dns_dispatcher_t *dispatcher, size_t index,
+  ftun_dns_server_t **out)
+{
+  if (out != NULL) *out = NULL;
+  if (dispatcher == NULL || out == NULL || index >= dispatcher->server_count) {
+    return FTUN_E_INVALID;
+  }
+  *out = dispatcher->servers[index];
   return FTUN_OK;
 }
 

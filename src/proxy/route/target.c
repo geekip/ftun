@@ -59,7 +59,7 @@ static int ftun_target_valid(const ftun_target_t *target)
          target->allowed_count <= target->candidate_count;
 }
 
-/* TASK-ROUTE-003 / TEST-ROUTE-003，目标 0.2.0：身份、候选和拨号地址分离。 */
+/* 身份、候选和拨号地址分离。 */
 ftun_status_t ftun_target_from_metadata(const ftun_metadata_t *metadata,
                                         ftun_target_t *out)
 {

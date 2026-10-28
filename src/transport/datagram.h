@@ -74,7 +74,6 @@ ftun_status_t ftun_packet_view(const ftun_packet_t *packet, ftun_bytes_t *out);
 ftun_status_t ftun_packet_release(ftun_packet_t *packet);
 
 /* 整包发送接口。
- * 需求 REQ-UDP-001；任务 TASK-TRANSPORT-003；目标 0.2.0；验收 TEST-TRANSPORT-003。
  * OK 只表示整包已发送或进入有界 backend 队列，不表示远端收到；AGAIN 和
  * 其他同步错误都完全未接纳。目标、payload 边界和 source_id 在完成前保留。
  * send token 按值复制并带 generation；complete/cancel 成功即为 backend 静默点，

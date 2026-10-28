@@ -725,7 +725,7 @@ static int test_queue_budget(void)
   return 0;
 }
 
-/* TASK-TRANSPORT-003 / TEST-TRANSPORT-003：整包、零长 payload 与来源。 */
+/* 整包、零长 payload 与来源。 */
 int main(void)
 {
   CHECK(test_queue_budget() == 0);

@@ -107,7 +107,7 @@ static char *make_large_array(size_t count)
   return text;
 }
 
-/* TASK-CONFIG-002 / TEST-CONFIG-002：有界解析、类型模型和失败清理。 */
+/* 有界解析、类型模型和失败清理。 */
 int main(int argc, char **argv)
 {
   static const char disabled_dns[] =
@@ -138,7 +138,7 @@ int main(int argc, char **argv)
   CHECK(config->inbound_count == 3u &&
         config->inbounds[2].kind == FTUN_CONFIG_INBOUND_TUN &&
         config->inbounds[2].mtu == 1500u && config->inbounds[2].strict_route);
-  CHECK(config->tun.present && !config->tun.legacy_fields &&
+  CHECK(config->tun.present &&
         strcmp(config->tun.interface_name, "ftun0") == 0 &&
         config->tun.mtu == 1500u &&
         strcmp(config->tun.ipv4_address, "172.19.0.1/30") == 0 &&
@@ -152,21 +152,12 @@ int main(int argc, char **argv)
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
-  CHECK(parse_text("{\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
-                   "\"interface\":{\"name\":\"ftun0\",\"mtu\":1420},"
-                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
-                   "\"auto-route\":true}]}", &config) == FTUN_OK);
-  CHECK(config->tun.present && config->tun.legacy_fields &&
-        strcmp(config->tun.interface_name, "ftun0") == 0 &&
-        config->tun.mtu == 1420u && config->tun.auto_route);
-  CHECK(ftun_config_destroy(&config) == FTUN_OK);
-
   CHECK(parse_text("{\"tun\":{\"interface\":\"ftun0\",\"mtu\":1420,"
                    "\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
                    "\"auto-route\":true,\"strict-route\":true},"
                    "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\"}]}",
                    &config) == FTUN_OK);
-  CHECK(config->tun.present && !config->tun.legacy_fields &&
+  CHECK(config->tun.present &&
         config->tun.mtu == 1420u && config->inbound_count == 1u &&
         strcmp(config->inbounds[0].interface_name, "ftun0") == 0 &&
         config->inbounds[0].mtu == 1420u &&
@@ -174,20 +165,17 @@ int main(int argc, char **argv)
         config->inbounds[0].auto_route && config->inbounds[0].strict_route);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
 
-  CHECK(parse_text("{\"tun\":{\"interface\":\"ftun0\",\"mtu\":1420,"
-                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"}},"
-                   "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
-                   "\"interface\":{\"name\":\"ftun0\",\"mtu\":1420},"
-                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"}}]}",
-                   &config) == FTUN_OK);
-  CHECK(config->tun.present && config->tun.legacy_fields);
-  CHECK(ftun_config_destroy(&config) == FTUN_OK);
-
+  /* 设备字段只允许出现在顶层 tun；TUN inbound 带设备字段，或缺少顶层 tun，都被拒绝。 */
   CHECK(expect_status("{\"tun\":{\"interface\":\"ftun0\","
                       "\"ipv4\":{\"address\":\"172.19.0.1/30\"}},"
                       "\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
-                      "\"interface\":{\"name\":\"other0\"},"
+                      "\"interface\":{\"name\":\"ftun0\"}}]}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\","
+                      "\"interface\":{\"name\":\"ftun0\"},"
                       "\"ipv4\":{\"address\":\"172.19.0.1/30\"}}]}",
+                      FTUN_E_INVALID));
+  CHECK(expect_status("{\"inbounds\":[{\"name\":\"tun-in\",\"type\":\"tun\"}]}",
                       FTUN_E_INVALID));
 
   CHECK(parse_text("{}", &config) == FTUN_OK);
@@ -199,6 +187,78 @@ int main(int argc, char **argv)
         strcmp(config->dns.fake_ip.range, "198.18.0.0/15") == 0 &&
         config->sniff.tls_sni && config->sniff.http_host);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
+
+  /* 网络标识：默认值与自定义值。 */
+  CHECK(parse_text("{}", &config) == FTUN_OK);
+  CHECK(config->base.routing_mark == 0x4654u && config->tun.route_table == 18004u &&
+        config->tun.rule_priority == 11000u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"routing-mark\":4660},\"tun\":{\"interface\":\"t0\","
+                   "\"ipv4\":{\"address\":\"172.19.0.1/30\"},\"route-table\":20000,"
+                   "\"rule-priority\":12000}}", &config) == FTUN_OK);
+  CHECK(config->base.routing_mark == 4660u && config->tun.route_table == 20000u &&
+        config->tun.rule_priority == 12000u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"base\":{\"routing-mark\":0}}", FTUN_E_INVALID));
+  /* log.max-size / log.max-files：日志轮转，默认 10MiB / 3 个文件。 */
+  CHECK(parse_text("{}", &config) == FTUN_OK && config->log.max_size == 10485760u &&
+        config->log.max_files == 3u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"log\":{\"max-size\":131072,\"max-files\":5}}", &config) == FTUN_OK &&
+        config->log.max_size == 131072u && config->log.max_files == 5u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"log\":{\"max-files\":0}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"log\":{\"max-files\":33}}", FTUN_E_INVALID));
+  /* base.reload-retain：保留的旧代次数量，默认 4，范围 1..64。 */
+  CHECK(parse_text("{}", &config) == FTUN_OK && config->base.reload_retain_count == 4u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"reload-retain\":{\"count\":8}}}", &config) == FTUN_OK &&
+        config->base.reload_retain_count == 8u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"base\":{\"reload-retain\":{\"count\":0}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"reload-retain\":{\"count\":65}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"reload-retain\":{\"bytes\":1}}}", FTUN_E_INVALID));
+  /* base.watchdog：默认 30s，可改，null 关闭。 */
+  CHECK(parse_text("{}", &config) == FTUN_OK && config->base.watchdog_ms == 30000u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"watchdog\":\"45s\"}}", &config) == FTUN_OK &&
+        config->base.watchdog_ms == 45000u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"watchdog\":null}}", &config) == FTUN_OK &&
+        config->base.watchdog_ms == 0u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"base\":{\"watchdog\":30}}", FTUN_E_INVALID));
+
+  /* base.timeouts：默认值、自定义值、关闭 keepalive 以及非法输入。 */
+  CHECK(parse_text("{}", &config) == FTUN_OK);
+  CHECK(config->base.timeouts.handshake_ms == 10000u && config->base.timeouts.connect_ms == 10000u &&
+        config->base.timeouts.reply_ms == 5000u && config->base.timeouts.write_progress_ms == 120000u &&
+        config->base.timeouts.tcp_idle_ms == 0u && config->base.timeouts.udp_idle_ms == 120000u &&
+        config->base.timeouts.keepalive.enabled && config->base.timeouts.keepalive.idle_s == 30u &&
+        config->base.timeouts.keepalive.interval_s == 15u && config->base.timeouts.keepalive.count == 4u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"timeouts\":{\"handshake\":\"3s\",\"connect\":\"500ms\","
+                   "\"reply\":\"2s\",\"write-progress\":\"60s\",\"tcp-idle\":\"10m\","
+                   "\"udp-idle\":\"90s\",\"tcp-keepalive\":{\"idle\":\"20s\","
+                   "\"interval\":\"5s\",\"count\":3}}},"
+                   "\"inbounds\":[{\"name\":\"a\",\"type\":\"socks5\","
+                   "\"listen\":\"127.0.0.1:1\",\"tcp-idle\":\"30s\"}]}", &config) == FTUN_OK);
+  CHECK(config->base.timeouts.handshake_ms == 3000u && config->base.timeouts.connect_ms == 500u &&
+        config->base.timeouts.reply_ms == 2000u && config->base.timeouts.write_progress_ms == 60000u &&
+        config->base.timeouts.tcp_idle_ms == 600000u && config->base.timeouts.udp_idle_ms == 90000u &&
+        config->base.timeouts.keepalive.enabled && config->base.timeouts.keepalive.idle_s == 20u &&
+        config->base.timeouts.keepalive.interval_s == 5u && config->base.timeouts.keepalive.count == 3u &&
+        config->inbounds[0].tcp_idle_ms == 30000u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"base\":{\"timeouts\":{\"tcp-keepalive\":false,\"tcp-idle\":null}}}", &config) == FTUN_OK);
+  CHECK(!config->base.timeouts.keepalive.enabled && config->base.timeouts.tcp_idle_ms == 0u);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"handshake\":\"10\"}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"handshake\":null}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"unknown\":\"1s\"}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"tcp-keepalive\":{\"count\":0}}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"tcp-keepalive\":{\"idle\":\"1500ms\"}}}}", FTUN_E_INVALID));
+  CHECK(expect_status("{\"base\":{\"timeouts\":{\"tcp-keepalive\":true}}}", FTUN_E_INVALID));
 
   CHECK(parse_text("{\"base\":{\"capacity\":{\"tcp-flows\":1000,"
                    "\"udp-flows\":2000,\"udp-associations\":3000}}}",

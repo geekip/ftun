@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* REQ-SNIFF-001 / TASK-SNIFF-002 / TEST-SNIFF-002，目标 0.5.0：
+/* 
  * ftun_sniff_tls_sni 有界解析分片 ClientHello，不启动 TLS 库。 */
 
 #define FTUN_SNIFF_TLS_MAX_BYTES 65536u

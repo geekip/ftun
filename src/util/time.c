@@ -6,7 +6,6 @@
 #include <time.h>
 
 /* 单调时间。
- * 需求 REQ-CORE-001；任务 TASK-UTIL-004；目标 0.2.0；验收 TEST-UTIL-004。
  * 实现路径：平台时钟转换检查溢出；阶段 timeout 共享总 deadline；不能用墙钟变化延长重试。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  */

@@ -15,7 +15,6 @@ typedef struct {
 } ftun_linux_socket_io_t;
 
 /* 物理出口保护。
- * 需求 REQ-GUARD-001；任务 TASK-PLATFORM-003；目标 0.2.0；验收 TEST-PLATFORM-003。
  * 实现路径：在 bind/connect/send 前设置必需 mark/出口约束；DIRECT、DNS、探测、relay 同样保护；必需项失败不得忽略。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * 输入同步借用；必须在 bind/connect/send 前调用。非零 mark 必需，接口名可选；

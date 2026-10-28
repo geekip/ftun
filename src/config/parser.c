@@ -1,6 +1,7 @@
 #include "parser.h"
 #include "compile.h"
 #include "model.h"
+#include "config.h"
 #include "core/budget.h"
 #include <cJSON.h>
 #include <math.h>
@@ -407,6 +408,20 @@ static ftun_status_t ftun_parse_string_list(ftun_config_t *config, const cJSON *
   return FTUN_OK;
 }
 
+void ftun_config_timeouts_default(ftun_config_t *config)
+{
+  config->base.timeouts.handshake_ms = 10000u;
+  config->base.timeouts.connect_ms = 10000u;
+  config->base.timeouts.reply_ms = 5000u;
+  config->base.timeouts.write_progress_ms = 120000u;
+  config->base.timeouts.tcp_idle_ms = 0u;
+  config->base.timeouts.udp_idle_ms = 120000u;
+  config->base.timeouts.keepalive.enabled = true;
+  config->base.timeouts.keepalive.idle_s = 30u;
+  config->base.timeouts.keepalive.interval_s = 15u;
+  config->base.timeouts.keepalive.count = 4u;
+}
+
 static ftun_status_t ftun_config_defaults(ftun_config_t *config)
 {
 #define FTUN_DEFAULT(field, value) do { \
@@ -417,9 +432,15 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
   config->base.capacity.tcp_flows = FTUN_CONFIG_CAPACITY_DEFAULT;
   config->base.capacity.udp_flows = FTUN_CONFIG_CAPACITY_DEFAULT;
   config->base.capacity.udp_associations = FTUN_CONFIG_CAPACITY_DEFAULT;
+  ftun_config_timeouts_default(config);
+  config->base.routing_mark = FTUN_CONFIG_ROUTING_MARK_DEFAULT;
+  config->base.watchdog_ms = FTUN_CONFIG_WATCHDOG_DEFAULT_MS;
+  config->base.reload_retain_count = FTUN_CONFIG_RELOAD_RETAIN_DEFAULT;
   FTUN_DEFAULT(config->base.cache_file, "~/.ftun/ftun.cache");
   FTUN_DEFAULT(config->log.level, "warn");
   FTUN_DEFAULT(config->log.file, "~/.ftun/ftun.log");
+  config->log.max_size = FTUN_CONFIG_LOG_MAX_SIZE_DEFAULT;
+  config->log.max_files = FTUN_CONFIG_LOG_MAX_FILES_DEFAULT;
   config->dns.enable = true;
   config->dns.cache = true;
   FTUN_DEFAULT(config->dns.default_server, "");
@@ -432,17 +453,88 @@ static ftun_status_t ftun_config_defaults(ftun_config_t *config)
   config->sniff.tls_sni = true;
   config->sniff.http_host = true;
   config->tun.mtu = 1500u;
+  config->tun.route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
+  config->tun.rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
 #undef FTUN_DEFAULT
   return FTUN_OK;
+}
+
+/* 可选的时长字段（"30s"）。null 或缺省保持原值；null 仅在 allow_null 时表示关闭（置 0）。 */
+static ftun_status_t ftun_optional_duration(const cJSON *object, const char *name,
+                                            bool allow_null, uint32_t *value)
+{
+  const cJSON *item = cJSON_GetObjectItemCaseSensitive(object, name);
+  uint64_t milliseconds;
+  if (item == NULL) return FTUN_OK;
+  if (cJSON_IsNull(item)) {
+    if (!allow_null) return FTUN_E_INVALID;
+    *value = 0u;
+    return FTUN_OK;
+  }
+  if (!cJSON_IsString(item) || !ftun_config_duration_ms(item->valuestring, &milliseconds) ||
+      milliseconds > UINT32_MAX) return FTUN_E_INVALID;
+  *value = (uint32_t)milliseconds;
+  return FTUN_OK;
+}
+
+static ftun_status_t ftun_parse_timeouts(const cJSON *item, ftun_config_t *config)
+{
+  static const char *const fields[] = {
+    "handshake", "connect", "reply", "tcp-keepalive", "write-progress",
+    "tcp-idle", "udp-idle"
+  };
+  static const char *const keepalive_fields[] = {"idle", "interval", "count"};
+  const cJSON *keepalive;
+  uint32_t milliseconds;
+  ftun_status_t status = ftun_check_fields(item, fields, 7u);
+  if (status != FTUN_OK) return status;
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "handshake", false,
+    &config->base.timeouts.handshake_ms);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "connect", false,
+    &config->base.timeouts.connect_ms);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "reply", false,
+    &config->base.timeouts.reply_ms);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "write-progress", false,
+    &config->base.timeouts.write_progress_ms);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "tcp-idle", true,
+    &config->base.timeouts.tcp_idle_ms);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "udp-idle", false,
+    &config->base.timeouts.udp_idle_ms);
+  keepalive = cJSON_GetObjectItemCaseSensitive(item, "tcp-keepalive");
+  if (status != FTUN_OK || keepalive == NULL) return status;
+  if (cJSON_IsFalse(keepalive)) {
+    config->base.timeouts.keepalive.enabled = false;
+    return FTUN_OK;
+  }
+  status = ftun_check_fields(keepalive, keepalive_fields, 3u);
+  if (status != FTUN_OK) return status;
+  config->base.timeouts.keepalive.enabled = true;
+  milliseconds = config->base.timeouts.keepalive.idle_s * 1000u;
+  status = ftun_optional_duration(keepalive, "idle", false, &milliseconds);
+  if (status == FTUN_OK) {
+    if (milliseconds % 1000u != 0u) return FTUN_E_INVALID;
+    config->base.timeouts.keepalive.idle_s = milliseconds / 1000u;
+    milliseconds = config->base.timeouts.keepalive.interval_s * 1000u;
+    status = ftun_optional_duration(keepalive, "interval", false, &milliseconds);
+  }
+  if (status == FTUN_OK) {
+    if (milliseconds % 1000u != 0u) return FTUN_E_INVALID;
+    config->base.timeouts.keepalive.interval_s = milliseconds / 1000u;
+    status = ftun_optional_uint(keepalive, "count", 1u, 1000u,
+                                &config->base.timeouts.keepalive.count);
+  }
+  return status;
 }
 
 static ftun_status_t ftun_parse_base(const cJSON *item, ftun_config_t *config)
 {
   static const char *const fields[] = {
-    "ipv6", "allow-lan", "cache-file", "state-cache", "capacity"
+    "ipv6", "allow-lan", "cache-file", "state-cache", "capacity", "timeouts",
+    "routing-mark", "watchdog", "reload-retain"
   };
   const cJSON *capacity;
-  ftun_status_t status = ftun_check_fields(item, fields, 5u);
+  const cJSON *timeouts;
+  ftun_status_t status = ftun_check_fields(item, fields, 9u);
   if (status != FTUN_OK) return status;
   status = ftun_optional_bool(item, "ipv6", &config->base.ipv6);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "allow-lan", &config->base.allow_lan);
@@ -466,18 +558,38 @@ static ftun_status_t ftun_parse_base(const cJSON *item, ftun_config_t *config)
       FTUN_CONFIG_CAPACITY_MAXIMUM,
       &config->base.capacity.udp_associations);
   }
+  if (status == FTUN_OK) status = ftun_optional_uint(
+    item, "routing-mark", 1u, UINT32_MAX, &config->base.routing_mark);
+  if (status == FTUN_OK) status = ftun_optional_duration(
+    item, "watchdog", true, &config->base.watchdog_ms);
+  {
+    const cJSON *retain = cJSON_GetObjectItemCaseSensitive(item, "reload-retain");
+    static const char *const retain_fields[] = {"count"};
+    if (status == FTUN_OK && retain != NULL) {
+      status = ftun_check_fields(retain, retain_fields, 1u);
+      if (status == FTUN_OK) status = ftun_optional_uint(
+        retain, "count", 1u, FTUN_CONFIG_RELOAD_RETAIN_MAXIMUM,
+        &config->base.reload_retain_count);
+    }
+  }
+  timeouts = cJSON_GetObjectItemCaseSensitive(item, "timeouts");
+  if (status == FTUN_OK && timeouts != NULL) status = ftun_parse_timeouts(timeouts, config);
   return status;
 }
 
 static ftun_status_t ftun_parse_log(const cJSON *item, ftun_config_t *config)
 {
-  static const char *const fields[] = {"level", "file"};
-  ftun_status_t status = ftun_check_fields(item, fields, 2u);
+  static const char *const fields[] = {"level", "file", "max-size", "max-files"};
+  ftun_status_t status = ftun_check_fields(item, fields, 4u);
   if (status != FTUN_OK) return status;
   status = ftun_replace_string(config, &config->log.level,
     cJSON_GetObjectItemCaseSensitive(item, "level"), 0);
   if (status == FTUN_OK) status = ftun_replace_string(config, &config->log.file,
     cJSON_GetObjectItemCaseSensitive(item, "file"), 0);
+  if (status == FTUN_OK) status = ftun_optional_uint(item, "max-size", 0u, UINT32_MAX,
+                                                    &config->log.max_size);
+  if (status == FTUN_OK) status = ftun_optional_uint(item, "max-files", 1u,
+    FTUN_CONFIG_LOG_MAX_FILES_MAXIMUM, &config->log.max_files);
   return status;
 }
 
@@ -694,7 +806,8 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
                                            ftun_config_t *config)
 {
   static const char *const fields[] = {
-    "interface", "mtu", "ipv4", "auto-route", "strict-route"
+    "interface", "mtu", "ipv4", "auto-route", "strict-route",
+    "route-table", "rule-priority"
   };
   static const char *const ipv4_fields[] = {"address"};
   const cJSON *ipv4;
@@ -702,7 +815,7 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
   if (item == NULL || config == NULL || !cJSON_IsObject(item)) {
     return FTUN_E_INVALID;
   }
-  status = ftun_check_fields(item, fields, 5u);
+  status = ftun_check_fields(item, fields, 7u);
   if (status == FTUN_OK) {
     status = ftun_replace_string(config, &config->tun.interface_name,
       cJSON_GetObjectItemCaseSensitive(item, "interface"), 1);
@@ -726,6 +839,14 @@ static ftun_status_t ftun_parse_tun_device(const cJSON *item,
     status = ftun_optional_bool(item, "strict-route",
                                 &config->tun.strict_route);
   }
+  if (status == FTUN_OK) {
+    status = ftun_optional_uint(item, "route-table", 1u, UINT32_MAX,
+                                &config->tun.route_table);
+  }
+  if (status == FTUN_OK) {
+    status = ftun_optional_uint(item, "rule-priority", 1u, UINT32_MAX,
+                                &config->tun.rule_priority);
+  }
   if (status == FTUN_OK) config->tun.present = true;
   return status;
 }
@@ -734,21 +855,14 @@ static ftun_status_t ftun_parse_tun_inbound(ftun_config_t *config,
   const cJSON *item, ftun_config_inbound_t *inbound)
 {
   static const char *const fields[] = {
-    "name", "type", "outbound", "interface", "stack", "ipv4", "tcp", "udp",
-    "auto-route", "strict-route", "dns-hijack"
+    "name", "type", "outbound", "stack", "tcp", "udp", "dns-hijack", "tcp-idle"
   };
-  static const char *const interface_fields[] = {"name", "mtu"};
-  static const char *const ipv4_fields[] = {"address"};
-  const cJSON *interface_object;
-  const cJSON *ipv4_object;
-  uint32_t mtu = 1500u;
-  ftun_status_t status = ftun_check_fields(item, fields, 11u);
+  ftun_status_t status = ftun_check_fields(item, fields, 8u);
   if (status != FTUN_OK) return status;
   inbound->kind = FTUN_CONFIG_INBOUND_TUN;
   inbound->tcp = true;
   inbound->udp = true;
   inbound->dns_hijack = true;
-  inbound->mtu = 1500u;
   inbound->stack = ftun_config_string_copy(config, "lwip");
   if (inbound->stack == NULL) return FTUN_E_LIMIT;
   status = ftun_replace_string(config, &inbound->name,
@@ -759,34 +873,10 @@ static ftun_status_t ftun_parse_tun_inbound(ftun_config_t *config,
     cJSON_GetObjectItemCaseSensitive(item, "stack"), 0);
   if (status != FTUN_OK) return status;
   if (strcmp(inbound->stack, "lwip") != 0) return FTUN_E_UNSUPPORTED;
-  interface_object = cJSON_GetObjectItemCaseSensitive(item, "interface");
-  ipv4_object = cJSON_GetObjectItemCaseSensitive(item, "ipv4");
-  if ((interface_object == NULL) != (ipv4_object == NULL)) {
-    return FTUN_E_INVALID;
-  }
-  if (interface_object != NULL) {
-    status = ftun_check_fields(interface_object, interface_fields, 2u);
-    if (status == FTUN_OK) {
-      status = ftun_replace_string(config, &inbound->interface_name,
-        cJSON_GetObjectItemCaseSensitive(interface_object, "name"), 1);
-    }
-    if (status == FTUN_OK) {
-      status = ftun_optional_uint(interface_object, "mtu", 1u,
-                                  UINT32_MAX, &mtu);
-    }
-    inbound->mtu = mtu;
-    if (status == FTUN_OK) {
-      status = ftun_check_fields(ipv4_object, ipv4_fields, 1u);
-    }
-    if (status == FTUN_OK) {
-      status = ftun_replace_string(config, &inbound->ipv4_address,
-        cJSON_GetObjectItemCaseSensitive(ipv4_object, "address"), 1);
-    }
-  }
-  if (status == FTUN_OK) status = ftun_optional_bool(item, "tcp", &inbound->tcp);
+  status = ftun_optional_bool(item, "tcp", &inbound->tcp);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "tcp-idle", false,
+                                                         &inbound->tcp_idle_ms);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "udp", &inbound->udp);
-  if (status == FTUN_OK) status = ftun_optional_bool(item, "auto-route", &inbound->auto_route);
-  if (status == FTUN_OK) status = ftun_optional_bool(item, "strict-route", &inbound->strict_route);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "dns-hijack", &inbound->dns_hijack);
   return status;
 }
@@ -796,10 +886,10 @@ static ftun_status_t ftun_parse_proxy_inbound(ftun_config_t *config, const cJSON
                                                ftun_config_inbound_kind_t kind)
 {
   static const char *const fields[] = {
-    "name", "type", "outbound", "listen", "users", "udp"
+    "name", "type", "outbound", "listen", "users", "udp", "tcp-idle"
   };
   const cJSON *users;
-  ftun_status_t status = ftun_check_fields(item, fields, 6u);
+  ftun_status_t status = ftun_check_fields(item, fields, 7u);
   if (status != FTUN_OK) return status;
   inbound->kind = kind;
   inbound->udp = true;
@@ -812,6 +902,8 @@ static ftun_status_t ftun_parse_proxy_inbound(ftun_config_t *config, const cJSON
   users = cJSON_GetObjectItemCaseSensitive(item, "users");
   if (status == FTUN_OK && users != NULL) status = ftun_parse_users(config, users, inbound);
   if (status == FTUN_OK) status = ftun_optional_bool(item, "udp", &inbound->udp);
+  if (status == FTUN_OK) status = ftun_optional_duration(item, "tcp-idle", false,
+                                                         &inbound->tcp_idle_ms);
   return status;
 }
 
@@ -991,52 +1083,16 @@ static void ftun_normalize_config_names(ftun_config_t *config)
   }
 }
 
-/* 顶层 tun 是物理设备的唯一内部模型。旧 TUN inbound 的设备字段在
- * 解析末尾复制到这里；新旧同时出现时只接受完全相同的值。 */
+/* 顶层 tun 是物理设备的唯一来源；TUN inbound 只描述 Proxy 消费者，
+ * 内部模型把设备参数复制到每个 TUN inbound。 */
 static ftun_status_t ftun_normalize_tun_device(ftun_config_t *config)
 {
-  ftun_config_inbound_t *legacy_source = NULL;
-  size_t tun_count = 0u;
   size_t index;
   if (config == NULL) return FTUN_E_INVALID;
   for (index = 0u; index < config->inbound_count; index++) {
-    ftun_config_inbound_t *current = &config->inbounds[index];
-    if (current->kind != FTUN_CONFIG_INBOUND_TUN) continue;
-    tun_count++;
-    if ((current->interface_name == NULL) !=
-        (current->ipv4_address == NULL)) return FTUN_E_INVALID;
-    if (legacy_source == NULL && current->interface_name != NULL) {
-      legacy_source = current;
-    }
-  }
-  if (tun_count == 0u) return FTUN_OK;
-  if (!config->tun.present) {
-    if (legacy_source == NULL) return FTUN_E_INVALID;
-    config->tun.interface_name =
-      ftun_config_string_copy(config, legacy_source->interface_name);
-    config->tun.ipv4_address =
-      ftun_config_string_copy(config, legacy_source->ipv4_address);
-    if (config->tun.interface_name == NULL ||
-        config->tun.ipv4_address == NULL) return FTUN_E_LIMIT;
-    config->tun.mtu = legacy_source->mtu;
-    config->tun.auto_route = legacy_source->auto_route;
-    config->tun.strict_route = legacy_source->strict_route;
-    config->tun.present = true;
-  }
-  for (index = 0u; index < config->inbound_count; index++) {
     ftun_config_inbound_t *inbound = &config->inbounds[index];
     if (inbound->kind != FTUN_CONFIG_INBOUND_TUN) continue;
-    if (inbound->interface_name != NULL) {
-      if (strcmp(config->tun.interface_name, inbound->interface_name) != 0 ||
-          strcmp(config->tun.ipv4_address, inbound->ipv4_address) != 0 ||
-          config->tun.mtu != inbound->mtu ||
-          config->tun.auto_route != inbound->auto_route ||
-          config->tun.strict_route != inbound->strict_route) {
-        return FTUN_E_INVALID;
-      }
-      config->tun.legacy_fields = true;
-      continue;
-    }
+    if (!config->tun.present) return FTUN_E_INVALID;
     inbound->interface_name =
       ftun_config_string_copy(config, config->tun.interface_name);
     inbound->ipv4_address =
@@ -1197,7 +1253,7 @@ ftun_status_t ftun_config_retain(ftun_config_t *config)
   return FTUN_OK;
 }
 
-/* TASK-CONFIG-002 / TEST-CONFIG-002，目标 0.2.0：有界 JSON 到拥有型配置。 */
+/* 有界 JSON 到拥有型配置。 */
 ftun_status_t ftun_config_parse_budget(ftun_budget_t *budget,
   ftun_bytes_t json, ftun_config_t **out)
 {

@@ -16,7 +16,6 @@ typedef struct {
 } ftun_packet_port_info_t;
 
 /* 平台无关包端口。
- * 需求 REQ-PLAT-001；任务 TASK-TUN-001；目标 0.2.0；验收 TEST-TUN-001。
  * 实现路径：委托平台设备或宿主回调读取整包；控制 MTU/队列/关闭；不负责平台路由和业务出口。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * spec 仅在打开期间借用；成功 port 独占平台设备并由 owner loop 使用。

@@ -131,7 +131,7 @@ static char *make_deep_group_config(size_t groups)
   return text;
 }
 
-/* TASK-CONFIG-003 / TEST-CONFIG-003：纯内存语义、引用与图校验。 */
+/* 纯内存语义、引用与图校验。 */
 int main(int argc, char **argv)
 {
   static const char valid_rules[] =
@@ -213,10 +213,52 @@ int main(int argc, char **argv)
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"mixed\","
                           "\"listen\":\"127.0.0.1:1\",\"outbound\":\"missing\"}]}",
                           FTUN_E_INVALID, "/inbounds"));
-  CHECK(expect_validation("{\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\","
-                          "\"interface\":{\"name\":\"t0\"},\"ipv4\":{"
-                          "\"address\":\"198.18.0.1/30\"}}]}",
+  CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{"
+                          "\"address\":\"198.18.0.1/30\"}},"
+                          "\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
                           FTUN_E_INVALID, "/dns/fake-ip/range"));
+  /* 路由表号避开系统保留表，规则优先级须在内核可用范围内。 */
+  CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
+                          "\"route-table\":254},\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
+                          FTUN_E_INVALID, "/tun"));
+  CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
+                          "\"rule-priority\":32766},\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
+                          FTUN_E_INVALID, "/tun"));
+  /* 日志轮转：max-size 为 0（不轮转）或至少 64KiB。 */
+  CHECK(expect_validation("{\"log\":{\"max-size\":0}}", FTUN_OK, NULL));
+  CHECK(expect_validation("{\"log\":{\"max-size\":65536}}", FTUN_OK, NULL));
+  CHECK(expect_validation("{\"log\":{\"max-size\":65535}}", FTUN_E_INVALID, "/log/max-size"));
+  /* 一个 DNS 服务器最多 4 个上游地址（配置顺序即优先级）。 */
+  CHECK(expect_validation("{\"dns\":{\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
+                          "\"address\":[\"1.1.1.1\",\"1.0.0.1\",\"8.8.8.8\",\"8.8.4.4\"],"
+                          "\"outbound\":\"DIRECT\"}]}}", FTUN_OK, NULL));
+  CHECK(expect_validation("{\"dns\":{\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
+                          "\"address\":[\"1.1.1.1\",\"1.0.0.1\",\"8.8.8.8\",\"8.8.4.4\",\"9.9.9.9\"],"
+                          "\"outbound\":\"DIRECT\"}]}}", FTUN_E_INVALID, "/dns/servers"));
+  CHECK(expect_validation("{\"base\":{\"watchdog\":\"500ms\"}}",
+                          FTUN_E_INVALID, "/base/watchdog"));
+  CHECK(expect_validation("{\"base\":{\"watchdog\":\"11m\"}}",
+                          FTUN_E_INVALID, "/base/watchdog"));
+  CHECK(expect_validation("{\"base\":{\"watchdog\":null}}", FTUN_OK, NULL));
+  /* base.timeouts 的取值范围与一致性。 */
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"handshake\":\"50ms\"}}}",
+                          FTUN_E_INVALID, "/base/timeouts/handshake"));
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"connect\":\"11m\"}}}",
+                          FTUN_E_INVALID, "/base/timeouts/connect"));
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"tcp-idle\":\"500ms\"}}}",
+                          FTUN_E_INVALID, "/base/timeouts/tcp-idle"));
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"tcp-keepalive\":{\"count\":21}}}}",
+                          FTUN_E_INVALID, "/base/timeouts/tcp-keepalive"));
+  /* 默认 keepalive 判定失联需要 30+15*4=90s，write-progress 不能更短。 */
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"write-progress\":\"90s\"}}}",
+                          FTUN_E_INVALID, "/base/timeouts/write-progress"));
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"write-progress\":\"91s\"}}}",
+                          FTUN_OK, NULL));
+  CHECK(expect_validation("{\"base\":{\"timeouts\":{\"tcp-keepalive\":false,"
+                          "\"write-progress\":\"30s\"}}}", FTUN_OK, NULL));
+  CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"socks5\","
+                          "\"listen\":\"127.0.0.1:1\",\"tcp-idle\":\"500ms\"}]}",
+                          FTUN_E_INVALID, "/inbounds"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"DIRECT\",\"type\":\"socks5\","
                           "\"server\":\"127.0.0.1:1\"}]}",
                           FTUN_E_INVALID, "/outbounds"));

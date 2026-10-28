@@ -43,6 +43,7 @@ static ftun_runtime_t *held;
 static unsigned int reject_octet;
 static uint64_t expected_generation;
 static bool hold_active;
+static bool expect_not_ready;
 
 static uint64_t now_ms(void)
 {
@@ -78,9 +79,10 @@ ftun_status_t __wrap_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
   memset(out, 0, sizeof(*out));
   (void)pthread_mutex_lock(&mutex);
   downloads++;
-  /* 启动使用尚未激活的第一代；失败重试不推进代次，reload 按候选代执行。
+  /* 后台下载（NOT_READY 启动后的两次尝试）使用当前生效的第一代；reload 按
+   * 候选代执行：规则文件发布后生效代次为 2，其后候选代为 3；最后一段是新启动的实例，候选代为 2。
    * 本夹具没有 TUN，显式装配控制通道工厂并允许系统解析。 */
-  if (spec->generation != (downloads <= 3u ? 1u : 2u) ||
+  if (spec->generation != (downloads <= 2u ? 1u : downloads <= 5u ? 3u : 2u) ||
       !spec->allow_system_resolver || spec->path.open == NULL ||
       spec->resolver.socket_mark != 0u || spec->budget == NULL) abort();
   if (spec->maximum_bytes < download_length) {
@@ -245,9 +247,12 @@ static void probe(ftun_operation_t *operation, ftun_error_t result, void *user)
     result.status = FTUN_E_STATE_CORRUPT;
   }
   if (active != NULL) {
+    /* FRS 尚未就绪时，第一条 FRS 规则对任何目标都拒绝新连接。 */
     if (route(active, reject_octet, FTUN_OUTBOUND_ID_REJECT) != 0 ||
         route(active, reject_octet == 10u ? 11u : 10u,
-          FTUN_OUTBOUND_ID_DIRECT) != 0) result.status = FTUN_E_STATE_CORRUPT;
+          expect_not_ready ? FTUN_OUTBOUND_ID_REJECT : FTUN_OUTBOUND_ID_DIRECT) != 0) {
+      result.status = FTUN_E_STATE_CORRUPT;
+    }
     if (hold_active) {
       held = active;
       active = NULL;
@@ -295,6 +300,34 @@ static int stop(pthread_t thread)
   CHECK(ftun_runtime_release(&held) == FTUN_OK);
   CHECK(ftun_core_destroy(&run_state.core) == FTUN_OK);
   return 0;
+}
+
+static int same_file(const char *path, const uint8_t *bytes);
+
+/* 等后台下载走到指定次数（含失败的尝试）。 */
+static int wait_downloads(unsigned int expected)
+{
+  uint64_t expires = now_ms() + 8000u;
+  for (;;) {
+    unsigned int current;
+    (void)pthread_mutex_lock(&mutex);
+    current = downloads;
+    (void)pthread_mutex_unlock(&mutex);
+    if (current >= expected) return 0;
+    CHECK(now_ms() < expires);
+    pause_once();
+  }
+}
+
+/* 等后台发布的规则文件出现且内容一致。 */
+static int wait_file(const char *path, const uint8_t *bytes)
+{
+  uint64_t expires = now_ms() + 8000u;
+  while (access(path, F_OK) != 0) {
+    CHECK(now_ms() < expires);
+    pause_once();
+  }
+  return same_file(path, bytes);
 }
 
 static int config(const char *path, const char *frs, const char *log)
@@ -354,43 +387,40 @@ int main(void)
   CHECK(config(original, first_file, NULL) == 0);
   CHECK(config(next, next_file, NULL) == 0 && config(bad, next_file, "/dev/null/invalid.log") == 0);
 
-  /* 启动 rename 前失败，候选回滚且句柄可重试。 */
-  inject(first, FTUN_FILE_STAGE_TEMP_SYNCED);
-  memset(&options, 0, sizeof(options));
-  options.struct_size = sizeof(options);
-  options.abi_version = FTUN_ABI_VERSION;
-  CHECK(ftun_core_create(&options, &run_state.core) == FTUN_OK);
-  CHECK(ftun_core_run(run_state.core, original) == FTUN_E_IO);
-  CHECK(ftun_core_get_info(run_state.core, &info) == FTUN_OK &&
-    info.state == FTUN_CORE_CREATED && info.generation == 0u);
-  CHECK(access(first_file, F_OK) != 0);
-  CHECK(ftun_core_run(run_state.core, original) == FTUN_E_IO);
-  CHECK(ftun_core_destroy(&run_state.core) == FTUN_OK);
-
-  /* 启动 rename 后错误仍采用已发布文件，并在启动附件阶段输出原警告。 */
+  /* 本地规则文件缺失：不再同步下载，以 NOT_READY 启动，命中 FRS 规则的新连接
+   * 被拒绝；后台下载在 rename 前失败时没有留下文件，服务继续运行并按退避重试。 */
   CHECK(snprintf(log, sizeof(log), "%s/startup.log", directory) > 0);
   CHECK(config(original, first_file, log) == 0);
-  inject(first, FTUN_FILE_STAGE_RENAMED);
+  inject(first, FTUN_FILE_STAGE_TEMP_SYNCED);
   CHECK(start(original, &thread) == 0);
-  CHECK(check_active(1u, 1u, 10u, true) == 0);
-  CHECK(same_file(first_file, first) == 0);
+  CHECK(wait_downloads(1u) == 0);
+  CHECK(access(first_file, F_OK) != 0);
+  expect_not_ready = true;
+  CHECK(check_active(1u, 1u, 10u, false) == 0);
+  expect_not_ready = false;
+  /* 退避重试在 rename 后出错：仍采用已发布的文件，并写出持久性警告；
+   * 发布后产生新的运行配置代次。 */
+  inject(first, FTUN_FILE_STAGE_RENAMED);
+  CHECK(wait_downloads(2u) == 0);
+  CHECK(wait_file(first_file, first) == 0);
+  CHECK(check_active(2u, 2u, 10u, true) == 0);
 
   inject(second, 0);
-  CHECK(reload(bad, 2u, FTUN_E_IO) == 0 && access(next_file, F_OK) != 0);
-  CHECK(check_active(3u, 1u, 10u, false) == 0);
+  CHECK(reload(bad, 3u, FTUN_E_IO) == 0 && access(next_file, F_OK) != 0);
+  CHECK(check_active(4u, 2u, 10u, false) == 0);
   inject(second, FTUN_FILE_STAGE_TEMP_SYNCED);
-  CHECK(reload(next, 4u, FTUN_E_IO) == 0 && access(next_file, F_OK) != 0);
-  CHECK(check_active(5u, 1u, 10u, false) == 0);
+  CHECK(reload(next, 5u, FTUN_E_IO) == 0 && access(next_file, F_OK) != 0);
+  CHECK(check_active(6u, 2u, 10u, false) == 0);
   inject(second, FTUN_FILE_STAGE_RENAMED);
-  CHECK(reload(next, 6u, FTUN_OK) == 0 && same_file(next_file, second) == 0);
-  CHECK(check_active(7u, 2u, 11u, false) == 0);
+  CHECK(reload(next, 7u, FTUN_OK) == 0 && same_file(next_file, second) == 0);
+  CHECK(check_active(8u, 3u, 11u, false) == 0);
   inject(second, 0);
-  CHECK(reload(original, 8u, FTUN_OK) == 0);
-  CHECK(check_active(9u, 3u, 10u, false) == 0);
+  CHECK(reload(original, 9u, FTUN_OK) == 0);
+  CHECK(check_active(10u, 4u, 10u, false) == 0);
   CHECK(stop(thread) == 0);
   {
     char text[8192];
-    const char *warning = "FRS startup publish succeeded but directory durability is uncertain";
+    const char *warning = "FRS update applied but directory durability is uncertain";
     FILE *file = fopen(log, "r");
     size_t length;
     CHECK(file != NULL);
@@ -400,7 +430,7 @@ int main(void)
     CHECK(strstr(text, warning) != NULL && strstr(strstr(text, warning) + strlen(warning), warning) == NULL);
     CHECK(strstr(text, "level=error status=io ") != NULL);
   }
-  CHECK(downloads == 6u && publishes == 5u);
+  CHECK(downloads == 5u && publishes == 4u);
   CHECK(descriptors() == baseline);
   CHECK(unlink(next_file) == 0);
 
@@ -438,7 +468,7 @@ int main(void)
     CHECK(status == FTUN_E_AGAIN && now_ms() < expires);
     pause_once();
   }
-  CHECK(completions == 1u && downloads == 7u && publishes == 6u);
+  CHECK(completions == 1u && downloads == 6u && publishes == 5u);
   CHECK(access(next_file, F_OK) != 0 && descriptors() == baseline);
   CHECK(unlink(first_file) == 0);
   CHECK(unlink(original) == 0 && unlink(next) == 0 && unlink(bad) == 0 && unlink(log) == 0);

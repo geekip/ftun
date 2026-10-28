@@ -22,9 +22,13 @@ struct ftun_route_transaction {
   bool strict_route;
   bool retiring;
   ftun_linux_route_io_t io;
+  /* 同一路由表号的实例互斥锁（-1 表示未持有）；转交给异步事务或随事务关闭。 */
+  int lock_descriptor;
 };
 
 ftun_status_t ftun_linux_route_errno(int error_code, bool removing);
+/* 以表号为键的 flock：第二个实例在改动网络前即被拒绝；table 为 0 时不加锁。 */
+ftun_status_t ftun_linux_route_lock_table(uint32_t table, int *out);
 int ftun_route_policy_valid(const ftun_route_policy_t *policy);
 int ftun_route_build(const ftun_route_policy_t *policy,
                      ftun_route_transaction_t *transaction);

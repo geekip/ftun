@@ -245,6 +245,8 @@ static uint16_t reserve_port(void)
   return ntohs(address.sin_port);
 }
 
+static const char *config_listen_host = "127.0.0.1";
+
 static ftun_config_t *make_config(bool cache, bool proxy, bool domain,
                                   uint16_t port)
 {
@@ -255,8 +257,8 @@ static ftun_config_t *make_config(bool cache, bool proxy, bool domain,
   int length;
   if (port != 0u) {
     (void)snprintf(listener, sizeof(listener),
-      ",\"listeners\":[{\"listen\":\"127.0.0.1:%u\",\"server\":\"real\"}]",
-      (unsigned int)port);
+      ",\"listeners\":[{\"listen\":\"%s:%u\",\"server\":\"real\"}]",
+      config_listen_host, (unsigned int)port);
   }
   if (proxy) {
     (void)snprintf(outbounds, sizeof(outbounds),
@@ -507,16 +509,24 @@ static int fatal_case(int fault, bool cancel_retry, bool reload, bool pending)
     cancel_failures = 1u;
   }
   send_fault = fault;
-  CHECK(drive_step(fixture.dns, connection) ==
-    (cancel_retry ? FTUN_E_AGAIN : FTUN_OK));
+  /* 撤销监视失败只隔离这一条连接：不向上报错，连接保持占用，到点重试。 */
+  CHECK(drive_step(fixture.dns, connection) == FTUN_OK);
   CHECK(connection->transport_failed && connection->peer_eof);
   CHECK(send_calls == 1u);
   if (cancel_retry) {
-    CHECK(connection_ready(connection) && connection->source == source);
+    size_t slice_work = 0u;
+    CHECK(!connection_ready(connection) && connection->source == source);
+    CHECK(connection->quarantine_retry_ms != 0u && fixture.dns->quarantined_tcp == 1u &&
+          ftun_dns_runtime_take_object_faults(fixture.dns) == 1u);
     CHECK(connection->descriptor == watched_fd && close_calls == 0u);
     CHECK(connection->response_count == 1u && connection->protocol == protocol);
     CHECK(fcntl(watched_fd, F_GETFD) >= 0);
-    CHECK(drive_step(fixture.dns, connection) == FTUN_OK);
+    /* 未到重试时间不动；到点后重新就绪并完成收尾。 */
+    CHECK(ftun_dns_runtime_run_slice(fixture.dns, 4u, &slice_work) == FTUN_OK);
+    CHECK(connection->quarantine_retry_ms != 0u && close_calls == 0u);
+    connection->quarantine_retry_ms = 1u;
+    CHECK(ftun_dns_runtime_run_slice(fixture.dns, 4u, &slice_work) == FTUN_OK);
+    CHECK(fixture.dns->quarantined_tcp == 0u && connection->quarantine_retry_ms == 0u);
     CHECK(send_calls == 1u);
     cancel_source = NULL;
   }
@@ -877,9 +887,88 @@ static int bootstrap_budget(void)
   return 0;
 }
 
+/* 监听出错只影响这个监听：关闭 socket、等待恢复，到点按原地址重新 bind。 */
+static int listener_recovery(void)
+{
+  fixture_t fixture;
+  ftun_dns_runtime_t *dns;
+  ftun_dns_runtime_listener_slot_t *slot;
+  ftun_recovery_info_t info;
+  struct sockaddr_in address;
+  socklen_t length = (socklen_t)sizeof(address);
+  size_t slice_work = 0u;
+  bool work = false;
+  CHECK(fixture_start(&fixture) == 0);
+  dns = fixture.dns;
+  slot = &dns->listeners[0];
+  CHECK(slot->descriptor >= 0 && slot->tcp_descriptor >= 0 && !slot->waiting);
+  CHECK(getsockname(slot->tcp_descriptor, (struct sockaddr *)&address, &length) == 0);
+  slot->events |= FTUN_EVENT_ERROR;
+  CHECK(ftun_dns_runtime_step_listener(dns, ftun_dns_runtime_now(NULL), &work) == FTUN_OK);
+  CHECK(work && slot->waiting && slot->descriptor == -1 && slot->tcp_descriptor == -1);
+  CHECK(slot->source == NULL && slot->tcp_source == NULL);
+  CHECK(ftun_dns_runtime_listeners_waiting(dns) == 1u &&
+        ftun_dns_runtime_take_object_faults(dns) == 1u);
+  /* 服务其余部分不受影响。 */
+  CHECK(ftun_dns_runtime_run_slice(dns, 4u, &slice_work) == FTUN_OK);
+  CHECK(ftun_recovery_query(dns->recovery, slot->recovery.slot, &info) == FTUN_OK &&
+        info.state == FTUN_RECOVERY_WAITING && info.failures == 1u);
+  /* 未到时间不重绑；到点后同步重绑成功。 */
+  CHECK(ftun_recovery_run(dns->recovery, info.next_ms - 1u, 4u, &slice_work) == FTUN_OK &&
+        slice_work == 0u && slot->waiting);
+  CHECK(ftun_recovery_run(dns->recovery, info.next_ms, 4u, &slice_work) == FTUN_OK &&
+        slice_work == 1u);
+  CHECK(!slot->waiting && slot->descriptor >= 0 && slot->tcp_descriptor >= 0);
+  CHECK(slot->source != NULL && slot->tcp_source != NULL);
+  CHECK(ftun_dns_runtime_listeners_waiting(dns) == 0u);
+  CHECK(ftun_recovery_query(dns->recovery, slot->recovery.slot, &info) == FTUN_OK &&
+        info.state == FTUN_RECOVERY_AVAILABLE);
+  {
+    struct sockaddr_in again;
+    socklen_t again_length = (socklen_t)sizeof(again);
+    CHECK(getsockname(slot->tcp_descriptor, (struct sockaddr *)&again, &again_length) == 0);
+    CHECK(again.sin_port == address.sin_port);
+  }
+  return fixture_destroy(&fixture);
+}
+
+/* 启动时监听地址尚未就绪：不失败，进入等待恢复并保持等待。 */
+static int listener_startup_waiting(void)
+{
+  fixture_t fixture;
+  ftun_dns_runtime_listener_slot_t *slot;
+  ftun_recovery_info_t info;
+  size_t slice_work = 0u;
+  CHECK(fixture_init(&fixture) == 0);
+  /* 192.0.2.0/24 是文档保留网段，本机没有这个地址。 */
+  config_listen_host = "192.0.2.77";
+  fixture.config = make_config(false, false, false, reserve_port());
+  config_listen_host = "127.0.0.1";
+  CHECK(fixture.config != NULL);
+  CHECK(ftun_dns_runtime_prepare(fixture.core, fixture.budget,
+    fixture.operations, fixture.loop, fixture.config, &fixture.adapter,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+      .path = {.open = ftun_socket_path_open}}, &fixture.dns) == FTUN_OK);
+  CHECK(ftun_dns_runtime_activate(fixture.dns) == FTUN_OK);
+  slot = &fixture.dns->listeners[0];
+  CHECK(slot->waiting && slot->descriptor == -1 && slot->tcp_descriptor == -1);
+  CHECK(ftun_dns_runtime_listeners_waiting(fixture.dns) == 1u);
+  CHECK(ftun_recovery_query(fixture.dns->recovery, slot->recovery.slot, &info) == FTUN_OK &&
+        info.state == FTUN_RECOVERY_WAITING);
+  /* 地址一直不出现：到点尝试失败，退避加长，仍在等待。 */
+  CHECK(ftun_recovery_run(fixture.dns->recovery, info.next_ms, 4u, &slice_work) == FTUN_OK);
+  CHECK(slot->waiting && ftun_recovery_query(fixture.dns->recovery,
+    slot->recovery.slot, &info) == FTUN_OK && info.failures == 2u &&
+    info.state == FTUN_RECOVERY_WAITING);
+  CHECK(ftun_dns_runtime_run_slice(fixture.dns, 4u, &slice_work) == FTUN_OK);
+  return fixture_destroy(&fixture);
+}
+
 int main(void)
 {
   CHECK(bootstrap_budget() == 0);
+  CHECK(listener_recovery() == 0);
+  CHECK(listener_startup_waiting() == 0);
   CHECK(ready_mask_case() == 0);
   unsigned int cache;
   unsigned int planned;

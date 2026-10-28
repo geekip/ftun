@@ -238,7 +238,7 @@ static void ftun_system_resolver_context_release(
   (void)ftun_reservation_release(&reservation);
 }
 
-/* TASK-PLATFORM-004 / TEST-PLATFORM-004，目标 0.2.0：有界系统解析适配。 */
+/* 有界系统解析适配。 */
 ftun_status_t ftun_system_resolve_with_execute(
   ftun_core_t *core, const ftun_system_resolve_request_t *request,
   ftun_worker_execute_fn execute, ftun_operation_t **out)

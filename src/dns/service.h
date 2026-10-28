@@ -71,9 +71,16 @@ ftun_status_t ftun_dns_runtime_reap(ftun_dns_runtime_t **retired);
 ftun_status_t ftun_dns_runtime_activate(ftun_dns_runtime_t *dns);
 /* 每单元至多推进一次有界传输并交付一个 waiter；未交付响应保留原接收
  * 时刻和缓冲。run/stop 的回调重入返回 AGAIN，不释放活跃借用。 */
+/* 被隔离（收尾失败、仍占用槽位）的 TCP 连接数，以及自上次读取起新增的对象级故障。 */
+size_t ftun_dns_runtime_quarantined(const ftun_dns_runtime_t *dns);
+/* 处于等待恢复（socket 已关闭、尚未重新 bind）的监听数。 */
+size_t ftun_dns_runtime_listeners_waiting(const ftun_dns_runtime_t *dns);
+size_t ftun_dns_runtime_take_object_faults(ftun_dns_runtime_t *dns);
 ftun_status_t ftun_dns_runtime_run_once(ftun_dns_runtime_t *dns, size_t quota,
                                        size_t *out_work);
 bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns);
+/* 网络变化：把等待中的监听和上游地址的恢复提前到 now_ms。 */
+void ftun_dns_runtime_network_changed(ftun_dns_runtime_t *dns, uint64_t now_ms);
 ftun_status_t ftun_dns_runtime_next_deadline(
   const ftun_dns_runtime_t *dns, uint64_t *out_deadline_ms, bool *out_present);
 bool ftun_dns_runtime_has_hijack(const ftun_dns_runtime_t *dns);

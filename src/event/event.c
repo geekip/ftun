@@ -78,7 +78,7 @@ struct ftun_event_loop {
   ftun_event_source_t *timer_heap[];
 };
 
-/* TASK-EVENT-001 / TEST-EVENT-001，目标 0.2.0：后端无关的有界事件前端。 */
+/* 后端无关的有界事件前端。 */
 ftun_status_t ftun_event_loop_create(ftun_core_t *core, ftun_event_loop_t **out)
 {
   return ftun_event_loop_create_with_capacity(

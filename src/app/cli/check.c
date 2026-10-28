@@ -88,7 +88,8 @@ ftun_status_t ftun_cli_core_create(const ftun_config_t *config,
     options.owned_queue_limit += datagram_capacity;
   }
   options.operation_capacity = 1024u;
-  options.retained_runtime_limit = 4u;
+  options.retained_runtime_limit = config != NULL
+    ? config->base.reload_retain_count : FTUN_CONFIG_RELOAD_RETAIN_DEFAULT;
   return ftun_core_create(&options, out);
 }
 
@@ -131,20 +132,11 @@ ftun_status_t ftun_cli_checked_config_destroy(ftun_cli_checked_config_t *checked
   return ftun_core_destroy(&checked->core);
 }
 
-void ftun_cli_warn_deprecated_config(const ftun_config_t *config)
-{
-  if (config != NULL && config->tun.legacy_fields) {
-    fputs("ftun: warning: TUN device fields under inbounds[] are deprecated; "
-          "use top-level tun\n", stderr);
-  }
-}
-
 int ftun_cli_check(const char *path)
 {
   ftun_cli_checked_config_t checked = {0};
   ftun_status_t status = ftun_cli_check_config(path, 0, &checked);
   ftun_status_t cleanup_status;
-  if (status == FTUN_OK) ftun_cli_warn_deprecated_config(checked.config);
   cleanup_status = ftun_cli_checked_config_destroy(&checked);
   if (status == FTUN_OK) status = cleanup_status;
   if (status != FTUN_OK) return ftun_cli_error("check", status);

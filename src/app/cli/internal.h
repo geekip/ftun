@@ -16,7 +16,6 @@ typedef struct {
 ftun_status_t ftun_cli_check_config(const char *path, int require_inbound,
   ftun_cli_checked_config_t *out);
 ftun_status_t ftun_cli_checked_config_destroy(ftun_cli_checked_config_t *checked);
-void ftun_cli_warn_deprecated_config(const ftun_config_t *config);
 int ftun_cli_check(const char *path);
 int ftun_cli_run(const char *path);
 int ftun_cli_signal_process(const char *text, int signal_number,

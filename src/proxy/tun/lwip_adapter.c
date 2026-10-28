@@ -22,7 +22,7 @@
 #define FTUN_LWIP_PACKET_POOL_BYTES (2u * 1024u * 1024u)
 #define FTUN_LWIP_PACKET_POOL_BUFFERS 64u
 
-/* TASK-TUN-002 / TEST-TUN-002，目标 0.2.0：NO_SYS raw IPv4、显式计时、
+/* NO_SYS raw IPv4、显式计时、
  * Budget allocator，以及 ftun_lwip_input 的 pbuf/ACK 所有权边界。 */
 
 typedef union {
@@ -74,6 +74,7 @@ struct ftun_lwip_udp {
 };
 
 struct ftun_lwip {
+  ftun_socket_liveness_t liveness;
   ftun_budget_t *budget;
   ftun_reservation_t *reservation;
   ftun_reservation_t *wrapper_reservation;
@@ -590,6 +591,13 @@ static err_t ftun_lwip_tcp_accept(void *argument, struct tcp_pcb *pcb, err_t err
   flow->linked = true;
   stack->flows = flow;
   stack->flow_count++;
+  if (stack->liveness.keepalive_enabled) {
+    /* lwIP 的 keep_* 以毫秒计；LAN 设备离开后由此回收半开连接。 */
+    ip_set_option(pcb, SOF_KEEPALIVE);
+    pcb->keep_idle = stack->liveness.idle_s * 1000u;
+    pcb->keep_intvl = stack->liveness.interval_s * 1000u;
+    pcb->keep_cnt = stack->liveness.count;
+  }
   tcp_arg(pcb, flow);
   tcp_recv(pcb, ftun_lwip_tcp_received);
   tcp_sent(pcb, ftun_lwip_tcp_sent);
@@ -677,6 +685,7 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
   stack->budget = spec->budget;
   stack->reservation = reservation;
   stack->mtu = spec->mtu;
+  stack->liveness = spec->liveness;
   stack->last_ms = spec->now_ms;
   stack->next_tcp_ms = spec->now_ms + TCP_TMR_INTERVAL;
   stack->next_reassembly_ms = spec->now_ms + IP_TMR_INTERVAL;

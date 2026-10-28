@@ -565,7 +565,7 @@ static int test_budget_competition(void)
   return 0;
 }
 
-/* TASK-UTIL-002 / TEST-UTIL-002：分档、slice 所有权和有界闲置保留。 */
+/* 分档、slice 所有权和有界闲置保留。 */
 int main(void)
 {
   CHECK(test_class_boundaries() == 0);

@@ -1,4 +1,5 @@
 #include "transport/socket_path.h"
+#include "platform/socket_liveness.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -127,6 +128,14 @@ static ftun_status_t ftun_socket_local_endpoint(void *user, ftun_endpoint_t *out
   memcpy(out->address, &address.sin_addr.s_addr, 4u);
   out->port = ntohs(address.sin_port);
   return FTUN_OK;
+}
+
+static ftun_status_t ftun_socket_send_progress_query(void *user, uint64_t *acked,
+  uint32_t *queued)
+{
+  ftun_socket_path_t *driver = (ftun_socket_path_t *)user;
+  if (driver->stopped || driver->socket < 0) return FTUN_E_CANCELLED;
+  return ftun_socket_send_progress(driver->socket, acked, queued);
 }
 
 static ftun_status_t ftun_socket_read(void *user, void *buffer, size_t capacity,
@@ -479,6 +488,7 @@ ftun_status_t ftun_socket_path_open(void *context, ftun_core_t *core,
   adopted.driver.resume = ftun_socket_resume;
   adopted.driver.context = driver;
   adopted.driver.local_endpoint = ftun_socket_local_endpoint;
+  adopted.driver.send_progress = ftun_socket_send_progress_query;
   if (request->dial.transport == FTUN_DIAL_TCP) {
     ftun_stream_options_t options = request->stream;
     ftun_stream_backend_t backend = {0};

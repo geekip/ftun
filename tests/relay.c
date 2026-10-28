@@ -621,7 +621,69 @@ static int test_mixed_pool_resume(void)
   return 0;
 }
 
-/* TASK-TRANSPORT-004 / TEST-TRANSPORT-004：水位、工作上限与排空 half-close。 */
+/* 水位、工作上限与排空 half-close。 */
+static void dummy_completed(ftun_operation_t *operation, ftun_error_t error, void *user)
+{
+  (void)operation;
+  (void)error;
+  (void)user;
+}
+
+/* 全局 Operation 队列满：写入不再每轮空转重试，而是登记等待，回收出额度后恢复。 */
+static int test_operation_queue_full_waits(void)
+{
+  fixture_t fixture;
+  ftun_operation_t *dummy[8];
+  ftun_operation_token_t token[8];
+  ftun_error_t done = {FTUN_OK, 0u, 0};
+  size_t index;
+  size_t round;
+  CHECK(fixture_start(&fixture, 8u, 3u, 8u) == 0);
+  for (index = 0u; index < 8u; index++) {
+    CHECK(ftun_operation_accept(fixture.operations, dummy_completed, NULL,
+                                &dummy[index], &token[index]) == FTUN_OK);
+  }
+  memcpy(fixture.left_backend.input, "abc", 3u);
+  fixture.left_backend.input_length = 3u;
+  /* 读取（含读空的那一次，共 2 次工作），随后的写入被 Operation 队列拒绝并登记等待。 */
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 2u) == 0);
+  CHECK(fixture.right_backend.write_calls == 0);
+  for (round = 0u; round < 16u; round++) {
+    CHECK(process(&fixture, 0u, FTUN_EVENT_WRITE, 0u) == 0);
+  }
+  CHECK(fixture.right_backend.write_calls == 0);
+  /* 回收一个额度：等待者收到提示，下一轮写入成功。 */
+  CHECK(ftun_operation_complete(token[0], done) == FTUN_OK);
+  CHECK(dispatch_all(&fixture, 1u) == 0);
+  CHECK(process(&fixture, 0u, 0u, 1u) == 0);
+  CHECK(fixture.right_backend.write_calls == 1);
+  CHECK(complete_write(&fixture.right_backend, FTUN_OK) == 0);
+  CHECK(dispatch_all(&fixture, 1u) == 0);
+  CHECK(fixture.right_backend.output_length == 3u &&
+        memcmp(fixture.right_backend.output, "abc", 3u) == 0);
+  for (index = 1u; index < 8u; index++) {
+    CHECK(ftun_operation_cancel(dummy[index]) == FTUN_OK);
+  }
+  CHECK(dispatch_all(&fixture, 7u) == 0);
+  CHECK(fixture_destroy(&fixture, 1) == 0);
+  /* 等待期间停止 relay：必须撤销等待，队列才能销毁。 */
+  CHECK(fixture_start(&fixture, 8u, 3u, 8u) == 0);
+  for (index = 0u; index < 8u; index++) {
+    CHECK(ftun_operation_accept(fixture.operations, dummy_completed, NULL,
+                                &dummy[index], &token[index]) == FTUN_OK);
+  }
+  memcpy(fixture.left_backend.input, "xyz", 3u);
+  fixture.left_backend.input_length = 3u;
+  CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 2u) == 0);
+  CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
+  for (index = 0u; index < 8u; index++) {
+    CHECK(ftun_operation_cancel(dummy[index]) == FTUN_OK);
+  }
+  CHECK(dispatch_all(&fixture, 8u) == 0);
+  CHECK(fixture_destroy(&fixture, 0) == 0);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_backpressure_and_half_close() == 0);
@@ -632,5 +694,6 @@ int main(void)
   CHECK(test_related_budget_hierarchy() == 0);
   CHECK(test_pool_wait_resume_and_cancel() == 0);
   CHECK(test_mixed_pool_resume() == 0);
+  CHECK(test_operation_queue_full_waits() == 0);
   return 0;
 }

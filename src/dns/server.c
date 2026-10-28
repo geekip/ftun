@@ -6,17 +6,18 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-DNS-001；任务 TASK-DNS-002；目标 0.3.0；验收 TEST-DNS-002。 */
-
 #define FTUN_DNS_SERVER_STAGE_ADMISSION 1u
 #define FTUN_DNS_SERVER_STAGE_TRANSPORT 2u
 #define FTUN_DNS_SERVER_STAGE_RESPONSE 3u
 #define FTUN_DNS_SERVER_STAGE_TIMEOUT 4u
+/* 刚恢复的上游地址只给这么长的试探期限（与剩余期限的一半取小）。 */
+#define FTUN_DNS_SERVER_PROBE_MAX_MS 1000u
 
 struct ftun_dns_server {
   ftun_budget_t *budget;
   ftun_operation_queue_t *operations;
   ftun_endpoint_t upstream;
+  ftun_upstream_set_t *upstream_set;
   uint32_t outbound_id;
   uint64_t fingerprint;
   ftun_dns_transport_t transport;
@@ -45,6 +46,12 @@ typedef struct {
   ftun_dns_transport_t current_transport;
   ftun_dns_transport_binding_t binding;
   bool selected;
+  bool upstream_chosen;
+  bool failed_over;
+  bool probing;
+  size_t upstream_index;
+  /* 本次尝试的期限；有备用地址时只占剩余期限的一部分，留出换地址的时间。 */
+  uint64_t attempt_deadline_ms;
   bool cancelling;
   bool completed_during_cancel;
 } ftun_dns_exchange_context_t;
@@ -193,13 +200,42 @@ static ftun_status_t ftun_dns_server_submit(
     }
     context->selected = true;
   }
+  if (!context->upstream_chosen) {
+    context->upstream_chosen = true;
+    context->attempt_deadline_ms = context->query.deadline_ms;
+    if (server->upstream_set != NULL) {
+      bool recovering = false;
+      size_t alternative = 0u;
+      uint64_t remaining = context->query.deadline_ms - now;
+      status = ftun_upstream_set_pick(server->upstream_set, SIZE_MAX,
+        &context->upstream_index, &recovering);
+      if (status != FTUN_OK) {
+        /* 所有地址都在退避中：立即失败，不阻塞。 */
+        return ftun_dns_server_finish(context, status,
+                                      FTUN_DNS_SERVER_STAGE_TRANSPORT);
+      }
+      context->query.upstream =
+        *ftun_upstream_set_endpoint(server->upstream_set, context->upstream_index);
+      /* 有备用地址时第一次尝试只用剩余期限的一半；刚恢复的地址最多 1 秒，
+       * 这次试探失败改发备用地址，不占用“换一个地址”的限额。 */
+      if (ftun_upstream_set_pick(server->upstream_set, context->upstream_index,
+                                 &alternative, &(bool){false}) == FTUN_OK) {
+        uint64_t share = remaining / 2u;
+        if (recovering && share > FTUN_DNS_SERVER_PROBE_MAX_MS) {
+          share = FTUN_DNS_SERVER_PROBE_MAX_MS;
+        }
+        context->attempt_deadline_ms = now + share;
+        context->probing = recovering;
+      }
+    }
+  }
   context->query.transport = transport;
   context->current_transport = transport;
   status = server->query_transport.submit(
     server->query_transport.context, &context->binding,
     context->query.policy_fingerprint, context->query.server_fingerprint,
-    &server->upstream, transport, context->query.wire,
-    context->query.deadline_ms,
+    &context->query.upstream, transport, context->query.wire,
+    context->attempt_deadline_ms,
     ftun_dns_server_transport_completed, context,
     &context->transport_request);
   if (status != FTUN_OK || context->transport_request == NULL) {
@@ -209,6 +245,28 @@ static ftun_status_t ftun_dns_server_submit(
       FTUN_DNS_SERVER_STAGE_TRANSPORT);
   }
   return FTUN_OK;
+}
+
+/* 当前地址不健康（网络类失败，或应答无法解析/对不上）：记入集合，并在剩余期限内
+ * 换下一个地址重新提交。上游自己返回的 SERVFAIL/REFUSED 是合法应答，不走这里。
+ * 换成功返回 true；没有集合、没有备用地址或限额用完返回 false，由调用方如实失败。 */
+static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context)
+{
+  ftun_dns_server_t *server = context->server;
+  size_t next = 0u;
+  if (server->upstream_set == NULL) return false;
+  ftun_upstream_set_report_failure(server->upstream_set, context->upstream_index);
+  if ((!context->probing && context->failed_over) ||
+      server->now(server->now_user) >= context->query.deadline_ms ||
+      ftun_upstream_set_pick(server->upstream_set, context->upstream_index,
+                             &next, &(bool){false}) != FTUN_OK) return false;
+  if (!context->probing) context->failed_over = true;
+  context->probing = false;
+  context->upstream_index = next;
+  context->query.upstream = *ftun_upstream_set_endpoint(server->upstream_set, next);
+  context->attempt_deadline_ms = context->query.deadline_ms;
+  (void)ftun_dns_server_submit(context, context->current_transport);
+  return true;
 }
 
 static void ftun_dns_server_transport_completed(
@@ -226,6 +284,10 @@ static void ftun_dns_server_transport_completed(
   if (context->cancelling) context->completed_during_cancel = true;
   context->transport_request = NULL;
   if (status != FTUN_OK) {
+    /* 网络类失败（超时、IO）：记入健康状态并换地址。取消不算失败。 */
+    if (!context->cancelling &&
+        (status == FTUN_E_TIMEOUT || status == FTUN_E_IO) &&
+        ftun_dns_server_failover(context)) return;
     (void)ftun_dns_server_finish(context, status,
                                  FTUN_DNS_SERVER_STAGE_TRANSPORT);
     return;
@@ -240,6 +302,7 @@ static void ftun_dns_server_transport_completed(
   }
   if (transport != context->current_transport ||
       response.data == NULL || response.length > server->max_response_bytes) {
+    if (ftun_dns_server_failover(context)) return;
     (void)ftun_dns_server_finish(context, FTUN_E_PROTOCOL,
                                  FTUN_DNS_SERVER_STAGE_RESPONSE);
     return;
@@ -251,6 +314,10 @@ static void ftun_dns_server_transport_completed(
   }
   if (status != FTUN_OK || !matches) {
     (void)ftun_dns_message_release(&message);
+    /* 应答无法解析或与查询对不上：按上游不健康处理。解析失败的原因可能是畸形的
+     * 计数或标签（解析器对它们返回 LIMIT/PROTOCOL），无法与本地预算不足可靠区分；
+     * 代价只是该地址进入一次退避，每次查询最多换一个地址。 */
+    if (ftun_dns_server_failover(context)) return;
     (void)ftun_dns_server_finish(context,
       status == FTUN_OK ? FTUN_E_PROTOCOL : status,
       FTUN_DNS_SERVER_STAGE_RESPONSE);
@@ -263,6 +330,8 @@ static void ftun_dns_server_transport_completed(
                                    FTUN_DNS_SERVER_STAGE_RESPONSE);
       return;
     }
+    /* 同一地址上的 TCP 重试不受“留出换地址时间”的缩短期限限制。 */
+    context->attempt_deadline_ms = context->query.deadline_ms;
     (void)ftun_dns_server_submit(context, FTUN_DNS_TRANSPORT_TCP);
     return;
   }
@@ -304,6 +373,7 @@ ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
   server->budget = options->budget;
   server->operations = options->operations;
   server->upstream = options->upstream;
+  server->upstream_set = options->upstream_set;
   server->outbound_id = options->outbound_id;
   server->fingerprint = options->fingerprint;
   server->transport = options->transport;

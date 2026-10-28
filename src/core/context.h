@@ -12,16 +12,35 @@ ftun_status_t ftun_core_context_create(ftun_budget_t *budget,
 ftun_status_t ftun_core_context_bind(ftun_core_t *core, void *extension);
 ftun_status_t ftun_core_context_extension(const ftun_core_t *core,
                                           void **out);
-ftun_status_t ftun_core_context_budget(ftun_core_t *core,
+ftun_status_t ftun_core_context_budget(const ftun_core_t *core,
                                        ftun_budget_t **out);
 /* 业务扩展已释放后，宿主可把借用预算切回仍存活的根，完成分步清理。
  * context 自身的预留仍属于创建时的预算，该节点必须存活至 context 销毁。 */
 ftun_status_t ftun_core_context_set_budget(ftun_core_t *core,
                                            ftun_budget_t *budget);
+/* 业务层判断上下文是否可用的公开入口，不暴露私有布局。 */
+bool ftun_core_context_is_valid(const ftun_core_t *core);
+/* 运行配置代次。读取可跨线程（原子获取）；其余入口只在 owner
+ * 线程调用。所有产生新运行配置代次的来源（reload、FRS 更新等）必须先
+ * reserve：同一时刻只允许一个预留，已有预留返回 AGAIN，调用方稍后重试；
+ * 达到上限返回 LIMIT。owner 是持有者标识（非空，只做相等比较），宿主事务
+ * 使用 Core 上下文自身。publish 只能由持有者发布当前预留值并清除预留；
+ * release 放弃预留且不改变代次；持有者或代次不符返回 STALE。 */
 ftun_status_t ftun_core_context_generation(const ftun_core_t *core,
                                            uint64_t *out);
-ftun_status_t ftun_core_context_set_generation(ftun_core_t *core,
-                                               uint64_t generation);
+ftun_status_t ftun_core_context_generation_reserve(ftun_core_t *core,
+  const void *owner, uint64_t *out_next);
+ftun_status_t ftun_core_context_generation_publish(ftun_core_t *core,
+  const void *owner, uint64_t next);
+ftun_status_t ftun_core_context_generation_release(ftun_core_t *core,
+  const void *owner, uint64_t next);
+/* 返回当前预留值，没有预留时为零。 */
+ftun_status_t ftun_core_context_generation_reserved(const ftun_core_t *core,
+                                                    uint64_t *out);
+/* owner 持有预留时返回 OK 并输出预留值；没有预留或由其他来源持有时返回
+ * STALE，输出为零。 */
+ftun_status_t ftun_core_context_generation_held(const ftun_core_t *core,
+  const void *owner, uint64_t *out_next);
 /* 发布槽借用 logger。替换返回后旧实例没有 Core emit 借用，拥有者才可
  * stop/destroy。Core 本身的销毁仍须由调用方保证没有并发 API 使用。 */
 ftun_status_t ftun_core_context_set_logger(ftun_core_t *core,

@@ -560,7 +560,7 @@ static const ftun_event_backend_ops_t ftun_libev_ops = {
   false
 };
 
-/* TASK-EVENT-002 / TEST-EVENT-002，目标 0.2.0：完整 libev 4.33 epoll 适配。 */
+/* 完整 libev 4.33 epoll 适配。 */
 ftun_status_t ftun_libev_attach(ftun_event_loop_t *loop)
 {
   ftun_libev_adapter_t *adapter;

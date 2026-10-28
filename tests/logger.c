@@ -189,7 +189,7 @@ static int test_basic(void)
         level == FTUN_LOG_TRACE);
   CHECK(ftun_log_level_parse("TRACE", &level) == FTUN_E_INVALID);
   CHECK(ftun_logger_create(&(ftun_logger_options_t){
-          FTUN_LOG_INFO, "/no/such/directory/ftun.log", 1u, 128u, NULL, NULL, NULL},
+          FTUN_LOG_INFO, "/no/such/directory/ftun.log", 1u, 128u, NULL, NULL, NULL, false, 0u, 0u},
         &logger) == FTUN_E_IO && logger == NULL);
   CHECK(pthread_cond_destroy(&writer.condition) == 0);
   CHECK(pthread_mutex_destroy(&writer.mutex) == 0);
@@ -231,6 +231,71 @@ static int record_valid(const writer_t *writer)
     if (byte < 0x20u || byte == 0x7fu) return 0;
   }
   return 1;
+}
+
+/* 带时间戳的前缀：ts 为 UTC 毫秒，seq 单调，boot 在进程内固定，id 仅在非零时出现。 */
+static int stamped_line(writer_t *writer, uint64_t *seq, char *boot, bool *has_id,
+  uint64_t *id, size_t *ts_ms)
+{
+  unsigned int year, month, day, hour, minute, second, millis;
+  unsigned long long sequence, correlation = 0u;
+  char hex[32];
+  const char *cursor = writer->output;
+  int consumed = 0;
+  if (sscanf(cursor, "ts=%4u-%2u-%2uT%2u:%2u:%2u.%3uZ seq=%llu boot=%16[0-9a-f] %n",
+             &year, &month, &day, &hour, &minute, &second, &millis, &sequence,
+             hex, &consumed) != 9 || consumed == 0 || strlen(hex) != 16u) return 0;
+  if (year < 2024u || month < 1u || month > 12u || day < 1u || day > 31u ||
+      hour > 23u || minute > 59u || second > 60u || millis > 999u) return 0;
+  *has_id = sscanf(cursor + consumed, "id=%llu ", &correlation) == 1;
+  if (*has_id) {
+    char text[40];
+    int id_width = snprintf(text, sizeof(text), "id=%llu ", correlation);
+    consumed += id_width;
+  }
+  if (strncmp(cursor + consumed, "level=", 6u) != 0) return 0;
+  *seq = sequence;
+  *id = correlation;
+  *ts_ms = ((size_t)hour * 3600u + (size_t)minute * 60u + second) * 1000u + millis;
+  memcpy(boot, hex, 17u);
+  return 1;
+}
+
+static int test_stamp(void)
+{
+  writer_t writer;
+  ftun_logger_t *logger = NULL;
+  ftun_logger_options_t options;
+  ftun_diagnostic_t item;
+  uint64_t sequence[3], id = 0u, first_id;
+  char boot[3][17];
+  bool has_id = false;
+  size_t ts = 0u, round;
+  CHECK(capture_init(&writer) == 0);
+  memset(&options, 0, sizeof(options));
+  options.level = FTUN_LOG_ERROR;
+  options.queue_capacity = 4u;
+  options.line_capacity = 256u;
+  options.writer = write_line;
+  options.writer_user = &writer;
+  options.stamp = true;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  for (round = 0u; round < 3u; round++) {
+    item = diagnostic("", "stamped");
+    item.correlation = round == 1u ? ftun_correlation_next() : 0u;
+    if (round == 1u) first_id = item.correlation;
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+    CHECK(stamped_line(&writer, &sequence[round], boot[round], &has_id, &id, &ts) == 1);
+    CHECK(has_id == (round == 1u));
+    if (round == 1u) CHECK(id == first_id && id != 0u);
+    CHECK(capture_reset(&writer) == 0);
+  }
+  CHECK(sequence[1] > sequence[0] && sequence[2] > sequence[1]);
+  CHECK(strcmp(boot[0], boot[1]) == 0 && strcmp(boot[1], boot[2]) == 0);
+  CHECK(ftun_log_boot_id() != 0u && ftun_correlation_next() > first_id);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  return 0;
 }
 
 static int test_format_and_bound(void)
@@ -747,10 +812,109 @@ static int test_real_sinks(void)
   return 0;
 }
 
+static size_t file_size(const char *path)
+{
+  struct stat info;
+  return stat(path, &info) == 0 ? (size_t)info.st_size : SIZE_MAX;
+}
+
+static int file_has(const char *path, const char *needle)
+{
+  char bytes[8192];
+  int descriptor = open(path, O_RDONLY);
+  ssize_t count;
+  if (descriptor < 0) return 0;
+  count = read(descriptor, bytes, sizeof(bytes) - 1u);
+  (void)close(descriptor);
+  if (count < 0) return 0;
+  bytes[count] = '\0';
+  return strstr(bytes, needle) != NULL;
+}
+
+/* 按大小轮转（保留 max_files 个文件）、截断模式、外部移走文件后重新打开。 */
+static int test_rotation_and_reopen(void)
+{
+  char directory[] = "/tmp/ftun-logrotate-XXXXXX";
+  char path[256], older[300], oldest[300], beyond[300], moved[300];
+  ftun_logger_options_t options;
+  ftun_logger_t *logger = NULL;
+  ftun_logger_usage_t usage;
+  ftun_diagnostic_t item = diagnostic("/rotate", "line");
+  size_t index;
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(snprintf(path, sizeof(path), "%s/ftun.log", directory) > 0);
+  CHECK(snprintf(older, sizeof(older), "%s.1", path) > 0);
+  CHECK(snprintf(oldest, sizeof(oldest), "%s.2", path) > 0);
+  CHECK(snprintf(beyond, sizeof(beyond), "%s.3", path) > 0);
+  CHECK(snprintf(moved, sizeof(moved), "%s/moved.log", directory) > 0);
+  memset(&options, 0, sizeof(options));
+  options.level = FTUN_LOG_ERROR;
+  options.queue_capacity = 64u;
+  options.line_capacity = 512u;
+  options.path = path;
+  options.max_size = 600u;
+  options.max_files = 3u;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  for (index = 0u; index < 40u; index++) {
+    item = diagnostic("/rotate", "line");
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  }
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
+        usage.rotations >= 3u && usage.rotate_errors == 0u);
+  /* 只保留 3 个文件，每个都不超过上限，最旧的被覆盖。 */
+  CHECK(file_size(path) <= 600u && file_size(older) <= 600u &&
+        file_size(oldest) <= 600u && file_size(beyond) == SIZE_MAX);
+  CHECK(file_size(older) > 0u && file_size(oldest) > 0u);
+  /* 外部把文件移走（logrotate）：重新打开之后写入落在新建的文件上。 */
+  CHECK(rename(path, moved) == 0);
+  CHECK(ftun_logger_reopen(logger) == FTUN_OK);
+  item = diagnostic("/after-reopen", "fresh");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(file_has(path, "/after-reopen") && !file_has(moved, "/after-reopen"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.reopens >= 1u);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(unlink(path) == 0 && unlink(older) == 0 && unlink(oldest) == 0 &&
+        unlink(moved) == 0);
+
+  /* max_files 为 1：超限直接截断重写，不产生其他文件。 */
+  options.max_files = 1u;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  for (index = 0u; index < 20u; index++) {
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  }
+  CHECK(file_size(path) <= 600u && file_size(older) == SIZE_MAX);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+
+  /* 自定义 writer 不支持轮转与重新打开。 */
+  {
+    writer_t writer;
+    ftun_logger_t *custom = NULL;
+    memset(&options, 0, sizeof(options));
+    options.level = FTUN_LOG_ERROR;
+    options.writer = write_line;
+    options.max_size = 1000u;
+    CHECK(capture_init(&writer) == 0);
+    options.writer_user = &writer;
+    CHECK(ftun_logger_create(&options, &custom) == FTUN_E_INVALID && custom == NULL);
+    options.max_size = 0u;
+    CHECK(ftun_logger_create(&options, &custom) == FTUN_OK);
+    CHECK(ftun_logger_reopen(custom) == FTUN_E_UNSUPPORTED);
+    CHECK(ftun_logger_destroy(&custom) == FTUN_OK);
+    CHECK(capture_destroy(&writer) == 0);
+  }
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_rotation_and_reopen() == 0);
   CHECK(test_basic() == 0);
   CHECK(test_format_and_bound() == 0);
+  CHECK(test_stamp() == 0);
   CHECK(test_guard_scope() == 0);
   CHECK(test_real_sinks() == 0);
   CHECK(test_publish_concurrency() == 0);

@@ -10,4 +10,4 @@
 
 完整示例使用 persist=true，首次运行必须先显式初始化 FakeIP 状态；状态路径相对该配置文件目录。只要规则引用 FRS 集合，启动就会校验 `.frs` 文件及所有引用集合；文件损坏、集合缺失、类型错误或空集合都会阻止完整 Runtime 就绪。作为 LAN 网关使用时还需配置系统转发与受管路由，不把 Socket allow-lan 当作 TUN 网关开关。运行前替换真实端点、探测 URL，准备权限和 CA。
 
-物理设备身份使用顶层 `tun` 配置，`inbounds[].type=tun` 只描述 Proxy 消费者。旧版把 `interface`、`ipv4`、`auto-route` 和 `strict-route` 放在 TUN inbound 下的写法仍可读取；`check/run` 会提示迁移。新旧字段同时出现时必须完全一致，冲突会被拒绝。
+物理设备身份使用顶层 `tun` 配置，`inbounds[].type=tun` 只描述 Proxy 消费者。设备字段（`interface`、`ipv4`、`auto-route`、`strict-route`）只能写在顶层 `tun` 下，写在 TUN inbound 下会被拒绝。

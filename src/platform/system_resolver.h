@@ -41,7 +41,6 @@ typedef struct {
 } ftun_system_resolve_request_t;
 
 /* 系统解析适配。
- * 需求 REQ-DNS-001；任务 TASK-PLATFORM-004；目标 0.2.0；验收 TEST-PLATFORM-004。
  * libc/NSS 调用只在有界 Worker 上执行，结果由 worker_poll 回到 owner loop。
  * 域名在接纳前复制；成功结果同步借给 completion，最多保留 16 个有序去重
  * IPv4 地址。取消只逻辑终结，无法中断的 libc 调用仍由 Worker 排空。

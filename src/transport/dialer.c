@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #include "dialer.h"
 #include "platform/linux/socket_protect.h"
+#include "platform/socket_liveness.h"
 #include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
@@ -383,7 +384,7 @@ static ftun_status_t ftun_dial_reject(ftun_dial_context_t *context,
   return cleanup == FTUN_OK ? original : cleanup;
 }
 
-/* TASK-TRANSPORT-001 / TEST-TRANSPORT-001，目标 0.2.0：唯一物理拨号入口。 */
+/* 唯一物理拨号入口。 */
 ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
                                       const ftun_dial_request_t *request,
                                       const ftun_dial_io_t *io,
@@ -421,6 +422,7 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
   context->completion = request->completion;
   context->completion_user = request->user;
   context->policy.mark = request->protection.mark;
+  context->policy.liveness = request->protection.liveness;
   if (request->protection.interface_name.length != 0u) {
     memcpy(context->interface_name, request->protection.interface_name.data,
            request->protection.interface_name.length);
@@ -452,6 +454,13 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
     status = context->io.protect_socket(context->io.context,
                                         context->result.socket,
                                         &context->policy);
+    if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  }
+  /* 系统 socket 才设置存活策略；测试注入的 io 没有真实描述符。 */
+  if (request->transport == FTUN_DIAL_TCP &&
+      context->io.open_socket == ftun_system_open_socket) {
+    status = ftun_socket_apply_liveness((int)context->result.socket,
+                                        &context->policy.liveness);
     if (status != FTUN_OK) return ftun_dial_reject(context, status);
   }
   status = context->io.connect_socket(context->io.context,

@@ -279,6 +279,13 @@ static int test_rejection_and_limits(void)
   CHECK(accepted == 4u && operation != NULL);
   operation = (ftun_operation_t *)(uintptr_t)1;
   accepted = 99u;
+  {
+    /* LIMIT 的来源可区分：这条流自己的在途写满；backend 资源不足。 */
+    ftun_stream_limit_t reason = FTUN_STREAM_LIMIT_NONE;
+    CHECK(ftun_stream_write_ref_ex(fixture.stream, &second, write_completed,
+                                   &fixture.completion, &accepted, &operation, &reason) ==
+          FTUN_E_LIMIT && reason == FTUN_STREAM_LIMIT_STREAM);
+  }
   CHECK(ftun_stream_write_ref(fixture.stream, &second, &accepted,
                               &operation) == FTUN_E_LIMIT);
   CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 4);
@@ -470,7 +477,7 @@ static int test_failure_and_boundaries(void)
   return 0;
 }
 
-/* TASK-TRANSPORT-002 / TEST-TRANSPORT-002：引用只在接纳后保留到完成事件。 */
+/* 引用只在接纳后保留到完成事件。 */
 int main(void)
 {
   CHECK(test_partial_and_lifetime() == 0);

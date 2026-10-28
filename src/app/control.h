@@ -2,6 +2,7 @@
 #define FTUN_APP_CONTROL_H
 
 #include "ftun/ftun.h"
+#include "core/service.h"
 #include "util/event_log.h"
 #include "config/config.h"
 #include <stdbool.h>
@@ -56,6 +57,11 @@ typedef struct {
   size_t queued_commands;
   bool reload_pending;
   bool stop_requested;
+  /* 服务级故障计数（按 ftun_fault_scope_t 范围累计）、暂停次数及当前是否
+   * 处于暂停新业务的状态。 */
+  uint64_t service_faults[FTUN_FAULT_SCOPE_COUNT];
+  uint64_t service_pauses;
+  bool service_paused;
   ftun_event_log_usage_t events;
   bool logger_present;
   ftun_logger_usage_t logger;
@@ -69,6 +75,9 @@ typedef struct {
   uint64_t config_trace_generation;
   char config_path[FTUN_APP_CONTROL_PATH_CAPACITY];
 } ftun_app_control_snapshot_t;
+
+/* 上一次 run 是否因 owner 失去响应由看门狗终止。 */
+bool ftun_app_control_watchdog_fired(ftun_core_t *core);
 
 ftun_status_t ftun_app_control_query(ftun_core_t *core,
   ftun_app_control_snapshot_t *out);

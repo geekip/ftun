@@ -18,7 +18,6 @@ struct ftun_fakeip_snapshot {
 };
 
 /* 批量映射快照。
- * 需求 REQ-PERSIST-001；任务 TASK-STATE-002；目标 0.3.0；验收 TEST-STATE-002。
  * save 在接纳前完整验证固定 sequence 视图并序列化为有界 Worker 输入；
  * Worker 在同目录写临时文件、同步、原子替换和目录同步。调用者在完成前
  * 可释放/修改输入 snapshot，因为 Worker 已拥有副本。

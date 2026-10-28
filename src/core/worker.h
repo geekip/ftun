@@ -39,7 +39,6 @@ typedef struct {
 } ftun_worker_usage_t;
 
 /* 有界文件任务。
- * 需求 REQ-CORE-001；任务 TASK-CORE-006；目标 0.2.0；验收 TEST-CORE-006。
  * 提交时复制输入并预留任务、结果、额外输出所有权和 completion 预算。
  * execute 只获得独立字节视图，不得访问 Session。input 若携带由
  * owner 预先保留的不可变快照，必须提供 input_cleanup；它在任务真正结束且

@@ -5,7 +5,7 @@
 
 #include "config/model.h"
 #include "proxy/runtime_state.h"
-#include "protocol/socks5.h"
+#include "protocol/socks5_client.h"
 #include "proxy/outbound_id.h"
 #include "tls/tls.h"
 #include "util/time.h"
@@ -352,78 +352,45 @@ ftun_status_t ftun_http_fetch_resolver(const ftun_config_t *config,
                                     spec->socket_mark, &spec->resolver);
 }
 
-static ftun_status_t ftun_http_socks_reply(ftun_control_channel_t *channel,
-                                            uint64_t deadline_ms,
-                                            ftun_socks5_reply_t *reply)
+typedef struct {
+  ftun_control_channel_t *channel;
+  uint64_t deadline_ms;
+} ftun_http_socks_io_t;
+
+static ftun_status_t ftun_http_socks_write(void *context, const uint8_t *data,
+                                           size_t length)
 {
-  uint8_t frame[262];
-  size_t length = 4u;
-  size_t consumed = 0u;
-  if (!ftun_http_recv_all(channel, frame, 4u, deadline_ms)) {
-    return FTUN_E_TIMEOUT;
-  }
-  if (frame[3] == 1u) length = 10u;
-  else if (frame[3] == 4u) length = 22u;
-  else if (frame[3] == 3u) {
-    if (!ftun_http_recv_all(channel, frame + 4u, 1u, deadline_ms)) {
-      return FTUN_E_TIMEOUT;
-    }
-    length = 7u + frame[4];
-    if (length > sizeof(frame) || !ftun_http_recv_all(
-          channel, frame + 5u, length - 5u, deadline_ms)) {
-      return FTUN_E_TIMEOUT;
-    }
-    return ftun_socks5_decode_reply((ftun_bytes_t){frame, length}, reply,
-                                    &consumed);
-  } else return FTUN_E_PROTOCOL;
-  if (!ftun_http_recv_all(channel, frame + 4u, length - 4u,
-                          deadline_ms)) return FTUN_E_TIMEOUT;
-  return ftun_socks5_decode_reply((ftun_bytes_t){frame, length}, reply,
-                                  &consumed);
+  ftun_http_socks_io_t *io = (ftun_http_socks_io_t *)context;
+  return ftun_http_send_all(io->channel, data, length, io->deadline_ms)
+    ? FTUN_OK : FTUN_E_TIMEOUT;
+}
+
+static ftun_status_t ftun_http_socks_read(void *context, uint8_t *data,
+                                          size_t length)
+{
+  ftun_http_socks_io_t *io = (ftun_http_socks_io_t *)context;
+  return ftun_http_recv_all(io->channel, data, length, io->deadline_ms)
+    ? FTUN_OK : FTUN_E_TIMEOUT;
 }
 
 static ftun_status_t ftun_http_socks_connect(
   ftun_control_channel_t *channel, const ftun_http_fetch_spec_t *spec,
   const ftun_endpoint_t *target)
 {
-  uint8_t frame[513];
-  uint8_t response[2];
-  ftun_socks5_reply_t reply;
-  size_t written = 0u;
+  ftun_http_socks_io_t transport = {channel, spec->deadline_ms};
+  ftun_socks5_client_io_t io = {ftun_http_socks_write, ftun_http_socks_read, &transport};
+  ftun_socks5_client_options_t options = {0};
+  ftun_socks5_client_result_t result;
+  ftun_socks5_client_t client;
   ftun_status_t status;
-  frame[0] = FTUN_SOCKS5_VERSION;
-  frame[1] = 1u;
-  frame[2] = spec->proxy_username.length == 0u
-    ? FTUN_SOCKS5_METHOD_NO_AUTH : FTUN_SOCKS5_METHOD_USERNAME_PASSWORD;
-  if (!ftun_http_send_all(channel, frame, 3u, spec->deadline_ms) ||
-      !ftun_http_recv_all(channel, response, 2u, spec->deadline_ms) ||
-      response[0] != FTUN_SOCKS5_VERSION || response[1] != frame[2]) {
-    return FTUN_E_REJECTED;
-  }
-  if (spec->proxy_username.length != 0u) {
-    status = ftun_socks5_encode_credentials(
-      (ftun_bytes_t){(const uint8_t *)spec->proxy_username.data,
-                     spec->proxy_username.length},
-      (ftun_bytes_t){(const uint8_t *)spec->proxy_password.data,
-                     spec->proxy_password.length},
-      frame, sizeof(frame), &written);
-    if (status != FTUN_OK || !ftun_http_send_all(channel, frame, written,
-          spec->deadline_ms) || !ftun_http_recv_all(channel, response, 2u,
-          spec->deadline_ms) || response[0] != FTUN_SOCKS5_AUTH_VERSION ||
-        response[1] != 0u) return status == FTUN_OK ? FTUN_E_REJECTED : status;
-  }
-  status = ftun_socks5_encode_request(FTUN_SOCKS5_COMMAND_CONNECT, target,
-                                      frame, sizeof(frame), &written);
-  if (status == FTUN_OK && !ftun_http_send_all(channel, frame, written,
-                                                spec->deadline_ms)) {
-    status = FTUN_E_TIMEOUT;
-  }
-  if (status == FTUN_OK) {
-    status = ftun_http_socks_reply(channel, spec->deadline_ms, &reply);
-  }
-  if (status == FTUN_OK && reply.reply != FTUN_SOCKS5_REPLY_SUCCEEDED) {
-    status = FTUN_E_REJECTED;
-  }
+  options.username = (ftun_bytes_t){(const uint8_t *)spec->proxy_username.data,
+                                    spec->proxy_username.length};
+  options.password = (ftun_bytes_t){(const uint8_t *)spec->proxy_password.data,
+                                    spec->proxy_password.length};
+  options.command = FTUN_SOCKS5_COMMAND_CONNECT;
+  options.target = *target;
+  status = ftun_socks5_client_init(&client, &options);
+  if (status == FTUN_OK) status = ftun_socks5_client_run(&client, &io, &result);
   return status;
 }
 
@@ -553,7 +520,7 @@ static ftun_status_t ftun_http_decode_chunked(uint8_t *data, size_t length,
   return FTUN_E_PROTOCOL;
 }
 
-static ftun_status_t ftun_http_parse_response(
+ftun_status_t ftun_http_fetch_parse_response(
   ftun_budget_t *budget, uint8_t *wire, size_t wire_length, size_t maximum,
   ftun_http_fetch_result_t *out, char **location,
   ftun_reservation_t **location_reservation)
@@ -772,7 +739,7 @@ static ftun_status_t ftun_http_fetch_once(
   }
   if (status == FTUN_OK && wire_length == wire_capacity) status = FTUN_E_LIMIT;
   if (status == FTUN_OK) {
-    status = ftun_http_parse_response(spec->budget, wire, wire_length,
+    status = ftun_http_fetch_parse_response(spec->budget, wire, wire_length,
       spec->maximum_bytes, out, location, location_reservation);
   }
   if (status == FTUN_OK && out->length != 0u) {

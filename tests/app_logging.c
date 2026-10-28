@@ -61,6 +61,8 @@ ftun_status_t __wrap_ftun_logger_create(const ftun_logger_options_t *options,
   ftun_logger_options_t copy = *options;
   /* 仅替换外部 writer；保留生产容量、level 和共享 ledger 绑定。 */
   copy.path = NULL;
+  copy.max_size = 0u;
+  copy.max_files = 0u;
   copy.writer = write_line;
   copy.writer_user = &test;
   return __real_ftun_logger_create(&copy, out);
@@ -154,7 +156,9 @@ static ftun_status_t destroy_until(void **instance, uint64_t deadline)
 static const ftun_core_service_descriptor_t descriptor = {
   "logging-test", plan_prepare, plan_destroy, prepare, success,
   reload_prepare, reload_planned, reload_commit, success, run_once,
-  success, success, stop_until, stop_until, destroy_until
+  success, success, stop_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
@@ -165,7 +169,7 @@ static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
   ftun_app_control_snapshot_t snapshot;
   uint64_t started;
   ftun_status_t expected = slow ? FTUN_E_TIMEOUT :
-    (fail_prepare || fail_poll_at != 0u) ? FTUN_E_IO : FTUN_OK;
+    fail_prepare ? FTUN_E_IO : FTUN_OK;
   memset(&test, 0, sizeof(test));
   test.slow = slow;
   test.fail = fail;
@@ -186,7 +190,7 @@ static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
     !snapshot.logger_present && test.destroyed == 1u);
   CHECK(snapshot.run_result == expected);
   CHECK(snapshot.events.last.kind == FTUN_LIFECYCLE_STOPPED &&
-    snapshot.events.last.status == (fail_prepare || fail_poll_at != 0u ? FTUN_E_IO : FTUN_OK));
+    snapshot.events.last.status == (fail_prepare ? FTUN_E_IO : FTUN_OK));
   CHECK(snapshot.log_totals.created == 1u && snapshot.log_totals.dropped == 0u);
   if (slow) {
     CHECK(snapshot.core.state == FTUN_CORE_STOPPING && snapshot.log_totals.instances == 1u &&
@@ -229,7 +233,8 @@ static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
     if (!fail_prepare) CHECK(strchr(terminal, '\n') == test.text + test.length - 1u);
   }
   if (fail_poll_at != 0u) {
-    CHECK(test.rounds == 0u && strstr(test.text, "production data plane failed") == NULL);
+    /* worker poll 的非 STATE_CORRUPT 错误只记录，不停机：服务照常运行。 */
+    CHECK(test.rounds >= 1u && strstr(test.text, "production data plane failed") == NULL);
     if (fail_poll_at == 1u) {
       CHECK(strstr(test.text, "message=reload worker failed\n") != NULL &&
         strstr(test.text, "state worker failed") == NULL);

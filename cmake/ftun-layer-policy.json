@@ -89,6 +89,30 @@
       ]
     },
     {
+      "pattern": "src/app/reload_txn.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/cleanup_driver.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/watchdog.c",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
+      "pattern": "src/app/watchdog.h",
+      "targets": [
+        "ftun_app"
+      ]
+    },
+    {
       "pattern": "src/app/runtime_support.h",
       "targets": [
         "ftun_app"

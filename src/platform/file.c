@@ -15,8 +15,6 @@
 #include <sys/types.h>
 #include <unistd.h>
 
-/* 需求 REQ-PERSIST-001；任务 TASK-PLATFORM-005；目标 0.3.0；验收 TEST-PLATFORM-005。 */
-
 struct ftun_file_lock {
   int descriptor;
   ftun_reservation_t *reservation;

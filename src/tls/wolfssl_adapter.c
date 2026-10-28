@@ -1,4 +1,4 @@
-/* TASK-TLS-002 / TEST-TLS-002：ftun_wolfssl_prepare，目标 0.4.0。 */
+/* ftun_wolfssl_prepare。 */
 #include "wolfssl_adapter.h"
 #include "core/budget.h"
 

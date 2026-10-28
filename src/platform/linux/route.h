@@ -7,6 +7,8 @@
 #define FTUN_LINUX_ROUTE_MAX_RESOURCES 7u
 #define FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES 128u
 #define FTUN_LINUX_ROUTE_PROTOCOL 186u
+/* 单个资源最多清理的遗留对象数，防止无界循环。 */
+#define FTUN_LINUX_ROUTE_SWEEP_LIMIT 16u
 
 typedef enum {
   FTUN_LINUX_ROUTE_ADDRESS = 1,
@@ -31,11 +33,17 @@ typedef struct {
   uint32_t mark_mask;
   uint32_t metric;
   uint8_t protocol;
+  /* 仅用于删除请求：放宽选择子，只按家族、优先级（路由为表与前缀）与协议号
+   * 清理上次崩溃遗留的过期对象；不属于计划资源，不进入账本。 */
+  bool stray;
 } ftun_linux_route_resource_t;
 
 typedef struct {
   ftun_linux_route_resource_t resources[FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES];
   size_t resource_count;
+  /* 安装前先按放宽的选择子清理同表同优先级的协议号 186 遗留对象。仅在持有
+   * 路由表互斥锁（策略事务）时启用，不能用于与其他管理者共享的计划。 */
+  bool sweep;
 } ftun_linux_route_plan_t;
 
 typedef struct {
@@ -115,6 +123,13 @@ typedef struct {
   size_t timeouts;
   size_t cleanup_failures;
   bool runnable;
+  /* 对账修复：repairing 为真时 state 暂为 APPLYING，但失败不会撤销已有资源。 */
+  bool repairing;
+  ftun_status_t repair_result;
+  size_t repair_runs;
+  size_t repairs;
+  size_t repair_failures;
+  size_t strays_removed;
 } ftun_linux_route_async_info_t;
 
 /* 动态路由事务使用非阻塞 rtnetlink，并把 fd/timer 挂到 owner loop。
@@ -157,6 +172,13 @@ ftun_status_t ftun_linux_route_guard_plan(
 ftun_status_t ftun_linux_route_overlay_plan(
   const ftun_network_view_t *view, ftun_string_t tun_interface,
   uint32_t table, uint32_t metric, ftun_linux_route_plan_t *out);
+/* 对已 READY 的事务做对账修复：按计划顺序（地址、保护规则、路由、捕获规则）
+ * 逐项核验，已存在的保持，缺失的重新添加。不重建整个事务，任何失败都回到
+ * READY 并记录 repair_result，已有资源保持原所有权；下次对账可以重试。
+ * 仅 READY 可调用，否则返回 AGAIN（进行中）或 INVALID。 */
+ftun_status_t ftun_linux_route_async_repair(
+  ftun_linux_route_async_t *operation, uint64_t now_ms,
+  uint64_t total_deadline_ms);
 /* 单轮最多处理 max_work 个提交或回复；不会等待 I/O。 */
 ftun_status_t ftun_linux_route_async_run(ftun_linux_route_async_t *operation,
                                          uint64_t now_ms, size_t max_work,
@@ -176,7 +198,6 @@ ftun_status_t ftun_linux_route_async_destroy(
   ftun_linux_route_async_t **operation);
 
 /* Linux 路由资源事务。
- * 需求 REQ-GUARD-001；任务 TASK-PLATFORM-002；目标 0.2.0；验收 TEST-PLATFORM-002。
  * 实现路径：记录实例所有权；保护与 TUN 路由按序准备；冲突拒绝、失败反序撤销；本机/LAN 分别验收，退出不改他人规则。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * policy 仅在调用期间借用，成功 transaction 拥有已安装资源记录。

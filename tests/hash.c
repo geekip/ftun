@@ -1,8 +1,36 @@
 #include "core/budget.h"
 #include "util/hash.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/random.h>
+
+static size_t entropy_calls;
+static int entropy_failure;
+static int entropy_interrupts;
+
+ssize_t __wrap_getrandom(void *buffer, size_t length, unsigned int flags)
+{
+  size_t offset;
+  (void)flags;
+  entropy_calls++;
+  if (entropy_interrupts > 0) {
+    entropy_interrupts--;
+    errno = EINTR;
+    return -1;
+  }
+  if (entropy_failure) {
+    errno = EIO;
+    return -1;
+  }
+  for (offset = 0u; offset < length; offset++) {
+    ((uint8_t *)buffer)[offset] = (uint8_t)(entropy_calls + offset);
+  }
+  return (ssize_t)length;
+}
+#endif
 
 #define CHECK(x) do { \
   if (!(x)) { \
@@ -25,6 +53,49 @@ static uint64_t collide(ftun_bytes_t key, void *user)
   (void)user;
   return 3u;
 }
+
+static int test_seeded_hash_vectors(void)
+{
+  uint8_t seed[FTUN_HASH_SEED_BYTES];
+  uint8_t data[15];
+  size_t index;
+  for (index = 0u; index < sizeof(seed); index++) seed[index] = (uint8_t)index;
+  for (index = 0u; index < sizeof(data); index++) data[index] = (uint8_t)index;
+  CHECK(ftun_hash_seeded((ftun_bytes_t){NULL, 0u}, seed) ==
+        UINT64_C(0x726fdb47dd0e0e31));
+  CHECK(ftun_hash_seeded((ftun_bytes_t){data, sizeof(data)}, seed) ==
+        UINT64_C(0xa129ca6149be45e5));
+  seed[0] ^= 1u;
+  CHECK(ftun_hash_seeded((ftun_bytes_t){data, sizeof(data)}, seed) !=
+        UINT64_C(0xa129ca6149be45e5));
+  return 0;
+}
+
+#if defined(__linux__)
+static int test_entropy_failure_and_retry(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_index_t *index = NULL;
+  ftun_budget_usage_t usage;
+  size_t before;
+  CHECK(ftun_budget_create(NULL, 4096u, 0u, &budget) == FTUN_OK);
+  entropy_failure = 1;
+  before = entropy_calls;
+  CHECK(ftun_index_create(budget, SIZE_MAX, SIZE_MAX, NULL, NULL, &index) ==
+        FTUN_E_LIMIT && entropy_calls == before);
+  CHECK(ftun_index_create(budget, 1u, 2u, NULL, NULL, &index) == FTUN_E_IO &&
+        index == NULL);
+  entropy_failure = 0;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  before = entropy_calls;
+  entropy_interrupts = 1;
+  CHECK(ftun_index_create(budget, 1u, 2u, NULL, NULL, &index) == FTUN_OK &&
+        entropy_calls == before + 2u);
+  CHECK(ftun_index_destroy(&index) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+#endif
 
 static int test_full_key_collision_and_growth(void)
 {
@@ -95,6 +166,10 @@ static int test_limits_and_persistent_version(void)
 
 int main(void)
 {
+  CHECK(test_seeded_hash_vectors() == 0);
+#if defined(__linux__)
+  CHECK(test_entropy_failure_and_retry() == 0);
+#endif
   CHECK(test_full_key_collision_and_growth() == 0);
   CHECK(test_limits_and_persistent_version() == 0);
   return 0;

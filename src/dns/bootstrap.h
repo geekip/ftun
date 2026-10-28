@@ -49,7 +49,6 @@ typedef struct {
 } ftun_bootstrap_io_t;
 
 /* 基础真实解析。
- * 需求 REQ-DNS-001；任务 TASK-DNS-004；目标 0.2.0；验收 TEST-DNS-004。
  * servers 非空时只按复制后的 IPv4 列表经 purpose=BOOTSTRAP 的受保护
  * UDP Dialer 顺序尝试，校验来源、ID 和完整 Question，绝不回退系统 DNS。
  * servers 为空时原样委托 SystemResolver，并要求其路径保护门禁。

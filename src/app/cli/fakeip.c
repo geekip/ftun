@@ -4,6 +4,7 @@
 
 #include "config/config.h"
 #include "config/parser.h"
+#include "network/address.h"
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
 #include "proxy/state/fakeip_store.h"
 #endif
@@ -64,35 +65,10 @@ static ftun_status_t ftun_cli_random_uuid(ftun_budget_t *budget,
 static int ftun_cli_fakeip_range(const char *range,
                                  uint32_t *first, uint32_t *end)
 {
-  struct in_addr address;
-  const char *slash;
-  char ip[INET_ADDRSTRLEN];
-  char *tail = NULL;
-  unsigned long prefix;
-  size_t length;
-  uint32_t host;
-  uint32_t mask;
-  uint32_t network;
-  uint32_t broadcast;
-  if (range == NULL || first == NULL || end == NULL ||
-      (slash = strchr(range, '/')) == NULL) return 0;
-  length = (size_t)(slash - range);
-  if (length == 0u || length >= sizeof(ip)) return 0;
-  memcpy(ip, range, length);
-  ip[length] = '\0';
-  errno = 0;
-  prefix = strtoul(slash + 1u, &tail, 10);
-  if (errno != 0 || tail == slash + 1u || *tail != '\0' || prefix > 32u ||
-      inet_pton(AF_INET, ip, &address) != 1) return 0;
-  host = ntohl(address.s_addr);
-  mask = prefix == 0u ? 0u : UINT32_MAX << (32u - (unsigned int)prefix);
-  network = host & mask;
-  broadcast = network | ~mask;
-  if (host != network || network == UINT32_MAX ||
-      network + 1u >= broadcast) return 0;
-  *first = network + 1u;
-  *end = broadcast;
-  return 1;
+  ftun_cidr_t cidr;
+  return range != NULL && first != NULL && end != NULL &&
+         ftun_cidr_parse(range, strlen(range), true, &cidr) &&
+         ftun_cidr_ipv4_hosts(&cidr, first, end);
 }
 #endif
 

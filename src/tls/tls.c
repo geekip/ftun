@@ -1,4 +1,4 @@
-/* TASK-TLS-001 / TEST-TLS-001：ftun_tls_client_open，目标 0.4.0。 */
+/* ftun_tls_client_open。 */
 #include "tls.h"
 #include "wolfssl_adapter.h"
 

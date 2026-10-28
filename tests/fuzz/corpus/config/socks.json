@@ -1,0 +1,1 @@
+{"inbounds":[{"name":"in","type":"socks5","listen":"127.0.0.1:1080"}],"rules":["MATCH,DIRECT"]}

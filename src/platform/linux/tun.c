@@ -184,7 +184,7 @@ static void ftun_linux_ifreq_name(struct ifreq *request, const char *name)
   memcpy(request->ifr_name, name, strlen(name) + 1u);
 }
 
-/* TASK-PLATFORM-001 / TEST-PLATFORM-001，目标 0.2.0：独占非阻塞 TUN 及失败回滚。 */
+/* 独占非阻塞 TUN 及失败回滚。 */
 ftun_status_t ftun_linux_tun_open_with_io_and_budget(ftun_budget_t *budget,
                                           const ftun_tun_spec_t *spec,
                                           const ftun_linux_tun_io_t *io,

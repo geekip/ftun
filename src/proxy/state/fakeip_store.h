@@ -52,7 +52,6 @@ ftun_status_t ftun_fakeip_store_get_info(const ftun_fakeip_store_t *store,
                                          ftun_fakeip_store_info_t *out);
 
 /* 预留范围持久化。
- * 需求 REQ-PERSIST-001；任务 TASK-STATE-001；目标 0.3.0；验收 TEST-STATE-001。
  * end_exclusive 必须单调增加且不超过池尾。接纳后由 Worker 追加带前值、
  * 序号和校验的记录并 fdatasync；仅 completion(OK) 后 info 才发布新高水位。
  * 任一失败/取消令 store halted，旧映射可读但拒绝后续新预留。

@@ -3,6 +3,7 @@
 #include "model.h"
 #include "parser.h"
 #include "core/budget.h"
+#include "network/address.h"
 #include <limits.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -89,43 +90,11 @@ static int ftun_path_valid(const char *value)
   return 1;
 }
 
-static int ftun_decimal_span(const char *value, size_t length, uint32_t maximum,
-                             uint32_t *out)
-{
-  uint32_t result = 0u;
-  size_t index;
-  if (value == NULL || length == 0u || (length > 1u && value[0] == '0')) return 0;
-  for (index = 0u; index < length; index++) {
-    uint32_t digit;
-    if (value[index] < '0' || value[index] > '9') return 0;
-    digit = (uint32_t)(value[index] - '0');
-    if (result > (maximum - digit) / 10u) return 0;
-    result = result * 10u + digit;
-  }
-  if (out != NULL) *out = result;
-  return 1;
-}
-
 static int ftun_ipv4_span(const char *value, size_t length, uint32_t *out)
 {
-  uint32_t result = 0u;
-  size_t start = 0u;
-  size_t part;
-  if (value == NULL || length == 0u) return 0;
-  for (part = 0u; part < 4u; part++) {
-    size_t end = start;
-    uint32_t octet;
-    while (end < length && value[end] != '.') end++;
-    if (!ftun_decimal_span(value + start, end - start, 255u, &octet)) return 0;
-    result = (result << 8u) | octet;
-    if (part == 3u) {
-      if (end != length) return 0;
-    } else {
-      if (end == length) return 0;
-      start = end + 1u;
-    }
-  }
-  if (out != NULL) *out = result;
+  uint8_t bytes[4];
+  if (!ftun_ipv4_parse(value, length, bytes)) return 0;
+  if (out != NULL) *out = ftun_ipv4_value(bytes);
   return 1;
 }
 
@@ -180,14 +149,6 @@ static int ftun_host_span(const char *value, size_t length, uint32_t *ipv4,
   return 1;
 }
 
-static int ftun_port_span(const char *value, size_t length, uint16_t *out)
-{
-  uint32_t port;
-  if (!ftun_decimal_span(value, length, 65535u, &port) || port == 0u) return 0;
-  if (out != NULL) *out = (uint16_t)port;
-  return 1;
-}
-
 static int ftun_listen_address(const char *value, ftun_config_listener_t *out)
 {
   const char *colon;
@@ -201,7 +162,7 @@ static int ftun_listen_address(const char *value, ftun_config_listener_t *out)
   host_length = (size_t)(colon - value);
   port_length = strlen(colon + 1);
   if (!ftun_ipv4_span(value, host_length, &address) ||
-      !ftun_port_span(colon + 1, port_length, &port)) return 0;
+      !ftun_port_parse(colon + 1, port_length, &port)) return 0;
   if (out != NULL) {
     out->address = address;
     out->port = port;
@@ -224,7 +185,7 @@ static int ftun_server_address(const char *value, int port_required,
   if (strchr(colon + 1, ':') != NULL) return 0;
   host_length = (size_t)(colon - value);
   if (!ftun_host_span(value, host_length, ipv4, is_ipv4)) return 0;
-  return ftun_port_span(colon + 1, strlen(colon + 1), &port);
+  return ftun_port_parse(colon + 1, strlen(colon + 1), &port);
 }
 
 static int ftun_bootstrap_address(const char *value, uint32_t *out)
@@ -241,7 +202,7 @@ static int ftun_bootstrap_address(const char *value, uint32_t *out)
   }
   if (strchr(colon + 1, ':') != NULL ||
       !ftun_ipv4_span(value, (size_t)(colon - value), &address)) return 0;
-  if (!ftun_port_span(colon + 1, strlen(colon + 1), &port)) return 0;
+  if (!ftun_port_parse(colon + 1, strlen(colon + 1), &port)) return 0;
   if (out != NULL) *out = address;
   return 1;
 }
@@ -249,25 +210,18 @@ static int ftun_bootstrap_address(const char *value, uint32_t *out)
 static int ftun_cidr(const char *value, int require_network,
                      ftun_config_cidr_t *out)
 {
-  const char *slash;
-  uint32_t address;
-  uint32_t prefix;
-  uint32_t mask;
-  if (value == NULL) return 0;
-  slash = strchr(value, '/');
-  if (slash == NULL || strchr(slash + 1, '/') != NULL) return 0;
-  if (!ftun_ipv4_span(value, (size_t)(slash - value), &address) ||
-      !ftun_decimal_span(slash + 1, strlen(slash + 1), 32u, &prefix)) return 0;
-  mask = prefix == 0u ? 0u : UINT32_MAX << (32u - prefix);
-  if (require_network && (address & ~mask) != 0u) return 0;
+  ftun_cidr_t cidr;
+  uint32_t network, broadcast;
+  if (value == NULL || !ftun_cidr_parse(value, strlen(value), require_network != 0, &cidr) ||
+      !ftun_cidr_ipv4_range(&cidr, &network, &broadcast)) return 0;
   if (out != NULL) {
-    out->address = address & mask;
-    out->mask = mask;
+    out->address = network;
+    out->mask = ftun_ipv4_mask(cidr.prefix);
   }
   return 1;
 }
 
-static int ftun_duration_ms(const char *value, uint64_t *out)
+int ftun_config_duration_ms(const char *value, uint64_t *out)
 {
   size_t length;
   size_t digits;
@@ -320,7 +274,7 @@ static int ftun_http_url(const char *value, uint32_t *ipv4, int *is_ipv4)
   if (colon != NULL) {
     if (memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL) return 0;
     host_length = (size_t)(colon - authority);
-    if (!ftun_port_span(colon + 1, (size_t)(end - colon - 1), &ignored_port)) return 0;
+    if (!ftun_port_parse(colon + 1, (size_t)(end - colon - 1), &ignored_port)) return 0;
   } else {
     host_length = (size_t)(end - authority);
   }
@@ -463,7 +417,7 @@ static ftun_status_t ftun_validate_rule(const ftun_config_t *config,
                                       "FRS label is invalid");
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "DST-PORT")) {
-      if (!ftun_decimal_span(first + 1, operand_length, 65535u, &ignored) || ignored == 0u) {
+      if (!ftun_decimal_parse(first + 1, operand_length, 65535u, &ignored) || ignored == 0u) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
                                       "rule port is invalid");
       }
@@ -517,7 +471,7 @@ static ftun_status_t ftun_validate_group_visit(const ftun_config_t *config,
   return FTUN_OK;
 }
 
-static int ftun_cidr_contains(const ftun_config_cidr_t *cidr, uint32_t address)
+static int ftun_config_cidr_has(const ftun_config_cidr_t *cidr, uint32_t address)
 {
   return (address & cidr->mask) == cidr->address;
 }
@@ -536,6 +490,75 @@ static int ftun_listener_conflict(const ftun_config_listener_t *left,
          (left->address == right->address || left->address == 0u || right->address == 0u);
 }
 
+/* 各时长的取值范围；write-progress 必须大于 keepalive 判定失联所需的总时长，
+ * 否则健康的慢速链路会先被误判为失联。 */
+static ftun_status_t ftun_validate_timeouts(const ftun_config_t *config,
+                                            ftun_diagnostic_t *out)
+{
+  const uint32_t minimum_ms = 100u;
+  const uint32_t maximum_ms = 600u * 1000u;
+  const uint32_t maximum_idle_ms = 7u * 24u * 3600u * 1000u;
+  const uint32_t maximum_progress_ms = 3600u * 1000u;
+  size_t index;
+  if (config->base.timeouts.handshake_ms < minimum_ms ||
+      config->base.timeouts.handshake_ms > maximum_ms) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/handshake",
+                                  "handshake timeout is out of range");
+  }
+  if (config->base.timeouts.connect_ms < minimum_ms ||
+      config->base.timeouts.connect_ms > maximum_ms) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/connect",
+                                  "connect timeout is out of range");
+  }
+  if (config->base.timeouts.reply_ms < minimum_ms ||
+      config->base.timeouts.reply_ms > maximum_ms) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/reply",
+                                  "reply timeout is out of range");
+  }
+  if (config->base.timeouts.write_progress_ms < 1000u ||
+      config->base.timeouts.write_progress_ms > maximum_progress_ms) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/write-progress",
+                                  "write progress timeout is out of range");
+  }
+  if (config->base.timeouts.tcp_idle_ms > maximum_idle_ms ||
+      (config->base.timeouts.tcp_idle_ms != 0u && config->base.timeouts.tcp_idle_ms < 1000u)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/tcp-idle",
+                                  "TCP idle timeout is out of range");
+  }
+  if (config->base.timeouts.udp_idle_ms < 1000u ||
+      config->base.timeouts.udp_idle_ms > maximum_idle_ms) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/udp-idle",
+                                  "UDP idle timeout is out of range");
+  }
+  if (config->base.timeouts.keepalive.enabled) {
+    uint64_t detection_ms;
+    if (config->base.timeouts.keepalive.idle_s < 1u ||
+        config->base.timeouts.keepalive.idle_s > 7200u ||
+        config->base.timeouts.keepalive.interval_s < 1u ||
+        config->base.timeouts.keepalive.interval_s > 600u ||
+        config->base.timeouts.keepalive.count < 1u ||
+        config->base.timeouts.keepalive.count > 20u) {
+      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/tcp-keepalive",
+                                    "TCP keepalive values are out of range");
+    }
+    detection_ms = ((uint64_t)config->base.timeouts.keepalive.idle_s +
+      (uint64_t)config->base.timeouts.keepalive.interval_s *
+      config->base.timeouts.keepalive.count) * 1000u;
+    if (config->base.timeouts.write_progress_ms <= detection_ms) {
+      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/timeouts/write-progress",
+        "write progress timeout must exceed the keepalive detection time");
+    }
+  }
+  for (index = 0u; index < config->inbound_count; index++) {
+    uint32_t idle = config->inbounds[index].tcp_idle_ms;
+    if (idle != 0u && (idle < 1000u || idle > maximum_idle_ms)) {
+      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
+                                    "inbound TCP idle timeout is out of range");
+    }
+  }
+  return FTUN_OK;
+}
+
 static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
                                          ftun_diagnostic_t *out)
 {
@@ -547,6 +570,12 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
   if (config->base.ipv6) {
     return ftun_config_diagnostic(out, FTUN_E_UNSUPPORTED, "/base/ipv6",
                                   "IPv6 mode is not supported");
+  }
+  if (config->base.watchdog_ms != 0u &&
+      (config->base.watchdog_ms < FTUN_CONFIG_WATCHDOG_MINIMUM_MS ||
+       config->base.watchdog_ms > FTUN_CONFIG_WATCHDOG_MAXIMUM_MS)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/watchdog",
+                                  "watchdog must be 1s..10m or null");
   }
   if (config->base.capacity.tcp_flows < FTUN_CONFIG_CAPACITY_MINIMUM ||
       config->base.capacity.tcp_flows > FTUN_CONFIG_CAPACITY_MAXIMUM) {
@@ -568,6 +597,10 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
                                   "/base/capacity/udp-associations",
                                   "UDP association capacity is out of range");
   }
+  {
+    ftun_status_t timeouts = ftun_validate_timeouts(config, out);
+    if (timeouts != FTUN_OK) return timeouts;
+  }
   if (!ftun_path_valid(config->base.cache_file)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/base/cache-file",
                                   "cache file path is invalid");
@@ -585,6 +618,16 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
   if (!ftun_path_valid(config->log.file)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/file",
                                   "log file path is invalid");
+  }
+  if (config->log.max_size != 0u &&
+      config->log.max_size < FTUN_CONFIG_LOG_MAX_SIZE_MINIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/max-size",
+                                  "log max-size must be 0 or at least 65536 bytes");
+  }
+  if (config->log.max_files == 0u ||
+      config->log.max_files > FTUN_CONFIG_LOG_MAX_FILES_MAXIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/max-files",
+                                  "log max-files must be 1..32");
   }
   return FTUN_OK;
 }
@@ -606,7 +649,7 @@ static ftun_status_t ftun_validate_dns(const ftun_config_t *config,
                                     "bootstrap address is invalid");
     }
     if (config->dns.enable && config->dns.fake_ip.enable &&
-        ftun_cidr_contains(&fake_range, address)) {
+        ftun_config_cidr_has(&fake_range, address)) {
       return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/bootstrap",
                                     "bootstrap address overlaps FakeIP range");
     }
@@ -627,6 +670,10 @@ static ftun_status_t ftun_validate_dns(const ftun_config_t *config,
       return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
                                     "DNS server address list is empty");
     }
+    if (server->addresses.count > 4u) {
+      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
+                                    "DNS server has more than 4 addresses");
+    }
     for (other = 0u; other < server->addresses.count; other++) {
       uint32_t address = 0u;
       int is_ipv4 = 0;
@@ -635,7 +682,7 @@ static ftun_status_t ftun_validate_dns(const ftun_config_t *config,
                                       "DNS server address is invalid");
       }
       if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
-          ftun_cidr_contains(&fake_range, address)) {
+          ftun_config_cidr_has(&fake_range, address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
                                       "DNS server address overlaps FakeIP range");
       }
@@ -702,7 +749,7 @@ static ftun_status_t ftun_validate_outbounds(const ftun_config_t *config,
                                       "SOCKS5 server address is invalid");
       }
       if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
-          ftun_cidr_contains(fake_range, address)) {
+          ftun_config_cidr_has(fake_range, address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
                                       "SOCKS5 server overlaps FakeIP range");
       }
@@ -748,12 +795,12 @@ static ftun_status_t ftun_validate_outbounds(const ftun_config_t *config,
                                       "health check URL is invalid");
       }
       if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
-          ftun_cidr_contains(fake_range, address)) {
+          ftun_config_cidr_has(fake_range, address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
                                       "health check URL overlaps FakeIP range");
       }
-      if (!ftun_duration_ms(outbound->interval, &interval) ||
-          !ftun_duration_ms(outbound->timeout, &timeout) || timeout > interval) {
+      if (!ftun_config_duration_ms(outbound->interval, &interval) ||
+          !ftun_config_duration_ms(outbound->timeout, &timeout) || timeout > interval) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
                                       "health check durations are invalid");
       }
@@ -867,13 +914,19 @@ static ftun_status_t ftun_validate_tun_device(
   ftun_diagnostic_t *out)
 {
   ftun_config_cidr_t tun_range;
-  const char *base;
+  const char *base = "/tun";
   if (config == NULL || !config->tun.present) return FTUN_OK;
-  base = config->tun.legacy_fields ? "/inbounds" : "/tun";
   if (!ftun_path_valid(config->tun.interface_name) ||
       strlen(config->tun.interface_name) > 15u) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
                                   "TUN interface name is invalid");
+  }
+  if (config->tun.route_table < 256u ||
+      config->tun.route_table > FTUN_CONFIG_ROUTE_TABLE_MAXIMUM ||
+      config->tun.rule_priority == 0u ||
+      config->tun.rule_priority > FTUN_CONFIG_RULE_PRIORITY_MAXIMUM) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+      "TUN route-table must be 256..4294967280 and rule-priority 1..32000");
   }
   if (config->tun.mtu == 0u ||
       (config->tun.strict_route && !config->tun.auto_route)) {
@@ -956,7 +1009,7 @@ static ftun_status_t ftun_validate_frs(const ftun_config_t *config,
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/url",
                                   "FRS update URL is invalid");
   }
-  if (!ftun_duration_ms(config->frs.update_interval, &ignored)) {
+  if (!ftun_config_duration_ms(config->frs.update_interval, &ignored)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/update-interval",
                                   "FRS update interval is invalid");
   }
@@ -970,14 +1023,14 @@ static ftun_status_t ftun_validate_frs(const ftun_config_t *config,
                                   "FRS DNS server does not exist");
   }
   if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
-      ftun_cidr_contains(fake_range, address)) {
+      ftun_config_cidr_has(fake_range, address)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/url",
                                   "FRS update URL overlaps FakeIP range");
   }
   return FTUN_OK;
 }
 
-/* TASK-CONFIG-003 / TEST-CONFIG-003，目标 0.2.0：无副作用语义校验。 */
+/* 无副作用语义校验。 */
 ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_t *out)
 {
   ftun_config_cidr_t fake_range;

@@ -2,7 +2,6 @@
 #include "config/compile.h"
 #include "config/model.h"
 #include "config/parser.h"
-#include "core/context_internal.h"
 #include "proxy/route/router.h"
 #include "proxy/route/rule.h"
 #include "proxy/group/url_test.h"
@@ -58,7 +57,7 @@ static ftun_status_t ftun_runtime_config_budget(ftun_core_t *core,
   bool same = false;
   ftun_status_t status;
   if (config->budget == NULL) return FTUN_OK;
-  status = ftun_budget_same_root(core->budget, config->budget, &same);
+  status = ftun_budget_same_root(ftun_runtime_core_budget(core), config->budget, &same);
   return status != FTUN_OK ? status : same ? FTUN_OK : FTUN_E_INVALID;
 }
 
@@ -328,9 +327,11 @@ ftun_status_t ftun_runtime_manager_attach(ftun_core_t *core,
   ftun_snapshot_manager_t *manager;
   ftun_reservation_t *reservation = NULL;
   ftun_status_t status;
-  if (!ftun_core_context_valid(core)) return FTUN_E_INVALID;
-  if (core->extension != NULL) return FTUN_E_STALE;
-  status = ftun_budget_reserve(core->budget, sizeof(*manager), &reservation);
+  void *existing = NULL;
+  if (!ftun_core_context_is_valid(core)) return FTUN_E_INVALID;
+  if (ftun_core_context_extension(core, &existing) == FTUN_OK) return FTUN_E_STALE;
+  status = ftun_budget_reserve(ftun_runtime_core_budget(core), sizeof(*manager),
+                               &reservation);
   if (status != FTUN_OK) return status;
   manager = (ftun_snapshot_manager_t *)calloc(1u, sizeof(*manager));
   if (manager == NULL) {
@@ -355,7 +356,7 @@ ftun_status_t ftun_runtime_manager_get_info(const ftun_core_t *core,
 {
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (!ftun_runtime_core_valid(core) || out == NULL) return FTUN_E_INVALID;
-  out->generation = core->generation;
+  out->generation = ftun_runtime_core_generation(core);
   out->has_active = FTUN_MANAGER(core)->active != NULL;
   out->has_candidate = FTUN_MANAGER(core)->candidate != NULL;
   out->has_cleanup = FTUN_MANAGER(core)->cleanup != NULL;
@@ -371,8 +372,8 @@ ftun_status_t ftun_runtime_manager_clear(ftun_core_t *owned)
   ftun_snapshot_manager_t *manager;
   ftun_reservation_t *reservation;
   ftun_status_t status;
-  if (!ftun_core_context_valid(owned)) return FTUN_E_INVALID;
-  if (owned->extension == NULL) return FTUN_OK;
+  if (!ftun_core_context_is_valid(owned)) return FTUN_E_INVALID;
+  if (FTUN_MANAGER(owned) == NULL) return FTUN_OK;
   if (!ftun_runtime_core_valid(owned)) return FTUN_E_INVALID;
   manager = FTUN_MANAGER(owned);
   status = ftun_runtime_collect(owned);
@@ -408,6 +409,11 @@ static ftun_status_t ftun_runtime_frs_bind(uint16_t kind, ftun_string_t label,
                                            ftun_frs_set_t **out, void *user)
 {
 #if defined(FTUN_HAVE_MODULE_FRS)
+  /* 没有视图表示 FRS 尚未就绪：规则保留并在匹配时拒绝新连接。 */
+  if (user == NULL) {
+    *out = NULL;
+    return FTUN_E_AGAIN;
+  }
   return ftun_frs_bind((ftun_frs_view_t *)user, (ftun_frs_set_kind_t)kind,
                        label, out);
 #else
@@ -421,7 +427,7 @@ static ftun_status_t ftun_runtime_frs_bind(uint16_t kind, ftun_string_t label,
 
 static ftun_status_t ftun_runtime_prepare_internal(
   ftun_core_t *core, const ftun_config_t *config, ftun_frs_view_t *provided_frs,
-  ftun_runtime_t **out)
+  bool frs_pending, ftun_runtime_t **out)
 {
   ftun_runtime_t *runtime;
   ftun_reservation_t *reservation = NULL;
@@ -436,10 +442,10 @@ static ftun_status_t ftun_runtime_prepare_internal(
   if (FTUN_MANAGER(core)->candidate != NULL) return FTUN_E_AGAIN;
   status = ftun_runtime_collect(core);
   if (status != FTUN_OK) return status;
-  if (core->generation == UINT64_MAX ||
+  if (ftun_runtime_core_generation(core) == UINT64_MAX ||
       !ftun_runtime_can_retain_active(core)) return FTUN_E_LIMIT;
   if (!ftun_runtime_layout(config, &item_count, &accounted_bytes)) return FTUN_E_LIMIT;
-  status = ftun_budget_reserve(core->budget,
+  status = ftun_budget_reserve(ftun_runtime_core_budget(core),
     ftun_runtime_reservation_bytes(config, accounted_bytes), &reservation);
   if (status != FTUN_OK) return status;
   runtime = (ftun_runtime_t *)calloc(1u, sizeof(*runtime));
@@ -473,7 +479,9 @@ static ftun_status_t ftun_runtime_prepare_internal(
   }
 #if defined(FTUN_HAVE_MODULE_FRS)
   if ((config->plan->prepare & FTUN_PLAN_FRS) != 0u) {
-    if (provided_frs != NULL) {
+    if (frs_pending) {
+      status = provided_frs == NULL ? FTUN_OK : FTUN_E_INVALID;
+    } else if (provided_frs != NULL) {
       status = ftun_frs_view_retain(provided_frs);
       if (status == FTUN_OK) runtime->snapshot.frs_view = provided_frs;
     } else if (config->frs.path == NULL || config->frs.path[0] == '\0') {
@@ -495,7 +503,7 @@ static ftun_status_t ftun_runtime_prepare_internal(
   status = ftun_route_table_create_with_frs(
     0u, (const char *const *)config->rules.items, config->rules.count,
     ftun_runtime_resolve_outbound, (void *)config,
-    runtime->snapshot.frs_view == NULL ? NULL : ftun_runtime_frs_bind,
+    (config->plan->prepare & FTUN_PLAN_FRS) != 0u ? ftun_runtime_frs_bind : NULL,
     runtime->snapshot.frs_view, &runtime->snapshot.routes);
   if (status != FTUN_OK) goto fail;
   runtime->snapshot.prepared_item_count = item_count;
@@ -514,12 +522,24 @@ fail:
   return status;
 }
 
-/* TASK-CORE-001 / TEST-CORE-001，目标 0.2.0：候选准备和快照生命周期。 */
+/* 候选准备和快照生命周期。 */
 ftun_status_t ftun_runtime_prepare(ftun_core_t *core,
                                    const ftun_config_t *config,
                                    ftun_runtime_t **out)
 {
-  return ftun_runtime_prepare_internal(core, config, NULL, out);
+  return ftun_runtime_prepare_internal(core, config, NULL, false, out);
+}
+
+ftun_status_t ftun_runtime_prepare_frs_pending(ftun_core_t *core,
+                                               const ftun_config_t *config,
+                                               ftun_runtime_t **out)
+{
+  if (config == NULL || config->plan == NULL ||
+      (config->plan->prepare & FTUN_PLAN_FRS) == 0u) {
+    if (out != NULL) *out = NULL;
+    return FTUN_E_INVALID;
+  }
+  return ftun_runtime_prepare_internal(core, config, NULL, true, out);
 }
 
 ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
@@ -531,7 +551,7 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
     if (out != NULL) *out = NULL;
     return FTUN_E_INVALID;
   }
-  return ftun_runtime_prepare_internal(core, config, view, out);
+  return ftun_runtime_prepare_internal(core, config, view, false, out);
 }
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -666,19 +686,19 @@ ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,
   if (FTUN_MANAGER(core)->candidate != NULL) return FTUN_E_AGAIN;
   status = ftun_runtime_collect(core);
   if (status != FTUN_OK) return status;
-  if (core->generation == UINT64_MAX ||
+  if (ftun_runtime_core_generation(core) == UINT64_MAX ||
       !ftun_runtime_can_retain_active(core)) return FTUN_E_LIMIT;
   status = ftun_config_retain((ftun_config_t *)runtime->snapshot.config);
   if (status != FTUN_OK) return status;
   /* 已绑定配置的候选持有同根额度，附着只转移拥有者，不重复准入。
    * 未绑定的独立候选在此获得额度；失败只归还本次新增 reservation。 */
   if (runtime->reservation == NULL) {
-    status = ftun_budget_reserve(core->budget,
+    status = ftun_budget_reserve(ftun_runtime_core_budget(core),
       ftun_runtime_reservation_bytes(runtime->snapshot.config, runtime->snapshot.accounted_bytes),
       &reservation);
   }
   if (status == FTUN_OK && runtime->snapshot.frs_view != NULL) {
-    status = ftun_frs_view_bind_budget(runtime->snapshot.frs_view, core->budget);
+    status = ftun_frs_view_bind_budget(runtime->snapshot.frs_view, ftun_runtime_core_budget(core));
   }
   if (status != FTUN_OK) {
     ftun_config_t *retained_config = (ftun_config_t *)runtime->snapshot.config;
@@ -719,7 +739,7 @@ ftun_status_t ftun_runtime_can_commit(const ftun_core_t *core,
       candidate->state != FTUN_RUNTIME_CANDIDATE ||
       candidate->reference_count != 1u) return FTUN_E_STALE;
   previous = FTUN_MANAGER(core)->active;
-  if (core->generation == UINT64_MAX) return FTUN_E_LIMIT;
+  if (ftun_runtime_core_generation(core) == UINT64_MAX) return FTUN_E_LIMIT;
   if (candidate->generation != 0u) {
     if (previous != NULL && previous->reference_count > 1u &&
         !candidate->retention_reserved) return FTUN_E_LIMIT;
@@ -739,7 +759,7 @@ ftun_status_t ftun_runtime_stage_commit(ftun_core_t *core,
   bool blocks_active_acquire = false;
   ftun_status_t status = ftun_runtime_can_commit(core, candidate);
   if (status != FTUN_OK) return status;
-  if (generation == 0u || generation != core->generation + 1u) {
+  if (generation == 0u || generation != ftun_runtime_core_generation(core) + 1u) {
     return FTUN_E_STALE;
   }
   if (candidate->generation == generation) return FTUN_OK;
@@ -760,11 +780,14 @@ ftun_status_t ftun_runtime_stage_commit(ftun_core_t *core,
   return status;
 }
 
-ftun_status_t ftun_runtime_commit(ftun_core_t *core,
-                                  ftun_runtime_t **candidate)
+static ftun_status_t ftun_runtime_commit_owned(ftun_core_t *core,
+  ftun_runtime_t **candidate, const void *owner)
 {
   ftun_runtime_t *next;
   ftun_runtime_t *previous;
+  uint64_t reserved = 0u;
+  uint64_t target = 0u;
+  bool self_reserved = false;
   ftun_status_t status;
   if (!ftun_runtime_core_valid(core) || candidate == NULL || *candidate == NULL) {
     return FTUN_E_INVALID;
@@ -773,9 +796,28 @@ ftun_status_t ftun_runtime_commit(ftun_core_t *core,
   status = ftun_runtime_can_commit(core, next);
   if (status != FTUN_OK) return status;
   previous = FTUN_MANAGER(core)->active;
-  status = ftun_runtime_stage_commit(core, next, core->generation + 1u);
-  if (status != FTUN_OK) return status;
-  core->generation++;
+  /* 代次唯一由 Core 上下文发布：owner 非空时只消费它自己持有
+   * 的预留；为空时要求没有任何预留，并以候选为持有者自行预留。 */
+  if (owner != NULL) {
+    status = ftun_core_context_generation_held(core, owner, &target);
+    if (status != FTUN_OK) return status;
+  } else {
+    status = ftun_core_context_generation_reserved(core, &reserved);
+    if (status != FTUN_OK) return status;
+    if (reserved != 0u) return FTUN_E_AGAIN;
+    owner = next;
+    status = ftun_core_context_generation_reserve(core, owner, &target);
+    if (status != FTUN_OK) return status;
+    self_reserved = true;
+  }
+  status = ftun_runtime_stage_commit(core, next, target);
+  if (status == FTUN_OK) {
+    status = ftun_core_context_generation_publish(core, owner, target);
+  }
+  if (status != FTUN_OK) {
+    if (self_reserved) (void)ftun_core_context_generation_release(core, owner, target);
+    return status;
+  }
   next->state = FTUN_RUNTIME_ACTIVE;
   FTUN_MANAGER(core)->candidate = NULL;
   FTUN_MANAGER(core)->active = next;
@@ -792,6 +834,18 @@ ftun_status_t ftun_runtime_commit(ftun_core_t *core,
     }
   }
   return FTUN_OK;
+}
+
+ftun_status_t ftun_runtime_commit(ftun_core_t *core, ftun_runtime_t **candidate)
+{
+  return ftun_runtime_commit_owned(core, candidate, NULL);
+}
+
+ftun_status_t ftun_runtime_commit_reserved(ftun_core_t *core,
+  ftun_runtime_t **candidate, const void *owner)
+{
+  if (owner == NULL) return FTUN_E_INVALID;
+  return ftun_runtime_commit_owned(core, candidate, owner);
 }
 
 ftun_status_t ftun_runtime_abort(ftun_core_t *core,

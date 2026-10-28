@@ -25,7 +25,7 @@ PEER_TCP_PORT = 18080
 PEER_UDP_PORT = 18081
 PEER_SOCKS_PORT = 11080
 LAN_RULE_PRIORITY = 11002
-ROUTE_TABLE = 51820
+ROUTE_TABLE = 18004
 
 
 def raise_descriptor_limit():
@@ -140,12 +140,13 @@ def write_tun_config(path, interface_name, use_proxy):
       "udp-associations": TCP_CAPACITY}},
     "dns": {"enable": False},
     "log": {"level": "error"},
+    "tun": {
+      "interface": interface_name, "mtu": 1400,
+      "ipv4": {"address": "10.77.0.1/30"},
+      "auto-route": True, "strict-route": True},
     "inbounds": [{
       "name": "capacity-tun", "type": "tun",
-      "interface": {"name": interface_name, "mtu": 1400},
-      "ipv4": {"address": "10.77.0.1/30"},
-      "tcp": True, "udp": True, "auto-route": True,
-      "strict-route": True, "dns-hijack": False}],
+      "tcp": True, "udp": True, "dns-hijack": False}],
   }
   if use_proxy:
     document["outbounds"] = [{

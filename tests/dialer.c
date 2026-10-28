@@ -3,6 +3,7 @@
 #include "event/libev_adapter.h"
 #include "util/time.h"
 #include <arpa/inet.h>
+#include <netinet/tcp.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -657,6 +658,11 @@ static int test_real_loopback(void)
   memcpy(request.endpoint.address, &address.sin_addr.s_addr, 4u);
   request.endpoint.port = ntohs(address.sin_port);
   request.protection.mark = 77u;
+  request.protection.liveness.keepalive_enabled = true;
+  request.protection.liveness.idle_s = 20u;
+  request.protection.liveness.interval_s = 5u;
+  request.protection.liveness.count = 3u;
+  request.protection.liveness.user_timeout_ms = 60000u;
   request.deadline_ms = now_ms + 2000u;
   request.transport = FTUN_DIAL_TCP;
   request.purpose = FTUN_DIAL_PURPOSE_PROBE;
@@ -675,6 +681,19 @@ static int test_real_loopback(void)
         completion.result.socket != FTUN_INVALID_SOCKET);
   accepted = accept(listener, NULL, NULL);
   CHECK(accepted >= 0);
+  /* 拨出的 TCP socket 带有存活探测和确认期限。 */
+  {
+    int value = 0;
+    socklen_t value_length = (socklen_t)sizeof(value);
+    int fd = (int)completion.result.socket;
+    CHECK(getsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &value, &value_length) == 0 && value == 1);
+    value_length = (socklen_t)sizeof(value);
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &value, &value_length) == 0 && value == 20);
+    value_length = (socklen_t)sizeof(value);
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &value, &value_length) == 0 && value == 3);
+    value_length = (socklen_t)sizeof(value);
+    CHECK(getsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &value, &value_length) == 0 && value == 60000);
+  }
   CHECK(close(accepted) == 0);
   CHECK(close((int)completion.result.socket) == 0);
   CHECK(close(listener) == 0);
@@ -721,7 +740,7 @@ static int test_real_loopback(void)
   return 0;
 }
 
-/* TASK-TRANSPORT-001 / TEST-TRANSPORT-001：准入、保护、异步终结与回滚。 */
+/* 准入、保护、异步终结与回滚。 */
 int main(int argc, char **argv)
 {
   if (argc == 2 && strcmp(argv[1], "--real-loopback") == 0) {

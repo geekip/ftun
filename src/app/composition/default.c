@@ -20,10 +20,12 @@
 #include "platform/linux/interface.h"
 #endif
 
+#include "platform/linux/netmon.h"
+#include "util/event_log.h"
+
 #include <stdlib.h>
 #include <string.h>
 
-#define FTUN_DEFAULT_TUN_MARK UINT32_C(0x4654)
 #define FTUN_DEFAULT_CLEANUP_QUOTA 32u
 
 #if defined(FTUN_HAVE_MODULE_PROXY)
@@ -70,6 +72,8 @@ typedef struct {
   ftun_reservation_t *reservation;
   ftun_event_loop_t *loop;
   ftun_operation_queue_t *operations;
+  /* 网络变化事件源；不可用时回到各恢复实体自己的退避，不影响启动。 */
+  ftun_netmon_t *netmon;
   ftun_status_t first_error;
   ftun_status_t cleanup_error;
 #if defined(FTUN_HAVE_MODULE_PROXY)
@@ -240,13 +244,13 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
 #endif
   runtime->dns_binding.socket_mark =
     (config->plan->required_modules & FTUN_BUILD_MODULE_TUN) != 0u
-      ? FTUN_DEFAULT_TUN_MARK : 0u;
+      ? config->base.routing_mark : 0u;
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
   runtime->tun.provider = &runtime->l3;
   runtime->tun.loop = runtime->loop;
   runtime->tun.network = &ftun_linux_interface_ops;
-  runtime->tun.protection_mark = FTUN_DEFAULT_TUN_MARK;
+  runtime->tun.protection_mark = config->base.routing_mark;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy.l3 =
     (config->plan->required_modules & FTUN_BUILD_MODULE_TUN) != 0u
@@ -310,6 +314,7 @@ static ftun_status_t ftun_default_prepare(
   (void)binding;
   status = ftun_app_event_source_capacity(config, &source_capacity);
   if (status != FTUN_OK) return status;
+  source_capacity += 2u; /* 网络变化事件源：netlink 读取与去抖计时器 */
   status = ftun_budget_reserve(budget, sizeof(*runtime), &reservation);
   if (status != FTUN_OK) return status;
   runtime = (ftun_default_runtime_t *)calloc(1u, sizeof(*runtime));
@@ -367,6 +372,10 @@ static ftun_status_t ftun_default_activate(void *implementation)
     status = ftun_core_module_runtime_activate(runtime->modules_runtime,
       now_ms == 0u ? 1u : now_ms);
   }
+  if (status == FTUN_OK && runtime->netmon == NULL) {
+    /* 订阅失败（例如受限环境）不是启动失败：恢复仍按各自的退避进行。 */
+    (void)ftun_netmon_create(runtime->loop, 0u, &runtime->netmon);
+  }
   if (status != FTUN_OK && runtime->first_error == FTUN_OK) {
     ftun_core_module_info_t info;
     runtime->first_error = status;
@@ -414,14 +423,30 @@ static ftun_status_t ftun_default_reload_abort(void *implementation)
     ftun_core_module_runtime_reload_abort(runtime->modules_runtime);
 }
 
+/* 取走已去抖的网络变化，转交给各服务（提前触发恢复），并记一条事件。 */
+static void ftun_default_deliver_network_changes(ftun_default_runtime_t *runtime)
+{
+  ftun_network_change_t change;
+  ftun_lifecycle_event_t event;
+  uint64_t now_ms = 0u;
+  if (runtime->netmon == NULL || ftun_monotonic_now(&now_ms) != FTUN_OK ||
+      ftun_netmon_take(runtime->netmon, now_ms, &change) != FTUN_OK) return;
+  ftun_core_module_runtime_network_changed(runtime->modules_runtime, &change, now_ms);
+  memset(&event, 0, sizeof(event));
+  event.kind = FTUN_LIFECYCLE_NETWORK_CHANGED;
+  event.status = change.storm ? FTUN_E_LIMIT : FTUN_OK;
+  (void)ftun_lifecycle_emit(runtime->core, &event);
+}
+
 static ftun_status_t ftun_default_run_once(
   void *implementation, bool may_block,
   ftun_core_service_run_usage_t *out_usage)
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_run_once(
-      runtime->modules_runtime, may_block, out_usage);
+  if (runtime == NULL) return FTUN_E_INVALID;
+  ftun_default_deliver_network_changes(runtime);
+  return ftun_core_module_runtime_run_once(
+    runtime->modules_runtime, may_block, out_usage);
 }
 
 static ftun_status_t ftun_default_wakeup(void *implementation)
@@ -436,6 +461,9 @@ static ftun_status_t ftun_default_quiesce(void *implementation)
 {
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
   if (runtime == NULL) return FTUN_E_INVALID;
+  /* 事件源挂在 loop 上，先于模块停止时撤销。已有待派发通知时撤销会返回 AGAIN，
+   * 这里不当作失败，由 drain 在轮询后再撤销。 */
+  (void)ftun_netmon_destroy(&runtime->netmon);
   return runtime->modules_runtime == NULL ? FTUN_OK
     : ftun_core_module_runtime_quiesce(runtime->modules_runtime);
 }
@@ -450,6 +478,7 @@ static ftun_status_t ftun_default_drain_until(void *implementation,
   uint64_t now = 0u;
   size_t callbacks = 0u;
   if (runtime == NULL) return FTUN_E_INVALID;
+  (void)ftun_netmon_destroy(&runtime->netmon);
   status = runtime->modules_runtime == NULL ? FTUN_OK :
     ftun_core_module_runtime_drain_until(runtime->modules_runtime, deadline_ms);
   if ((status == FTUN_OK || status == FTUN_E_AGAIN ||
@@ -460,6 +489,10 @@ static ftun_status_t ftun_default_drain_until(void *implementation,
     if (polled == FTUN_OK) polled = ftun_event_loop_poll(
       runtime->loop, now, FTUN_DEFAULT_CLEANUP_QUOTA, &callbacks);
     if (polled != FTUN_OK) status = polled;
+    /* 轮询消费掉待派发通知之后才能撤销网络变化事件源，否则它会一直占着 ready。 */
+    if (polled == FTUN_OK && ftun_netmon_destroy(&runtime->netmon) != FTUN_OK) {
+      status = FTUN_E_AGAIN;
+    }
     if (status == FTUN_OK) {
       status = ftun_event_loop_get_usage(runtime->loop, &events);
       if (status == FTUN_OK) status = ftun_operation_queue_get_usage(
@@ -495,6 +528,7 @@ static ftun_status_t ftun_default_destroy_until(void **implementation,
   if (implementation == NULL || deadline_ms == 0u) return FTUN_E_INVALID;
   runtime = (ftun_default_runtime_t *)*implementation;
   if (runtime == NULL) return FTUN_OK;
+  if (ftun_netmon_destroy(&runtime->netmon) != FTUN_OK) return FTUN_E_AGAIN;
   status = ftun_core_module_runtime_destroy_until(
     &runtime->modules_runtime, deadline_ms);
   if (status == FTUN_OK) status = ftun_default_loop_destroy(runtime);
@@ -523,7 +557,9 @@ static const ftun_core_service_descriptor_t ftun_default_service = {
   ftun_default_quiesce,
   ftun_default_drain_until,
   ftun_default_stop_until,
-  ftun_default_destroy_until
+  ftun_default_destroy_until,
+  NULL, /* maintain_once：尚未支持暂停 */
+  NULL /* network_changed */
 };
 
 ftun_status_t ftun_core_create(const ftun_core_options_t *options,

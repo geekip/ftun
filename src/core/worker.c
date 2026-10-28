@@ -67,7 +67,7 @@ struct ftun_worker {
   int cleanup_failed;
 };
 
-/* TASK-CORE-006 / TEST-CORE-006，目标 0.2.0：有界文件 worker。 */
+/* 有界文件 worker。 */
 static ftun_error_t ftun_worker_error(ftun_status_t status)
 {
   ftun_error_t error;

@@ -243,7 +243,7 @@ static ftun_status_t ftun_session_close(ftun_session_t *session,
   return FTUN_OK;
 }
 
-/* ftun_session_submit 实现 TASK-CORE-002（0.2.0）的 owner-loop 生命周期。 */
+/* ftun_session_submit 的 owner-loop 生命周期。 */
 ftun_status_t ftun_session_submit(ftun_core_t *core,
                                   const ftun_metadata_t *metadata,
                                   ftun_stream_t *inbound,

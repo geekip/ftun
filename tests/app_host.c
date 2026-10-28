@@ -298,7 +298,9 @@ static ftun_status_t destroy_until(void **instance, uint64_t deadline)
 static const ftun_core_service_descriptor_t descriptor = {
   "host-test", plan_prepare, plan_destroy, prepare, success,
   reload_prepare, reload_planned, reload_commit, reload_abort,
-  run_once, success, success, stop_until, stop_until, destroy_until
+  run_once, success, success, stop_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static int write_config(const char *path, const char *level, const char *log)

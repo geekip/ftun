@@ -40,6 +40,8 @@ struct ftun_operation_queue {
   ftun_operation_t *ready_tail;
   ftun_operation_t *storage;
   ftun_operation_t *free_head;
+  ftun_operation_waiter_t *waiter_head;
+  ftun_operation_waiter_t *waiter_tail;
   size_t capacity;
   size_t inflight;
   _Atomic size_t ready_count;
@@ -64,7 +66,7 @@ static void ftun_operation_recycle(ftun_operation_queue_t *queue,
   queue->free_head = operation;
 }
 
-/* TASK-CORE-005 / TEST-CORE-005，目标 0.2.0：owner-loop 异步终结仲裁。 */
+/* owner-loop 异步终结仲裁。 */
 static ftun_error_t ftun_cancelled_error(void)
 {
   ftun_error_t error;
@@ -410,6 +412,81 @@ ftun_status_t ftun_operation_cancel(ftun_operation_t *operation)
   return FTUN_OK;
 }
 
+static void ftun_operation_waiter_unlink(ftun_operation_waiter_t *waiter)
+{
+  ftun_operation_queue_t *queue = waiter->queue;
+  if (waiter->previous != NULL) waiter->previous->next = waiter->next;
+  else queue->waiter_head = waiter->next;
+  if (waiter->next != NULL) waiter->next->previous = waiter->previous;
+  else queue->waiter_tail = waiter->previous;
+  waiter->previous = NULL;
+  waiter->next = NULL;
+  waiter->queue = NULL;
+}
+
+/* 回收出额度后按排队顺序通知等待者；通知不持锁，回调里可以重新排队。 */
+static void ftun_operation_wake_waiters(ftun_operation_queue_t *queue)
+{
+  size_t woken;
+  for (woken = 0u; woken < FTUN_OPERATION_WAKE_QUOTA; woken++) {
+    ftun_operation_waiter_t *waiter;
+    ftun_operation_ready_fn ready;
+    void *user;
+    (void)pthread_mutex_lock(&queue->mutex);
+    waiter = queue->waiter_head;
+    if (waiter == NULL || !queue->accepting ||
+        queue->inflight >= queue->capacity ||
+        queue->normal_inflight >= queue->capacity - queue->control_reserve) {
+      (void)pthread_mutex_unlock(&queue->mutex);
+      return;
+    }
+    ready = waiter->ready;
+    user = waiter->user;
+    ftun_operation_waiter_unlink(waiter);
+    (void)pthread_mutex_unlock(&queue->mutex);
+    ready(user);
+  }
+}
+
+ftun_status_t ftun_operation_queue_wait(ftun_operation_queue_t *queue,
+  ftun_operation_waiter_t *waiter, ftun_operation_ready_fn ready, void *user)
+{
+  ftun_status_t status = FTUN_OK;
+  if (queue == NULL || waiter == NULL || ready == NULL) return FTUN_E_INVALID;
+  (void)pthread_mutex_lock(&queue->mutex);
+  if (waiter->queue != NULL) {
+    if (waiter->queue != queue) status = FTUN_E_INVALID;
+  } else if (!queue->accepting) {
+    status = FTUN_E_CANCELLED;
+  } else if (queue->inflight < queue->capacity &&
+             queue->normal_inflight < queue->capacity - queue->control_reserve) {
+    status = FTUN_E_AGAIN;
+  } else {
+    waiter->queue = queue;
+    waiter->ready = ready;
+    waiter->user = user;
+    waiter->next = NULL;
+    waiter->previous = queue->waiter_tail;
+    if (queue->waiter_tail != NULL) queue->waiter_tail->next = waiter;
+    else queue->waiter_head = waiter;
+    queue->waiter_tail = waiter;
+  }
+  (void)pthread_mutex_unlock(&queue->mutex);
+  return status;
+}
+
+ftun_status_t ftun_operation_queue_wait_cancel(ftun_operation_waiter_t *waiter)
+{
+  ftun_operation_queue_t *queue;
+  if (waiter == NULL) return FTUN_E_INVALID;
+  queue = waiter->queue;
+  if (queue == NULL) return FTUN_E_STALE;
+  (void)pthread_mutex_lock(&queue->mutex);
+  ftun_operation_waiter_unlink(waiter);
+  (void)pthread_mutex_unlock(&queue->mutex);
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
                                       size_t max_callbacks, size_t *out_dispatched)
 {
@@ -477,6 +554,7 @@ ftun_status_t ftun_operation_dispatch(ftun_operation_queue_t *queue,
   (void)pthread_mutex_lock(&queue->mutex);
   queue->dispatching = 0;
   (void)pthread_mutex_unlock(&queue->mutex);
+  if (dispatched != 0u) ftun_operation_wake_waiters(queue);
   *out_dispatched = dispatched;
   return FTUN_OK;
 }
@@ -598,7 +676,7 @@ ftun_status_t ftun_operation_queue_destroy(ftun_operation_queue_t **queue)
   (void)pthread_mutex_lock(&owned->mutex);
   if (owned->dispatching || owned->inflight != 0u || owned->head != NULL ||
       owned->tail != NULL || owned->ready_head != NULL ||
-      owned->ready_tail != NULL ||
+      owned->ready_tail != NULL || owned->waiter_head != NULL ||
       atomic_load_explicit(&owned->ready_count, memory_order_relaxed) != 0u) {
     (void)pthread_mutex_unlock(&owned->mutex);
     return FTUN_E_AGAIN;

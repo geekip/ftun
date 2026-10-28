@@ -1,4 +1,4 @@
-/* TASK-PROTOCOL-002 / TEST-PROTOCOL-002：ftun_http_decode，目标 0.4.0。 */
+/* ftun_http_decode。 */
 #include "http.h"
 
 #include <string.h>

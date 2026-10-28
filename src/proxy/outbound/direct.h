@@ -27,7 +27,6 @@ struct ftun_direct_request {
 };
 
 /* 直连出口。
- * 需求 REQ-OUT-001；任务 TASK-OUTBOUND-002；目标 0.2.0；验收 TEST-OUTBOUND-002。
  * 使用受保护 Dialer；仅当本次没有任何真实候选时返回 RESOLVE。
  * TCP 只在已固定 allowed 集合内串行重试，UDP 只拨号第一个允许目标。
  * 本层不发送业务字节，因此重试不会重放业务数据。

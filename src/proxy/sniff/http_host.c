@@ -1,7 +1,7 @@
 #include "http_host.h"
 #include <string.h>
 
-/* REQ-SNIFF-001 / TASK-SNIFF-003 / TEST-SNIFF-003，目标 0.5.0：
+/* 
  * ftun_sniff_http_host 有界解析 HTTP/1 Host 且输入只读。 */
 
 #define FTUN_SNIFF_HTTP_MAX_BYTES 16384u

@@ -1,9 +1,9 @@
 #ifndef FTUN_TLS_WOLFSSL_ADAPTER_H
 #define FTUN_TLS_WOLFSSL_ADAPTER_H
-/* TASK-TLS-002 / TEST-TLS-002：ftun_wolfssl_prepare，目标 0.4.0。 */
+/* ftun_wolfssl_prepare。 */
 #include "tls/tls.h"
 
-/* TASK-TLS-002 / TEST-TLS-002：wolfSSL v5.8.4-stable 候选。 */
+/* wolfSSL v5.8.4-stable 候选。 */
 ftun_status_t ftun_wolfssl_prepare(const ftun_tls_options_t *options, ftun_tls_context_t **out);
 /* context 与 client 由同一 owner 串行使用。成功时 context 所有权转给唯一
  * client，调用方不再销毁或复用；失败时 context 保留，可重试或销毁。

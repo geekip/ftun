@@ -151,7 +151,7 @@ static ftun_status_t ftun_stream_write_reject(ftun_stream_write_t *write,
   return result;
 }
 
-/* TASK-TRANSPORT-002 / TEST-TRANSPORT-002，目标 0.2.0：保留引用至完成事件。 */
+/* 保留引用至完成事件。 */
 ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
                                  const ftun_stream_backend_t *backend,
                                  ftun_stream_t **out)
@@ -203,10 +203,10 @@ ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_stream_write_ref_with_completion(
+ftun_status_t ftun_stream_write_ref_ex(
   ftun_stream_t *stream, const ftun_buffer_slice_t *slice,
   ftun_completion_fn completion, void *completion_user,
-  size_t *accepted, ftun_operation_t **out)
+  size_t *accepted, ftun_operation_t **out, ftun_stream_limit_t *reason)
 {
   ftun_stream_write_t *write;
   ftun_bytes_t bytes;
@@ -214,6 +214,7 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   size_t available;
   size_t offered;
   size_t backend_accepted = 0u;
+  if (reason != NULL) *reason = FTUN_STREAM_LIMIT_NONE;
   if (accepted != NULL) *accepted = 0u;
   if (out != NULL) *out = NULL;
   if (stream == NULL || slice == NULL || completion == NULL ||
@@ -224,10 +225,16 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   if (status != FTUN_OK || bytes.length == 0u) return FTUN_E_INVALID;
   if (!stream->accepting) return FTUN_E_CANCELLED;
   if (stream->pending_writes >= stream->max_pending_writes ||
-      stream->pending_bytes >= stream->max_pending_bytes) return FTUN_E_LIMIT;
+      stream->pending_bytes >= stream->max_pending_bytes) {
+    if (reason != NULL) *reason = FTUN_STREAM_LIMIT_STREAM;
+    return FTUN_E_LIMIT;
+  }
   available = stream->max_pending_bytes - stream->pending_bytes;
   offered = bytes.length < available ? bytes.length : available;
-  if (offered == 0u) return FTUN_E_LIMIT;
+  if (offered == 0u) {
+    if (reason != NULL) *reason = FTUN_STREAM_LIMIT_STREAM;
+    return FTUN_E_LIMIT;
+  }
 
   write = stream->free_head;
   if (write == NULL) return FTUN_E_STATE_CORRUPT;
@@ -245,6 +252,9 @@ ftun_status_t ftun_stream_write_ref_with_completion(
                                  &write->operation, &write->completion_token);
   if (status != FTUN_OK) {
     ftun_stream_write_release(write);
+    if (status == FTUN_E_LIMIT && reason != NULL) {
+      *reason = FTUN_STREAM_LIMIT_OPERATIONS;
+    }
     return status;
   }
   status = ftun_buffer_slice_clone(slice, &write->slice);
@@ -261,7 +271,12 @@ ftun_status_t ftun_stream_write_ref_with_completion(
                                        &write->slice, &backend_accepted);
   stream->backend_calls--;
   write->starting = 0;
-  if (status != FTUN_OK) return ftun_stream_write_reject(write, status);
+  if (status != FTUN_OK) {
+    if (status == FTUN_E_LIMIT && reason != NULL) {
+      *reason = FTUN_STREAM_LIMIT_BACKEND;
+    }
+    return ftun_stream_write_reject(write, status);
+  }
   write->backend_owned = 1;
   if (backend_accepted == 0u || backend_accepted > offered) {
     write->cancelling = 1;
@@ -280,6 +295,20 @@ ftun_status_t ftun_stream_write_ref_with_completion(
   *accepted = backend_accepted;
   *out = write->operation;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_stream_write_ref_with_completion(
+  ftun_stream_t *stream, const ftun_buffer_slice_t *slice,
+  ftun_completion_fn completion, void *completion_user,
+  size_t *accepted, ftun_operation_t **out)
+{
+  return ftun_stream_write_ref_ex(stream, slice, completion, completion_user,
+                                  accepted, out, NULL);
+}
+
+ftun_operation_queue_t *ftun_stream_operations(const ftun_stream_t *stream)
+{
+  return stream == NULL ? NULL : stream->operations;
 }
 
 ftun_status_t ftun_stream_write_ref(ftun_stream_t *stream,

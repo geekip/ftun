@@ -2,7 +2,7 @@
 #define FTUN_UTIL_LOGGER_H
 #include "internal/contracts.h"
 
-/* REQ-OBS-001 / TASK-UTIL-001 / TEST-UTIL-001，目标 0.5.0：
+/* 
  * ftun_log_emit 不把秘密或慢 writer 带入 owner-loop 热路径。 */
 
 typedef enum {
@@ -56,7 +56,20 @@ typedef struct {
    * 新旧实例重叠计量，线程栈/allocator/内核缓冲不包含在逻辑字节中。
    * App 在所有 Worker 和候选/退休 logger 之后销毁 ledger。 */
   ftun_log_ledger_t *ledger;
+  /* 为每行加上 ts（UTC 毫秒）、seq（进程内单调序号）、boot（进程标识）及
+   * 非零的 id 前缀。底层单元测试不开启，产品路径开启。 */
+  bool stamp;
+  /* 文件轮转（仅 path 方式有效，自定义 writer 时必须为 0）。写入会让当前文件超过
+   * max_size 字节时，先把 path.(n-1) 依次改名为 path.n 再新建 path；max_files 是保留
+   * 的文件总数（含当前文件，≥1；为 1 时超限直接截断重写）。max_size 为 0 不轮转。 */
+  uint64_t max_size;
+  size_t max_files;
 } ftun_logger_options_t;
+
+/* 进程标识：第一次调用时随机生成，此后不变。不是安全用途的标识。 */
+uint64_t ftun_log_boot_id(void);
+/* 进程内单调递增的关联 ID，从 1 开始；线程安全。 */
+uint64_t ftun_correlation_next(void);
 
 typedef struct {
   size_t capacity;
@@ -68,6 +81,10 @@ typedef struct {
   uint64_t redacted;
   uint64_t oversized;
   uint64_t truncated;
+  /* 文件轮转次数、外部请求的重新打开次数、轮转/重新打开失败次数。 */
+  uint64_t rotations;
+  uint64_t reopens;
+  uint64_t rotate_errors;
   bool accepting;
   bool stopping;
   bool exited;
@@ -82,6 +99,9 @@ ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
  * 成功只表示日志已过滤或已接纳；队列满时丢弃新项并返回 OK。 */
 ftun_status_t ftun_logger_write(ftun_logger_t *logger, ftun_log_level_t level,
                                 const ftun_diagnostic_t *diagnostic);
+/* 请求重新打开日志文件（配合外部 logrotate：它改走了旧文件之后，下一次写入落在新建
+ * 的文件上）。可从任意线程调用，不阻塞；由写入线程执行。自定义 writer 返回 UNSUPPORTED。 */
+ftun_status_t ftun_logger_reopen(ftun_logger_t *logger);
 ftun_status_t ftun_logger_flush(ftun_logger_t *logger);
 ftun_status_t ftun_logger_flush_until(ftun_logger_t *logger,
                                       uint64_t deadline_ms);
@@ -96,6 +116,8 @@ ftun_status_t ftun_logger_destroy(ftun_logger_t **logger);
 /* 到期时保留 logger 及 writer 仍可能访问的全部内存，调用方稍后重试。 */
 ftun_status_t ftun_logger_destroy_until(ftun_logger_t **logger,
                                         uint64_t deadline_ms);
+/* Core 便利入口：对当前发布的 logger 请求重新打开日志文件（线程安全）。 */
+ftun_status_t ftun_log_reopen(ftun_core_t *core);
 /* Core 便利入口；保留 diagnostic 内已捕获的 stage/native_code。 */
 ftun_status_t ftun_log_emit(ftun_core_t *core, const ftun_diagnostic_t *diagnostic);
 #endif

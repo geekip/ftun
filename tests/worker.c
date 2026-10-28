@@ -368,7 +368,7 @@ static int cleanup_quota(void)
   return 0;
 }
 
-/* TASK-CORE-006 / TEST-CORE-006：复制输入、有界接纳、取消与迟到清理。 */
+/* 复制输入、有界接纳、取消与迟到清理。 */
 int main(void)
 {
   ftun_budget_t *budget = NULL;

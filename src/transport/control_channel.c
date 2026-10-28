@@ -54,6 +54,9 @@ struct ftun_control_channel {
   uint64_t deadline_ms;
   ftun_status_t status;
   bool expired;
+  /* 事件后端已挂上；创建中途失败（例如 FD 耗尽时 libev 建不起来）时没有后端，
+   * 也就没有事件可以轮询，关闭时不能去轮询。 */
+  bool attached;
   bool stopping;
   bool sending;
   bool has_received;
@@ -213,6 +216,7 @@ ftun_status_t ftun_control_channel_create_execution(
   if (status == FTUN_OK) status = ftun_operation_queue_create(budget, 8u, &channel->operations);
   if (status == FTUN_OK) status = ftun_event_loop_create_with_capacity(channel->core, 16u, &channel->loop);
   if (status == FTUN_OK) status = ftun_libev_attach(channel->loop);
+  channel->attached = status == FTUN_OK;
   spec.budget = budget;
   spec.generation = generation;
   spec.ops.open = execution->path.open == NULL ? ftun_socket_path_open : execution->path.open;
@@ -524,7 +528,7 @@ ftun_status_t ftun_control_channel_close(ftun_control_channel_t **pointer)
     /* 取消失败不阻止已终结操作派发；迟到 OK 也必须先交还 Provider，
      * 由其取消标记抑制结果，不能卡在下一次相同 cancel hook 前。 */
     if (status != FTUN_OK && status != FTUN_E_AGAIN) return status;
-    if (channel->loop != NULL) {
+    if (channel->loop != NULL && channel->attached) {
       status = ftun_control_channel_poll(channel, false);
       if (status != FTUN_OK) return status;
     }
@@ -580,7 +584,7 @@ void ftun_control_channel_drain(ftun_control_channel_t **pointer)
     uint64_t now;
     /* 取消失败时不能释放生产者引用。只在清理重试期间安排下一次唤醒，
      * 数据传输不使用周期 tick；不延长外层 Worker 的停止期限。 */
-    if (channel->loop != NULL && channel->operations != NULL &&
+    if (channel->loop != NULL && channel->attached && channel->operations != NULL &&
         ftun_monotonic_now(&now) == FTUN_OK) {
       (void)ftun_event_source_cancel(&channel->timer);
       if (ftun_event_timer_start(channel->loop, now + 10u,

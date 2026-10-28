@@ -43,6 +43,51 @@ static int context_case(void)
   return 0;
 }
 
+/* 运行配置代次唯一由 Core 上下文预留与发布，预留带持有者。 */
+static int generation_case(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  int host = 0, other = 0;
+  uint64_t value = 99u;
+  uint64_t next = 0u;
+  uint64_t second = 0u;
+  CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(ftun_core_context_is_valid(core) && !ftun_core_context_is_valid(NULL));
+  CHECK(ftun_core_context_generation(core, &value) == FTUN_OK && value == 0u);
+  CHECK(ftun_core_context_generation_reserved(core, &value) == FTUN_OK && value == 0u);
+  CHECK(ftun_core_context_generation_held(core, &host, &value) == FTUN_E_STALE && value == 0u);
+  /* 未预留不能发布；持有者必须非空。 */
+  CHECK(ftun_core_context_generation_publish(core, &host, 1u) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_reserve(core, NULL, &next) == FTUN_E_INVALID && next == 0u);
+  CHECK(ftun_core_context_generation_reserve(core, &host, &next) == FTUN_OK && next == 1u);
+  /* 预留期间其他来源得到 AGAIN，且不能发布、释放或查询为己有。 */
+  CHECK(ftun_core_context_generation_reserve(core, &other, &second) == FTUN_E_AGAIN && second == 0u);
+  CHECK(ftun_core_context_generation_publish(core, &other, next) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_release(core, &other, next) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_held(core, &other, &value) == FTUN_E_STALE && value == 0u);
+  CHECK(ftun_core_context_generation_held(core, &host, &value) == FTUN_OK && value == 1u);
+  CHECK(ftun_core_context_generation(core, &value) == FTUN_OK && value == 0u);
+  /* 释放后可重新预留同一代次；错误代次的发布/释放返回 STALE。 */
+  CHECK(ftun_core_context_generation_release(core, &host, 2u) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_release(core, &host, next) == FTUN_OK);
+  CHECK(ftun_core_context_generation_release(core, &host, next) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_reserve(core, &other, &next) == FTUN_OK && next == 1u);
+  CHECK(ftun_core_context_generation_publish(core, &other, 2u) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_publish(core, &other, next) == FTUN_OK);
+  CHECK(ftun_core_context_generation(core, &value) == FTUN_OK && value == 1u);
+  CHECK(ftun_core_context_generation_reserved(core, &value) == FTUN_OK && value == 0u);
+  CHECK(ftun_core_context_generation_publish(core, &other, next) == FTUN_E_STALE);
+  CHECK(ftun_core_context_generation_reserve(core, &host, &next) == FTUN_OK && next == 2u);
+  CHECK(ftun_core_context_generation_publish(core, &host, next) == FTUN_OK);
+  CHECK(ftun_core_context_generation(core, &value) == FTUN_OK && value == 2u);
+  CHECK(ftun_core_context_generation_reserve(NULL, &host, &next) == FTUN_E_INVALID && next == 0u);
+  CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 static int app_case(void)
 {
   ftun_core_options_t options = {0};
@@ -98,6 +143,7 @@ static int app_case(void)
 int main(void)
 {
   CHECK(context_case() == 0);
+  CHECK(generation_case() == 0);
   CHECK(app_case() == 0);
   return 0;
 }

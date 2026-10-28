@@ -202,12 +202,48 @@ ftun_status_t ftun_core_service_run_once(
                                        out_usage);
 }
 
+bool ftun_core_service_run_fatal(ftun_status_t status,
+                                 const ftun_core_service_run_usage_t *usage)
+{
+  return status == FTUN_E_STATE_CORRUPT || (usage != NULL && usage->fatal);
+}
+
+bool ftun_core_service_can_pause(const ftun_core_service_t *service)
+{
+  return service != NULL && service->descriptor != NULL &&
+         service->descriptor->maintain_once != NULL &&
+         service->implementation != NULL && service->prepared;
+}
+
+ftun_status_t ftun_core_service_maintain_once(
+  ftun_core_service_t *service, uint64_t now_ms, size_t quota,
+  ftun_core_service_run_usage_t *out_usage)
+{
+  ftun_status_t status = ftun_core_service_running(service);
+  if (out_usage != NULL) memset(out_usage, 0, sizeof(*out_usage));
+  if (status != FTUN_OK || out_usage == NULL || quota == 0u) {
+    return status == FTUN_OK ? FTUN_E_INVALID : status;
+  }
+  if (service->descriptor->maintain_once == NULL) return FTUN_E_UNSUPPORTED;
+  return service->descriptor->maintain_once(service->implementation, now_ms,
+                                            quota, out_usage);
+}
+
 ftun_status_t ftun_core_service_wakeup(ftun_core_service_t *service)
 {
   ftun_status_t status = ftun_core_service_check(service);
   if (status == FTUN_OK && !service->prepared) return FTUN_OK;
   return status == FTUN_OK
     ? service->descriptor->wakeup(service->implementation) : status;
+}
+
+void ftun_core_service_network_changed(ftun_core_service_t *service,
+  const ftun_network_change_t *change, uint64_t now_ms)
+{
+  if (change == NULL || ftun_core_service_check(service) != FTUN_OK ||
+      !service->prepared || service->cleanup_only ||
+      service->descriptor->network_changed == NULL) return;
+  service->descriptor->network_changed(service->implementation, change, now_ms);
 }
 
 ftun_status_t ftun_core_service_quiesce(ftun_core_service_t *service)
@@ -272,9 +308,4 @@ ftun_status_t ftun_core_service_destroy_until(ftun_core_service_t *service,
     service->prepared = false;
   }
   return status;
-}
-
-ftun_status_t ftun_core_service_destroy(ftun_core_service_t *service)
-{
-  return ftun_core_service_destroy_until(service, UINT64_MAX);
 }

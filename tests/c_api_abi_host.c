@@ -182,7 +182,9 @@ static ftun_status_t destroy_until(void **implementation, uint64_t deadline)
 static const ftun_core_service_descriptor_t descriptor = {
   "abi-test", plan_prepare, plan_destroy, prepare, success,
   reload_prepare, reload_planned, reload_commit, success,
-  run_once, success, success, drain_until, stop_until, destroy_until
+  run_once, success, success, drain_until, stop_until, destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 int ftun_test_service_create(const void *options, void **out)

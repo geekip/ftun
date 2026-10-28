@@ -1,4 +1,4 @@
-/* TASK-INBOUND-003 / TEST-INBOUND-003：ftun_socks5_server_create，目标 0.4.0。 */
+/* ftun_socks5_server_create。 */
 #include "socks5.h"
 
 #include <stdlib.h>

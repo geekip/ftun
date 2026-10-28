@@ -6,8 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-DNSWIRE-001；任务 TASK-DNS-006；目标 0.3.0；验收 TEST-DNS-006。 */
-
 #define FTUN_DNS_CACHE_KEY_BYTES (FTUN_DNS_MAX_NAME_BYTES + 33u)
 
 typedef struct {

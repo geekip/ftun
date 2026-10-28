@@ -183,7 +183,9 @@ static const ftun_core_service_descriptor_t descriptor = {
   fake_reload_prepare, fake_reload_prepare_planned, fake_reload_commit,
   fake_reload_abort, fake_run_once, fake_wakeup, fake_quiesce,
   fake_drain_until,
-  fake_stop_until, fake_destroy_until
+  fake_stop_until, fake_destroy_until,
+  NULL,
+  NULL /* network_changed */
 };
 
 static ftun_status_t empty_plan_prepare(ftun_budget_t *budget,

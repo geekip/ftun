@@ -360,6 +360,76 @@ static int test_stop_steps(void)
   return 0;
 }
 
+typedef struct {
+  int calls;
+  int order[4];
+} wake_state_t;
+
+static void wake_ready(void *user)
+{
+  wake_state_t *state = (wake_state_t *)user;
+  state->calls++;
+}
+
+static void noop_completed(ftun_operation_t *operation, ftun_error_t result, void *user)
+{
+  (void)operation;
+  (void)result;
+  (void)user;
+}
+
+/* 队列满时的等待：排队、幂等、取消、按序恰好一次通知、有等待者不能销毁。 */
+static int test_waiters(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_operation_queue_t *queue = NULL;
+  ftun_operation_t *first = NULL, *second = NULL, *extra = NULL;
+  ftun_operation_token_t first_token = {0}, second_token = {0}, extra_token = {0};
+  ftun_operation_waiter_t a, b, c;
+  wake_state_t wa = {0}, wb = {0}, wc = {0};
+  ftun_error_t success = {FTUN_OK, 0u, 0};
+  size_t dispatched = 0u;
+  memset(&a, 0, sizeof(a));
+  memset(&b, 0, sizeof(b));
+  memset(&c, 0, sizeof(c));
+  CHECK(ftun_budget_create(NULL, 4096u, 256u, &budget) == FTUN_OK);
+  CHECK(ftun_operation_queue_create(budget, 2u, &queue) == FTUN_OK);
+  /* 有额度时不排队。 */
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_E_AGAIN);
+  CHECK(ftun_operation_accept(queue, noop_completed, NULL, &first, &first_token) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, noop_completed, NULL, &second, &second_token) == FTUN_OK);
+  CHECK(ftun_operation_accept(queue, noop_completed, NULL, &extra, &extra_token) == FTUN_E_LIMIT);
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait(queue, &b, wake_ready, &wb) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait(queue, &c, wake_ready, &wc) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait_cancel(&b) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait_cancel(&b) == FTUN_E_STALE);
+  CHECK(ftun_operation_queue_destroy(&queue) == FTUN_E_AGAIN && queue != NULL);
+  /* 没有回收出额度之前不通知。 */
+  CHECK(ftun_operation_dispatch(queue, 4u, &dispatched) == FTUN_OK && dispatched == 0u);
+  CHECK(wa.calls == 0 && wc.calls == 0);
+  /* 回收一个额度：两个等待者都被通知一次（额度由重试时的 accept 最终仲裁）。 */
+  CHECK(ftun_operation_complete(first_token, success) == FTUN_OK);
+  CHECK(ftun_operation_dispatch(queue, 4u, &dispatched) == FTUN_OK && dispatched == 1u);
+  CHECK(wa.calls == 1 && wb.calls == 0 && wc.calls == 1);
+  CHECK(ftun_operation_queue_wait_cancel(&a) == FTUN_E_STALE);
+  /* 通知后可重新排队；额度已回收时直接让调用方重试。 */
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_E_AGAIN);
+  CHECK(ftun_operation_accept(queue, noop_completed, NULL, &extra, &extra_token) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait_cancel(&a) == FTUN_OK);
+  /* 停止后拒绝排队。 */
+  CHECK(ftun_operation_complete(second_token, success) == FTUN_OK);
+  CHECK(ftun_operation_complete(extra_token, success) == FTUN_OK);
+  CHECK(ftun_operation_dispatch(queue, 4u, &dispatched) == FTUN_OK && dispatched == 2u);
+  CHECK(ftun_operation_queue_stop(queue) == FTUN_OK);
+  CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_E_CANCELLED);
+  CHECK(ftun_operation_queue_destroy(&queue) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   ftun_budget_t *budget = NULL;
@@ -378,6 +448,7 @@ int main(void)
   size_t baseline;
   size_t dispatched = 99u;
 
+  if (test_waiters() != 0) return 1;
   CHECK(ftun_budget_create(NULL, 4096u, 256u, &budget) == FTUN_OK);
   CHECK(ftun_operation_queue_create(budget, 2u, &queue) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);

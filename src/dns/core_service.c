@@ -329,6 +329,9 @@ static ftun_status_t ftun_dns_service_run_once(
   out_usage->quota_exhausted = active_work == FTUN_DNS_SERVICE_QUOTA ||
     retired_work == FTUN_DNS_SERVICE_QUOTA ||
     callbacks == FTUN_DNS_SERVICE_EVENT_QUOTA || event_usage.backend_quota_exhausted;
+  out_usage->faults[FTUN_FAULT_SCOPE_OBJECT] =
+    ftun_dns_runtime_take_object_faults(service->active) +
+    ftun_dns_runtime_take_object_faults(service->retired);
   return FTUN_OK;
 }
 
@@ -406,6 +409,18 @@ static ftun_status_t ftun_dns_service_destroy_until(
   return ftun_reservation_release(&reservation);
 }
 
+static void ftun_dns_service_network_changed(void *implementation,
+  const ftun_network_change_t *change, uint64_t now_ms)
+{
+  ftun_dns_service_instance_t *service = (ftun_dns_service_instance_t *)implementation;
+  (void)change;
+  if (service == NULL) return;
+  ftun_dns_runtime_network_changed(service->active, now_ms);
+  ftun_dns_runtime_network_changed(service->retired, now_ms);
+  /* 提前到期的恢复要在这一轮就被处理，而不是等原来的期限计时器。 */
+  service->deadline_ready = true;
+}
+
 const ftun_core_service_descriptor_t ftun_dns_core_service = {
   "dns",
   ftun_dns_service_plan_prepare,
@@ -421,10 +436,7 @@ const ftun_core_service_descriptor_t ftun_dns_core_service = {
   ftun_dns_service_quiesce,
   ftun_dns_service_drain_until,
   ftun_dns_service_stop_until,
-  ftun_dns_service_destroy_until
+  ftun_dns_service_destroy_until,
+  NULL /* maintain_once：尚未支持暂停 */,
+  ftun_dns_service_network_changed
 };
-
-const ftun_core_service_descriptor_t *ftun_dns_service_descriptor(void)
-{
-  return &ftun_dns_core_service;
-}

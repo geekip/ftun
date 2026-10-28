@@ -8,21 +8,21 @@
   "dns": {
     "enable": false
   },
+  "tun": {
+    "interface": "ftun-no-cap0",
+    "mtu": 1400,
+    "ipv4": {
+      "address": "10.79.0.1/30"
+    },
+    "auto-route": true,
+    "strict-route": true
+  },
   "inbounds": [
     {
       "name": "tun-no-capability",
       "type": "tun",
-      "interface": {
-        "name": "ftun-no-cap0",
-        "mtu": 1400
-      },
-      "ipv4": {
-        "address": "10.79.0.1/30"
-      },
       "tcp": true,
       "udp": true,
-      "auto-route": true,
-      "strict-route": true,
       "dns-hijack": false
     }
   ],

@@ -55,7 +55,6 @@ typedef struct {
 } ftun_socks5_udp_datagram_t;
 
 /* 共享 SOCKS5 编解码。
- * 需求 REQ-OUT-001；任务 TASK-PROTOCOL-001；目标 0.2.0；验收 TEST-PROTOCOL-001。
  * 所有 decode 都是无状态纯增量解析：OK 表示一帧完整且 consumed 精确指向
  * 下一帧，AGAIN 表示还需字节，PROTOCOL 表示非法线格式，UNSUPPORTED 表示
  * 已识别但首版不支持的 BIND、IPv6 或 UDP 分片。非 OK 时输出和 consumed 清零。
@@ -89,6 +88,9 @@ ftun_status_t ftun_socks5_decode_request(
 ftun_status_t ftun_socks5_encode_request(
   ftun_socks5_command_t command, const ftun_endpoint_t *endpoint,
   uint8_t *output, size_t capacity, size_t *written);
+/* 回复的 BND 字段允许 ATYP=IPv6，解析为 FTUN_ADDRESS_IPV6_RESERVED；
+ * 是否可用该地址（如 UDP relay）由调用方按自身能力判断。请求和 UDP 封装
+ * 中的 IPv6 目标仍返回 UNSUPPORTED。 */
 ftun_status_t ftun_socks5_decode_reply(
   ftun_bytes_t input, ftun_socks5_reply_t *out, size_t *consumed);
 ftun_status_t ftun_socks5_encode_reply(

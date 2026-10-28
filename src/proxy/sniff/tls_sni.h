@@ -1,7 +1,7 @@
 #ifndef FTUN_PROXY_SNIFF_TLS_SNI_H
 #define FTUN_PROXY_SNIFF_TLS_SNI_H
 #include "internal/contracts.h"
-/* REQ-SNIFF-001 / TASK-SNIFF-002 / TEST-SNIFF-002，目标 0.5.0：
+/* 
  * ftun_sniff_tls_sni 只返回明文 SNI 提示。 */
 /* 纯字节 TLS ClientHello 解析，不启动 TLS 库。支持跨 record 的
  * handshake 分片；不完整输入以 need_more 表示，畸形输入返回

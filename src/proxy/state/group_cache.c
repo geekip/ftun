@@ -16,7 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-/* REQ-STATE-001 / TASK-STATE-003 / TEST-STATE-003，目标 0.5.0：
+/* 
  * ftun_group_cache_save 原子写入可丢弃 Group/Health 缓存。 */
 
 #define FTUN_GROUP_CACHE_HEADER_BYTES 40u

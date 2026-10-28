@@ -713,7 +713,7 @@ static int test_system_branch(void)
   return 0;
 }
 
-/* TASK-DNS-004 / TEST-DNS-004：显式 DIRECT 源与 SystemResolver 分支。 */
+/* 显式 DIRECT 源与 SystemResolver 分支。 */
 int main(void)
 {
   CHECK(test_explicit_success_and_copy() == 0);

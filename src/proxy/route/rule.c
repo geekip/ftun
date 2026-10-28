@@ -9,8 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 需求 REQ-ROUTE-001；任务 TASK-ROUTE-002；目标 0.3.0；验收 TEST-ROUTE-002。 */
-
 static unsigned char ftun_rule_ascii_lower(unsigned char byte)
 {
   if (byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') {
@@ -184,6 +182,11 @@ ftun_status_t ftun_rule_match(const ftun_rule_t *rule,
       (metadata->known_fields & ~known) != 0u ||
       (metadata->resolved_count != 0u && metadata->resolved == NULL)) {
     return FTUN_E_INVALID;
+  }
+  /* 集合未就绪：不需要地址或域名，直接命中（由 Router 拒绝新连接）。 */
+  if (rule->frs_pending) {
+    out->matched = true;
+    return FTUN_OK;
   }
   switch (rule->kind) {
     case FTUN_RULE_SRC_IP_CIDR:
@@ -423,6 +426,11 @@ ftun_status_t ftun_rule_compile_with_frs(
       goto fail;
     }
     status = frs_bind(kind, operand, &rule->frs_set, frs_user);
+    /* AGAIN 表示集合尚未就绪：规则保留，匹配时拒绝新连接。 */
+    if (status == FTUN_E_AGAIN) {
+      rule->frs_pending = true;
+      status = FTUN_OK;
+    }
     if (status != FTUN_OK) goto fail;
   } else if (rule->kind == FTUN_RULE_SRC_IP_CIDR ||
       rule->kind == FTUN_RULE_IP_CIDR) {

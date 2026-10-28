@@ -58,7 +58,6 @@ typedef struct {
 } ftun_event_loop_usage_t;
 
 /* 可移植事件接口。
- * 需求 REQ-CORE-001；任务 TASK-EVENT-001；目标 0.2.0；验收 TEST-EVENT-001。
  * source 仅是内部句柄，不进入公开 C API。I/O readiness 由后端投递，
  * timer 使用绝对单调毫秒。defer 可跨线程接纳，固定队列从空变为
  * 非空时才唤醒后端。defer/wakeup 可跨线程调用；poll、usage、source 和

@@ -35,6 +35,8 @@ void ftun_lwip_port_free(void *pointer);
 #define LWIP_AUTOIP 0
 #define LWIP_DNS 0
 #define LWIP_TCP 1
+/* 每条 TCP 连接的存活探测由 lwip_adapter 在 accept 时按配置打开（SOF_KEEPALIVE）。 */
+#define LWIP_TCP_KEEPALIVE 1
 #define LWIP_UDP 1
 
 /* MTU 在 netif 上运行时收紧；编译上限保持常见 1500 字节链路的 MSS。 */

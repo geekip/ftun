@@ -4,11 +4,31 @@
     "ipv6": false,
     "allow-lan": false,
     "cache-file": "./state/ftun.cache",
-    "state-cache": true
+    "state-cache": true,
+    "routing-mark": 18004,
+    "watchdog": "30s",
+    "reload-retain": {
+      "count": 4
+    },
+    "timeouts": {
+      "handshake": "10s",
+      "connect": "10s",
+      "reply": "5s",
+      "tcp-keepalive": {
+        "idle": "30s",
+        "interval": "15s",
+        "count": 4
+      },
+      "write-progress": "120s",
+      "tcp-idle": null,
+      "udp-idle": "120s"
+    }
   },
   "log": {
     "level": "warn",
-    "file": "./state/ftun.log"
+    "file": "./state/ftun.log",
+    "max-size": 10485760,
+    "max-files": 3
   },
   "dns": {
     "enable": true,
@@ -61,7 +81,9 @@
       "address": "172.19.0.1/30"
     },
     "auto-route": true,
-    "strict-route": true
+    "strict-route": true,
+    "route-table": 18004,
+    "rule-priority": 11000
   },
   "inbounds": [
     {

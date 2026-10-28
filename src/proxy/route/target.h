@@ -4,7 +4,6 @@
 #include "internal/contracts.h"
 
 /* 目标与候选约束。
- * 需求 REQ-ROUTE-001；任务 TASK-ROUTE-003；目标 0.2.0；验收 TEST-ROUTE-003。
  * 返回值只借用 metadata 中的域名和候选；original 始终保持入口真实/FakeIP
  * 目标，identity 单独保存恢复或嗅探域名，dial 只能从 allowed 中选择。
  */

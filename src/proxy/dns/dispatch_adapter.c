@@ -1,9 +1,9 @@
 #include "proxy/dns/dispatch_adapter.h"
 
-#include "dns/internal.h"
+#include "dns/dispatcher.h"
 #include "proxy/dns/runtime_adapter.h"
 
-/* REQ-DNS-001 / TASK-DNS-001 / TEST-DNS-001，目标 0.3.0：
+/* 
  * Proxy adapter 保持既有策略入口，DNS 原语不反向依赖 Proxy。 */
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -21,6 +21,7 @@ ftun_status_t ftun_proxy_dns_dispatch(
     (const ftun_proxy_dns_runtime_adapter_t *)user;
   ftun_fakeip_service_t *fakeip = NULL;
   ftun_dns_server_info_t server_info;
+  ftun_dns_server_t *server = NULL;
   ftun_dns_query_t selected;
   size_t server_index;
   ftun_status_t status;
@@ -28,7 +29,7 @@ ftun_status_t ftun_proxy_dns_dispatch(
   if (adapter == NULL || adapter->core == NULL ||
       core == NULL || core != adapter->core || query == NULL || out == NULL) return FTUN_E_INVALID;
   if (dispatcher == NULL) return FTUN_E_AGAIN;
-  status = ftun_dns_query_request_validate(dispatcher->budget, query);
+  status = ftun_dns_dispatcher_validate(dispatcher, query);
   if (status != FTUN_OK) return status;
   if (adapter->fakeip_slot != NULL) fakeip = *adapter->fakeip_slot;
   if (query->entry == FTUN_DNS_ENTRY_FIXED) {
@@ -46,7 +47,8 @@ ftun_status_t ftun_proxy_dns_dispatch(
     status = ftun_runtime_active_acquire(core, &runtime);
     if (status != FTUN_OK) return status;
     status = ftun_runtime_config(runtime, &config);
-    if (status == FTUN_OK && config != dispatcher->config_scope) {
+    if (status == FTUN_OK &&
+        config != ftun_dns_dispatcher_config_scope(dispatcher)) {
       status = FTUN_E_STALE;
     }
     if (status == FTUN_OK) status = ftun_runtime_route_table(runtime, &table);
@@ -54,8 +56,8 @@ ftun_status_t ftun_proxy_dns_dispatch(
       status = ftun_route_table_evaluate_known(table, &metadata, &route);
     }
     if (status == FTUN_OK && route.kind == FTUN_ROUTE_READY) {
-      status = dispatcher->select_server(route.outbound_id, &server_index,
-                                         dispatcher->select_user);
+      status = ftun_dns_dispatcher_select(dispatcher, route.outbound_id,
+                                          &server_index);
     }
     if (ftun_runtime_release(&runtime) != FTUN_OK && status == FTUN_OK) {
       status = FTUN_E_STATE_CORRUPT;
@@ -68,9 +70,9 @@ ftun_status_t ftun_proxy_dns_dispatch(
   } else {
     return FTUN_E_INVALID;
   }
-  if (server_index >= dispatcher->server_count) return FTUN_E_INVALID;
-  status = ftun_dns_server_get_info(dispatcher->servers[server_index],
-                                    &server_info);
+  status = ftun_dns_dispatcher_server(dispatcher, server_index, &server);
+  if (status != FTUN_OK) return status;
+  status = ftun_dns_server_get_info(server, &server_info);
   if (status != FTUN_OK) return status;
   selected = *query;
   selected.server_fingerprint = server_info.fingerprint;
@@ -106,8 +108,7 @@ ftun_status_t ftun_proxy_dns_dispatch(
   }
 #endif
   selected.resolution_mode = 1u;
-  return ftun_dns_exchange(core, dispatcher->servers[server_index],
-                           &selected, out);
+  return ftun_dns_exchange(core, server, &selected, out);
 }
 
 typedef struct {
@@ -236,17 +237,17 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   size_t wire_length;
   size_t name_length;
   size_t server_index;
+  ftun_dns_server_t *upstream = NULL;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || request == NULL || request->budget == NULL ||
       request->completion == NULL || out == NULL || server.data == NULL ||
       server.length == 0u) return FTUN_E_INVALID;
   if (dispatcher == NULL) return FTUN_E_AGAIN;
-  if (dispatcher->select_named_server == NULL) return FTUN_E_UNSUPPORTED;
-  status = dispatcher->select_named_server(server, &server_index,
-                                           dispatcher->select_user);
+  status = ftun_dns_dispatcher_select_named(dispatcher, server, &server_index);
   if (status != FTUN_OK) return status;
-  if (server_index >= dispatcher->server_count) return FTUN_E_INVALID;
+  status = ftun_dns_dispatcher_server(dispatcher, server_index, &upstream);
+  if (status != FTUN_OK) return status;
   status = ftun_dns_named_wire(request->domain, request->query_id, wire,
                                &wire_length, &name_length);
   if (status != FTUN_OK) return status;
@@ -279,7 +280,7 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   query.entry = FTUN_DNS_ENTRY_FIXED;
   query.fixed_server = server_index;
   query.real_only = true;
-  status = ftun_dns_exchange(core, dispatcher->servers[server_index],
+  status = ftun_dns_exchange(core, upstream,
                              &query, out);
   if (status != FTUN_OK) {
     free(context);
@@ -287,6 +288,5 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   }
   return status;
 }
-
 
 #endif
