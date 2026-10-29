@@ -1,0 +1,20 @@
+set(ftun_sources_core
+  config/document.c
+  config/fields.c
+  config/syntax.c
+  context.c
+  ddra.c
+  errors.c
+  event/backend.c
+  event/loop.c
+  index.c
+  io/file.c
+  lifecycle.c
+  limits.c
+  log/event_log.c
+  log/log.c
+  operation.c
+  recovery.c
+  worker.c
+)
+ftun_add_layer(core ftun_platform ftun_util Threads::Threads ftun_cjson)

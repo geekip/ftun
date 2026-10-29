@@ -1,0 +1,393 @@
+#define _GNU_SOURCE 1
+#include "libs/transport/dialer.h"
+#include "platform/linux/socket_protect.h"
+#include "platform/posix/sockopt.h"
+#include <limits.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+  ftun_event_loop_t *loop;
+  ftun_operation_t *operation;
+  ftun_operation_token_t completion_token;
+  ftun_event_source_t *io_source;
+  ftun_event_source_t *timer_source;
+  ftun_reservation_t reservation;
+  ftun_dial_io_t io;
+  ftun_dial_result_t result;
+  ftun_dial_completion_fn completion;
+  void *completion_user;
+  ftun_socket_policy_t policy;
+  char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  ftun_error_t pending_error;
+  int has_pending_error;
+} ftun_dial_context_t;
+
+static ftun_error_t ftun_dial_error(ftun_status_t status, uint32_t stage)
+{
+  ftun_error_t error;
+  memset(&error, 0, sizeof(error));
+  error.status = status;
+  error.stage = stage;
+  return error;
+}
+
+static int ftun_dial_transport_valid(ftun_dial_transport_t transport)
+{
+  return transport == FTUN_DIAL_TCP || transport == FTUN_DIAL_UDP;
+}
+
+static int ftun_dial_purpose_valid(ftun_dial_purpose_t purpose)
+{
+  return purpose >= FTUN_DIAL_PURPOSE_BUSINESS &&
+         purpose <= FTUN_DIAL_PURPOSE_RELAY;
+}
+
+static int ftun_dial_domain_valid(ftun_dial_domain_t domain)
+{
+  return domain >= FTUN_DIAL_DOMAIN_AUTO &&
+         domain <= FTUN_DIAL_DOMAIN_OVERLAY;
+}
+
+static int ftun_dial_endpoint_equal(const ftun_endpoint_t *left,
+                                    const ftun_endpoint_t *right)
+{
+  return left->kind == FTUN_ADDRESS_IPV4 &&
+         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
+         memcmp(left->address, right->address, 4u) == 0;
+}
+
+static int ftun_dial_allowed_valid(const ftun_dial_request_t *request)
+{
+  size_t index;
+  if (request->allowed_count == 0u) return request->allowed == NULL;
+  if (request->allowed == NULL) return 0;
+  for (index = 0u; index < request->allowed_count; index++) {
+    const ftun_endpoint_t *item = &request->allowed[index];
+    if (item->kind != FTUN_ADDRESS_IPV4 || item->port == 0u ||
+        item->domain.length != 0u) return 0;
+  }
+  return 1;
+}
+
+static int ftun_dial_endpoint_allowed(const ftun_dial_request_t *request)
+{
+  size_t index;
+  if (request->allowed_count == 0u) return 1;
+  for (index = 0u; index < request->allowed_count; index++) {
+    if (ftun_dial_endpoint_equal(&request->allowed[index],
+                                 &request->endpoint)) return 1;
+  }
+  return 0;
+}
+
+static int ftun_dial_io_valid(const ftun_dial_io_t *io)
+{
+  return io != NULL && io->open_socket != NULL && io->protect_socket != NULL &&
+         io->connect_socket != NULL && io->get_socket_error != NULL &&
+         io->close_socket != NULL;
+}
+
+static int ftun_dial_request_valid(const ftun_dial_request_t *request)
+{
+  if (request == NULL || request->loop == NULL || request->operations == NULL ||
+      request->budget == NULL ||
+      request->endpoint.kind != FTUN_ADDRESS_IPV4 ||
+      request->endpoint.port == 0u ||
+      !ftun_dial_transport_valid(request->transport) ||
+      !ftun_dial_purpose_valid(request->purpose) ||
+      !ftun_dial_domain_valid(request->requested_domain) ||
+      !ftun_dial_allowed_valid(request)) return 0;
+  if (request->protection.interface_name.length >=
+      FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+  if (request->protection.interface_name.length != 0u &&
+      request->protection.interface_name.data == NULL) return 0;
+  if (request->protection.mark == 0u &&
+      request->protection.interface_name.length != 0u) return 0;
+  return 1;
+}
+
+static ftun_status_t ftun_dial_select_domain(
+  const ftun_dial_request_t *request, ftun_network_dial_decision_t *out)
+{
+  ftun_network_view_info_t info;
+  ftun_status_t status;
+  memset(out, 0, sizeof(*out));
+  if (request->network_view == NULL) {
+    if (request->network_generation != 0u ||
+        request->requested_domain == FTUN_DIAL_DOMAIN_OVERLAY) {
+      return FTUN_E_UNSUPPORTED;
+    }
+    out->domain = FTUN_DIAL_DOMAIN_UNDERLAY;
+    return FTUN_OK;
+  }
+  status = ftun_network_view_get_info(request->network_view, &info);
+  if (status != FTUN_OK) return status;
+  if (request->network_generation != 0u &&
+      request->network_generation != info.generation) return FTUN_E_STALE;
+  status = ftun_network_view_select_dial(request->network_view,
+    &request->endpoint, request->purpose, request->requested_domain, out);
+  if (status != FTUN_OK) return status;
+  if (out->domain == FTUN_DIAL_DOMAIN_UNDERLAY &&
+      info.protected_prefix_count != 0u && request->protection.mark == 0u &&
+      request->protection.interface_name.length == 0u) {
+    return FTUN_E_REJECTED;
+  }
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_dial_authorize(const ftun_dial_request_t *request,
+  ftun_network_dial_decision_t *out)
+{
+  ftun_network_dial_decision_t decision;
+  ftun_status_t status;
+  if (out != NULL) memset(out, 0, sizeof(*out));
+  if (out == NULL || !ftun_dial_request_valid(request)) return FTUN_E_INVALID;
+  if (!ftun_dial_endpoint_allowed(request)) return FTUN_E_REJECTED;
+  status = ftun_dial_select_domain(request, &decision);
+  if (status == FTUN_OK) *out = decision;
+  return status;
+}
+
+static ftun_status_t ftun_dial_cancel_sources(ftun_dial_context_t *context)
+{
+  ftun_status_t status;
+  status = ftun_event_source_cancel(&context->io_source);
+  if (status != FTUN_OK) return status;
+  return ftun_event_source_cancel(&context->timer_source);
+}
+
+static ftun_status_t ftun_dial_close(ftun_dial_context_t *context)
+{
+  ftun_status_t status;
+  if (context->result.socket == FTUN_INVALID_SOCKET) return FTUN_OK;
+  status = context->io.close_socket(context->io.context, context->result.socket);
+  context->result.socket = FTUN_INVALID_SOCKET;
+  return status;
+}
+
+static ftun_status_t ftun_dial_cancel(void *user)
+{
+  ftun_dial_context_t *context = (ftun_dial_context_t *)user;
+  ftun_status_t status;
+  if (context == NULL) return FTUN_E_INVALID;
+  status = ftun_dial_cancel_sources(context);
+  if (status != FTUN_OK) return status;
+  return ftun_dial_close(context);
+}
+
+static void ftun_dial_completed(ftun_operation_t *operation,
+                                ftun_error_t error, void *user)
+{
+  ftun_dial_context_t *context = (ftun_dial_context_t *)user;
+  ftun_reservation_t reservation;
+  ftun_dial_completion_fn completion;
+  void *completion_user;
+  if (context == NULL) return;
+  if (error.status != FTUN_OK) {
+    (void)ftun_dial_close(context);
+  }
+  completion = context->completion;
+  completion_user = context->completion_user;
+  reservation = context->reservation;
+  context->operation = NULL;
+  context->reservation = (ftun_reservation_t){0};
+  completion(operation, error, &context->result, completion_user);
+  memset(context, 0, sizeof(*context));
+  free(context);
+  (void)ftun_reservation_release(&reservation);
+}
+
+static ftun_status_t ftun_dial_finish(ftun_dial_context_t *context,
+                                      ftun_error_t error)
+{
+  ftun_status_t status;
+  status = ftun_dial_cancel_sources(context);
+  if (status != FTUN_OK) {
+    context->pending_error = error;
+    context->has_pending_error = 1;
+    return status;
+  }
+  if (error.status != FTUN_OK) (void)ftun_dial_close(context);
+  context->pending_error = error;
+  context->has_pending_error = 0;
+  return ftun_operation_complete(context->completion_token, error);
+}
+
+static void ftun_dial_io_ready(ftun_event_source_t *source,
+                               uint32_t events, void *user)
+{
+  ftun_dial_context_t *context = (ftun_dial_context_t *)user;
+  ftun_status_t status;
+  (void)source;
+  (void)events;
+  if (context->has_pending_error) {
+    (void)ftun_dial_finish(context, context->pending_error);
+    return;
+  }
+  status = context->io.get_socket_error(context->io.context,
+                                        context->result.socket);
+  if (status == FTUN_E_AGAIN) return;
+  (void)ftun_dial_finish(context,
+    ftun_dial_error(status, FTUN_DIAL_STAGE_WAIT));
+}
+
+static void ftun_dial_timer_ready(ftun_event_source_t *source,
+                                  uint32_t events, void *user)
+{
+  ftun_dial_context_t *context = (ftun_dial_context_t *)user;
+  ftun_error_t error;
+  (void)source;
+  (void)events;
+  error = context->has_pending_error ? context->pending_error :
+          ftun_dial_error(FTUN_E_TIMEOUT, FTUN_DIAL_STAGE_TIMEOUT);
+  (void)ftun_dial_finish(context, error);
+}
+
+static void ftun_dial_release_context(ftun_dial_context_t *context)
+{
+  ftun_reservation_t reservation;
+  if (context == NULL) return;
+  reservation = context->reservation;
+  context->reservation = (ftun_reservation_t){0};
+  memset(context, 0, sizeof(*context));
+  free(context);
+  (void)ftun_reservation_release(&reservation);
+}
+
+static ftun_status_t ftun_dial_reject(ftun_dial_context_t *context,
+                                      ftun_status_t original)
+{
+  ftun_status_t status;
+  ftun_status_t cleanup = FTUN_OK;
+  status = ftun_dial_cancel_sources(context);
+  if (status != FTUN_OK) return status;
+  status = ftun_dial_close(context);
+  if (status != FTUN_OK) cleanup = status;
+  status = ftun_operation_set_cancel_hook(context->operation, NULL, NULL);
+  if (status != FTUN_OK && cleanup == FTUN_OK) cleanup = status;
+  status = ftun_operation_reject(&context->operation);
+  if (status != FTUN_OK && cleanup == FTUN_OK) cleanup = status;
+  if (context->operation == NULL) ftun_dial_release_context(context);
+  return cleanup == FTUN_OK ? original : cleanup;
+}
+
+/* 唯一物理拨号入口。 */
+ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
+                                      const ftun_dial_request_t *request,
+                                      const ftun_dial_io_t *io,
+                                      ftun_operation_t **out)
+{
+  ftun_dial_context_t *context;
+  ftun_reservation_t reservation = (ftun_reservation_t){0};
+  ftun_network_dial_decision_t decision;
+  ftun_status_t status;
+  (void)core;
+  if (out != NULL) *out = NULL;
+  if (out == NULL || request == NULL || request->completion == NULL ||
+      !ftun_dial_io_valid(io)) return FTUN_E_INVALID;
+  status = ftun_dial_authorize(request, &decision);
+  if (status != FTUN_OK) return status;
+
+  status = ftun_budget_reserve(request->budget, sizeof(*context), &reservation);
+  if (status != FTUN_OK) return status;
+  context = (ftun_dial_context_t *)calloc(1u, sizeof(*context));
+  if (context == NULL) {
+    (void)ftun_reservation_release(&reservation);
+    return FTUN_E_LIMIT;
+  }
+  context->loop = request->loop;
+  context->reservation = reservation;
+  context->io = *io;
+  context->result.socket = FTUN_INVALID_SOCKET;
+  context->result.endpoint = request->endpoint;
+  context->result.endpoint.domain.data = NULL;
+  context->result.endpoint.domain.length = 0u;
+  context->result.transport = request->transport;
+  context->result.purpose = request->purpose;
+  context->result.domain = decision.domain;
+  context->result.network_generation = decision.generation;
+  context->completion = request->completion;
+  context->completion_user = request->user;
+  context->policy.mark = request->protection.mark;
+  context->policy.liveness = request->protection.liveness;
+  if (request->protection.interface_name.length != 0u) {
+    memcpy(context->interface_name, request->protection.interface_name.data,
+           request->protection.interface_name.length);
+    context->policy.interface_name.data = context->interface_name;
+    context->policy.interface_name.length =
+      request->protection.interface_name.length;
+  }
+
+  status = ftun_operation_accept(request->operations, ftun_dial_completed,
+                                 context, &context->operation,
+                                 &context->completion_token);
+  if (status != FTUN_OK) {
+    ftun_dial_release_context(context);
+    return status;
+  }
+  status = ftun_operation_set_cancel_hook(context->operation,
+                                          ftun_dial_cancel, context);
+  if (status != FTUN_OK) return ftun_dial_reject(context, status);
+
+  status = context->io.open_socket(context->io.context, request->transport,
+                                   &context->result.socket);
+  if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  if (context->result.socket == FTUN_INVALID_SOCKET) {
+    return ftun_dial_reject(context, FTUN_E_STATE_CORRUPT);
+  }
+  if (context->result.domain == FTUN_DIAL_DOMAIN_UNDERLAY &&
+      (context->policy.mark != 0u ||
+       context->policy.interface_name.length != 0u)) {
+    status = context->io.protect_socket(context->io.context,
+                                        context->result.socket,
+                                        &context->policy);
+    if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  }
+  /* 系统 socket 才设置存活策略；测试注入的 io 没有真实描述符。 */
+  if (request->transport == FTUN_DIAL_TCP &&
+      context->io.open_socket == ftun_socket_default_io()->open_socket) {
+    status = ftun_socket_apply_liveness((int)context->result.socket,
+                                        &context->policy.liveness);
+    if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  }
+  status = context->io.connect_socket(context->io.context,
+                                      context->result.socket,
+                                      &context->result.endpoint);
+  if (status == FTUN_OK) {
+    status = ftun_operation_complete(context->completion_token,
+      ftun_dial_error(FTUN_OK, FTUN_DIAL_STAGE_CONNECT));
+    if (status != FTUN_OK) return ftun_dial_reject(context, status);
+    *out = context->operation;
+    return FTUN_OK;
+  }
+  if (status != FTUN_E_AGAIN) return ftun_dial_reject(context, status);
+
+  status = ftun_event_timer_start(context->loop, request->deadline_ms,
+                                  ftun_dial_timer_ready, context,
+                                  &context->timer_source);
+  if (status != FTUN_OK) return ftun_dial_reject(context, status);
+  status = ftun_event_io_start(context->loop, context->result.socket,
+                               FTUN_EVENT_WRITE | FTUN_EVENT_ERROR,
+                               ftun_dial_io_ready, context,
+                               &context->io_source);
+  if (status != FTUN_OK) {
+    ftun_status_t cleanup = ftun_event_source_cancel(&context->timer_source);
+    if (cleanup != FTUN_OK) {
+      context->pending_error = ftun_dial_error(status, FTUN_DIAL_STAGE_WAIT);
+      context->has_pending_error = 1;
+      *out = context->operation;
+      return FTUN_OK;
+    }
+    return ftun_dial_reject(context, status);
+  }
+  *out = context->operation;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_dial_start(ftun_core_t *core,
+                              const ftun_dial_request_t *request,
+                              ftun_operation_t **out)
+{
+  return ftun_dial_start_with_io(core, request, ftun_socket_default_io(), out);
+}

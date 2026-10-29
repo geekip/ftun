@@ -1,0 +1,137 @@
+{
+  "properties": {
+    "dns": {
+      "$ref": "#/$defs/DNS"
+    }
+  },
+  "$defs": {
+    "FakeIP": {
+      "title": "全局 FakeIP",
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "是否允许合成 FakeIP；dns.enable=false 时本开关不生效。"
+        },
+        "range": {
+          "$ref": "#/$defs/IPv4CIDR",
+          "default": "198.18.0.0/15"
+        },
+        "persist": {
+          "type": "boolean",
+          "default": true,
+          "description": "先耐久预留地址，再批量保存映射；首次显式初始化，缺失/损坏不自动重建。池范围与持久化模式更改需要重启。"
+        }
+      },
+      "additionalProperties": false,
+      "description": "所有 fake-ip server 共用域名身份池；不自动复用，满池拒绝新映射。"
+    },
+    "DNSListener": {
+      "title": "DNS 监听入口",
+      "type": "object",
+      "properties": {
+        "listen": {
+          "$ref": "#/$defs/ListenAddress"
+        },
+        "server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "非空为固定 DNS Server；空值或省略为策略入口。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "listen"
+      ]
+    },
+    "DNSServer": {
+      "title": "DNS 上游与回答策略",
+      "type": "object",
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/Name"
+        },
+        "type": {
+          "type": "string",
+          "enum": [
+            "udp",
+            "tcp"
+          ],
+          "description": "v1 仅支持 UDP/TCP DNS。"
+        },
+        "address": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSAddress"
+          },
+          "minItems": 1,
+          "maxItems": 4,
+          "description": "上游地址，配置顺序就是优先级；最多 4 个。网络类失败的地址进入退避，查询自动换到下一个。"
+        },
+        "outbound": {
+          "$ref": "#/$defs/Name",
+          "default": "DIRECT",
+          "description": "只决定 DNS 查询的传输路径，不决定查询域名的业务出口。"
+        },
+        "fake-ip": {
+          "type": "boolean",
+          "default": false,
+          "description": "客户端回答策略；内部 REAL 查询仍通过 address/outbound 获取真实地址。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "type",
+        "address"
+      ]
+    },
+    "DNS": {
+      "title": "DNS",
+      "type": "object",
+      "properties": {
+        "enable": {
+          "type": "boolean",
+          "default": true,
+          "description": "false 时停用 FTUN DNS 入口、缓存、Hijack 与 FakeIP；必要本地解析使用系统解析器。"
+        },
+        "cache": {
+          "type": "boolean",
+          "default": true,
+          "description": "缓存真实答案；不控制 FakeIP 身份寿命。"
+        },
+        "bootstrap": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/BootstrapAddress"
+          },
+          "default": [],
+          "description": "空数组/省略使用系统解析配置，不硬编码公共 DNS。显式来源失败不静默切换来源。"
+        },
+        "default-server": {
+          "$ref": "#/$defs/OptionalDNSName",
+          "description": "默认服务及路由前 REAL 解析器；空值/省略为 Bootstrap。"
+        },
+        "fake-ip": {
+          "$ref": "#/$defs/FakeIP"
+        },
+        "listeners": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSListener"
+          },
+          "default": []
+        },
+        "servers": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/DNSServer"
+          },
+          "default": []
+        }
+      },
+      "additionalProperties": false,
+      "description": "关闭后仍检查字段形状和语法，但不建立失效 DNS 引用或资源依赖。"
+    }
+  }
+}

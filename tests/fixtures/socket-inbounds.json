@@ -1,0 +1,42 @@
+{
+  "base": {
+    "state-cache": false
+  },
+  "log": {
+    "level": "silent"
+  },
+  "dns": {
+    "enable": true,
+    "cache": true,
+    "bootstrap": ["127.0.0.1:18053"],
+    "default-server": "real",
+    "listeners": [
+      {"listen": "127.0.0.1:21553", "server": "real"}
+    ],
+    "servers": [
+      {
+        "name": "real",
+        "type": "udp",
+        "address": ["dns.socket.test:18053"],
+        "outbound": "DIRECT"
+      }
+    ]
+  },
+  "inbounds": [
+    {
+      "name": "socks",
+      "type": "socks5",
+      "listen": "127.0.0.1:21081",
+      "udp": true
+    },
+    {
+      "name": "mixed",
+      "type": "mixed",
+      "listen": "127.0.0.1:21082",
+      "udp": true
+    }
+  ],
+  "rules": [
+    "MATCH,DIRECT"
+  ]
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "../../schema/ftun.schema.json",
+  "dns": {
+    "enable": false
+  },
+  "inbounds": [
+    {
+      "name": "socks-in",
+      "type": "socks5",
+      "listen": "127.0.0.1:10808",
+      "udp": true
+    }
+  ],
+  "rules": [
+    "MATCH,DIRECT"
+  ]
+}

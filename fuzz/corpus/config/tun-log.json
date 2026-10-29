@@ -1,0 +1,1 @@
+{"tun":{"interface":"ftun0","mtu":1400,"ipv4":{"address":"10.0.0.1/30"},"auto-route":true},"log":{"max-size":65536,"max-files":2}}

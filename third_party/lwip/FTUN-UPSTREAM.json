@@ -1,0 +1,18 @@
+{
+  "name": "heiher/lwip",
+  "revision": "150d2b1a2658612741b4ac002578d440e7874540",
+  "archive": "https://github.com/heiher/lwip/archive/150d2b1a2658612741b4ac002578d440e7874540.tar.gz",
+  "sha256": "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416",
+  "upstream_tree_sha256": "c6f799f51564f89f962df9b3b1dc82ea5ab68af54f1585872d0421d00b682c59",
+  "vendored_tree_sha256": "beaa0b74d1660d0997a2f79e0918ecddd2b1c9548ced43ece8da83869d988eba",
+  "license": "BSD-3-Clause",
+  "license_sha256": "ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b",
+  "local_patches": [
+    {
+      "path": "patches/0001-ipv4-only-pretend-udp.patch",
+      "reason": "Use the public IP_GET_TYPE macro so the pretend-UDP extension compiles with LWIP_IPV6=0.",
+      "patched_file": "src/core/udp.c",
+      "patched_sha256": "96667cdb5506e8c5c2a7c2ec54f24c529166bf38855c76a80814230405966291"
+    }
+  ]
+}

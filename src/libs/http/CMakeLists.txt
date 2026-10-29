@@ -1,0 +1,2 @@
+set(ftun_sources_lib_http http.c)
+ftun_add_layer(lib_http ftun_lib_resolver ftun_lib_transport ftun_lib_tls ftun_core)

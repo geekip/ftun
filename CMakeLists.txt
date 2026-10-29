@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.21)
+project(FTUN VERSION 1.0.4 LANGUAGES C)
+include(cmake/FtunOptions.cmake)
+include(cmake/FtunDependencies.cmake)
+add_subdirectory(src)
+include(cmake/FtunSchema.cmake)
+include(cmake/FtunInstall.cmake)
+include(tests/CMakeLists.txt)

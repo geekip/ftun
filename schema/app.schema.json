@@ -1,0 +1,240 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FTUN v1.0 配置",
+  "description": "FTUN 配置模型（Linux x86_64、IPv4）。用于编辑器补全及静态结构校验；Schema 通过不等于运行时校验通过，运行前仍须执行 ftun check。",
+  "$comment": "参考 https://sing-box.sagernet.org/schema.json 的 Draft 2020-12、$defs 与类型分支组织；字段和约束依据 FTUN 配置规范独立编写。尚未发布固定远程 URL，不设置虚构的 $id。",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "minLength": 1,
+      "format": "uri-reference",
+      "description": "编辑器使用的 Schema 引用，可为本地相对路径；FTUN 运行时忽略该元数据，不联网下载。",
+      "examples": [
+        "../schema.json"
+      ]
+    },
+    "base": {
+      "$ref": "#/$defs/Base"
+    },
+    "log": {
+      "$ref": "#/$defs/Log"
+    }
+  },
+  "$defs": {
+    "Base": {
+      "title": "基础配置",
+      "type": "object",
+      "properties": {
+        "ipv6": {
+          "type": "boolean",
+          "const": false,
+          "default": false,
+          "description": "FTUN v1.0 仅支持 IPv4；真实 DNS 回答不因此删除 AAAA 记录。"
+        },
+        "allow-lan": {
+          "type": "boolean",
+          "default": false,
+          "description": "允许 Mixed/SOCKS5 的非回环客户端；不控制 TUN 或 DNS Listener。"
+        },
+        "cache-file": {
+          "$ref": "#/$defs/Path",
+          "default": "~/.ftun/ftun.cache",
+          "description": "状态逻辑路径；普通快照与 FakeIP 耐久身份分开存储。"
+        },
+        "state-cache": {
+          "type": "boolean",
+          "default": true,
+          "description": "Group/Health 状态持久化开关，独立于 FakeIP persist 和未来 api.cache。"
+        },
+        "capacity": {
+          "$ref": "#/$defs/Capacity",
+          "default": {},
+          "description": "Proxy 运行时对象容量。三个维度分别计数。"
+        },
+        "reload-retain": {
+          "type": "object",
+          "properties": {
+            "count": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 64,
+              "default": 4,
+              "description": "同时保留的旧代次数量；满了以后拒绝 reload。只在启动时读取，修改需要重启。"
+            }
+          },
+          "additionalProperties": false,
+          "default": {}
+        },
+        "watchdog": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/Duration"
+            }
+          ],
+          "default": "30s",
+          "description": "owner 心跳看门狗：超过这个时长没有响应就停止进程（退出码 4）；null 关闭，范围 1s～10m。"
+        },
+        "routing-mark": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295,
+          "default": 18004,
+          "description": "出站 socket 的 fwmark，同时是 TUN 路由保护规则匹配值；同机多实例必须不同。"
+        },
+        "timeouts": {
+          "$ref": "#/$defs/Timeouts",
+          "default": {},
+          "description": "握手、建连、存活探测与空闲回收期限。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Log": {
+      "title": "日志",
+      "type": "object",
+      "properties": {
+        "level": {
+          "type": "string",
+          "enum": [
+            "silent",
+            "error",
+            "warn",
+            "info",
+            "debug",
+            "trace"
+          ],
+          "default": "warn",
+          "description": "silent 关闭日志格式化及输出。"
+        },
+        "file": {
+          "$ref": "#/$defs/Path",
+          "default": "~/.ftun/ftun.log"
+        },
+        "max-size": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295,
+          "default": 10485760,
+          "description": "单个日志文件的大小上限（字节）；写入会超过时轮转。0 表示不轮转；非 0 时至少 65536。"
+        },
+        "max-files": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 3,
+          "description": "保留的日志文件总数（含当前文件）：ftun.log、ftun.log.1…；为 1 时超限直接截断重写。收到 SIGUSR1 会重新打开日志文件，配合外部 logrotate。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Capacity": {
+      "title": "运行容量",
+      "type": "object",
+      "properties": {
+        "tcp-flows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的普通 TCP 流上限；仅启动时生效。"
+        },
+        "udp-flows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的 UDP 五元组流上限；仅启动时生效。"
+        },
+        "udp-associations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "default": 256,
+          "description": "同时存活的 SOCKS5 UDP 关联上限；仅启动时生效。"
+        }
+      },
+      "additionalProperties": false
+    },
+    "Timeouts": {
+      "title": "超时与存活",
+      "type": "object",
+      "properties": {
+        "handshake": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "入站协议握手期限。"
+        },
+        "connect": {
+          "$ref": "#/$defs/Duration",
+          "default": "10s",
+          "description": "出站建连期限。"
+        },
+        "reply": {
+          "$ref": "#/$defs/Duration",
+          "default": "5s",
+          "description": "协议失败回复的排空期限。"
+        },
+        "tcp-keepalive": {
+          "oneOf": [
+            {
+              "const": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "idle": {
+                  "$ref": "#/$defs/Duration",
+                  "default": "30s",
+                  "description": "空闲多久后开始探测，取整秒。"
+                },
+                "interval": {
+                  "$ref": "#/$defs/Duration",
+                  "default": "15s",
+                  "description": "探测间隔，取整秒。"
+                },
+                "count": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 20,
+                  "default": 4,
+                  "description": "连续无应答多少次判为失联。"
+                }
+              },
+              "additionalProperties": false
+            }
+          ],
+          "default": {},
+          "description": "TCP 存活探测。设为 false 关闭。"
+        },
+        "write-progress": {
+          "$ref": "#/$defs/Duration",
+          "default": "120s",
+          "description": "已发送的数据有积压且在此期限内没有被对端确认任何新字节，则判为失联；慢速但仍在读取的对端不受影响。必须大于 keepalive 判定失联所需的总时长。"
+        },
+        "tcp-idle": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/Duration"
+            }
+          ],
+          "default": null,
+          "description": "TCP 两个方向都没有活动多久后回收。null 关闭（默认）。"
+        },
+        "udp-idle": {
+          "$ref": "#/$defs/Duration",
+          "default": "120s",
+          "description": "UDP 流空闲回收期限。"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,1 @@
+{"dns":{"servers":[{"name":"up","type":"udp","addresses":["1.1.1.1:53"]}],"fake-ip":{"range":"198.18.0.0/15"}}}

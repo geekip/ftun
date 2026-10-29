@@ -1,0 +1,33 @@
+{
+  "$schema": "../../schema/ftun.schema.json",
+  "dns": {
+    "enable": false
+  },
+  "inbounds": [
+    {
+      "name": "本地混合入口",
+      "type": "mixed",
+      "listen": "127.0.0.1:7890"
+    }
+  ],
+  "outbounds": [
+    {
+      "name": "Proxy",
+      "type": "socks5",
+      "server": "192.0.2.10:1080"
+    }
+  ],
+  "rules": [
+    "FRS-IP,CN,DIRECT",
+    "frs-domain,CN,DIRECT",
+    "FRS-DOMAIN,Proxy,Proxy",
+    "MATCH,Proxy"
+  ],
+  "frs": {
+    "path": "./data/rules.frs",
+    "url": "https://updates.example.invalid/rules.frs",
+    "auto-update": true,
+    "update-interval": "24h",
+    "update-outbound": "DIRECT"
+  }
+}
