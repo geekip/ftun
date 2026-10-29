@@ -34,7 +34,7 @@ typedef struct {
 /* descriptor 只借到调用返回；sink 持有独立 duplicate，且不修改共享 OFD 标志。
  * 固定对象/34 槽/1 FD 由 sink 自有 Budget 计量，独立于可更早销毁的
  * Core 根。usage 可与 Core 账本相加；线程栈、allocator/内核内存另计。 */
-ftun_status_t ftun_cli_result_sink_create(int descriptor,
+ftun_status_t ftun_cli_result_sink_create(ftun_handle_t descriptor,
                                           ftun_cli_result_sink_t **out);
 /* reserve 必须先于异步操作接纳；成功 ticket 只允许 publish 一次。 */
 ftun_status_t ftun_cli_result_reserve(ftun_cli_result_sink_t *sink,

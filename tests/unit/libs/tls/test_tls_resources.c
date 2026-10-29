@@ -64,7 +64,7 @@ static int usage_is(ftun_budget_t *budget, size_t memory, size_t metadata)
 {
   ftun_budget_usage_t usage;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(usage.used == memory && usage.used_resources.memory_bytes == memory);
+  CHECK(usage.used_resources.memory_bytes == memory && usage.used_resources.memory_bytes == memory);
   CHECK(usage.used_resources.descriptors == 0u);
   CHECK(usage.used_resources.queue_slots == 0u);
   CHECK(usage.metadata_bytes == metadata && usage.child_count == 0u);
@@ -98,11 +98,11 @@ int main(void)
   options.ca_file = ca_file;
   options.maximum_plaintext = 8192u;
 
-  CHECK(ftun_budget_reserve(budget, empty.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, empty.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   calls = init_calls;
   CHECK(ftun_wolfssl_prepare(&options, &context) == FTUN_E_LIMIT);
   CHECK(context == NULL && init_calls == calls);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(usage_is(budget, 0u, empty.metadata_bytes) == 0);
 
   fail_init = true;
@@ -125,13 +125,13 @@ int main(void)
 
   CHECK(ftun_wolfssl_prepare(&options, &context) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &prepared) == FTUN_OK);
-  CHECK(prepared.used > 0u && prepared.used < options.maximum_plaintext);
-  CHECK(ftun_budget_reserve(budget, prepared.normal_available, &hold) == FTUN_OK);
+  CHECK(prepared.used_resources.memory_bytes > 0u && prepared.used_resources.memory_bytes < options.maximum_plaintext);
+  CHECK(ftun_budget_reserve(budget, prepared.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   calls = client_calls;
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_E_LIMIT);
   CHECK(client == NULL && client_calls == calls);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
-  CHECK(usage_is(budget, prepared.used, prepared.metadata_bytes) == 0);
+  ftun_reservation_release(&hold);
+  CHECK(usage_is(budget, prepared.used_resources.memory_bytes, prepared.metadata_bytes) == 0);
 
   options.maximum_plaintext = 0u;
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_E_INVALID);
@@ -142,33 +142,33 @@ int main(void)
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_E_INVALID);
   options.budget = budget;
   CHECK(client == NULL && client_calls == calls);
-  CHECK(usage_is(budget, prepared.used, prepared.metadata_bytes) == 0);
+  CHECK(usage_is(budget, prepared.used_resources.memory_bytes, prepared.metadata_bytes) == 0);
 
   fail_client = true;
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_E_LIMIT);
   fail_client = false;
   CHECK(client == NULL);
-  CHECK(usage_is(budget, prepared.used, prepared.metadata_bytes) == 0);
+  CHECK(usage_is(budget, prepared.used_resources.memory_bytes, prepared.metadata_bytes) == 0);
   fail_sni = true;
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_E_REJECTED);
   fail_sni = false;
   CHECK(client == NULL);
-  CHECK(usage_is(budget, prepared.used, prepared.metadata_bytes) == 0);
+  CHECK(usage_is(budget, prepared.used_resources.memory_bytes, prepared.metadata_bytes) == 0);
 
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_OK);
   borrowed = context;
   context = NULL;
   CHECK(ftun_budget_get_usage(budget, &active) == FTUN_OK);
-  CHECK(active.used > prepared.used + options.maximum_plaintext);
+  CHECK(active.used_resources.memory_bytes > prepared.used_resources.memory_bytes + options.maximum_plaintext);
   CHECK(active.metadata_bytes == prepared.metadata_bytes);
   calls = client_calls;
   CHECK(ftun_wolfssl_client_create(borrowed, &options, &second) == FTUN_OK);
   CHECK(second != NULL && client_calls == calls + 1u);
-  CHECK(usage_is(budget, active.used * 2u - prepared.used, active.metadata_bytes) == 0);
+  CHECK(usage_is(budget, active.used_resources.memory_bytes * 2u - prepared.used_resources.memory_bytes, active.metadata_bytes) == 0);
   CHECK(ftun_tls_client_destroy(&second) == FTUN_OK && second == NULL);
   CHECK(ftun_wolfssl_context_destroy(&borrowed) == FTUN_E_AGAIN);
   CHECK(borrowed != NULL);
-  CHECK(usage_is(budget, active.used, active.metadata_bytes) == 0);
+  CHECK(usage_is(budget, active.used_resources.memory_bytes, active.metadata_bytes) == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN && budget != NULL);
   CHECK(ftun_tls_client_handshake(client) == FTUN_E_AGAIN);
 
@@ -177,19 +177,19 @@ int main(void)
   options.maximum_plaintext = 16384u;
   CHECK(ftun_tls_client_open(&options, &second) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &combined) == FTUN_OK);
-  CHECK(combined.used == active.used * 2u + 8192u + 7u);
+  CHECK(combined.used_resources.memory_bytes == active.used_resources.memory_bytes * 2u + 8192u + 7u);
   CHECK(combined.used_resources.descriptors == 0u &&
         combined.used_resources.queue_slots == 0u);
-  CHECK(ftun_budget_reserve(budget, combined.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, combined.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_tls_client_open(&options, &rejected) == FTUN_E_LIMIT);
   CHECK(rejected == NULL);
   CHECK(ftun_tls_client_handshake(client) == FTUN_E_AGAIN);
   CHECK(ftun_tls_client_handshake(second) == FTUN_E_AGAIN);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_tls_client_destroy(&second) == FTUN_OK && second == NULL);
-  CHECK(usage_is(budget, active.used, active.metadata_bytes) == 0);
+  CHECK(usage_is(budget, active.used_resources.memory_bytes, active.metadata_bytes) == 0);
   CHECK(ftun_tls_client_destroy(&client) == FTUN_OK && client == NULL);
-  CHECK(usage_is(budget, prepared.used, empty.metadata_bytes) == 0);
+  CHECK(usage_is(budget, prepared.used_resources.memory_bytes, empty.metadata_bytes) == 0);
   CHECK(ftun_wolfssl_context_destroy(&borrowed) == FTUN_OK && borrowed == NULL);
   CHECK(usage_is(budget, 0u, empty.metadata_bytes) == 0);
 
@@ -205,12 +205,12 @@ int main(void)
   options.maximum_plaintext = 4096u;
   CHECK(ftun_wolfssl_client_create(context, &options, &client) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(usage.used == active.used - 4096u);
+  CHECK(usage.used_resources.memory_bytes == active.used_resources.memory_bytes - 4096u);
   CHECK(ftun_tls_client_destroy(&client) == FTUN_OK && client == NULL);
   CHECK(ftun_wolfssl_context_destroy(&context) == FTUN_OK && context == NULL);
   CHECK(ftun_wolfssl_prepare(&options, &context) == FTUN_OK);
   CHECK(ftun_wolfssl_context_destroy(&context) == FTUN_OK && context == NULL);
-  CHECK(ftun_budget_get_usage(other_budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(other_budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(usage_is(budget, 0u, empty.metadata_bytes) == 0);
   CHECK(ftun_budget_destroy(&other_budget) == FTUN_OK && other_budget == NULL);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK && budget == NULL);

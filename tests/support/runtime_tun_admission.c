@@ -306,7 +306,7 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
           &pressure) == FTUN_OK);
       } else {
         /* 前一场景保留slab，借用Stream接纳后创建scope/Session时才申请内存。 */
-        REQUIRE(ftun_budget_reserve(budget, usage.normal_available, &pressure) == FTUN_OK);
+        REQUIRE(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &pressure) == FTUN_OK);
       }
     }
     armed = true;
@@ -317,7 +317,7 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
     }
     if (mode == ADMISSION_FAILED) {
       ftun_stream_usage_t stream_usage;
-      REQUIRE(ftun_reservation_release(&pressure) == FTUN_OK);
+      ftun_reservation_release(&pressure);
       REQUIRE(accepted == FTUN_E_LIMIT && destroyed == 0u);
       REQUIRE(ftun_stream_get_usage(incoming, &stream_usage) == FTUN_OK &&
         stream_usage.reference_count == 1u);
@@ -328,7 +328,7 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
       REQUIRE(path_opens == 0u);
       REQUIRE(ftun_proxy_runtime_get_capacity_info(runtime, &capacity) == FTUN_OK &&
         capacity.tcp_active == 1u);
-      REQUIRE(ftun_reservation_release(&pressure) == FTUN_OK);
+      ftun_reservation_release(&pressure);
     }
     REQUIRE(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
     REQUIRE(usage.used_resources.descriptors == baseline_descriptors +
@@ -343,7 +343,7 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
       allow_cancel = true;
       REQUIRE(ftun_operation_cancel(pending_operation) == FTUN_OK);
     } else {
-      REQUIRE(ftun_stream_release(&held_remote) == FTUN_OK);
+      ftun_stream_release(&held_remote);
       REQUIRE(remote_progress != NULL);
       remote_progress(remote_user);
     }

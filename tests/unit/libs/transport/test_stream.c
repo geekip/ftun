@@ -143,7 +143,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_buffer_pool_destroy(&fixture->pool) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   if (ftun_budget_destroy(&fixture->budget) != FTUN_OK) return 1;
   return 0;
 }
@@ -162,7 +162,7 @@ static int make_slice(fixture_t *fixture, uint8_t seed, size_t offset,
       capacity < offset + length) return 1;
   for (index = 0u; index < length; index++) data[offset + index] = seed + (uint8_t)index;
   if (ftun_buffer_slice(buffer, offset, length, out) != FTUN_OK) return 1;
-  if (ftun_buffer_release(&buffer) != FTUN_OK) return 1;
+  ftun_buffer_release(&buffer);
   return 0;
 }
 
@@ -203,7 +203,7 @@ static int test_partial_and_lifetime(void)
   CHECK(fixture.backend.start_calls == 1 && fixture.backend.offered == 5u &&
         fixture.backend.first_byte == 10u &&
         fixture.backend.complete_during_start_was_stale == 1);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_stream_write_data(fixture.backend.write, &bytes) == FTUN_OK);
   CHECK(bytes.length == 3u && bytes.data[0] == 10u && bytes.data[2] == 12u);
   CHECK(ftun_stream_get_usage(fixture.stream, &usage) == FTUN_OK);
@@ -248,17 +248,17 @@ static int test_rejection_and_limits(void)
                               &operation) == FTUN_E_AGAIN);
   CHECK(accepted == 0u && operation == NULL && fixture.completion.calls == 0);
   CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK &&
-        after.used == before.used);
+        after.used_resources.memory_bytes == before.used_resources.memory_bytes);
 
-  CHECK(after.normal_available > 0u);
-  CHECK(ftun_budget_reserve(fixture.budget, after.normal_available,
+  CHECK(after.normal_available_resources.memory_bytes > 0u);
+  CHECK(ftun_budget_reserve(fixture.budget, after.normal_available_resources.memory_bytes,
                             &blocker) == FTUN_OK);
   operation = (ftun_operation_t *)(uintptr_t)1;
   accepted = 99u;
   CHECK(ftun_stream_write_ref(fixture.stream, &first, &accepted,
                               &operation) == FTUN_E_AGAIN);
   CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 2);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
 
   fixture.backend.start_status = FTUN_OK;
   fixture.backend.accept_count = 0u;
@@ -269,7 +269,7 @@ static int test_rejection_and_limits(void)
   CHECK(accepted == 0u && operation == NULL &&
         fixture.backend.write.stream == NULL &&
         fixture.backend.cancel_calls == 1 && fixture.completion.calls == 0);
-  CHECK(ftun_buffer_slice_release(&first) == FTUN_OK);
+  ftun_buffer_slice_release(&first);
 
   fixture.backend.accept_count = SIZE_MAX;
   CHECK(make_slice(&fixture, 30u, 0u, 4u, &first) == 0);
@@ -289,8 +289,8 @@ static int test_rejection_and_limits(void)
   CHECK(ftun_stream_write_ref(fixture.stream, &second, &accepted,
                               &operation) == FTUN_E_LIMIT);
   CHECK(accepted == 0u && operation == NULL && fixture.backend.start_calls == 4);
-  CHECK(ftun_buffer_slice_release(&first) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&second) == FTUN_OK);
+  ftun_buffer_slice_release(&first);
+  ftun_buffer_slice_release(&second);
   CHECK(complete_backend(&fixture, success) == 0);
   CHECK(dispatch_one(&fixture) == 0);
   CHECK(fixture_stop(&fixture) == 0);
@@ -309,7 +309,7 @@ static int test_cancel_failure_then_complete(void)
   CHECK(make_slice(&fixture, 61u, 0u, 4u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   fixture.backend.cancel_status = FTUN_E_IO;
   fixture.backend.complete_during_cancel = 1;
   CHECK(ftun_operation_cancel(operation) == FTUN_E_IO);
@@ -339,7 +339,7 @@ static int test_cancel_and_stop(void)
   CHECK(make_slice(&fixture, 50u, 0u, 4u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   fixture.backend.cancel_status = FTUN_E_IO;
   CHECK(ftun_operation_cancel(operation) == FTUN_E_IO);
   CHECK(fixture.backend.cancel_calls == 1 &&
@@ -365,7 +365,7 @@ static int test_cancel_and_stop(void)
   CHECK(make_slice(&fixture, 55u, 0u, 4u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   write = fixture.backend.write;
   CHECK(complete_backend(&fixture, success) == 0);
   CHECK(ftun_operation_cancel(operation) == FTUN_OK);
@@ -379,7 +379,7 @@ static int test_cancel_and_stop(void)
   CHECK(make_slice(&fixture, 60u, 0u, 4u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_operation_queue_stop(fixture.operations) == FTUN_OK);
   CHECK(fixture.backend.cancel_calls == 3 &&
         fixture.backend.write.stream == NULL);
@@ -404,7 +404,7 @@ static int test_generation_after_slot_reuse(void)
   CHECK(make_slice(&fixture, 90u, 0u, 2u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   late = fixture.backend.write;
   CHECK(complete_backend(&fixture, success) == 0);
   CHECK(dispatch_one(&fixture) == 0 && fixture.completion.calls == 1);
@@ -412,7 +412,7 @@ static int test_generation_after_slot_reuse(void)
   CHECK(make_slice(&fixture, 100u, 0u, 2u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   current = fixture.backend.write;
   CHECK(current.stream == late.stream && current.slot == late.slot &&
         current.generation != late.generation);
@@ -440,7 +440,7 @@ static int test_failure_and_boundaries(void)
   CHECK(make_slice(&fixture, 70u, 0u, 4u, &slice) == 0);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_stream_destroy(&fixture.stream) == FTUN_E_AGAIN &&
         fixture.stream != NULL);
   CHECK(complete_backend(&fixture, failure) == 0);
@@ -456,7 +456,7 @@ static int test_failure_and_boundaries(void)
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_E_CANCELLED);
   CHECK(accepted == 0u && operation == NULL);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_stream_get_usage(fixture.stream, &usage) == FTUN_OK &&
         !usage.accepting && usage.pending_writes == 0u);
   CHECK(fixture_stop(&fixture) == 0);

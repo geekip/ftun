@@ -139,7 +139,7 @@ int main(void)
   CHECK(ftun_resolver_provider_scope(provider, 7u, &other) == FTUN_E_LIMIT && other == NULL);
   CHECK(ftun_resolver_scope_retain(scope) == FTUN_OK);
   other = scope;
-  CHECK(ftun_resolver_scope_release(&other) == FTUN_OK && other == NULL);
+  ftun_resolver_scope_release(&other); CHECK(other == NULL);
   request.system.budget = foreign;
   CHECK(ftun_resolver_scope_start(scope, core, &request, &operation) == FTUN_E_REJECTED && operation == NULL);
   request.system.budget = budget;
@@ -186,9 +186,9 @@ int main(void)
   CHECK(result.calls == 3u && result.status == FTUN_E_CANCELLED && result.observed_pending);
   CHECK(ftun_resolver_provider_stop_until(provider, now + 3000u) == FTUN_OK);
   CHECK(ftun_resolver_provider_destroy(&provider) == FTUN_E_AGAIN);
-  CHECK(ftun_resolver_scope_release(&scope) == FTUN_OK);
+  ftun_resolver_scope_release(&scope);
   CHECK(ftun_resolver_provider_destroy(&provider) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used && usage.metadata_bytes == baseline.metadata_bytes);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes && usage.metadata_bytes == baseline.metadata_bytes);
   CHECK(ftun_operation_queue_stop(operations) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);

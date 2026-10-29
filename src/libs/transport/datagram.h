@@ -71,7 +71,8 @@ ftun_status_t ftun_packet_init(ftun_packet_t *packet,
 ftun_status_t ftun_packet_clone(const ftun_packet_t *source,
                                 ftun_packet_t *out);
 ftun_status_t ftun_packet_view(const ftun_packet_t *packet, ftun_bytes_t *out);
-ftun_status_t ftun_packet_release(ftun_packet_t *packet);
+/* 消费 payload 并清空元数据；packet 存储必须有效，空 payload 幂等。 */
+void ftun_packet_release(ftun_packet_t *packet);
 
 /* 整包发送接口。
  * OK 只表示整包已发送或进入有界 backend 队列，不表示远端收到；AGAIN 和
@@ -108,7 +109,8 @@ ftun_status_t ftun_datagram_budget(ftun_datagram_t *channel,
  * receive/result 回调允许 retain/release；初始所有者引用只能由 destroy 释放。
  * stop 不等待额外引用，destroy 在引用未归还时返回 AGAIN 并保留对象及 backend。 */
 ftun_status_t ftun_datagram_retain(ftun_datagram_t *channel);
-ftun_status_t ftun_datagram_release(ftun_datagram_t **channel);
+/* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
+void ftun_datagram_release(ftun_datagram_t **channel);
 /* stop 关闭接纳并取消全部 backend 在途包；取消失败保留待重试项。 */
 ftun_status_t ftun_datagram_stop(ftun_datagram_t *channel);
 ftun_status_t ftun_datagram_get_usage(const ftun_datagram_t *channel,

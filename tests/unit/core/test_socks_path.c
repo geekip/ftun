@@ -121,7 +121,7 @@ static int scenario(unsigned int mode)
   request.stream.completion = written;
   CHECK(ftun_socks5_connect(core, &request, &operation) == FTUN_OK);
   /* 发起后释放调用方 scope；握手仍应保持旧代身份和拥有权。 */
-  CHECK(ftun_path_scope_release(&scope) == FTUN_OK);
+  ftun_path_scope_release(&scope);
   CHECK(ftun_path_provider_reload_prepare(provider, 8u) == FTUN_OK);
   CHECK(ftun_path_provider_reload_commit(provider, 8u) == FTUN_OK);
   if (mode == 3u) CHECK(ftun_operation_cancel(operation) == FTUN_E_AGAIN);
@@ -171,7 +171,7 @@ static int scenario(unsigned int mode)
     held = stream;
     CHECK(ftun_stream_retain(held) == FTUN_OK);
     CHECK(ftun_socks5_connection_close(&result.connection) == FTUN_E_AGAIN && result.connection != NULL);
-    CHECK(ftun_stream_release(&held) == FTUN_OK);
+    ftun_stream_release(&held);
     CHECK(ftun_socks5_connection_close(&result.connection) == FTUN_OK && result.connection == NULL);
   }
   for (round = 0u; round < 4u; round++) CHECK(tick(loop, operations) == 0);
@@ -185,7 +185,7 @@ static int scenario(unsigned int mode)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

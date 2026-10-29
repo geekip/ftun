@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 
 #include "proxy/engine_internal.h"
+#include "libs/tls/tls.h"
 
 ftun_status_t ftun_proxy_runtime_datagram_capacity(
   const ftun_config_t *config, size_t *out)
@@ -129,7 +130,7 @@ ftun_status_t ftun_proxy_runtime_prepare(ftun_core_t *core, ftun_budget_t *budge
   if (status != FTUN_OK) return status;
   engine = (ftun_proxy_runtime_t *)calloc(1u, sizeof(*engine));
   if (engine == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   for (index = 0u; index < FTUN_PROXY_RUNTIME_MAX_LISTENERS; index++) {
@@ -591,7 +592,7 @@ ftun_status_t ftun_proxy_runtime_reload_commit_owned(
   engine->pending_frs_interval_ms = 0u;
   free(engine->frs_etag);
   engine->frs_etag = NULL;
-  (void)ftun_reservation_release(&engine->frs_etag_reservation);
+  ftun_reservation_release(&engine->frs_etag_reservation);
   if (engine->frs_enabled &&
       ftun_monotonic_now(&engine->now_ms) == FTUN_OK &&
       engine->frs_interval_ms <= UINT64_MAX - engine->now_ms) {
@@ -1037,12 +1038,12 @@ ftun_status_t ftun_proxy_runtime_quiesce(ftun_proxy_runtime_t *engine)
     engine->listeners[index].udp_events = 0u;
     if (engine->listeners[index].source == NULL &&
         engine->listeners[index].descriptor >= 0) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)engine->listeners[index].descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)engine->listeners[index].descriptor);
       engine->listeners[index].descriptor = -1;
     }
     if (engine->listeners[index].udp_source == NULL &&
         engine->listeners[index].udp_descriptor >= 0) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)engine->listeners[index].udp_descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)engine->listeners[index].udp_descriptor);
       engine->listeners[index].udp_descriptor = -1;
     }
   }
@@ -1315,7 +1316,7 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
   }
   free(owned->fakeip_directory);
   owned->fakeip_directory = NULL;
-  (void)ftun_reservation_release(&owned->fakeip_directory_reservation);
+  ftun_reservation_release(&owned->fakeip_directory_reservation);
 #endif
   for (index = 0u; index < owned->listener_count; index++) {
     free(owned->listeners[index].name);
@@ -1337,6 +1338,7 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
       return FTUN_E_AGAIN;
     }
   }
+  if (ftun_tls_context_destroy(&owned->http_tls_context) != FTUN_OK) return FTUN_E_AGAIN;
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
   if (owned->fakeip_worker != NULL &&
       ftun_worker_destroy(&owned->fakeip_worker) != FTUN_OK) {
@@ -1356,13 +1358,13 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
 #if defined(FTUN_HAVE_MODULE_FRS)
   free(owned->frs_etag);
   owned->frs_etag = NULL;
-  (void)ftun_reservation_release(&owned->frs_etag_reservation);
+  ftun_reservation_release(&owned->frs_etag_reservation);
   free(owned->frs_candidate_etag);
   owned->frs_candidate_etag = NULL;
-  (void)ftun_reservation_release(&owned->frs_candidate_etag_reservation);
+  ftun_reservation_release(&owned->frs_candidate_etag_reservation);
   free(owned->frs_group_records);
   owned->frs_group_records = NULL;
-  (void)ftun_reservation_release(&owned->frs_group_records_reservation);
+  ftun_reservation_release(&owned->frs_group_records_reservation);
 #endif
   free(owned->association_channels);
   owned->association_channels = NULL;
@@ -1370,9 +1372,7 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
   owned->association_clients = NULL;
   free(owned->udp_backoff);
   owned->udp_backoff = NULL;
-  if (ftun_reservation_release(&owned->reservation) != FTUN_OK) {
-    return FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&owned->reservation);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *engine = NULL;

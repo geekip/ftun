@@ -128,8 +128,8 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
     REQUIRE(ftun_buffer_acquire(ingress.budget, 1u, &buffer) == FTUN_OK);
     REQUIRE(ftun_buffer_slice(buffer, 0u, 0u, &slice) == FTUN_OK);
     REQUIRE(ftun_packet_init(&packet, &slice, ingress.inbound_id) == FTUN_OK);
-    REQUIRE(ftun_buffer_slice_release(&slice) == FTUN_OK);
-    REQUIRE(ftun_buffer_release(&buffer) == FTUN_OK);
+    ftun_buffer_slice_release(&slice);
+    ftun_buffer_release(&buffer);
     metadata.generation = ingress.generation;
     metadata.inbound_id = ingress.inbound_id;
     metadata.network = 2u;
@@ -176,7 +176,7 @@ static void owner_command(ftun_operation_t *operation, ftun_error_t error, void 
     REQUIRE(ftun_datagram_get_usage(channel, &usage) == FTUN_OK &&
       usage.reference_count == 1u && !usage.accepting);
     REQUIRE(ftun_datagram_destroy(&channel) == FTUN_OK && destroyed == 1u);
-    REQUIRE(ftun_packet_release(&packet) == FTUN_OK);
+    ftun_packet_release(&packet);
   }
 #if defined(FTUN_TEST_TUN_UDP_RECOVERY)
 done:

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
-#include "libs/tun/linux/device.h"
+#include "platform/linux/tun.h"
+#include "libs/tun/port.h"
 #include "platform/linux/uapi.h"
 #include "libs/tun/device.h"
 #include <errno.h>
@@ -123,7 +124,7 @@ static int real_smoke(void)
 int main(int argc, char **argv)
 {
   port_mock_t mock;
-  ftun_linux_tun_io_t io;
+  ftun_platform_tun_io_t io;
   ftun_tun_spec_t spec;
   ftun_packet_port_t *port = NULL;
   ftun_packet_port_info_t info;
@@ -143,7 +144,7 @@ int main(int argc, char **argv)
   spec.name.data = "ftun0";
   spec.name.length = strlen(spec.name.data);
   spec.mtu = 128u;
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_OK && port != NULL);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_OK && port != NULL);
   CHECK(mock.ioctl_calls == 4 && mock.closes == 1);
   CHECK(ftun_packet_port_get_info(port, &info) == FTUN_OK);
   CHECK(strcmp(info.name, "ftun0") == 0 && info.mtu == 128u &&

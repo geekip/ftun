@@ -90,7 +90,7 @@ static int run(bool hold, bool reject)
     CHECK(result.kind == 0u && state.callbacks == 0u);
     CHECK(ftun_control_channel_close(&channel) == FTUN_E_AGAIN && channel != NULL);
     CHECK(state.cancelled != 0u);
-    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used != 0u);
+    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes != 0u);
     memset(&result, 0xa5, sizeof(result));
     CHECK(ftun_operation_complete(state.token, (ftun_error_t){FTUN_OK, 0u, 0}) == FTUN_OK);
     CHECK(ftun_control_channel_close(&channel) == FTUN_OK);
@@ -101,7 +101,7 @@ static int run(bool hold, bool reject)
     CHECK(ftun_control_channel_close(&channel) == FTUN_OK);
   }
   CHECK(channel == NULL);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used && after.metadata_bytes == before.metadata_bytes);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes && after.metadata_bytes == before.metadata_bytes);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

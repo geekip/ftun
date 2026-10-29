@@ -106,10 +106,10 @@ int main(void)
   CHECK(ftun_path_provider_scope(provider, 7u, &scope) == FTUN_OK);
   CHECK(ftun_path_provider_scope(provider, 7u, &other) == FTUN_OK);
   CHECK(ftun_path_provider_scope(provider, 7u, &overflow) == FTUN_E_LIMIT && overflow == NULL);
-  CHECK(ftun_path_scope_release(&other) == FTUN_OK);
+  ftun_path_scope_release(&other);
   held = scope;
   CHECK(ftun_path_scope_retain(held) == FTUN_OK);
-  CHECK(ftun_path_scope_release(&held) == FTUN_OK && held == NULL);
+  ftun_path_scope_release(&held); CHECK(held == NULL);
   endpoints[0].kind = FTUN_ADDRESS_IPV4;
   endpoints[0].port = 443u;
   endpoints[0].address[0] = 127u;
@@ -173,9 +173,9 @@ int main(void)
     CHECK(ftun_buffer_data(buffer, &data, &capacity) == FTUN_OK);
     memcpy(data, "ab\0defgh", 8u);
     CHECK(ftun_buffer_slice(buffer, 0u, 8u, &slice) == FTUN_OK);
-    CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+    ftun_buffer_release(&buffer);
     CHECK(ftun_stream_write_ref(stream, &slice, &accepted, &write) == FTUN_OK && accepted == 8u);
-    CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+    ftun_buffer_slice_release(&slice);
     /* 驱动还有未派发任务，必须保持 Path/后端，不能只取消写后立即释放。 */
     CHECK(ftun_path_revoke(state.path) == FTUN_E_AGAIN);
     CHECK(ftun_path_destroy(&state.path) == FTUN_E_AGAIN && state.path != NULL);
@@ -205,7 +205,7 @@ int main(void)
   CHECK(state.starts == 3u && state.calls == 2u);
   direct.network_view = NULL;
   direct.network_generation = 0u;
-  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  ftun_network_view_release(&view);
   target.generation = 8u;
   route.generation = 8u;
   leaf.generation = 8u;
@@ -226,13 +226,13 @@ int main(void)
   request.direct = &direct;
   request.metadata = NULL;
   CHECK(ftun_outbound_open(core, &request, &rejected, &operation) == FTUN_E_CANCELLED && operation == NULL);
-  CHECK(ftun_path_scope_release(&scope) == FTUN_OK);
+  ftun_path_scope_release(&scope);
   CHECK(ftun_path_provider_destroy(&provider) == FTUN_OK);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   puts("outbound Path contract passed");
   return 0;

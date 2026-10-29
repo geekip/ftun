@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 
+/*
  * ftun_group_cache_save 原子写入可丢弃 Group/Health 缓存。 */
 
 #define FTUN_GROUP_CACHE_HEADER_BYTES 40u
@@ -87,7 +87,7 @@ static uint32_t ftun_cache_boot_token(ftun_budget_t *budget)
   ftun_budget_resources_t resources = {0u, 1u, 0u};
   if (budget != NULL && ftun_budget_reserve_resources(budget, resources, &reservation) != FTUN_OK) return 0u;
   ftun_status_t status = ftun_platform_boot_identity(data, sizeof(data), &length);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   if (status != FTUN_OK || length == 0u) return 0u;
   hash = ftun_cache_hash(hash, data, length);
   {
@@ -189,7 +189,7 @@ static ftun_status_t ftun_group_cache_encode_snapshot(
     if (status != FTUN_OK) return status;
   }
   data = (uint8_t *)calloc(1u, length);
-  if (data == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (data == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   memcpy(data, "FTGC", 4u);
   ftun_cache_u32(data + 4u, 1u);
   ftun_cache_u64(data + 8u, snapshot->fingerprint);
@@ -233,7 +233,7 @@ ftun_status_t ftun_group_cache_write_budget(ftun_budget_t *budget,
   if (status == FTUN_OK) status = ftun_file_write_atomic_budget(budget,
     path, (ftun_bytes_t){data, length}, 0600u, NULL, NULL);
   free(data);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -249,7 +249,7 @@ static ftun_status_t ftun_cache_read(ftun_budget_t *budget, const char *path,
   ftun_file_info_t metadata;
   uint8_t *data = NULL;
   size_t offset = 0u;
-  int descriptor = -1;
+  ftun_handle_t descriptor = -1;
   ftun_reservation_t reservation = (ftun_reservation_t){0}, fd_reservation = (ftun_reservation_t){0};
   ftun_budget_resources_t resources = {0u, 1u, 0u};
   ftun_status_t status;
@@ -296,8 +296,8 @@ static ftun_status_t ftun_cache_read(ftun_budget_t *budget, const char *path,
 done:
   if (descriptor >= 0) (void)ftun_file_close(descriptor);
   free(data);
-  (void)ftun_reservation_release(&reservation);
-  (void)ftun_reservation_release(&fd_reservation);
+  ftun_reservation_release(&reservation);
+  ftun_reservation_release(&fd_reservation);
   return status;
 }
 
@@ -411,8 +411,8 @@ corrupt:
 done:
   free(snapshot);
   free(file);
-  (void)ftun_reservation_release(&reservation);
-  (void)ftun_reservation_release(&file_reservation);
+  ftun_reservation_release(&reservation);
+  ftun_reservation_release(&file_reservation);
   return status;
 }
 
@@ -423,11 +423,9 @@ ftun_status_t ftun_group_cache_load(const char *path, ftun_group_cache_snapshot_
 
 ftun_status_t ftun_group_cache_destroy(ftun_group_cache_snapshot_t **snapshot)
 {
-  ftun_status_t status;
   if (snapshot == NULL) return FTUN_E_INVALID;
   if (*snapshot == NULL) return FTUN_OK;
-  status = ftun_reservation_release(&(*snapshot)->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&(*snapshot)->reservation);
   free(*snapshot);
   *snapshot = NULL;
   return FTUN_OK;
@@ -460,7 +458,7 @@ ftun_status_t ftun_group_cache_capture(ftun_core_t *core, ftun_budget_t *budget,
     snapshot.records = (ftun_runtime_group_record_t *)calloc(
       count, sizeof(*snapshot.records));
     if (snapshot.records == NULL) {
-      (void)ftun_reservation_release(&records_reservation);
+      ftun_reservation_release(&records_reservation);
       return FTUN_E_LIMIT;
     }
   }
@@ -474,7 +472,7 @@ ftun_status_t ftun_group_cache_capture(ftun_core_t *core, ftun_budget_t *budget,
       out, out_length, out_reservation);
   }
   free(snapshot.records);
-  (void)ftun_reservation_release(&records_reservation);
+  ftun_reservation_release(&records_reservation);
   return status;
 }
 
@@ -497,14 +495,14 @@ ftun_status_t ftun_group_cache_publish(ftun_budget_t *budget, const char *path,
   status = ftun_budget_reserve(budget, captured.length, &reservation);
   if (status != FTUN_OK) return status;
   data = (uint8_t *)malloc(captured.length);
-  if (data == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (data == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   memcpy(data, captured.data, captured.length);
   ftun_cache_u32(data + 28u, ftun_cache_boot_token(budget));
   ftun_cache_u64(data + 32u, ftun_cache_checksum(data, captured.length));
   status = ftun_file_write_atomic_budget(budget, path,
     (ftun_bytes_t){data, captured.length}, 0600u, NULL, NULL);
   free(data);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -523,6 +521,6 @@ ftun_status_t ftun_group_cache_save(ftun_core_t *core, const char *path)
       (ftun_bytes_t){captured, length});
   }
   free(captured);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }

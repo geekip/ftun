@@ -531,12 +531,10 @@ static void ftun_plan_compile_definitions(const ftun_config_t *config,
 ftun_status_t ftun_feature_plan_destroy(ftun_feature_plan_t **plan)
 {
   ftun_feature_plan_t *owned;
-  ftun_status_t status;
   if (plan == NULL) return FTUN_E_INVALID;
   owned = *plan;
   if (owned == NULL) return FTUN_OK;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned->outbound_states);
   free(owned->dns_server_states);
   free(owned->rule_order);
@@ -569,7 +567,7 @@ ftun_status_t ftun_config_compile(const ftun_config_t *config, ftun_feature_plan
   }
   plan = (ftun_feature_plan_t *)calloc(1u, sizeof(*plan));
   if (plan == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   plan->owned_bytes = bytes;

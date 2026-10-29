@@ -113,7 +113,7 @@ static ftun_status_t received(ftun_datagram_t *channel, const ftun_endpoint_t *s
   if (fixture->pause_receive) return FTUN_E_AGAIN;
   if (fixture->close_in_callback) fixture->close_status = ftun_socks5_connection_close(&fixture->connection);
   fixture->accepted++;
-  (void)ftun_packet_release(&fixture->received);
+  ftun_packet_release(&fixture->received);
   return ftun_packet_clone(packet, &fixture->received);
 }
 
@@ -191,7 +191,7 @@ static int setup(fixture_t *fixture, unsigned int mode)
     request.datagram.budget = NULL;
   }
   CHECK(ftun_socks5_connect(fixture->core, &request, &fixture->operation) == FTUN_OK);
-  CHECK(ftun_path_scope_release(&fixture->scope) == FTUN_OK);
+  ftun_path_scope_release(&fixture->scope);
   CHECK(ftun_path_provider_reload_prepare(fixture->provider, 8u) == FTUN_OK);
   CHECK(ftun_path_provider_reload_commit(fixture->provider, 8u) == FTUN_OK);
   for (round = 0u; round < 1000u && fixture->completed == 0u; round++) {
@@ -229,8 +229,8 @@ static int packet_make(fixture_t *fixture, size_t length, ftun_packet_t *packet)
   for (index = 0u; index < length; index++) bytes[index] = (uint8_t)index;
   CHECK(ftun_buffer_slice(buffer, 0u, length, &slice) == FTUN_OK);
   CHECK(ftun_packet_init(packet, &slice, 77u) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   return 0;
 }
 
@@ -264,10 +264,10 @@ static int rejected_packets(fixture_t *fixture)
   CHECK(ftun_datagram_deliver(wire, &source, &packet) == FTUN_OK && fixture->accepted == accepted);
   bytes[length - 8u] ^= 1u;
   CHECK(ftun_datagram_deliver(wire, &source, &packet) == FTUN_OK && fixture->accepted == accepted + 1u);
-  CHECK(ftun_packet_release(&fixture->received) == FTUN_OK);
-  CHECK(ftun_packet_release(&packet) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_packet_release(&fixture->received);
+  ftun_packet_release(&packet);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   return 0;
 }
 
@@ -315,7 +315,7 @@ static int scenario(unsigned int mode)
         CHECK(ftun_channel_send(fixture.datagram, &wrong, &packet) == FTUN_E_REJECTED);
         CHECK(ftun_channel_send(fixture.datagram, &fixture.target, &packet) == FTUN_OK);
         CHECK(ftun_channel_send(fixture.datagram, &fixture.target, &packet) == FTUN_E_AGAIN);
-        CHECK(ftun_packet_release(&packet) == FTUN_OK);
+        ftun_packet_release(&packet);
         if (mode == 3u) {
           CHECK(ftun_socks5_connection_close(&fixture.connection) == FTUN_E_AGAIN && fixture.connection != NULL);
           CHECK(fixture.sent == 1u && fixture.send_status == FTUN_E_CANCELLED && fixture.accepted == 0u);
@@ -334,7 +334,7 @@ static int scenario(unsigned int mode)
         CHECK(ftun_packet_view(&fixture.received, &payload) == FTUN_OK && payload.length == lengths[index]);
         for (size_t byte = 0u; byte < payload.length; byte++) CHECK(payload.data[byte] == (uint8_t)byte);
         CHECK(fixture.received.source_id == 77u);
-        CHECK(ftun_packet_release(&fixture.received) == FTUN_OK);
+        ftun_packet_release(&fixture.received);
       }
     }
     fixture.close_in_callback = false;
@@ -343,7 +343,7 @@ static int scenario(unsigned int mode)
       CHECK(packet_make(&fixture, 65536u, &packet) == 0);
       CHECK(ftun_channel_send(fixture.datagram, &fixture.target, &packet) == FTUN_E_LIMIT);
     }
-    CHECK(ftun_packet_release(&packet) == FTUN_OK);
+    ftun_packet_release(&packet);
     CHECK(ftun_socks5_connection_close(&fixture.connection) == FTUN_OK);
   }
   for (round = 0u; round < 4u; round++) CHECK(tick(&fixture) == 0);
@@ -356,7 +356,7 @@ static int scenario(unsigned int mode)
   CHECK(ftun_event_loop_destroy(&fixture.loop) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&fixture.operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&fixture.core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&fixture.budget) == FTUN_OK);
   return 0;
 }

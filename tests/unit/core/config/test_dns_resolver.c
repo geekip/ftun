@@ -294,7 +294,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_runtime_manager_destroy(&fixture->core) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   return ftun_budget_destroy(&fixture->budget) == FTUN_OK ? 0 : 1;
 }
 

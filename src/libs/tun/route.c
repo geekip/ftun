@@ -1,5 +1,6 @@
 #include "libs/tun/internal.h"
 
+#include <assert.h>
 #include <string.h>
 
 uint32_t ftun_tun_service_ipv4_value(const uint8_t address[4])
@@ -158,13 +159,7 @@ ftun_status_t ftun_tun_service_update_consumer(
   if (status != FTUN_OK) return status;
   next_route = *route;
   next_path = *path;
-  status = ftun_tun_service_consumer_clear(service, consumer);
-  if (status != FTUN_OK) {
-    service->accepting = false;
-    (void)ftun_event_source_cancel(&service->source);
-    ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_FAILED, status);
-    return status;
-  }
+  ftun_tun_service_consumer_clear(service, consumer);
   consumer->route = next_route;
   consumer->path = next_path;
   consumer->inner_mtu = inner_mtu;
@@ -185,13 +180,12 @@ ftun_status_t ftun_tun_service_release(ftun_tun_lease_t *lease)
 {
   ftun_tun_service_t *service;
   ftun_tun_service_consumer_t *consumer;
-  ftun_status_t status;
   if (lease == NULL) return FTUN_E_INVALID;
   if (lease->service == NULL) return FTUN_OK;
   service = lease->service;
   consumer = ftun_tun_service_lease_consumer(service, *lease);
   if (consumer == NULL) return FTUN_E_STALE;
-  status = ftun_tun_service_consumer_clear(service, consumer);
+  ftun_tun_service_consumer_clear(service, consumer);
   memset(&consumer->consumer, 0, sizeof(consumer->consumer));
   memset(&consumer->route, 0, sizeof(consumer->route));
   memset(&consumer->path, 0, sizeof(consumer->path));
@@ -201,13 +195,9 @@ ftun_status_t ftun_tun_service_release(ftun_tun_lease_t *lease)
   consumer->feedback_tokens = 0u;
   consumer->feedback_progress = 0u;
   memset(lease, 0, sizeof(*lease));
-  if (service->active_leases == 0u) return FTUN_E_STATE_CORRUPT;
+  assert(service->active_leases != 0u);
   service->active_leases--;
-  if (service->source != NULL) {
-    ftun_status_t update = ftun_tun_service_interests(service);
-    if (status == FTUN_OK) status = update;
-  }
-  return status;
+  return service->source != NULL ? ftun_tun_service_interests(service) : FTUN_OK;
 }
 
 ftun_tun_service_consumer_t *ftun_tun_service_route(

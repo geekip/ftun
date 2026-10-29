@@ -70,7 +70,7 @@ static int finish(ftun_budget_t **budget, ftun_recovery_scheduler_t **scheduler)
 {
   ftun_budget_usage_t usage;
   CHECK(ftun_recovery_scheduler_destroy(scheduler) == FTUN_OK && *scheduler == NULL);
-  CHECK(ftun_budget_get_usage(*budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(*budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(budget) == FTUN_OK);
   return 0;
 }

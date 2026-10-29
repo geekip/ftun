@@ -97,14 +97,14 @@ static int make_config(ftun_budget_t *budget, const char *json, ftun_config_t **
 static int memory(ftun_budget_t *budget, size_t expected)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == expected);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == expected);
   return 0;
 }
 static int block_memory(ftun_budget_t *budget, ftun_reservation_t *out)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.normal_available > 128u);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available - 128u, out) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.normal_available_resources.memory_bytes > 128u);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes - 128u, out) == FTUN_OK);
   return 0;
 }
 
@@ -125,19 +125,19 @@ static int construction(void)
   CHECK(ftun_runtime_prepare_detached(config, NULL, &prepared) == FTUN_OK);
   attempts = allocation_calls;
   CHECK((prepared->reservation).budget != NULL && config->document.reference_count == 1u);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used + charge);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes + charge);
   /* 此样例只使用拥有字符串的DOMAIN与MATCH规则，按实际申请核对。 */
   CHECK(live_bytes == charge + after.metadata_bytes - before.metadata_bytes && !tracker_failed);
   hold_routes = true;
   CHECK(ftun_runtime_prepared_release(&prepared) == FTUN_E_AGAIN && prepared != NULL);
-  CHECK(memory(budget, after.used) == 0 && (prepared->reservation).budget != NULL);
+  CHECK(memory(budget, after.used_resources.memory_bytes) == 0 && (prepared->reservation).budget != NULL);
   hold_routes = false;
   CHECK(ftun_runtime_prepared_release(&prepared) == FTUN_OK && prepared == NULL);
-  CHECK(live_bytes == 0u && memory(budget, before.used) == 0);
+  CHECK(live_bytes == 0u && memory(budget, before.used_resources.memory_bytes) == 0);
   for (i = 1u; i <= attempts; i++) {
     fail_at = i; allocation_calls = 0u;
     CHECK(ftun_runtime_prepare_detached(config, NULL, &prepared) == FTUN_E_LIMIT && prepared == NULL);
-    CHECK(live_bytes == 0u && !tracker_failed && memory(budget, before.used) == 0);
+    CHECK(live_bytes == 0u && !tracker_failed && memory(budget, before.used_resources.memory_bytes) == 0);
     CHECK(config->document.reference_count == 1u);
   }
   fail_at = 0u; tracking = false;
@@ -146,7 +146,7 @@ static int construction(void)
   CHECK(ftun_runtime_prepare_detached(config, NULL, &prepared) == FTUN_E_LIMIT && prepared == NULL);
   CHECK(calloc_calls == 0u && live_bytes == 0u);
   tracking = false;
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && memory(budget, 0u) == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -172,7 +172,7 @@ static int adoption(void)
   charge -= config->document.owned_bytes + config->plan->owned_bytes;
   CHECK(ftun_runtime_prepare_detached(config, NULL, &first) == FTUN_OK);
   CHECK(ftun_runtime_prepare_detached(config, NULL, &second) == FTUN_OK);
-  CHECK(memory(budget, before.used + 2u * charge) == 0 && config->document.reference_count == 1u);
+  CHECK(memory(budget, before.used_resources.memory_bytes + 2u * charge) == 0 && config->document.reference_count == 1u);
   first_reservation = first->reservation;
   CHECK(ftun_runtime_attach_prepared(other, &first, &candidate) == FTUN_E_INVALID);
   CHECK(first != NULL && candidate == NULL && same_reservation(&first->reservation, &first_reservation));
@@ -182,15 +182,15 @@ static int adoption(void)
   /* 同根父子预算复用已有句柄；没有新增额度的空间也能附着。 */
   CHECK(ftun_runtime_attach_prepared(core, &first, &candidate) == FTUN_OK);
   CHECK(first == NULL && same_reservation(&candidate->reservation, &first_reservation));
-  CHECK(config->document.reference_count == 2u && memory(budget, after.used) == 0);
-  CHECK(ftun_budget_get_usage(child, &child_after) == FTUN_OK && child_after.used == child_before.used);
+  CHECK(config->document.reference_count == 2u && memory(budget, after.used_resources.memory_bytes) == 0);
+  CHECK(ftun_budget_get_usage(child, &child_after) == FTUN_OK && child_after.used_resources.memory_bytes == child_before.used_resources.memory_bytes);
   CHECK(ftun_runtime_attach_prepared(core, &second, &first) == FTUN_E_AGAIN);
-  CHECK(first == NULL && second != NULL && memory(budget, after.used) == 0);
+  CHECK(first == NULL && second != NULL && memory(budget, after.used_resources.memory_bytes) == 0);
   CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_attach_prepared(core, &second, &candidate) == FTUN_OK && second == NULL);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_manager_clear(core) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK && memory(budget, 0u) == 0);
   CHECK(ftun_runtime_manager_destroy(&other) == FTUN_OK);
@@ -226,11 +226,11 @@ static int frs_admission(void)
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
   CHECK(ftun_runtime_attach_prepared(core, &prepared, &candidate) == FTUN_E_LIMIT);
   CHECK(prepared != NULL && candidate == NULL && same_reservation(&prepared->reservation, &reservation));
-  CHECK(config->document.reference_count == 1u && memory(budget, after.used) == 0);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  CHECK(config->document.reference_count == 1u && memory(budget, after.used_resources.memory_bytes) == 0);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_runtime_attach_prepared(core, &prepared, &candidate) == FTUN_OK && prepared == NULL);
   CHECK(same_reservation(&candidate->reservation, &reservation) && config->document.reference_count == 2u);
-  CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && memory(budget, before.used) == 0);
+  CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && memory(budget, before.used_resources.memory_bytes) == 0);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK && memory(budget, 0u) == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);

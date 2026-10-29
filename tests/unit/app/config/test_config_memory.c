@@ -132,7 +132,7 @@ static ftun_status_t parse(ftun_budget_t *budget, const char *text, ftun_config_
 static int check_usage(ftun_budget_t *budget, size_t expected)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == expected);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == expected);
   CHECK(usage.used_resources.descriptors == 0u);
   return 0;
 }
@@ -151,12 +151,12 @@ static int allocations(void)
   CHECK(strcmp(config->inbounds[0].name, "tunnel") == 0);
   CHECK(strcmp(config->rules.items[0], "MATCH,DIRECT") == 0);
   CHECK(config->tun.interface_name != config->inbounds[0].interface_name);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == config->document.owned_bytes);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == config->document.owned_bytes);
   /* 跟踪真实malloc/calloc请求；包括被裁剪的尾部与两份TUN副本。 */
-  CHECK(live_bytes == after.used + after.metadata_bytes - before.metadata_bytes && !tracker_failed);
+  CHECK(live_bytes == after.used_resources.memory_bytes + after.metadata_bytes - before.metadata_bytes && !tracker_failed);
   CHECK(ftun_config_retain(config) == FTUN_OK);
   copy = config;
-  CHECK(ftun_config_destroy(&copy) == FTUN_OK && check_usage(budget, after.used) == 0);
+  CHECK(ftun_config_destroy(&copy) == FTUN_OK && check_usage(budget, after.used_resources.memory_bytes) == 0);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && live_bytes == 0u && check_usage(budget, 0u) == 0);
   for (i = 1u; i <= attempts; i++) {
     fail_at = i; allocation_calls = 0u;
@@ -170,8 +170,8 @@ static int allocations(void)
   CHECK(ftun_config_compile(config, &config->plan) == FTUN_OK);
   attempts = allocation_calls;
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(after.used == config->document.owned_bytes + config->plan->owned_bytes);
-  CHECK(live_bytes == after.used + after.metadata_bytes - before.metadata_bytes);
+  CHECK(after.used_resources.memory_bytes == config->document.owned_bytes + config->plan->owned_bytes);
+  CHECK(live_bytes == after.used_resources.memory_bytes + after.metadata_bytes - before.metadata_bytes);
   CHECK(ftun_feature_plan_destroy(&config->plan) == FTUN_OK);
   for (i = 1u; i <= attempts; i++) {
     fail_at = i; allocation_calls = 0u;
@@ -239,8 +239,8 @@ static int loading(void)
   attempts = allocation_calls;
   CHECK(trace.completed == FTUN_CONFIG_STEP_COMPILE && trace.failed == FTUN_CONFIG_STEP_NONE);
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.high_watermarks.memory_bytes < 16384u);
-  CHECK(after.used == config->document.owned_bytes + config->plan->owned_bytes);
-  CHECK(live_bytes == after.used + after.metadata_bytes - before.metadata_bytes);
+  CHECK(after.used_resources.memory_bytes == config->document.owned_bytes + config->plan->owned_bytes);
+  CHECK(live_bytes == after.used_resources.memory_bytes + after.metadata_bytes - before.metadata_bytes);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && live_bytes == 0u && check_usage(budget, 0u) == 0);
   for (i = 1u; i <= attempts; i++) {
     fail_at = i; allocation_calls = 0u;
@@ -285,7 +285,7 @@ static int shared(void)
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(parse(budget, minimal, &config) == FTUN_OK && ftun_config_compile(config, &config->plan) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 2u, &core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); baseline = usage.used;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); baseline = usage.used_resources.memory_bytes;
   CHECK(ftun_runtime_accounted_bytes(config, &own) == FTUN_OK);
   own -= config->document.owned_bytes + config->plan->owned_bytes;
   {

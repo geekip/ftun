@@ -1,4 +1,4 @@
-#include "libs/transport/connector.h"
+#include "proxy/outbound/connector.h"
 #include <string.h>
 
 ftun_status_t ftun_connector_register(ftun_connector_registry_t *registry,

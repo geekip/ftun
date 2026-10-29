@@ -17,7 +17,7 @@ ftun_status_t ftun_random_bytes(void *buffer, size_t length)
 ftun_status_t ftun_random_device_bytes(void *buffer, size_t length)
 {
   size_t offset = 0u;
-  int descriptor;
+  ftun_handle_t descriptor;
   ftun_status_t status = ftun_file_open("/dev/urandom", FTUN_FILE_READ, &descriptor);
   if (status != FTUN_OK) return FTUN_E_IO;
   while (offset < length) {

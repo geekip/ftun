@@ -1,4 +1,5 @@
 #define _GNU_SOURCE 1
+#include "proxy/protocol/socks5.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -319,7 +320,7 @@ static int fixture_init(fixture_t *fixture, int variant)
   fixture->adapter.select_member = select_member;
   CHECK(ftun_dns_runtime_prepare(fixture->core, fixture->budget, fixture->operations,
     fixture->loop, fixture->config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture->dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_activate(fixture->dns) == FTUN_OK);
   for (index = 0u; index < 3u; index++) CHECK(fixture->proxies[index].udp_queries == 0u);
@@ -408,7 +409,7 @@ static int reload(fixture_t *fixture, int variant)
   CHECK(ftun_dns_runtime_plan_prepare(fixture->budget, config, 0u, &plan) == FTUN_OK);
   CHECK(ftun_dns_runtime_prepare_reload_planned(fixture->dns, fixture->core,
     fixture->budget, fixture->operations, fixture->loop, config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &prepared) == FTUN_OK);
   CHECK(ftun_dns_runtime_commit_reload(&fixture->dns, &prepared, &fixture->retired) == FTUN_OK);
   CHECK(ftun_runtime_commit(fixture->core, &candidate) == FTUN_OK);

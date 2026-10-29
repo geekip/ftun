@@ -33,7 +33,7 @@ static pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
 static uint8_t *download_bytes;
 static size_t download_length;
-static unsigned int downloads, publishes;
+static unsigned int downloads, publishes, publishes_finished;
 static ftun_file_stage_t fail_stage;
 static bool block_publish, publish_entered, release_publish;
 static unsigned int completions;
@@ -130,12 +130,17 @@ ftun_status_t __wrap_ftun_file_write_atomic_budget(ftun_budget_t *budget, const 
   ftun_bytes_t bytes, unsigned int mode, ftun_file_stage_hook_fn hook, void *user)
 {
   file_hook_t intercepted = {hook, user, 0};
+  ftun_status_t status;
   (void)pthread_mutex_lock(&mutex);
   publishes++;
   intercepted.fail = fail_stage;
   (void)pthread_mutex_unlock(&mutex);
-  return __real_ftun_file_write_atomic_budget(budget, path, bytes, mode,
+  status = __real_ftun_file_write_atomic_budget(budget, path, bytes, mode,
     file_stage, &intercepted);
+  (void)pthread_mutex_lock(&mutex);
+  publishes_finished++;
+  (void)pthread_mutex_unlock(&mutex);
+  return status;
 }
 
 static void inject(uint8_t *bytes, ftun_file_stage_t stage)
@@ -305,16 +310,17 @@ static int stop(pthread_t thread)
 
 static int same_file(const char *path, const uint8_t *bytes);
 
-/* 等后台下载走到指定次数（含失败的尝试）。 */
-static int wait_downloads(unsigned int expected)
+/* 等到实际发布结束再切换故障，避免下载完成而发布尚未取到注入阶段。 */
+static int wait_downloads(unsigned int expected, unsigned int published)
 {
   uint64_t expires = now_ms() + 8000u;
   for (;;) {
-    unsigned int current;
+    unsigned int current, finished;
     (void)pthread_mutex_lock(&mutex);
     current = downloads;
+    finished = publishes_finished;
     (void)pthread_mutex_unlock(&mutex);
-    if (current >= expected) return 0;
+    if (current >= expected && finished >= published) return 0;
     CHECK(now_ms() < expires);
     pause_once();
   }
@@ -393,7 +399,7 @@ int main(void)
   CHECK(config(original, first_file, log) == 0);
   inject(first, FTUN_FILE_STAGE_TEMP_SYNCED);
   CHECK(start(original, &thread) == 0);
-  CHECK(wait_downloads(1u) == 0);
+  CHECK(wait_downloads(1u, 1u) == 0);
   CHECK(access(first_file, F_OK) != 0);
   expect_not_ready = true;
   CHECK(check_active(1u, 1u, 10u, false) == 0);
@@ -401,7 +407,7 @@ int main(void)
   /* 退避重试在 rename 后出错：仍采用已发布的文件，并写出持久性警告；
    * 发布后产生新的运行配置代次。 */
   inject(first, FTUN_FILE_STAGE_RENAMED);
-  CHECK(wait_downloads(2u) == 0);
+  CHECK(wait_downloads(2u, 2u) == 0);
   CHECK(wait_file(first_file, first) == 0);
   CHECK(check_active(2u, 2u, 10u, true) == 0);
 

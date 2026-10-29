@@ -1,7 +1,6 @@
 #define _GNU_SOURCE 1
 #include "libs/transport/dialer.h"
-#include "platform/linux/socket_protect.h"
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +17,7 @@ typedef struct {
   ftun_dial_completion_fn completion;
   void *completion_user;
   ftun_socket_policy_t policy;
-  char interface_name[FTUN_LINUX_SOCKET_DEVICE_BYTES];
+  char interface_name[FTUN_SOCKET_INTERFACE_BYTES];
   ftun_error_t pending_error;
   int has_pending_error;
 } ftun_dial_context_t;
@@ -99,7 +98,7 @@ static int ftun_dial_request_valid(const ftun_dial_request_t *request)
       !ftun_dial_domain_valid(request->requested_domain) ||
       !ftun_dial_allowed_valid(request)) return 0;
   if (request->protection.interface_name.length >=
-      FTUN_LINUX_SOCKET_DEVICE_BYTES) return 0;
+      FTUN_SOCKET_INTERFACE_BYTES) return 0;
   if (request->protection.interface_name.length != 0u &&
       request->protection.interface_name.data == NULL) return 0;
   if (request->protection.mark == 0u &&
@@ -195,7 +194,7 @@ static void ftun_dial_completed(ftun_operation_t *operation,
   completion(operation, error, &context->result, completion_user);
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_dial_finish(ftun_dial_context_t *context,
@@ -252,7 +251,7 @@ static void ftun_dial_release_context(ftun_dial_context_t *context)
   context->reservation = (ftun_reservation_t){0};
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_dial_reject(ftun_dial_context_t *context,
@@ -293,7 +292,7 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
   if (status != FTUN_OK) return status;
   context = (ftun_dial_context_t *)calloc(1u, sizeof(*context));
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->loop = request->loop;
@@ -347,7 +346,7 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
   /* 系统 socket 才设置存活策略；测试注入的 io 没有真实描述符。 */
   if (request->transport == FTUN_DIAL_TCP &&
       context->io.open_socket == ftun_socket_default_io()->open_socket) {
-    status = ftun_socket_apply_liveness((int)context->result.socket,
+    status = ftun_socket_apply_liveness((ftun_handle_t)context->result.socket,
                                         &context->policy.liveness);
     if (status != FTUN_OK) return ftun_dial_reject(context, status);
   }

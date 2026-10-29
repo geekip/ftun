@@ -97,7 +97,7 @@ static int rejected(ftun_path_provider_t *provider, ftun_core_t *core,
   CHECK(ftun_operation_dispatch(request->operations, 8u, &count) == FTUN_OK);
   CHECK(count == 0u && state->calls == previous);
   CHECK(ftun_budget_get_usage(request->budget, &after) == FTUN_OK);
-  CHECK(before.used == after.used);
+  CHECK(before.used_resources.memory_bytes == after.used_resources.memory_bytes);
   return 0;
 }
 
@@ -213,14 +213,14 @@ int main(void)
   CHECK(ftun_path_provider_stop_until(provider, UINT64_MAX) == FTUN_OK);
   CHECK(rejected(provider, core, 8u, &request, &state, FTUN_E_CANCELLED) == 0);
   CHECK(ftun_path_provider_destroy(&provider) == FTUN_OK);
-  CHECK(ftun_network_view_release(&open_view) == FTUN_OK);
-  CHECK(ftun_network_view_release(&closed_view) == FTUN_OK);
+  ftun_network_view_release(&open_view);
+  ftun_network_view_release(&closed_view);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_stop(operations) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(close(server) == 0);
   puts("Path configuration and network generation contract passed");

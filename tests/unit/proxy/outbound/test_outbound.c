@@ -45,10 +45,10 @@ static void operation_completed(ftun_operation_t *operation,
 }
 
 static ftun_status_t mock_direct_open(
-  void *user, ftun_core_t *core, const void *raw, ftun_operation_t **out)
+  void *user, ftun_core_t *core, const ftun_outbound_request_t *raw, ftun_operation_t **out)
 {
   fixture_t *fixture = (fixture_t *)user;
-  const ftun_direct_request_t *request = (const ftun_direct_request_t *)raw;
+  const ftun_direct_request_t *request = raw->direct;
   (void)core;
   fixture->direct_calls++;
   fixture->captured_target = request->target;
@@ -60,11 +60,11 @@ static ftun_status_t mock_direct_open(
 }
 
 static ftun_status_t mock_socks5_open(
-  void *user, ftun_core_t *core, const void *raw, ftun_operation_t **out)
+  void *user, ftun_core_t *core, const ftun_outbound_request_t *raw, ftun_operation_t **out)
 {
   fixture_t *fixture = (fixture_t *)user;
   const ftun_socks5_connect_request_t *request =
-    (const ftun_socks5_connect_request_t *)raw;
+    raw->socks5;
   (void)core;
   fixture->socks5_calls++;
   fixture->captured_target = request->target;
@@ -137,7 +137,7 @@ static int fixture_stop(fixture_t *fixture)
   ftun_budget_usage_t usage;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   return ftun_budget_destroy(&fixture->budget) == FTUN_OK ? 0 : 1;
 }
 

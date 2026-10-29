@@ -97,7 +97,7 @@ static void *create_clients(void *unused)
     barrier_wait(&prepared);
     CHECK(ftun_tls_client_handshake(client) == FTUN_E_AGAIN);
     CHECK(ftun_tls_client_destroy(&client) == FTUN_OK && client == NULL);
-    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
     barrier_wait(&start);
   }
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
@@ -136,7 +136,7 @@ int main(void)
   atomic_store(&fail_registration, true);
   CHECK(ftun_tls_client_open(&options, &client) == FTUN_E_LIMIT);
   CHECK(client == NULL && atomic_load(&cleanup_calls) == 1u);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
 
   /* 外部使用者持有自己的 native 引用，不计为 FTUN 初始化调用。 */
   atomic_store(&inside_native_init, true);

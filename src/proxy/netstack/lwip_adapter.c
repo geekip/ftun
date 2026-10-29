@@ -11,6 +11,7 @@
 #include <lwip/tcp.h>
 #include <lwip/udp.h>
 
+#include <assert.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,7 +30,6 @@ typedef union {
   struct {
     uint64_t magic;
     ftun_lwip_t *stack;
-    ftun_reservation_t reservation;
     size_t charge;
   } value;
   long double long_double_alignment;
@@ -78,6 +78,8 @@ struct ftun_lwip {
   ftun_budget_t *budget;
   ftun_reservation_t reservation;
   ftun_reservation_t wrapper_reservation;
+  ftun_reservation_t allocation_reservation;
+  size_t allocation_capacity;
   ftun_buffer_pool_t *packet_pool;
   struct netif netif;
   struct tcp_pcb *listener;
@@ -137,7 +139,7 @@ static void ftun_lwip_input_release(ftun_lwip_input_pbuf_t *input)
   ftun_lwip_t *stack;
   if (input == NULL || input->stack == NULL) return;
   stack = input->stack;
-  (void)ftun_buffer_slice_release(&input->slice);
+  ftun_buffer_slice_release(&input->slice);
   if (stack->input_active == 0u) {
     stack->corrupt = true;
     return;
@@ -166,7 +168,7 @@ static void ftun_lwip_send_release(ftun_lwip_t *stack,
     if (stack != NULL) stack->corrupt = true;
     return;
   }
-  (void)ftun_buffer_slice_release(&reference->slice);
+  ftun_buffer_slice_release(&reference->slice);
   stack->send_active--;
   memset(reference, 0, sizeof(*reference));
   reference->free_next = stack->send_free;
@@ -199,21 +201,27 @@ static ftun_status_t ftun_lwip_from_err(err_t error)
 void *ftun_lwip_port_malloc(size_t size)
 {
   ftun_lwip_alloc_header_t *header;
-  ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_lwip_t *stack = ftun_lwip_active;
   size_t charge;
   if (stack == NULL || size == 0u || size > SIZE_MAX - sizeof(*header)) return NULL;
   charge = sizeof(*header) + size;
-  if (ftun_budget_reserve(stack->budget, charge, &reservation) != FTUN_OK) return NULL;
-  header = (ftun_lwip_alloc_header_t *)malloc(charge);
-  if (header == NULL) {
-    (void)ftun_reservation_release(&reservation);
-    return NULL;
+  /* owner 独占预准入额度，每 32 KiB 扩容一次；逐对象分配/释放不取预算锁。
+   * 闲置额度保留到 stack 销毁，始终计入预算，不是未计账缓存。 */
+  if (charge > stack->allocation_capacity - (stack->allocated_bytes - sizeof(*stack))) {
+    size_t required = stack->allocated_bytes - sizeof(*stack) + charge;
+    size_t capacity = (required + 32767u) & ~(size_t)32767u;
+    ftun_status_t status = stack->allocation_capacity == 0u ?
+      ftun_budget_reserve(stack->budget, capacity, &stack->allocation_reservation) :
+      ftun_reservation_resize(&stack->allocation_reservation,
+        (ftun_budget_resources_t){capacity, 0u, 0u});
+    if (status != FTUN_OK) return NULL;
+    stack->allocation_capacity = capacity;
   }
+  header = (ftun_lwip_alloc_header_t *)malloc(charge);
+  if (header == NULL) return NULL;
   memset(header, 0, sizeof(*header));
   header->value.magic = FTUN_LWIP_ALLOC_MAGIC;
   header->value.stack = stack;
-  header->value.reservation = reservation;
   header->value.charge = charge;
   stack->allocated_bytes += charge;
   stack->allocated_blocks++;
@@ -235,22 +243,14 @@ void ftun_lwip_port_free(void *pointer)
 {
   ftun_lwip_alloc_header_t *header;
   ftun_lwip_t *stack;
-  ftun_reservation_t reservation;
-  size_t charge;
   if (pointer == NULL) return;
   header = (ftun_lwip_alloc_header_t *)pointer - 1;
-  if (header->value.magic != FTUN_LWIP_ALLOC_MAGIC || header->value.stack == NULL) return;
+  assert(header->value.magic == FTUN_LWIP_ALLOC_MAGIC);
   stack = header->value.stack;
-  reservation = header->value.reservation;
-  charge = header->value.charge;
-  if (stack->allocated_blocks == 0u || stack->allocated_bytes < charge ||
-      ftun_reservation_release(&reservation) != FTUN_OK) {
-    stack->corrupt = true;
-    return;
-  }
+  assert(stack == ftun_lwip_active && stack->allocated_blocks > 1u);
+  assert(stack->allocated_bytes >= sizeof(*stack) + header->value.charge);
   stack->allocated_blocks--;
-  stack->allocated_bytes -= charge;
-  memset(header, 0, sizeof(*header));
+  stack->allocated_bytes -= header->value.charge;
   free(header);
 }
 
@@ -526,12 +526,12 @@ static void ftun_lwip_udp_received(void *argument, struct udp_pcb *pcb,
   if (status == FTUN_OK) {
     status = ftun_packet_init(&packet, &slice, stack->packet_source_id);
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&owned);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&owned);
   pbuf_free(buffer);
   if (status == FTUN_OK) {
     status = stack->udp_receive(stack->user, flow, &packet);
-    (void)ftun_packet_release(&packet);
+    ftun_packet_release(&packet);
   }
   if (status != FTUN_OK && stack->input_status == FTUN_OK) {
     stack->input_status = status;
@@ -679,7 +679,7 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
   }
   stack = (ftun_lwip_t *)calloc(1u, sizeof(*stack));
   if (stack == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   stack->budget = spec->budget;
@@ -1128,15 +1128,14 @@ ftun_status_t ftun_lwip_destroy(ftun_lwip_t **stack)
   owned->send_storage = NULL;
   owned->input_free = NULL;
   owned->send_free = NULL;
-  if (ftun_reservation_release(&owned->wrapper_reservation) != FTUN_OK) {
-    owned->corrupt = true;
-  }
+  ftun_reservation_release(&owned->wrapper_reservation);
   if (owned->allocated_blocks != 1u || owned->allocated_bytes != sizeof(*owned)) {
     owned->corrupt = true;
   }
+  ftun_reservation_release(&owned->allocation_reservation);
   corrupt = owned->corrupt;
   reservation = owned->reservation;
-  if (ftun_reservation_release(&reservation) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   owned->allocated_blocks = 0u;
   owned->allocated_bytes = 0u;

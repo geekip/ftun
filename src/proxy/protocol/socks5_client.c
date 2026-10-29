@@ -1,4 +1,4 @@
-#include "libs/transport/socks5_client.h"
+#include "proxy/protocol/socks5_client.h"
 #include <string.h>
 
 static ftun_status_t ftun_socks5_client_expected_method(

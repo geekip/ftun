@@ -1,7 +1,7 @@
 #ifndef FTUN_PROXY_OUTBOUND_SOCKS5_H
 #define FTUN_PROXY_OUTBOUND_SOCKS5_H
 
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 #include "libs/transport/path.h"
 
 typedef struct ftun_socks5_connection ftun_socks5_connection_t;

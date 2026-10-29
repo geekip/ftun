@@ -188,16 +188,14 @@ ftun_status_t ftun_fakeip_snapshot_save(ftun_fakeip_store_t *store,
   if (status != FTUN_OK) return status;
   serialized = (uint8_t *)malloc(length);
   if (serialized == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   ftun_snapshot_encode(snapshot, serialized, length);
   status = ftun_fakeip_store_submit_snapshot(
     store, (ftun_bytes_t){serialized, length}, snapshot->sequence, out);
   free(serialized);
-  if (ftun_reservation_release(&reservation) != FTUN_OK && status == FTUN_OK) {
-    return FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -210,7 +208,7 @@ static ftun_status_t ftun_snapshot_read(const char *path, size_t maximum,
   ftun_budget_resources_t resources = {0u, 1u, 0u};
   uint8_t *data = NULL;
   size_t offset = 0u;
-  int descriptor = -1;
+  ftun_handle_t descriptor = -1;
   ftun_status_t status;
   *out = NULL;
   *out_length = 0u;
@@ -234,14 +232,14 @@ static ftun_status_t ftun_snapshot_read(const char *path, size_t maximum,
   status = FTUN_OK;
 done:
   if (descriptor >= 0 && ftun_file_close(descriptor) != 0 && status == FTUN_OK) status = FTUN_E_IO;
-  (void)ftun_reservation_release(&fd_reservation);
+  ftun_reservation_release(&fd_reservation);
   if (status == FTUN_OK) {
     *out = data;
     *out_length = offset;
     *out_reservation = reservation;
   } else {
     free(data);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
   }
   return status;
 }
@@ -362,11 +360,8 @@ done:
     free(snapshot->owned_block);
   }
   free(file);
-  if (ftun_reservation_release(&file_reservation) != FTUN_OK && status == FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
-  if (ftun_reservation_release(&snapshot_reservation) != FTUN_OK &&
-      status == FTUN_OK) status = FTUN_E_STATE_CORRUPT;
+  ftun_reservation_release(&file_reservation);
+  ftun_reservation_release(&snapshot_reservation);
   return status;
 }
 
@@ -380,5 +375,6 @@ ftun_status_t ftun_fakeip_snapshot_destroy(ftun_fakeip_snapshot_t **snapshot)
   reservation = owned->reservation;
   free(owned->owned_block);
   *snapshot = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

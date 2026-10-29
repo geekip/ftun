@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#include "platform/linux/route.h"
 #include "ftun/ftun.h"
-#include "libs/tun/linux/routes.h"
+#include "libs/tun/routes.h"
 #include "proxy/netstack/ingress.h"
 #include "libs/tun/service.h"
 #include "platform/clock.h"
@@ -15,9 +16,9 @@
   fprintf(stderr, "Async TUN runtime failed at %d: %s\n", __LINE__, #value); \
   abort(); } } while (0)
 
-static ftun_linux_route_resource_t resources[FTUN_LINUX_ROUTE_MAX_RESOURCES];
+static ftun_route_resource_t resources[FTUN_LINUX_ROUTE_MAX_RESOURCES];
 static size_t resource_count, applies, removes, binds;
-static ftun_linux_route_reply_t reply;
+static ftun_route_reply_t reply;
 static bool has_reply, fail_open;
 static ftun_tun_lease_t lease;
 static ftun_tun_ingress_spec_t ingress;
@@ -26,7 +27,7 @@ static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
 enum { REFRESH, REFRESH_READY, FAIL_REBUILD, FAILED, REBUILD, REBUILT };
 typedef struct { int step; bool done, ready; } command_t;
 
-static bool equal(const ftun_linux_route_resource_t *a, const ftun_linux_route_resource_t *b)
+static bool equal(const ftun_route_resource_t *a, const ftun_route_resource_t *b)
 {
   return a->kind == b->kind && a->family == b->family &&
     strcmp(a->interface_name, b->interface_name) == 0 &&
@@ -36,7 +37,7 @@ static bool equal(const ftun_linux_route_resource_t *a, const ftun_linux_route_r
     a->mark_mask == b->mark_mask && a->metric == b->metric && a->protocol == b->protocol;
 }
 
-static ftun_status_t apply(void *context, const ftun_linux_route_resource_t *resource)
+static ftun_status_t apply(void *context, const ftun_route_resource_t *resource)
 {
   size_t index;
   (void)context;
@@ -49,7 +50,7 @@ static ftun_status_t apply(void *context, const ftun_linux_route_resource_t *res
   return FTUN_OK;
 }
 
-static ftun_status_t remove_route(void *context, const ftun_linux_route_resource_t *resource)
+static ftun_status_t remove_route(void *context, const ftun_route_resource_t *resource)
 {
   size_t index;
   (void)context;
@@ -63,12 +64,12 @@ static ftun_status_t remove_route(void *context, const ftun_linux_route_resource
   return FTUN_E_STALE;
 }
 
-static ftun_status_t submit_route(void *context, const ftun_linux_route_request_t *request)
+static ftun_status_t submit_route(void *context, const ftun_route_request_t *request)
 {
   size_t index;
   (void)context;
   REQUIRE(!has_reply);
-  reply = (ftun_linux_route_reply_t){request->sequence, FTUN_OK, false};
+  reply = (ftun_route_reply_t){request->sequence, FTUN_OK, false};
   if (request->kind == FTUN_LINUX_ROUTE_REQUEST_QUERY) {
     for (index = 0u; index < resource_count; index++) {
       if (equal(&request->resource, &resources[index])) reply.present = true;
@@ -80,7 +81,7 @@ static ftun_status_t submit_route(void *context, const ftun_linux_route_request_
   return FTUN_OK;
 }
 
-static ftun_status_t receive_route(void *context, ftun_linux_route_reply_t *out)
+static ftun_status_t receive_route(void *context, ftun_route_reply_t *out)
 {
   (void)context;
   if (!has_reply) return FTUN_E_AGAIN;
@@ -89,36 +90,36 @@ static ftun_status_t receive_route(void *context, ftun_linux_route_reply_t *out)
   return FTUN_OK;
 }
 
-ftun_status_t __wrap_ftun_linux_route_prepare(const ftun_route_policy_t *policy,
+ftun_status_t __wrap_ftun_route_prepare(const ftun_route_policy_t *policy,
   ftun_route_transaction_t **out)
 {
-  const ftun_linux_route_io_t io = {apply, remove_route, NULL};
-  return ftun_linux_route_prepare_with_io(policy, &io, out);
+  const ftun_route_io_t io = {apply, remove_route, NULL};
+  return ftun_route_prepare_with_io(policy, &io, out);
 }
 
-ftun_status_t __wrap_ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
+ftun_status_t __wrap_ftun_route_prepare_with_budget(ftun_budget_t *budget,
   const ftun_route_policy_t *policy, ftun_route_transaction_t **out)
 {
-  const ftun_linux_route_io_t io = {apply, remove_route, NULL};
-  return ftun_linux_route_prepare_with_io_and_budget(budget, policy, &io, out);
+  const ftun_route_io_t io = {apply, remove_route, NULL};
+  return ftun_route_prepare_with_io_and_budget(budget, policy, &io, out);
 }
 
-ftun_status_t __wrap_ftun_linux_route_async_start(const ftun_route_policy_t *policy,
+ftun_status_t __wrap_ftun_route_async_start(const ftun_route_policy_t *policy,
   ftun_event_loop_t *loop, uint64_t now_ms, uint64_t step_ms, uint64_t deadline_ms,
-  ftun_linux_route_async_t **out)
+  ftun_route_async_t **out)
 {
-  const ftun_linux_route_async_io_t io = {submit_route, receive_route, NULL};
+  const ftun_route_async_io_t io = {submit_route, receive_route, NULL};
   (void)loop;
-  return ftun_linux_route_async_start_with_io(policy, &io, now_ms, step_ms, deadline_ms, 1u, out);
+  return ftun_route_async_start_with_io(policy, &io, now_ms, step_ms, deadline_ms, 1u, out);
 }
 
-ftun_status_t __wrap_ftun_linux_route_async_adopt(ftun_route_transaction_t **source,
+ftun_status_t __wrap_ftun_route_async_adopt(ftun_route_transaction_t **source,
   ftun_event_loop_t *loop, uint64_t now_ms, uint64_t step_ms, uint64_t deadline_ms,
-  ftun_linux_route_async_t **out)
+  ftun_route_async_t **out)
 {
-  const ftun_linux_route_async_io_t io = {submit_route, receive_route, NULL};
+  const ftun_route_async_io_t io = {submit_route, receive_route, NULL};
   (void)loop;
-  return ftun_linux_route_async_adopt_with_io(source, &io, now_ms, step_ms, deadline_ms, 1u, out);
+  return ftun_route_async_adopt_with_io(source, &io, now_ms, step_ms, deadline_ms, 1u, out);
 }
 
 ftun_status_t __real_ftun_l3_provider_acquire(const ftun_l3_provider_t *,

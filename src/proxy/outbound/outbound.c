@@ -61,17 +61,17 @@ static ftun_status_t ftun_outbound_validate(
 }
 
 static ftun_status_t ftun_outbound_direct_open(
-  void *context, ftun_core_t *core, const void *request, ftun_operation_t **out)
+  void *context, ftun_core_t *core, const ftun_outbound_request_t *request, ftun_operation_t **out)
 {
   (void)context;
-  return ftun_direct_open(core, (const ftun_direct_request_t *)request, out);
+  return ftun_direct_open(core, request->direct, out);
 }
 
 static ftun_status_t ftun_outbound_socks5_open(
-  void *context, ftun_core_t *core, const void *request, ftun_operation_t **out)
+  void *context, ftun_core_t *core, const ftun_outbound_request_t *request, ftun_operation_t **out)
 {
   (void)context;
-  return ftun_socks5_connect(core, (const ftun_socks5_connect_request_t *)request,
+  return ftun_socks5_connect(core, request->socks5,
                              out);
 }
 
@@ -104,6 +104,7 @@ ftun_status_t ftun_outbound_open_with_registry(
   ftun_reject_result_t *reject_result, ftun_operation_t **out)
 {
   const ftun_connector_ops_t *connector;
+  ftun_outbound_request_t connection;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (reject_result != NULL) memset(reject_result, 0, sizeof(*reject_result));
@@ -137,6 +138,7 @@ ftun_status_t ftun_outbound_open_with_registry(
        (connector->capabilities & FTUN_CONNECTOR_UDP) == 0u)) {
     return FTUN_E_UNSUPPORTED;
   }
+  connection = *request;
   if (request->leaf->kind == FTUN_OUTBOUND_LEAF_DIRECT) {
     ftun_direct_request_t direct;
     if (request->direct == NULL || request->socks5 != NULL ||
@@ -144,7 +146,8 @@ ftun_status_t ftun_outbound_open_with_registry(
     direct = *request->direct;
     direct.target = request->target;
     direct.transport = request->transport;
-    return connector->open(connector->context, core, &direct, out);
+    connection.direct = &direct;
+    return connector->open(connector->context, core, &connection, out);
   } else {
     ftun_socks5_connect_request_t socks5;
     if (request->socks5 == NULL || request->direct != NULL ||
@@ -152,7 +155,8 @@ ftun_status_t ftun_outbound_open_with_registry(
     socks5 = *request->socks5;
     socks5.target = request->target;
     socks5.transport = request->transport;
-    return connector->open(connector->context, core, &socks5, out);
+    connection.socks5 = &socks5;
+    return connector->open(connector->context, core, &connection, out);
   }
 }
 

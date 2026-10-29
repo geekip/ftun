@@ -110,7 +110,7 @@ struct ftun_tun_service {
 ftun_tun_service_consumer_t *ftun_tun_service_lease_consumer(
   const ftun_tun_service_t *service, ftun_tun_lease_t lease);
 ftun_status_t ftun_tun_service_interests(ftun_tun_service_t *service);
-ftun_status_t ftun_tun_service_consumer_clear(
+void ftun_tun_service_consumer_clear(
   ftun_tun_service_t *service, ftun_tun_service_consumer_t *consumer);
 
 uint32_t ftun_tun_service_ipv4_value(const uint8_t address[4]);

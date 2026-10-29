@@ -1,3 +1,4 @@
+#include "platform/route.h"
 #include "libs/tun/config/parse.h"
 #include "core/config/fields.h"
 #include <stdlib.h>
@@ -61,6 +62,9 @@ void ftun_config_clear_tun(ftun_config_tun_t *tun)
 void ftun_config_defaults_tun(ftun_config_tun_t *tun)
 {
   tun->mtu = 1500u;
-  tun->route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
-  tun->rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
+  {
+    ftun_route_settings_t settings = ftun_platform_route_defaults();
+    tun->route_table = settings.routing_domain;
+    tun->rule_priority = settings.precedence;
+  }
 }

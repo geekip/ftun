@@ -1,6 +1,6 @@
 #ifndef FTUN_LIBS_TRANSPORT_SOCKS5_CLIENT_H
 #define FTUN_LIBS_TRANSPORT_SOCKS5_CLIENT_H
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 
 /* SOCKS5 客户端握手状态机（无 I/O）。
  * 握手顺序：方法协商 -> （用户名密码认证）-> CONNECT/UDP ASSOCIATE 请求 -> 回复。

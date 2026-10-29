@@ -1,4 +1,4 @@
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 
 #include <stdint.h>
 #include <stdio.h>

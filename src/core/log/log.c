@@ -15,7 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 
+/*
  * ftun_log_emit 进入有界异步日志并保留丢弃/错误计数。 */
 
 #define FTUN_LOG_DEFAULT_QUEUE 64u
@@ -132,12 +132,12 @@ ftun_status_t ftun_log_ledger_create(ftun_budget_t *budget, ftun_log_ledger_t **
   if (status != FTUN_OK) return status;
   ledger = calloc(1u, sizeof(*ledger));
   if (ledger == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   if (ftun_mutex_init(&ledger->mutex) != FTUN_OK) {
     free(ledger);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   ledger->reservation = reservation;
@@ -173,7 +173,8 @@ ftun_status_t ftun_log_ledger_destroy(ftun_log_ledger_t **ledger)
   reservation = owned->reservation;
   free(owned);
   *ledger = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 typedef enum {
@@ -386,7 +387,7 @@ ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
   }
   logger = (ftun_logger_t *)calloc(1u, sizeof(*logger));
   if (logger == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   logger->reservation = reservation;
@@ -451,7 +452,7 @@ io:
   free(logger->lengths);
   free(logger->lines);
   free(logger);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return failure;
 available_io:
   ftun_condition_destroy(&logger->available);
@@ -460,7 +461,7 @@ limit:
   free(logger->lengths);
   free(logger->lines);
   free(logger);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return FTUN_E_LIMIT;
 }
 
@@ -774,8 +775,8 @@ ftun_status_t ftun_logger_destroy_until(ftun_logger_t **logger,
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *logger = NULL;
-  status = ftun_reservation_release(&reservation);
-  return close_status == FTUN_OK ? status : FTUN_E_IO;
+  ftun_reservation_release(&reservation);
+  return close_status == FTUN_OK ? FTUN_OK : FTUN_E_IO;
 }
 
 ftun_status_t ftun_log_emit(ftun_core_t *core, const ftun_diagnostic_t *diagnostic)

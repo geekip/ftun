@@ -1,6 +1,6 @@
 #ifndef FTUN_PLATFORM_LINUX_ROUTE_H
 #define FTUN_PLATFORM_LINUX_ROUTE_H
-#include "util/types.h"
+#include "platform/route.h"
 #define FTUN_ROUTE_FAMILY_IPV4 2
 #define FTUN_ROUTE_FAMILY_IPV6 10
 #define FTUN_ROUTE_TABLE_UNSPEC 0u
@@ -23,10 +23,10 @@ typedef enum {
   FTUN_LINUX_ROUTE_PROTECT_RULE,
   FTUN_LINUX_ROUTE_OVERLAY,
   FTUN_LINUX_ROUTE_UNREACHABLE
-} ftun_linux_route_resource_kind_t;
+} ftun_route_resource_kind_t;
 
 typedef struct {
-  ftun_linux_route_resource_kind_t kind;
+  ftun_route_resource_kind_t kind;
   int family;
   char interface_name[FTUN_LINUX_ROUTE_NAME_BYTES];
   uint8_t address[16];
@@ -40,64 +40,64 @@ typedef struct {
   /* 仅用于删除请求：放宽选择子，只按家族、优先级（路由为表与前缀）与协议号
    * 清理上次崩溃遗留的过期对象；不属于计划资源，不进入账本。 */
   bool stray;
-} ftun_linux_route_resource_t;
+} ftun_route_resource_t;
 
-typedef struct {
-  ftun_linux_route_resource_t resources[FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES];
+struct ftun_route_plan {
+  ftun_route_resource_t resources[FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES];
   size_t resource_count;
   /* 安装前先按放宽的选择子清理同表同优先级的协议号 186 遗留对象。仅在持有
    * 路由表互斥锁（策略事务）时启用，不能用于与其他管理者共享的计划。 */
   bool sweep;
-} ftun_linux_route_plan_t;
+};
 
-typedef struct {
+struct ftun_route_io {
   ftun_status_t (*apply)(void *context,
-                         const ftun_linux_route_resource_t *resource);
+                         const ftun_route_resource_t *resource);
   ftun_status_t (*remove)(void *context,
-                          const ftun_linux_route_resource_t *resource);
+                          const ftun_route_resource_t *resource);
   void *context;
-} ftun_linux_route_io_t;
+};
 
 typedef enum {
   FTUN_LINUX_ROUTE_REQUEST_QUERY = 1,
   FTUN_LINUX_ROUTE_REQUEST_ADD,
   FTUN_LINUX_ROUTE_REQUEST_REMOVE
-} ftun_linux_route_request_kind_t;
+} ftun_route_request_kind_t;
 
 typedef struct {
   uint32_t sequence;
-  ftun_linux_route_request_kind_t kind;
-  ftun_linux_route_resource_t resource;
-} ftun_linux_route_request_t;
+  ftun_route_request_kind_t kind;
+  ftun_route_resource_t resource;
+} ftun_route_request_t;
 
 typedef struct {
   uint32_t sequence;
   ftun_status_t status;
   bool present;
-} ftun_linux_route_reply_t;
+} ftun_route_reply_t;
 
-typedef struct {
+struct ftun_route_async_io {
   /* submit/receive 均不得阻塞；AGAIN 表示等待下一次 readiness。 */
   ftun_status_t (*submit)(void *context,
-                          const ftun_linux_route_request_t *request);
-  ftun_status_t (*receive)(void *context, ftun_linux_route_reply_t *reply);
+                          const ftun_route_request_t *request);
+  ftun_status_t (*receive)(void *context, ftun_route_reply_t *reply);
   void *context;
-} ftun_linux_route_async_io_t;
+};
 
 /* 原生 Netlink 协议状态嵌入调用方准入的对象，不含事件循环或预算指针。 */
 typedef struct {
   int descriptor;
   uint32_t pending_sequence;
-  ftun_linux_route_request_kind_t pending_kind;
-  ftun_linux_route_resource_t query_resource;
+  ftun_route_request_kind_t pending_kind;
+  ftun_route_resource_t query_resource;
   bool query_present, io_ready, io_error, runnable, write_interest;
 } ftun_route_kernel_t;
-const ftun_linux_route_io_t *ftun_platform_route_io(void);
-ftun_status_t ftun_linux_route_lock_table(uint32_t table, int *out);
-ftun_status_t ftun_platform_route_open(int *out);
-ftun_status_t ftun_platform_route_close(int descriptor);
+const ftun_route_io_t *ftun_platform_route_io(void);
+ftun_status_t ftun_route_lock_table(uint32_t table, ftun_handle_t *out);
+ftun_status_t ftun_platform_route_open(ftun_handle_t *out);
+ftun_status_t ftun_platform_route_close(ftun_handle_t descriptor);
 ftun_status_t ftun_platform_route_submit(ftun_route_kernel_t *operation,
-  const ftun_linux_route_request_t *request);
+  const ftun_route_request_t *request);
 ftun_status_t ftun_platform_route_receive(ftun_route_kernel_t *operation,
-  ftun_linux_route_reply_t *reply);
+  ftun_route_reply_t *reply);
 #endif

@@ -1,16 +1,10 @@
-#ifndef FTUN_LIBS_TRANSPORT_CONNECTOR_H
-#define FTUN_LIBS_TRANSPORT_CONNECTOR_H
+#ifndef FTUN_PROXY_OUTBOUND_CONNECTOR_H
+#define FTUN_PROXY_OUTBOUND_CONNECTOR_H
 #include "libs/transport/path.h"
 
-/* Connector：出站“怎么连上对端”的扩展点。每种出站协议（direct、socks5，以后的
- * tls、anytls、mesh 承载……）是登记表里的一项：名字、能力位和 open。
- * 登记表由组合层静态建立，取代只服务于测试的写死字段的函数表；加一种协议时
- * 登记一项，不改结构体。
- *
- * open 的 request 是该 Connector 约定的具体请求类型（direct 为
- * ftun_direct_request_t，socks5 为 ftun_socks5_connect_request_t）；调用方按名字
- * 查到项就知道类型。完成方式沿用各自的契约：返回 Operation，接纳后由 Event/Operation
- * 恰好一次终结，同步拒绝清空 out 且零回调。 */
+/* 出站登记表属于 Proxy；每个实现接收同一个类型化出站请求。
+ * 请求在 open 返回前借用；异步拥有权由具体连接器复制与保留。 */
+typedef struct ftun_outbound_request ftun_outbound_request_t;
 #define FTUN_CONNECTOR_MAX 8u
 #define FTUN_CONNECTOR_TCP 0x01u
 #define FTUN_CONNECTOR_UDP 0x02u
@@ -22,7 +16,7 @@
 typedef struct {
   const char *kind;
   uint32_t capabilities;
-  ftun_status_t (*open)(void *context, ftun_core_t *core, const void *request,
+  ftun_status_t (*open)(void *context, ftun_core_t *core, const ftun_outbound_request_t *request,
                         ftun_operation_t **out);
   void *context;
 } ftun_connector_ops_t;

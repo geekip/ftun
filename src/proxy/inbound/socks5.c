@@ -180,7 +180,7 @@ ftun_status_t ftun_socks5_server_create(const ftun_inbound_spec_t *spec,
   }
   server = (ftun_socks5_server_t *)calloc(1u, sizeof(*server));
   if (server == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   server->reservation = reservation;
@@ -192,7 +192,7 @@ ftun_status_t ftun_socks5_server_create(const ftun_inbound_spec_t *spec,
       free(server->credential_bytes);
       free(server->users);
       free(server);
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return FTUN_E_LIMIT;
     }
   }
@@ -406,8 +406,7 @@ ftun_status_t ftun_socks5_server_destroy(ftun_socks5_server_t **server)
   if (server == NULL) return FTUN_E_INVALID;
   owned = *server;
   if (owned == NULL) return FTUN_OK;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned->credential_bytes);
   free(owned->users);
   memset(owned, 0, sizeof(*owned));

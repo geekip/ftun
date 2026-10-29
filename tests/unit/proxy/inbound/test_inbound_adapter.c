@@ -160,7 +160,7 @@ static int cleanup(fixture_t *f)
   CHECK(ftun_operation_queue_stop(f->operations) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&f->operations) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&f->pool) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(f->budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(f->budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&f->budget) == FTUN_OK);
   return 0;
 }
@@ -237,7 +237,7 @@ static int socks(bool auth, size_t fragment, bool mixed, bool pooled)
   if (event.preread.owner != NULL) {
     if (pooled) CHECK(ftun_buffer_pool_destroy(&f.pool) == FTUN_E_AGAIN && f.pool != NULL);
     CHECK(ftun_buffer_slice_data(&event.preread, &bytes) == FTUN_OK && bytes.length <= 5u);
-    CHECK(ftun_buffer_slice_release(&event.preread) == FTUN_OK);
+    ftun_buffer_slice_release(&event.preread);
   }
   /* 已拥有的预读在 adapter 销毁后仍有效。 */
   CHECK(ftun_stream_abort(f.stream) == FTUN_OK);
@@ -283,7 +283,7 @@ static int http(const char *input, size_t length, const char *preread,
     else CHECK(f.output_length > 12u && memcmp(f.output,
       result == FTUN_OK ? "HTTP/1.1 200" :
       result == FTUN_E_REJECTED ? "HTTP/1.1 403" : "HTTP/1.1 502", 12u) == 0);
-    CHECK(ftun_buffer_slice_release(&event.preread) == FTUN_OK);
+    ftun_buffer_slice_release(&event.preread);
   }
   CHECK(cleanup(&f) == 0);
   return 0;
@@ -374,7 +374,7 @@ static int admission_and_deadline(void)
   spec.budget = small;
   CHECK(ftun_inbound_adapter_create(f.stream, &spec, 1u, 1u, NULL, NULL, &other) ==
     FTUN_E_LIMIT && other == NULL);
-  CHECK(ftun_budget_get_usage(small, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(small, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&small) == FTUN_OK);
   spec.budget = f.budget;
   CHECK(ftun_inbound_adapter_create(f.stream, &spec, 1u, 1u, NULL, NULL, &other) == FTUN_OK);

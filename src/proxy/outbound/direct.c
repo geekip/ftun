@@ -183,11 +183,11 @@ static void ftun_direct_release_context(ftun_direct_context_t *context)
   network_view = context->network_view;
   context->reservation = (ftun_reservation_t){0};
   context->network_view = NULL;
-  (void)ftun_path_scope_release(&context->scope);
+  ftun_path_scope_release(&context->scope);
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_network_view_release(&network_view);
-  (void)ftun_reservation_release(&reservation);
+  ftun_network_view_release(&network_view);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_direct_completed(ftun_operation_t *operation,
@@ -365,7 +365,7 @@ static ftun_status_t ftun_direct_open_internal(
   if (status != FTUN_OK) return status;
   context = (ftun_direct_context_t *)calloc(1u, allocation_size);
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->core = core;

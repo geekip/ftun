@@ -95,9 +95,8 @@ ftun_status_t ftun_proxy_runtime_udp_slot_reset(ftun_proxy_runtime_udp_slot_t *s
   engine = slot->engine;
   token = slot->slot_token;
   ftun_proxy_runtime_udp_unschedule(slot);
-  status = ftun_path_scope_release(&slot->path_scope);
-  if (status == FTUN_OK) status = ftun_resolver_scope_release(&slot->resolver_scope);
-  if (status != FTUN_OK) return status;
+  ftun_path_scope_release(&slot->path_scope);
+  ftun_resolver_scope_release(&slot->resolver_scope);
   status = ftun_proxy_runtime_object_release(&slot->budget, &slot->admission);
   if (status != FTUN_OK) return status;
   owned = slot;
@@ -660,10 +659,10 @@ void ftun_proxy_runtime_udp_pending_release(
   engine = pending->engine;
   token = pending->slot_token;
   if (pending->tun) engine->tun_pending_count--;
-  (void)ftun_datagram_release(&pending->inbound);
-  (void)ftun_resolver_scope_release(&pending->resolver_scope);
-  (void)ftun_path_scope_release(&pending->path_scope);
-  (void)ftun_packet_release(&pending->packet);
+  ftun_datagram_release(&pending->inbound);
+  ftun_resolver_scope_release(&pending->resolver_scope);
+  ftun_path_scope_release(&pending->path_scope);
+  ftun_packet_release(&pending->packet);
   (void)ftun_runtime_release(&pending->runtime);
   owned = pending;
   if (ftun_proxy_slot_pool_release(engine->udp_pending_pool, token,
@@ -1378,13 +1377,13 @@ ftun_status_t ftun_proxy_runtime_listener_udp(ftun_proxy_runtime_t *engine,
     if (status == FTUN_OK) {
       status = ftun_packet_init(&packet, &slice, flow->udp_inbound_id);
     }
-    (void)ftun_buffer_slice_release(&slice);
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_slice_release(&slice);
+    ftun_buffer_release(&buffer);
     if (status == FTUN_OK) {
       status = ftun_proxy_runtime_udp_route_datagram(engine, flow->udp_channel,
         &metadata, &packet, flow->udp_runtime, false);
     }
-    (void)ftun_packet_release(&packet);
+    ftun_packet_release(&packet);
     /* Client/protocol/routing failures drop this datagram, not the daemon. */
     (void)status;
   }

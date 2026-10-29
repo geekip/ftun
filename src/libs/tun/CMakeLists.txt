@@ -1,10 +1,10 @@
 set(ftun_sources_lib_tun
   device.c
   dispatch.c
-  linux/device.c
-  linux/interface.c
-  linux/routes.c
-  linux/routes_async.c
+  port.c
+  interface.c
+  routes.c
+  routes_async.c
   owner.c
   path.c
   route.c

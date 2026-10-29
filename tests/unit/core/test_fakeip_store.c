@@ -282,7 +282,7 @@ static int test_bounded_resources(void)
       CHECK(ftun_fakeip_store_initialize_budget(observed_budget, directory, &identity) == FTUN_E_LIMIT);
       CHECK(access(directory, F_OK) != 0 && observed_count == 0u);
       CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
-        usage.used == 0u && usage.used_resources.descriptors == 0u);
+        usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
     } else {
       CHECK(ftun_fakeip_store_initialize_budget(observed_budget, directory, &identity) == FTUN_OK);
       CHECK(ftun_worker_create(observed_budget, 2u, &worker) == FTUN_OK);
@@ -291,19 +291,19 @@ static int test_bounded_resources(void)
       CHECK(ftun_budget_get_usage(observed_budget, &before) == FTUN_OK);
       CHECK(ftun_fakeip_store_open(&store_options, &store) == FTUN_OK);
       CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
-        usage.used > before.used && usage.used_resources.descriptors == 1u && observed_count == 1u);
-      CHECK(ftun_budget_reserve(observed_budget, usage.normal_available, &hold) == FTUN_OK);
+        usage.used_resources.memory_bytes > before.used_resources.memory_bytes && usage.used_resources.descriptors == 1u && observed_count == 1u);
+      CHECK(ftun_budget_reserve(observed_budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
       CHECK(ftun_fakeip_store_reserve(store, 110u, &operation) == FTUN_E_LIMIT && operation == NULL);
-      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      ftun_reservation_release(&hold);
       CHECK(ftun_budget_reserve_resources(observed_budget, full, &hold) == FTUN_OK);
       opens = observed_opens;
       CHECK(ftun_fakeip_snapshot_load(store, 16u, &loaded) == FTUN_E_LIMIT && loaded == NULL);
-      CHECK(observed_opens == opens && ftun_reservation_release(&hold) == FTUN_OK);
+      CHECK(observed_opens == opens); ftun_reservation_release(&hold);
       memcpy(empty.uuid, identity.uuid, sizeof(empty.uuid));
       CHECK(ftun_budget_reserve_resources(observed_budget, one, &hold) == FTUN_OK);
       CHECK(ftun_fakeip_snapshot_save(store, &empty, &operation) == FTUN_OK);
       CHECK(poll_until(worker, &completion, 1u) && completion.status == FTUN_E_LIMIT);
-      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      ftun_reservation_release(&hold);
       CHECK(ftun_fakeip_snapshot_load(store, 16u, &loaded) == FTUN_OK && loaded->mapping_count == 0u);
       CHECK(ftun_fakeip_snapshot_destroy(&loaded) == FTUN_OK);
       CHECK(ftun_fakeip_snapshot_save(store, &empty, &operation) == FTUN_OK);
@@ -312,10 +312,10 @@ static int test_bounded_resources(void)
       CHECK(ftun_fakeip_store_reserve(store, 110u, &operation) == FTUN_OK);
       CHECK(poll_until(worker, &completion, 3u) && completion.status == FTUN_E_LIMIT);
       CHECK(ftun_fakeip_store_get_info(store, &info) == FTUN_OK && info.halted && info.sequence == 0u && info.reserved_end == 100u);
-      CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+      ftun_reservation_release(&hold);
       CHECK(ftun_fakeip_store_destroy(&store) == FTUN_OK && observed_count == 0u);
       CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
-        usage.used == before.used && usage.metadata_bytes == before.metadata_bytes &&
+        usage.used_resources.memory_bytes == before.used_resources.memory_bytes && usage.metadata_bytes == before.metadata_bytes &&
         usage.used_resources.descriptors == before.used_resources.descriptors);
       CHECK(ftun_worker_stop(worker) == FTUN_OK && ftun_worker_join(worker) == FTUN_OK);
       CHECK(ftun_worker_destroy(&worker) == FTUN_OK);

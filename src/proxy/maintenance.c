@@ -90,6 +90,8 @@ ftun_status_t ftun_proxy_runtime_http_execute(
   etag = password + header->password_length;
   memset(&spec, 0, sizeof(spec));
   spec.budget = budget;
+  spec.tls_context = header->tls_context;
+  spec.protocol = header->protocol;
   spec.url.data = url;
   spec.url.length = header->url_length;
   spec.maximum_bytes = maximum;
@@ -255,7 +257,6 @@ ftun_status_t ftun_proxy_runtime_http_submit(
   size_t password_length;
   size_t etag_length;
   ftun_reservation_t input_reservation = (ftun_reservation_t){0};
-  ftun_status_t release_status;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (engine == NULL || engine->budget == NULL || spec == NULL || completion == NULL || out == NULL ||
@@ -288,12 +289,14 @@ ftun_status_t ftun_proxy_runtime_http_submit(
   if (status != FTUN_OK) return status;
   input = (uint8_t *)calloc(1u, input_length);
   if (input == NULL) {
-    (void)ftun_reservation_release(&input_reservation);
+    ftun_reservation_release(&input_reservation);
     return FTUN_E_LIMIT;
   }
   header = (ftun_proxy_runtime_http_work_t *)input;
   header->magic = FTUN_PROXY_RUNTIME_HTTP_WORK_MAGIC;
   header->budget = (uintptr_t)engine->budget;
+  header->tls_context = &engine->http_tls_context;
+  header->protocol = spec->protocol;
   header->mark = spec->socket_mark;
   header->generation = spec->generation;
   header->purpose = spec->purpose;
@@ -341,7 +344,7 @@ ftun_status_t ftun_proxy_runtime_http_submit(
     status = ftun_runtime_retain(runtime_snapshot);
     if (status != FTUN_OK) {
       free(input);
-      (void)ftun_reservation_release(&input_reservation);
+      ftun_reservation_release(&input_reservation);
       return status;
     }
   }
@@ -351,10 +354,7 @@ ftun_status_t ftun_proxy_runtime_http_submit(
     (void)ftun_runtime_release(&runtime_snapshot);
   }
   free(input);
-  release_status = ftun_reservation_release(&input_reservation);
-  if (status != FTUN_OK && release_status != FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&input_reservation);
   return status;
 }
 
@@ -515,7 +515,7 @@ ftun_status_t ftun_proxy_runtime_fakeip_prepare(ftun_proxy_runtime_t *engine,
     if (status != FTUN_OK) return status;
     engine->fakeip_directory = (char *)malloc(path_length + sizeof(".fakeip"));
     if (engine->fakeip_directory == NULL) {
-      (void)ftun_reservation_release(&engine->fakeip_directory_reservation);
+      ftun_reservation_release(&engine->fakeip_directory_reservation);
       return FTUN_E_LIMIT;
     }
     memcpy(engine->fakeip_directory, ftun_config_base(config)->cache_file, path_length);
@@ -789,7 +789,7 @@ ftun_status_t ftun_proxy_runtime_health_prepare(
   if (groups == NULL || slots == NULL) {
     free(groups);
     free(slots);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   status = ftun_monotonic_now(&now_ms);
@@ -832,7 +832,7 @@ ftun_status_t ftun_proxy_runtime_health_prepare(
   if (status != FTUN_OK) {
     free(groups);
     free(slots);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   *out_groups = groups;
@@ -861,7 +861,8 @@ ftun_status_t ftun_proxy_runtime_health_release(
   free(*slots);
   *groups = NULL;
   *slots = NULL;
-  return ftun_reservation_release(reservation);
+  ftun_reservation_release(reservation);
+  return FTUN_OK;
 }
 
 void ftun_proxy_runtime_health_consume(ftun_proxy_runtime_t *engine,
@@ -981,7 +982,7 @@ ftun_status_t ftun_proxy_runtime_health_publish(
 done:
   free(samples);
   free(members);
-  (void)ftun_reservation_release(&scratch_reservation);
+  ftun_reservation_release(&scratch_reservation);
   (void)ftun_runtime_release(&runtime);
   return status;
 }
@@ -1205,7 +1206,7 @@ ftun_status_t ftun_proxy_runtime_copy_etag(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   *out = (char *)malloc(length + 1u);
   if (*out == NULL) {
-    (void)ftun_reservation_release(out_reservation);
+    ftun_reservation_release(out_reservation);
     return FTUN_E_LIMIT;
   }
   memcpy(*out, value, length);
@@ -1227,7 +1228,7 @@ ftun_status_t ftun_proxy_runtime_replace_etag(ftun_proxy_runtime_t *engine,
     &reservation);
   if (status != FTUN_OK) return status;
   free(engine->frs_etag);
-  (void)ftun_reservation_release(&engine->frs_etag_reservation);
+  ftun_reservation_release(&engine->frs_etag_reservation);
   engine->frs_etag = copy;
   engine->frs_etag_reservation = reservation;
   return FTUN_OK;
@@ -1291,7 +1292,6 @@ ftun_status_t ftun_proxy_runtime_frs_publish_submit(
   size_t path_length;
   size_t input_length;
   ftun_reservation_t input_reservation = (ftun_reservation_t){0};
-  ftun_status_t release_status;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (engine == NULL || path == NULL || path[0] == '\0' ||
@@ -1309,7 +1309,7 @@ ftun_status_t ftun_proxy_runtime_frs_publish_submit(
   if (status != FTUN_OK) return status;
   input = (uint8_t *)malloc(input_length);
   if (input == NULL) {
-    (void)ftun_reservation_release(&input_reservation);
+    ftun_reservation_release(&input_reservation);
     return FTUN_E_LIMIT;
   }
   work = (ftun_proxy_runtime_frs_publish_work_t *)input;
@@ -1330,10 +1330,7 @@ ftun_status_t ftun_proxy_runtime_frs_publish_submit(
   status = ftun_worker_submit(engine->maintenance_worker, &job, completion,
                               engine, out);
   free(input);
-  release_status = ftun_reservation_release(&input_reservation);
-  if (status != FTUN_OK && release_status != FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&input_reservation);
   return status;
 }
 
@@ -1428,7 +1425,7 @@ void ftun_proxy_runtime_frs_publish_completed(ftun_operation_t *operation,
   }
   if (status == FTUN_OK) {
     free(engine->frs_etag);
-    (void)ftun_reservation_release(&engine->frs_etag_reservation);
+    ftun_reservation_release(&engine->frs_etag_reservation);
     engine->frs_etag = engine->frs_candidate_etag;
     engine->frs_etag_reservation = engine->frs_candidate_etag_reservation;
     engine->frs_candidate_etag = NULL;
@@ -1460,10 +1457,10 @@ void ftun_proxy_runtime_frs_publish_completed(ftun_operation_t *operation,
   }
   free(engine->frs_candidate_etag);
   engine->frs_candidate_etag = NULL;
-  (void)ftun_reservation_release(&engine->frs_candidate_etag_reservation);
+  ftun_reservation_release(&engine->frs_candidate_etag_reservation);
   free(engine->frs_group_records);
   engine->frs_group_records = NULL;
-  (void)ftun_reservation_release(&engine->frs_group_records_reservation);
+  ftun_reservation_release(&engine->frs_group_records_reservation);
   engine->frs_group_record_capacity = 0u;
   ftun_proxy_runtime_frs_schedule_next(engine, now_ms);
   if (status != FTUN_OK && status != FTUN_E_STALE &&
@@ -1644,8 +1641,8 @@ void ftun_proxy_runtime_frs_completed(ftun_operation_t *operation,
   if (!publish_scheduled) ftun_proxy_runtime_frs_release_generation(engine);
   free(candidate_etag);
   free(records);
-  (void)ftun_reservation_release(&etag_reservation);
-  (void)ftun_reservation_release(&records_reservation);
+  ftun_reservation_release(&etag_reservation);
+  ftun_reservation_release(&records_reservation);
   {
     ftun_status_t cleanup = ftun_runtime_prepared_release(&prepared);
     if (status == FTUN_OK) status = cleanup;
@@ -1684,7 +1681,7 @@ ftun_status_t ftun_proxy_runtime_frs_schedule(ftun_proxy_runtime_t *engine)
   }
   if (status == FTUN_OK) status = ftun_runtime_config(runtime, &config);
   if (status == FTUN_OK) status = ftun_budget_get_usage(engine->budget, &usage);
-  if (status == FTUN_OK && usage.normal_available / 2u < FTUN_FRS_HEADER_BYTES) {
+  if (status == FTUN_OK && usage.normal_available_resources.memory_bytes / 2u < FTUN_FRS_HEADER_BYTES) {
     status = FTUN_E_LIMIT;
   }
   memset(&spec, 0, sizeof(spec));
@@ -1694,7 +1691,7 @@ ftun_status_t ftun_proxy_runtime_frs_schedule(ftun_proxy_runtime_t *engine)
     spec.url.length = strlen(ftun_config_frs(config)->url);
     /* 这里只限制业务输入；下载、校验和新旧候选按各自拥有期实际准入，
      * 不把此上限作为任务额外总预留，也不承诺上限大小的响应必能接纳。 */
-    spec.maximum_bytes = usage.normal_available / 2u;
+    spec.maximum_bytes = usage.normal_available_resources.memory_bytes / 2u;
     spec.socket_mark = engine->socket_mark;
     if (engine->now_ms > UINT64_MAX - UINT64_C(30000)) status = FTUN_E_LIMIT;
     else spec.deadline_ms = engine->now_ms + UINT64_C(30000);

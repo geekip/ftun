@@ -4,7 +4,7 @@
 #include "dns/dispatcher.h"
 #include "proxy/dns/runtime_adapter.h"
 
-/* 
+/*
  * Proxy adapter 保持既有策略入口，DNS 原语不反向依赖 Proxy。 */
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -182,7 +182,7 @@ static void ftun_dns_named_completed(ftun_operation_t *operation,
   (void)ftun_dns_message_release(&message);
   context->completion(operation, error, &result, context->completion_user);
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_dns_named_wire(ftun_string_t domain, uint16_t id,
@@ -256,7 +256,7 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   if (status != FTUN_OK) return status;
   context = (ftun_dns_named_context_t *)calloc(1u, sizeof(*context));
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->reservation = reservation;
@@ -285,7 +285,7 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
                              &query, out);
   if (status != FTUN_OK) {
     free(context);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
   }
   return status;
 }

@@ -19,24 +19,24 @@ static int context_case(void)
   CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_budget_create(NULL, 65536u, 0u, &alternate) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &empty) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, empty.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, empty.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_core_context_create(budget, &core) == FTUN_E_LIMIT && core == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &first) == FTUN_OK && first.used > 0u);
+  CHECK(ftun_budget_get_usage(budget, &first) == FTUN_OK && first.used_resources.memory_bytes > 0u);
   CHECK(ftun_core_context_create(budget, &second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &both) == FTUN_OK && both.used == 2u * first.used);
+  CHECK(ftun_budget_get_usage(budget, &both) == FTUN_OK && both.used_resources.memory_bytes == 2u * first.used_resources.memory_bytes);
   CHECK(ftun_core_context_bind(core, &extension) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_E_AGAIN && core != NULL);
   CHECK(ftun_core_context_bind(core, NULL) == FTUN_OK);
   CHECK(ftun_core_context_set_budget(core, alternate) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == both.used);
-  CHECK(ftun_budget_get_usage(alternate, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == both.used_resources.memory_bytes);
+  CHECK(ftun_budget_get_usage(alternate, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_core_context_destroy(&second) == FTUN_OK && second == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == first.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == first.used_resources.memory_bytes);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN && budget != NULL);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK && core == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u &&
         usage.metadata_bytes == empty.metadata_bytes);
   CHECK(ftun_budget_destroy(&alternate) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
@@ -112,29 +112,29 @@ static int app_case(void)
   CHECK(ftun_core_context_budget(core, &control) == FTUN_OK);
   CHECK(ftun_budget_get_usage(control, &baseline) == FTUN_OK);
   /* task 指针环和 Operation 存储是两份内存，但同一容量只计一组槽。 */
-  CHECK(baseline.used > 0u && baseline.used_resources.queue_slots >= 4u);
+  CHECK(baseline.used_resources.memory_bytes > 0u && baseline.used_resources.queue_slots >= 4u);
   CHECK(ftun_budget_reserve(control, 1u, &hold) == FTUN_OK);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
   CHECK(ftun_core_context_budget(core, &root) == FTUN_OK && root != control);
-  CHECK(ftun_budget_get_usage(control, &live) == FTUN_OK && live.used > 1u);
-  CHECK(live.used < baseline.used && live.used_resources.queue_slots == 0u &&
+  CHECK(ftun_budget_get_usage(control, &live) == FTUN_OK && live.used_resources.memory_bytes > 1u);
+  CHECK(live.used_resources.memory_bytes < baseline.used_resources.memory_bytes && live.used_resources.queue_slots == 0u &&
         live.used_resources.descriptors == 0u);
   CHECK(ftun_core_get_info(core, &info) == FTUN_OK && info.state == FTUN_CORE_STOPPED);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
-  CHECK(ftun_budget_get_usage(control, &usage) == FTUN_OK && usage.used == live.used);
+  CHECK(ftun_budget_get_usage(control, &usage) == FTUN_OK && usage.used_resources.memory_bytes == live.used_resources.memory_bytes);
   CHECK(ftun_budget_create(control, 1024u, 0u, &control_child) == FTUN_OK);
   CHECK(ftun_budget_create(root, 1024u, 0u, &root_child) == FTUN_OK);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
   CHECK(ftun_budget_destroy(&control_child) == FTUN_OK);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
-  CHECK(ftun_budget_get_usage(control, &usage) == FTUN_OK && usage.used == live.used - 1u);
+  CHECK(ftun_budget_get_usage(control, &usage) == FTUN_OK && usage.used_resources.memory_bytes == live.used_resources.memory_bytes - 1u);
   CHECK(ftun_budget_destroy(&root_child) == FTUN_OK);
   CHECK(ftun_budget_reserve_resources(root,
     (ftun_budget_resources_t){0u, 1u, 1u}, &hold) == FTUN_OK);
   CHECK(ftun_core_destroy(&core) == FTUN_E_AGAIN && core != NULL);
   CHECK(ftun_core_get_info(core, &info) == FTUN_OK && info.state == FTUN_CORE_STOPPED);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_core_destroy(&core) == FTUN_OK && core == NULL);
   CHECK(ftun_core_destroy(&core) == FTUN_OK);
   return 0;

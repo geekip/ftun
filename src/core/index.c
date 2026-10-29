@@ -110,7 +110,7 @@ static ftun_status_t ftun_index_rehash(ftun_index_t *index,
   if (status != FTUN_OK) return status;
   next = (ftun_index_slot_t *)calloc(new_capacity, sizeof(*next));
   if (next == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   for (cursor = 0u; cursor < index->capacity; cursor++) {
@@ -131,9 +131,7 @@ static ftun_status_t ftun_index_rehash(ftun_index_t *index,
   index->capacity = new_capacity;
   index->tombstones = 0u;
   index->table_reservation = reservation;
-  if (ftun_reservation_release(&old_reservation) != FTUN_OK) {
-    return FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&old_reservation);
   return FTUN_OK;
 }
 
@@ -166,7 +164,7 @@ ftun_status_t ftun_index_create(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   status = ftun_budget_reserve(budget, table_bytes, &table_reservation);
   if (status != FTUN_OK) {
-    (void)ftun_reservation_release(&self_reservation);
+    ftun_reservation_release(&self_reservation);
     return status;
   }
   index = (ftun_index_t *)calloc(1u, sizeof(*index));
@@ -187,8 +185,8 @@ ftun_status_t ftun_index_create(ftun_budget_t *budget,
 allocation_error:
   if (index != NULL) free(index->slots);
   free(index);
-  (void)ftun_reservation_release(&table_reservation);
-  (void)ftun_reservation_release(&self_reservation);
+  ftun_reservation_release(&table_reservation);
+  ftun_reservation_release(&self_reservation);
   return FTUN_E_LIMIT;
 }
 
@@ -228,7 +226,7 @@ ftun_status_t ftun_index_insert(ftun_index_t *index, ftun_bytes_t key,
     if (status != FTUN_OK) return status;
     copy = (uint8_t *)malloc(key.length);
     if (copy == NULL) {
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return FTUN_E_LIMIT;
     }
     memcpy(copy, key.data, key.length);
@@ -286,9 +284,7 @@ ftun_status_t ftun_index_remove(ftun_index_t *index, ftun_bytes_t key,
   slot->state = FTUN_INDEX_TOMBSTONE;
   index->entries--;
   index->tombstones++;
-  if (ftun_reservation_release(&reservation) != FTUN_OK) {
-    return FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&reservation);
   return FTUN_OK;
 }
 
@@ -320,19 +316,14 @@ ftun_status_t ftun_index_destroy(ftun_index_t **index)
     if (slot->state != FTUN_INDEX_OCCUPIED) continue;
     reservation = slot->reservation;
     free(slot->key);
-    if (ftun_reservation_release(&reservation) != FTUN_OK) {
-      return FTUN_E_STATE_CORRUPT;
-    }
+    ftun_reservation_release(&reservation);
   }
   table_reservation = owned->table_reservation;
   self_reservation = owned->self_reservation;
   free(owned->slots);
   free(owned);
   *index = NULL;
-  if (ftun_reservation_release(&table_reservation) != FTUN_OK ||
-      ftun_reservation_release(&self_reservation) != FTUN_OK) {
-    return FTUN_E_STATE_CORRUPT;
-  }
+  ftun_reservation_release(&table_reservation); ftun_reservation_release(&self_reservation);
   return FTUN_OK;
 }
 

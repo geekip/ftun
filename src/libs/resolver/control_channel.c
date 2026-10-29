@@ -202,7 +202,7 @@ ftun_status_t ftun_control_channel_create_execution(
   if (status != FTUN_OK) return status;
   channel = calloc(1u, sizeof(*channel));
   if (channel == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   channel->budget = budget;
@@ -387,8 +387,8 @@ ftun_status_t ftun_control_channel_write(void *user, const uint8_t *data,
   }
   if (status == FTUN_OK) status = ftun_channel_write_ref(channel->data,
     &slice, &accepted, &channel->writing);
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   while (status == FTUN_OK && channel->writing != NULL) {
     status = ftun_control_channel_wait(channel);
   }
@@ -426,8 +426,8 @@ ftun_status_t ftun_control_channel_send(ftun_control_channel_t *channel,
     status = ftun_channel_send(channel->data, target, &packet);
     if (status != FTUN_OK) channel->sending = false;
   }
-  (void)ftun_packet_release(&packet);
-  (void)ftun_buffer_release(&buffer);
+  ftun_packet_release(&packet);
+  ftun_buffer_release(&buffer);
   while (status == FTUN_OK && channel->sending) {
     status = ftun_control_channel_wait(channel);
   }
@@ -497,7 +497,7 @@ ftun_status_t ftun_control_channel_receive(ftun_control_channel_t *channel,
     *length = bytes.length;
     *source = channel->received_source;
   }
-  (void)ftun_packet_release(&channel->received);
+  ftun_packet_release(&channel->received);
   channel->has_received = false;
   resumed = ftun_path_resume(channel->path);
   if (resumed != FTUN_OK) channel->status = resumed;
@@ -536,7 +536,7 @@ ftun_status_t ftun_control_channel_close(ftun_control_channel_t **pointer)
     if (status != FTUN_OK) return status;
     channel->data = NULL;
   }
-  (void)ftun_packet_release(&channel->received);
+  ftun_packet_release(&channel->received);
   channel->has_received = false;
   if (channel->resolver != NULL) {
     status = ftun_resolver_provider_stop_until(channel->resolver, UINT64_MAX);
@@ -566,7 +566,7 @@ ftun_status_t ftun_control_channel_close(ftun_control_channel_t **pointer)
     status = ftun_core_context_destroy(&channel->core);
     if (status != FTUN_OK) return status;
   }
-  (void)ftun_reservation_release(&channel->reservation);
+  ftun_reservation_release(&channel->reservation);
   free(channel);
   *pointer = NULL;
   return FTUN_OK;

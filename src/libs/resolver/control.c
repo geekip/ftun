@@ -5,7 +5,6 @@
 
 #include "util/ip.h"
 
-#include "libs/resolver/socks5_transport.h"
 #if defined(FTUN_HAVE_MODULE_DNS)
 #include "libs/resolver/dnswire.h"
 #endif
@@ -147,7 +146,7 @@ static ftun_status_t ftun_control_encode_query(
 static ftun_status_t ftun_control_dns_query(
   const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan,
-  const ftun_resolver_socks5_query_t *transport,
+  const ftun_resolver_transport_query_t *transport,
   ftun_string_t domain, uint16_t port, ftun_endpoint_t *out)
 {
   uint8_t query_wire[FTUN_DNS_HEADER_BYTES + FTUN_DNS_MAX_NAME_BYTES + 4u];
@@ -161,13 +160,17 @@ static ftun_status_t ftun_control_dns_query(
   size_t index;
   uint16_t id = UINT16_C(0x4654);
   ftun_status_t status;
-  (void)plan;
   status = ftun_control_encode_query(domain, id, query_wire,
     sizeof(query_wire), &query_length, &name_length);
   if (status == FTUN_OK) {
-    status = ftun_resolver_socks5_query_blocking(execution, transport,
-      (ftun_bytes_t){query_wire, query_length}, response, sizeof(response),
-      &response_length);
+    if (transport->use_proxy) {
+      status = plan->query == NULL ? FTUN_E_UNSUPPORTED :
+        plan->query(execution, transport, (ftun_bytes_t){query_wire, query_length},
+          response, sizeof(response), &response_length);
+    } else {
+      status = ftun_dns_query_blocking(execution, &transport->direct,
+        (ftun_bytes_t){query_wire, query_length}, response, sizeof(response), &response_length);
+    }
   }
   if (status == FTUN_OK) {
     status = ftun_dns_message_parse_with_budget(execution->budget,
@@ -208,7 +211,7 @@ static ftun_status_t ftun_control_dns_query(
 static ftun_status_t ftun_control_dns_query(
   const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan,
-  const ftun_resolver_socks5_query_t *transport,
+  const ftun_resolver_transport_query_t *transport,
   ftun_string_t domain, uint16_t port, ftun_endpoint_t *out)
 {
   (void)plan;
@@ -241,7 +244,7 @@ static ftun_status_t ftun_control_bootstrap(
     return status;
   }
   for (index = 0u; index < plan->bootstrap_count; index++) {
-    ftun_resolver_socks5_query_t query;
+    ftun_resolver_transport_query_t query;
     memset(&query, 0, sizeof(query));
     query.direct.upstream = plan->bootstrap[index];
     query.direct.socket_mark = plan->socket_mark;
@@ -273,7 +276,7 @@ static ftun_status_t ftun_control_resolve_raw(
   const ftun_control_resolver_plan_t *plan, ftun_string_t domain,
   uint16_t port, ftun_endpoint_t *out)
 {
-  ftun_resolver_socks5_query_t query;
+  ftun_resolver_transport_query_t query;
   ftun_endpoint_t upstream;
   ftun_endpoint_t proxy;
   ftun_status_t status;
@@ -339,7 +342,7 @@ static void ftun_control_resolution_completed(ftun_operation_t *operation,
   (void)ftun_event_source_cancel(&state->task);
   state->completion(operation, error, error.status == FTUN_OK ? &result : NULL, state->user);
   free(state);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_control_resolution_run(ftun_event_source_t *source,
@@ -383,7 +386,7 @@ static ftun_status_t ftun_control_resolver_start(void *context, ftun_core_t *cor
   status = ftun_budget_reserve(request->system.budget, sizeof(*state), &reservation);
   if (status != FTUN_OK) return status;
   state = calloc(1u, sizeof(*state));
-  if (state == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (state == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   state->reservation = reservation;
   state->binding = *binding;
   state->binding.execution.budget = request->system.budget;
@@ -404,7 +407,7 @@ static ftun_status_t ftun_control_resolver_start(void *context, ftun_core_t *cor
   if (status != FTUN_OK) {
     (void)ftun_event_source_cancel(&state->task);
     free(state);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   status = ftun_operation_set_cancel_hook(*out, ftun_control_resolution_cancel, state);

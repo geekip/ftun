@@ -618,59 +618,59 @@ static int resource_admission(void)
   CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
   set_config(&config, &plan, required, required);
   reset();
-  CHECK(ftun_budget_reserve(budget, baseline.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, baseline.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_core_module_runtime_prepare(&catalog, core, budget, operations,
     &config, 1u, &runtime, NULL) == FTUN_E_LIMIT);
   CHECK(runtime == NULL && event_count == 0u && faults_a.live == 0u && faults_b.live == 0u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_core_module_runtime_prepare(&catalog, core, budget, operations,
     &config, 1u, &runtime, NULL) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &active) == FTUN_OK && active.used > baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &active) == FTUN_OK && active.used_resources.memory_bytes > baseline.used_resources.memory_bytes);
   CHECK(active.used_resources.queue_slots == baseline.used_resources.queue_slots &&
         active.used_resources.descriptors == baseline.used_resources.descriptors);
   faults_b.destroy_failures = 1u;
   CHECK(ftun_core_module_runtime_destroy_until(&runtime, 100u) == FTUN_E_TIMEOUT);
   CHECK(runtime != NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == active.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == active.used_resources.memory_bytes);
   CHECK(ftun_core_module_runtime_destroy_until(&runtime, 100u) == FTUN_OK && runtime == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
         usage.metadata_bytes == baseline.metadata_bytes);
   reset();
   faults_b.fail_prepare = 1;
   faults_b.destroy_failures = 1u;
   CHECK(ftun_core_module_runtime_prepare(&catalog, core, budget, operations,
     &config, 1u, &runtime, NULL) == FTUN_E_IO && runtime != NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == active.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == active.used_resources.memory_bytes);
   CHECK(ftun_core_module_runtime_destroy_until(&runtime, 100u) == FTUN_OK && runtime == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
         usage.metadata_bytes == baseline.metadata_bytes);
   reset();
   last_plan_budget = NULL;
-  CHECK(ftun_budget_reserve(budget, baseline.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, baseline.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_core_module_reload_plan_prepare(&catalog, budget, &config, 0u,
     &reload_plan, NULL) == FTUN_E_LIMIT);
   CHECK(reload_plan == NULL && event_count == 0u && last_plan_budget == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_plan_calloc = true;
   CHECK(ftun_core_module_reload_plan_prepare(&catalog, budget, &config, 0u,
     &reload_plan, NULL) == FTUN_E_LIMIT && reload_plan == NULL && !fail_plan_calloc);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes);
   CHECK(ftun_core_module_reload_plan_prepare(&catalog, budget, &config, 0u,
     &reload_plan, NULL) == FTUN_OK && last_plan_budget == budget);
-  CHECK(ftun_budget_get_usage(budget, &active) == FTUN_OK && active.used > baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &active) == FTUN_OK && active.used_resources.memory_bytes > baseline.used_resources.memory_bytes);
   faults_b.plan_destroy_failures = 1u;
   CHECK(ftun_core_module_reload_plan_destroy(&reload_plan) == FTUN_E_AGAIN);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == active.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == active.used_resources.memory_bytes);
   CHECK(ftun_core_module_reload_plan_destroy(&reload_plan) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes);
   reset();
   faults_b.fail_plan = 1;
   faults_b.plan_destroy_failures = 1u;
   CHECK(ftun_core_module_reload_plan_prepare(&catalog, budget, &config, 0u,
     &reload_plan, NULL) == FTUN_E_IO && reload_plan != NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == active.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == active.used_resources.memory_bytes);
   CHECK(ftun_core_module_reload_plan_destroy(&reload_plan) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
     usage.metadata_bytes == baseline.metadata_bytes);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);

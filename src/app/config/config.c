@@ -22,7 +22,7 @@ static ftun_status_t ftun_config_read_file(ftun_budget_t *budget,
   ftun_budget_resources_t resources = {0u, 1u, 0u};
   uint8_t *data = NULL;
   size_t length = 0u, capacity = 0u;
-  int descriptor = -1;
+  ftun_handle_t descriptor = -1;
   ftun_file_info_t metadata;
   ftun_status_t status = FTUN_E_IO;
   *out = NULL;
@@ -88,7 +88,7 @@ static ftun_status_t ftun_config_read_file(ftun_budget_t *budget,
 done:
   if (descriptor >= 0) (void)ftun_file_close(descriptor);
   free(data);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -269,7 +269,7 @@ ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   status = ftun_config_parse_budget(budget, bytes, &config);
   free(data);
   data = NULL;
-  (void)ftun_reservation_release(&input_reservation);
+  ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) goto done;
   result.completed = FTUN_CONFIG_STEP_PARSE;
   step = FTUN_CONFIG_STEP_PATHS;
@@ -290,7 +290,7 @@ ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   config = NULL;
 done:
   free(data);
-  (void)ftun_reservation_release(&input_reservation);
+  ftun_reservation_release(&input_reservation);
   (void)ftun_feature_plan_destroy(&plan);
   (void)ftun_config_destroy(&config);
   result.status = status;

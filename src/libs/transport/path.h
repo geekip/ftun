@@ -64,7 +64,8 @@ ftun_status_t ftun_path_adopt_stream(const ftun_path_spec_t *spec,
 ftun_status_t ftun_path_adopt_datagram(const ftun_path_spec_t *spec,
   ftun_datagram_t **channel, ftun_path_t **out);
 ftun_status_t ftun_path_retain(ftun_path_t *path);
-ftun_status_t ftun_path_release(ftun_path_t **path);
+/* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
+void ftun_path_release(ftun_path_t **path);
 ftun_status_t ftun_path_get_info(const ftun_path_t *path, ftun_path_info_t *out);
 /* 通道仅借用；其拥有权不得从 Path 再次移走。额外 Stream 引用可以保留，
  * 但必须在 Path destroy 成功前释放；Datagram 借用不得超出 Path 引用寿命。 */
@@ -184,7 +185,7 @@ ftun_status_t ftun_path_provider_open_channel(ftun_path_provider_t *provider,
 ftun_status_t ftun_path_provider_scope(ftun_path_provider_t *provider,
   uint64_t configuration_generation, ftun_path_scope_t **out);
 ftun_status_t ftun_path_scope_retain(ftun_path_scope_t *scope);
-ftun_status_t ftun_path_scope_release(ftun_path_scope_t **scope);
+void ftun_path_scope_release(ftun_path_scope_t **scope);
 ftun_status_t ftun_path_scope_generation(const ftun_path_scope_t *scope, uint64_t *out);
 ftun_status_t ftun_path_scope_open(ftun_path_scope_t *scope, ftun_core_t *core,
   const ftun_path_open_request_t *request, ftun_operation_t **out);

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "platform/linux/route.h"
 #include <fcntl.h>
 #include "app/config/model.h"
 #include "libs/tun/service.h"
@@ -10,8 +11,8 @@
 #include "core/event/loop.h"
 #include "core/event/backend.h"
 #include "libs/tun/owner.h"
-#include "libs/tun/linux/interface.h"
-#include "libs/tun/linux/routes.h"
+#include "libs/tun/interface_backend.h"
+#include "libs/tun/routes.h"
 #include "platform/clock.h"
 
 #include <stdio.h>
@@ -55,14 +56,14 @@ typedef struct {
   bool close_order_error;
   bool real_descriptor;
   int descriptor;
-  ftun_linux_route_resource_t resources[32];
+  ftun_route_resource_t resources[32];
   size_t resource_count;
   bool provide_packet;
   bool stall_writes;
   bool withhold_replies;
   bool withhold_add_reply;
   bool has_reply;
-  ftun_linux_route_reply_t reply;
+  ftun_route_reply_t reply;
   size_t async_requests;
 } host_state_t;
 
@@ -166,8 +167,8 @@ static ftun_status_t fake_close(void *user, ftun_packet_port_t **port)
   return FTUN_OK;
 }
 
-static bool resource_equal(const ftun_linux_route_resource_t *left,
-                             const ftun_linux_route_resource_t *right)
+static bool resource_equal(const ftun_route_resource_t *left,
+                             const ftun_route_resource_t *right)
 {
   return left->kind == right->kind && left->family == right->family &&
     strcmp(left->interface_name, right->interface_name) == 0 &&
@@ -179,7 +180,7 @@ static bool resource_equal(const ftun_linux_route_resource_t *left,
 }
 
 static ftun_status_t route_apply(
-  void *context, const ftun_linux_route_resource_t *resource)
+  void *context, const ftun_route_resource_t *resource)
 {
   host_state_t *state = (host_state_t *)context;
   size_t index;
@@ -200,7 +201,7 @@ static ftun_status_t route_apply(
 }
 
 static ftun_status_t route_remove(
-  void *context, const ftun_linux_route_resource_t *resource)
+  void *context, const ftun_route_resource_t *resource)
 {
   host_state_t *state = (host_state_t *)context;
   size_t index;
@@ -487,8 +488,8 @@ static void set_config(ftun_config_t *config, ftun_feature_plan_t *plan,
   config->tun.ipv4_address = inbound->ipv4_address;
   config->tun.auto_route = inbound->auto_route;
   config->tun.strict_route = inbound->strict_route;
-  config->tun.route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
-  config->tun.rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
+  config->tun.route_table = 18004u;
+  config->tun.rule_priority = 11000u;
   plan->modules.required_modules |= FTUN_BUILD_MODULE_TUN;
 }
 
@@ -499,7 +500,7 @@ static bool network_matches(const host_state_t *host, const uint8_t address[4],
   size_t blocks = 0u;
   size_t index;
   for (index = 0u; index < host->resource_count; index++) {
-    const ftun_linux_route_resource_t *resource = &host->resources[index];
+    const ftun_route_resource_t *resource = &host->resources[index];
     if (resource->kind == FTUN_LINUX_ROUTE_ADDRESS) {
       if (memcmp(resource->address, address, 4u) != 0 ||
           resource->prefix_length != prefix) return false;
@@ -613,12 +614,12 @@ static int test_network_update(ftun_core_t *core, ftun_budget_t *budget,
   return 0;
 }
 
-static ftun_status_t async_submit(void *context, const ftun_linux_route_request_t *request)
+static ftun_status_t async_submit(void *context, const ftun_route_request_t *request)
 {
   host_state_t *host = context;
   size_t index;
   host->async_requests++;
-  host->reply = (ftun_linux_route_reply_t){request->sequence, FTUN_OK, false};
+  host->reply = (ftun_route_reply_t){request->sequence, FTUN_OK, false};
   if (request->kind == FTUN_LINUX_ROUTE_REQUEST_QUERY) {
     for (index = 0u; index < host->resource_count; index++) {
       if (resource_equal(&host->resources[index], &request->resource)) host->reply.present = true;
@@ -634,7 +635,7 @@ static ftun_status_t async_submit(void *context, const ftun_linux_route_request_
   return FTUN_OK;
 }
 
-static ftun_status_t async_receive(void *context, ftun_linux_route_reply_t *reply)
+static ftun_status_t async_receive(void *context, ftun_route_reply_t *reply)
 {
   host_state_t *host = context;
   if (host->withhold_replies || !host->has_reply) return FTUN_E_AGAIN;
@@ -649,9 +650,9 @@ static int test_network_changed_repair(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
 {
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   const ftun_interface_ops_t *previous = binding->network;
-  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_route_async_io_t io = {async_submit, async_receive, host};
   ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
   ftun_config_t config;
   ftun_feature_plan_t plan;
@@ -710,7 +711,7 @@ static int test_network_changed_repair(ftun_core_t *core, ftun_budget_t *budget,
     CHECK(status == FTUN_OK || status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
   }
   CHECK(owner == NULL && host->resource_count == 0u);
-  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes);
   host->fail_apply_at = 0u;
   host->async_requests = 0u;
   binding->network = previous;
@@ -721,9 +722,9 @@ static int test_async_stop(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
 {
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   const ftun_interface_ops_t *previous = binding->network;
-  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_route_async_io_t io = {async_submit, async_receive, host};
   ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
   ftun_config_t config;
   ftun_feature_plan_t plan;
@@ -750,7 +751,7 @@ static int test_async_stop(ftun_core_t *core, ftun_budget_t *budget,
   deadline = now_ms + 200u;
   CHECK(ftun_tun_owner_service.stop_until(owner, deadline) == FTUN_E_AGAIN);
   CHECK(host->async_requests == 1u && host->closes == closes);
-  CHECK(ftun_budget_get_usage(budget, &held) == FTUN_OK && held.used > baseline.used);
+  CHECK(ftun_budget_get_usage(budget, &held) == FTUN_OK && held.used_resources.memory_bytes > baseline.used_resources.memory_bytes);
   (void)nanosleep(&pause, NULL);
   CHECK(ftun_tun_owner_service.stop_until(owner, deadline) == FTUN_E_TIMEOUT);
   CHECK(ftun_tun_owner_service.destroy_until(&owner, deadline) == FTUN_E_TIMEOUT && owner != NULL);
@@ -765,7 +766,7 @@ static int test_async_stop(ftun_core_t *core, ftun_budget_t *budget,
     CHECK(status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
   }
   CHECK(owner == NULL && host->closes == closes + 1u && host->resource_count == 0u);
-  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
     final.used_resources.descriptors == baseline.used_resources.descriptors &&
     final.used_resources.queue_slots == baseline.used_resources.queue_slots);
   binding->network = previous;
@@ -790,9 +791,9 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
 {
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   const ftun_interface_ops_t *previous = binding->network;
-  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_route_async_io_t io = {async_submit, async_receive, host};
   ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
   ftun_config_t config;
   ftun_feature_plan_t plan;
@@ -894,7 +895,7 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
       CHECK(status == FTUN_OK || status == FTUN_E_AGAIN || status == FTUN_E_TIMEOUT);
     }
     CHECK(owner == NULL && host->resource_count == 0u && host->closes == closes + 1u);
-    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
       final.used_resources.descriptors == baseline.used_resources.descriptors &&
       final.used_resources.queue_slots == baseline.used_resources.queue_slots);
   }
@@ -909,9 +910,9 @@ static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
 {
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   const ftun_interface_ops_t *previous = binding->network;
-  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_route_async_io_t io = {async_submit, async_receive, host};
   ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
   ftun_config_t config;
   ftun_feature_plan_t plan;
@@ -1036,7 +1037,7 @@ static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
     }
     CHECK(owner == NULL && host->resource_count == 0u && !host->close_order_error &&
       host->opens - opens == host->closes - closes);
-    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+    CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
       final.used_resources.descriptors == baseline.used_resources.descriptors &&
       final.used_resources.queue_slots == baseline.used_resources.queue_slots);
   }
@@ -1049,9 +1050,9 @@ static int test_owner_deadline_wakeup(ftun_core_t *core, ftun_budget_t *budget,
   ftun_operation_queue_t *operations, ftun_tun_owner_binding_t *binding,
   host_state_t *host)
 {
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   const ftun_interface_ops_t *previous = binding->network;
-  ftun_linux_route_async_io_t io = {async_submit, async_receive, host};
+  ftun_route_async_io_t io = {async_submit, async_receive, host};
   ftun_core_service_binding_t service_binding = {binding, sizeof(*binding)};
   ftun_config_t config;
   ftun_feature_plan_t plan;
@@ -1098,7 +1099,7 @@ static int test_owner_deadline_wakeup(ftun_core_t *core, ftun_budget_t *budget,
     CHECK(status == FTUN_OK || status == FTUN_E_AGAIN);
   }
   CHECK(owner == NULL && host->resource_count == 0u);
-  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
     final.used_resources.descriptors == baseline.used_resources.descriptors &&
     final.used_resources.queue_slots == baseline.used_resources.queue_slots);
   CHECK(ftun_event_loop_stop(binding->loop) == FTUN_OK);
@@ -1124,28 +1125,28 @@ static int test_plan_budget(void)
   CHECK(ftun_budget_reserve(budget, 65536u, &hold) == FTUN_OK);
   CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
     0u, &first) == FTUN_E_LIMIT && first.implementation == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_plan_calloc = true;
   CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
     0u, &first) == FTUN_E_LIMIT && first.implementation == NULL && !fail_plan_calloc);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   config.tun.mtu = 0u;
   CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
     0u, &first) == FTUN_E_INVALID && first.implementation == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   config.tun.mtu = 1400u;
   CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
     0u, &first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u &&
     usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 0u);
-  charge = usage.used;
+  charge = usage.used_resources.memory_bytes;
   CHECK(ftun_core_service_plan_prepare(&ftun_tun_owner_service, budget, &config,
     0u, &second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 2u * charge);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 2u * charge);
   CHECK(ftun_core_service_plan_destroy(&first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == charge);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == charge);
   CHECK(ftun_core_service_plan_destroy(&second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -1155,8 +1156,8 @@ int main(void)
   host_state_t host;
   consumer_state_t consumer;
   ftun_tun_device_ops_t device_ops;
-  ftun_linux_route_io_t route_io;
-  ftun_interface_ops_t network = ftun_linux_interface_ops;
+  ftun_route_io_t route_io;
+  ftun_interface_ops_t network = ftun_interface_default_ops;
   ftun_tun_owner_binding_t owner_binding;
   ftun_l3_provider_t provider;
   ftun_core_module_descriptor_t modules[3];

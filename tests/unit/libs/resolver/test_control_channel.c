@@ -124,7 +124,7 @@ static int run(bool hold_open)
   }
   CHECK(ftun_control_channel_close(&channel) == FTUN_E_AGAIN && channel != NULL);
   CHECK(fixture.cancelled != 0u && fixture.destroyed == 0u);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used != 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes != 0u);
   if (hold_open) {
     CHECK(ftun_operation_complete(fixture.opening, (ftun_error_t){FTUN_E_CANCELLED, 0u, 0}) == FTUN_OK);
   } else {
@@ -132,7 +132,7 @@ static int run(bool hold_open)
   }
   CHECK(ftun_control_channel_close(&channel) == FTUN_OK && channel == NULL);
   CHECK(fixture.destroyed == (hold_open ? 0u : 1u));
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u && usage.used_resources.descriptors == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

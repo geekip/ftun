@@ -1,6 +1,7 @@
 #include "core/limits.h"
 #include "platform/thread.h"
 #include "platform/atomic.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -456,7 +457,7 @@ ftun_status_t ftun_budget_reserve_cleanup(ftun_budget_t *budget, size_t bytes,
   return ftun_budget_reserve_cleanup_resources(budget, resources, out);
 }
 
-static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
+static void ftun_budget_get_usage_locked(const ftun_budget_t *budget,
                                                   ftun_budget_usage_t *out)
 {
   size_t normal[FTUN_BUDGET_RESOURCE_COUNT];
@@ -468,10 +469,9 @@ static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
     const ftun_budget_t *path_child;
     size_t ceiling;
     size_t protected_unused;
-    if (budget->used[index] > budget->limit[index] ||
-        budget->cleanup_reserve[index] > budget->limit[index] ||
-        budget->child_guaranteed_used[index] >
-          budget->child_guarantees[index]) return FTUN_E_STATE_CORRUPT;
+    assert(budget->used[index] <= budget->limit[index]);
+    assert(budget->cleanup_reserve[index] <= budget->limit[index]);
+    assert(budget->child_guaranteed_used[index] <= budget->child_guarantees[index]);
     ceiling = budget->limit[index] - budget->cleanup_reserve[index];
     protected_unused = budget->child_guarantees[index] -
       budget->child_guaranteed_used[index];
@@ -488,12 +488,9 @@ static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
       size_t path_unused;
       size_t ancestor_normal;
       size_t ancestor_total;
-      if (ancestor->used[index] > ancestor->limit[index] ||
-          ancestor->cleanup_reserve[index] > ancestor->limit[index] ||
-          ancestor->child_guaranteed_used[index] >
-            ancestor->child_guarantees[index]) {
-        return FTUN_E_STATE_CORRUPT;
-      }
+      assert(ancestor->used[index] <= ancestor->limit[index]);
+      assert(ancestor->cleanup_reserve[index] <= ancestor->limit[index]);
+      assert(ancestor->child_guaranteed_used[index] <= ancestor->child_guarantees[index]);
       ancestor_ceiling = ancestor->limit[index] -
         ancestor->cleanup_reserve[index];
       ancestor_protected = ancestor->child_guarantees[index] -
@@ -501,7 +498,7 @@ static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
       path_covered = ftun_budget_covered(path_child->used[index],
                                           path_child->guarantee[index]);
       path_unused = path_child->guarantee[index] - path_covered;
-      if (path_unused > ancestor_protected) return FTUN_E_STATE_CORRUPT;
+      assert(path_unused <= ancestor_protected);
       ancestor_protected -= path_unused;
       ancestor_normal = ancestor->used[index] < ancestor_ceiling &&
         ancestor_protected <= ancestor_ceiling - ancestor->used[index]
@@ -521,27 +518,20 @@ static ftun_status_t ftun_budget_get_usage_locked(const ftun_budget_t *budget,
   out->total_available_resources = ftun_budget_pack(total);
   out->borrowed_resources = ftun_budget_pack(borrowed);
   out->high_watermarks = ftun_budget_pack(budget->high_watermark);
-  out->limit = out->limits.memory_bytes;
-  out->cleanup_reserve = out->cleanup_reserves.memory_bytes;
-  out->used = out->used_resources.memory_bytes;
-  out->normal_available = out->normal_available_resources.memory_bytes;
-  out->total_available = out->total_available_resources.memory_bytes;
   out->child_count = budget->child_count;
   out->rejected_reservations = budget->rejected_reservations;
   out->metadata_bytes = budget->metadata_bytes;
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget, ftun_budget_usage_t *out)
 {
-  ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (budget == NULL || out == NULL) return FTUN_E_INVALID;
   ftun_budget_lock_snapshot(budget->root);
-  status = ftun_budget_get_usage_locked(budget, out);
+  ftun_budget_get_usage_locked(budget, out);
   ftun_budget_unlock_domains(budget->root);
   ftun_mutex_unlock(&budget->root->registry_mutex);
-  return status;
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_budget_same_root(const ftun_budget_t *left,
@@ -596,22 +586,18 @@ done:
   return status;
 }
 
-ftun_status_t ftun_reservation_release(ftun_reservation_t *reservation)
+void ftun_reservation_release(ftun_reservation_t *reservation)
 {
   ftun_budget_t *budget;
-  if (reservation == NULL) return FTUN_E_INVALID;
+  assert(reservation != NULL);
   budget = reservation->budget;
-  if (budget == NULL) return FTUN_OK;
-  if (ftun_budget_values_zero(reservation->resources)) return FTUN_E_STATE_CORRUPT;
+  if (budget == NULL) return;
+  assert(!ftun_budget_values_zero(reservation->resources));
   ftun_mutex_lock(&budget->domain->mutex);
-  if (!ftun_budget_can_subtract(budget, reservation->resources)) {
-    ftun_mutex_unlock(&budget->domain->mutex);
-    return FTUN_E_STATE_CORRUPT;
-  }
+  assert(ftun_budget_can_subtract(budget, reservation->resources));
   ftun_budget_subtract(budget, reservation->resources);
   ftun_mutex_unlock(&budget->domain->mutex);
   *reservation = (ftun_reservation_t){0};
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_budget_destroy(ftun_budget_t **budget)

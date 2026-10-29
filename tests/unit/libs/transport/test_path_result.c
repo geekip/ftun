@@ -219,7 +219,7 @@ static int setup(fixture_t *fixture)
   memcpy(data, "abcdefgh", 8u);
   CHECK(ftun_buffer_slice(buffer, 0u, 8u, &fixture->bytes) == FTUN_OK);
   CHECK(ftun_buffer_slice(buffer, 0u, 0u, &fixture->empty) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_release(&buffer);
   spec.generation = 9u;
   CHECK(ftun_network_view_create(&spec, &fixture->old_view) == FTUN_OK);
   CHECK(ftun_network_view_create(&spec, &fixture->new_view) == FTUN_OK);
@@ -230,15 +230,15 @@ static int setup(fixture_t *fixture)
 static int cleanup(fixture_t *fixture)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_network_view_release(&fixture->old_view) == FTUN_OK);
-  CHECK(ftun_network_view_release(&fixture->new_view) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&fixture->bytes) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&fixture->empty) == FTUN_OK);
+  ftun_network_view_release(&fixture->old_view);
+  ftun_network_view_release(&fixture->new_view);
+  ftun_buffer_slice_release(&fixture->bytes);
+  ftun_buffer_slice_release(&fixture->empty);
   CHECK(ftun_buffer_pool_destroy(&fixture->pool) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&fixture->operations) == FTUN_OK);
   CHECK(ftun_budget_destroy(&fixture->tiny) == FTUN_OK);
   CHECK(ftun_budget_destroy(&fixture->foreign) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&fixture->budget) == FTUN_OK);
   return 0;
 }
@@ -348,7 +348,7 @@ static int stream_case(void)
   owner = state.stream;
   CHECK(ftun_path_adopt_stream(&state.spec, &owner, &out) == FTUN_E_AGAIN &&
         owner == state.stream && out == NULL);
-  CHECK(ftun_stream_release(&retained) == FTUN_OK);
+  ftun_stream_release(&retained);
   state.spec.endpoint.kind = FTUN_ADDRESS_DOMAIN;
   state.spec.endpoint.domain = (ftun_string_t){domain, sizeof(domain) - 1u};
   CHECK(ftun_path_adopt_stream(&state.spec, &owner, &state.path) == FTUN_OK &&
@@ -360,7 +360,7 @@ static int stream_case(void)
         info.network_view != fixture.new_view && info.references == 1u &&
         info.endpoint.domain.length == 12u &&
         memcmp(info.endpoint.domain.data, "node.example", 12u) == 0);
-  CHECK(ftun_network_view_release(&fixture.old_view) == FTUN_OK);
+  ftun_network_view_release(&fixture.old_view);
   CHECK(ftun_network_view_get_info(info.network_view, &view_info) == FTUN_OK &&
         view_info.generation == 9u);
   CHECK(ftun_path_stream(state.path, &owner) == FTUN_OK && owner == state.stream);
@@ -392,7 +392,7 @@ static int stream_case(void)
   CHECK(ftun_stream_write_data(late, &bytes) == FTUN_OK && bytes.length == 3u &&
         memcmp(bytes.data, "abc", 3u) == 0);
   CHECK(ftun_path_destroy(&state.path) == FTUN_E_AGAIN);
-  CHECK(ftun_path_release(&alias) == FTUN_OK && alias == NULL);
+  ftun_path_release(&alias); CHECK(alias == NULL);
   state.cancel_status = FTUN_OK;
   CHECK(ftun_path_revoke(state.path) == FTUN_OK && state.cancels == 2u);
   CHECK(ftun_path_revoke(state.path) == FTUN_OK && state.cancels == 2u);
@@ -405,7 +405,7 @@ static int stream_case(void)
   CHECK(ftun_stream_retain(owner) == FTUN_OK);
   retained = owner;
   CHECK(ftun_path_destroy(&state.path) == FTUN_E_AGAIN);
-  CHECK(ftun_stream_release(&retained) == FTUN_OK);
+  ftun_stream_release(&retained);
   CHECK(ftun_path_destroy(&state.path) == FTUN_OK && state.path == NULL &&
         state.destroyed == 1u && state.failures == 0u);
   CHECK(cleanup(&fixture) == 0);
@@ -434,7 +434,7 @@ static int datagram_case(bool revoke_from_receive)
         info.configuration_generation == 7u && info.path_generation == 42u &&
         info.network_generation == 9u && info.network_view == fixture.new_view &&
         info.network_view != fixture.old_view);
-  CHECK(ftun_network_view_release(&fixture.new_view) == FTUN_OK);
+  ftun_network_view_release(&fixture.new_view);
   CHECK(ftun_path_datagram(state.path, &owner) == FTUN_OK && owner == state.datagram);
   CHECK(ftun_path_stream(state.path, &wrong) == FTUN_E_UNSUPPORTED && wrong == NULL);
   {
@@ -482,8 +482,8 @@ static int datagram_case(bool revoke_from_receive)
   CHECK(ftun_datagram_send_complete(late, success) == FTUN_E_STALE);
   CHECK(ftun_path_destroy(&state.path) == FTUN_OK && state.path == NULL &&
         state.destroyed == 1u && state.failures == 0u);
-  CHECK(ftun_packet_release(&empty) == FTUN_OK);
-  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  ftun_packet_release(&empty);
+  ftun_packet_release(&packet);
   CHECK(cleanup(&fixture) == 0);
   return 0;
 }
@@ -509,9 +509,9 @@ static int no_view_case(bool datagram)
         info.network_view == NULL && info.network_generation == 0u &&
         info.configuration_generation == 7u && info.domain == FTUN_DIAL_DOMAIN_UNDERLAY);
   alias = state.path;
-  CHECK(ftun_path_release(&alias) == FTUN_E_STATE_CORRUPT && alias == state.path);
+
   CHECK(ftun_path_retain(state.path) == FTUN_OK);
-  CHECK(ftun_path_release(&alias) == FTUN_OK && alias == NULL);
+  ftun_path_release(&alias); CHECK(alias == NULL);
   CHECK(ftun_path_destroy(&state.path) == FTUN_E_AGAIN);
   CHECK(ftun_path_revoke(state.path) == FTUN_OK);
   CHECK(ftun_path_destroy(&state.path) == FTUN_OK && state.path == NULL &&

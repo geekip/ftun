@@ -54,8 +54,8 @@ ftun_status_t ftun_platform_file_lock_acquire(const char *path,
 }
 ftun_status_t ftun_platform_file_lock_release(ftun_platform_file_lock_t *lock)
 {
-  int unlock_status = flock(lock->descriptor, LOCK_UN);
-  int close_status = close(lock->descriptor);
+  int unlock_status = flock((int)lock->descriptor, LOCK_UN);
+  int close_status = close((int)lock->descriptor);
   lock->descriptor = -1;
   return unlock_status == 0 && close_status == 0 ? FTUN_OK : FTUN_E_IO;
 }
@@ -141,12 +141,12 @@ ftun_status_t ftun_platform_file_open_append(const char *path, bool truncate,
   if (truncate) flags |= O_TRUNC;
   out->descriptor = open(path, flags, 0600);
   if (out->descriptor < 0) return FTUN_E_IO;
-  *size = fstat(out->descriptor, &info) == 0 && info.st_size > 0 ? (uint64_t)info.st_size : 0u;
+  *size = fstat((int)out->descriptor, &info) == 0 && info.st_size > 0 ? (uint64_t)info.st_size : 0u;
   return FTUN_OK;
 }
 ftun_status_t ftun_platform_file_close(ftun_file_handle_t *file)
 {
-  int result = close(file->descriptor);
+  int result = close((int)file->descriptor);
   file->descriptor = -1;
   return result == 0 ? FTUN_OK : FTUN_E_IO;
 }
@@ -155,7 +155,7 @@ ftun_status_t ftun_platform_file_write(ftun_file_handle_t *file,
 {
   *written = 0u;
   while (*written < contents.length) {
-    ssize_t count = write(file->descriptor, contents.data + *written, contents.length - *written);
+    ssize_t count = write((int)file->descriptor, contents.data + *written, contents.length - *written);
     if (count < 0 && errno == EINTR) continue;
     if (count < 0) return ftun_file_errno(errno);
     if (count == 0) return FTUN_E_IO;
@@ -168,15 +168,15 @@ ftun_status_t ftun_platform_file_rename_if_exists(const char *from, const char *
   return rename(from, to) == 0 || errno == ENOENT ? FTUN_OK : FTUN_E_IO;
 }
 
-ftun_status_t ftun_platform_file_write_ready(int descriptor, ftun_bytes_t contents)
+ftun_status_t ftun_platform_file_write_ready(ftun_handle_t descriptor, ftun_bytes_t contents)
 {
-  struct pollfd entry = {descriptor, POLLOUT, 0};
+  struct pollfd entry = {(int)descriptor, POLLOUT, 0};
   if (poll(&entry, 1u, 0) != 1 || (entry.revents & POLLOUT) == 0) return FTUN_E_AGAIN;
-  return write(descriptor, contents.data, contents.length) == (ssize_t)contents.length
+  return write((int)descriptor, contents.data, contents.length) == (ssize_t)contents.length
     ? FTUN_OK : FTUN_E_IO;
 }
 
-ftun_status_t ftun_file_open(const char *path, ftun_file_open_mode_t mode, int *out)
+ftun_status_t ftun_file_open(const char *path, ftun_file_open_mode_t mode, ftun_handle_t *out)
 {
   int flags = O_RDONLY | O_CLOEXEC;
   if (mode != FTUN_FILE_READ) flags |= O_NOFOLLOW;
@@ -187,9 +187,9 @@ ftun_status_t ftun_file_open(const char *path, ftun_file_open_mode_t mode, int *
   return errno == ENOENT ? FTUN_E_EOF : ftun_file_errno(errno);
 }
 
-ftun_status_t ftun_file_close(int descriptor)
+ftun_status_t ftun_file_close(ftun_handle_t descriptor)
 {
-  return close(descriptor) == 0 ? FTUN_OK : FTUN_E_IO;
+  return close((int)descriptor) == 0 ? FTUN_OK : FTUN_E_IO;
 }
 
 static ftun_status_t ftun_file_describe(const struct stat *info, ftun_file_info_t *out)
@@ -201,10 +201,10 @@ static ftun_status_t ftun_file_describe(const struct stat *info, ftun_file_info_
   return FTUN_OK;
 }
 
-ftun_status_t ftun_file_inspect(int descriptor, ftun_file_info_t *out)
+ftun_status_t ftun_file_inspect(ftun_handle_t descriptor, ftun_file_info_t *out)
 {
   struct stat info;
-  if (fstat(descriptor, &info) != 0) return FTUN_E_IO;
+  if (fstat((int)descriptor, &info) != 0) return FTUN_E_IO;
   return ftun_file_describe(&info, out);
 }
 
@@ -215,26 +215,26 @@ ftun_status_t ftun_file_inspect_path(const char *path, ftun_file_info_t *out)
   return ftun_file_describe(&info, out);
 }
 
-ptrdiff_t ftun_file_read(int descriptor, void *buffer, size_t capacity)
+ptrdiff_t ftun_file_read(ftun_handle_t descriptor, void *buffer, size_t capacity)
 {
   ssize_t count;
   do {
-    count = read(descriptor, buffer, capacity);
+    count = read((int)descriptor, buffer, capacity);
   } while (count < 0 && errno == EINTR);
   return (ptrdiff_t)count;
 }
 
-ptrdiff_t ftun_file_write_some(int descriptor, const void *buffer, size_t length,
+ptrdiff_t ftun_file_write_some(ftun_handle_t descriptor, const void *buffer, size_t length,
   ftun_status_t *status)
 {
-  ssize_t count = write(descriptor, buffer, length);
+  ssize_t count = write((int)descriptor, buffer, length);
   *status = count < 0 ? (errno == EINTR ? FTUN_E_AGAIN : ftun_file_errno(errno)) : FTUN_OK;
   return (ptrdiff_t)count;
 }
 
-ftun_status_t ftun_file_sync(int descriptor, bool data_only)
+ftun_status_t ftun_file_sync(ftun_handle_t descriptor, bool data_only)
 {
-  int result = data_only ? fdatasync(descriptor) : fsync(descriptor);
+  int result = data_only ? fdatasync((int)descriptor) : fsync((int)descriptor);
   return result == 0 ? FTUN_OK : FTUN_E_IO;
 }
 
@@ -256,9 +256,9 @@ void ftun_directory_remove(const char *path)
   (void)rmdir(path);
 }
 
-void *ftun_file_map_read(int descriptor, size_t length)
+void *ftun_file_map_read(ftun_handle_t descriptor, size_t length)
 {
-  void *mapped = mmap(NULL, length, PROT_READ, MAP_PRIVATE, descriptor, 0);
+  void *mapped = mmap(NULL, length, PROT_READ, MAP_PRIVATE, (int)descriptor, 0);
   return mapped == MAP_FAILED ? NULL : mapped;
 }
 
@@ -289,15 +289,15 @@ ftun_status_t ftun_user_home(char *storage, size_t capacity, ftun_string_t *home
   return FTUN_OK;
 }
 
-ftun_status_t ftun_file_duplicate(int descriptor, int *out)
+ftun_status_t ftun_file_duplicate(ftun_handle_t descriptor, ftun_handle_t *out)
 {
-  *out = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+  *out = fcntl((int)descriptor, F_DUPFD_CLOEXEC, 0);
   return *out >= 0 ? FTUN_OK : FTUN_E_IO;
 }
 
-ftun_status_t ftun_file_wait_writable(int descriptor, uint32_t timeout_ms)
+ftun_status_t ftun_file_wait_writable(ftun_handle_t descriptor, uint32_t timeout_ms)
 {
-  struct pollfd item = {descriptor, POLLOUT, 0};
+  struct pollfd item = {(int)descriptor, POLLOUT, 0};
   int result = poll(&item, 1u, (int)timeout_ms);
   if (result < 0) return errno == EINTR ? FTUN_E_AGAIN : FTUN_E_IO;
   if (result == 0) return FTUN_E_AGAIN;

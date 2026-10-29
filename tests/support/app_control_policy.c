@@ -1,6 +1,7 @@
+#include "platform/linux/route.h"
 #include "app/config/model.h"
 #include "app/runtime_support.h"
-#include "libs/tun/linux/routes.h"
+#include "libs/tun/routes.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,7 +10,7 @@ static const ftun_app_runtime_support_t *original;
 static ftun_app_runtime_support_t support;
 static unsigned int starts, prepares, applied, removed;
 static bool invalid;
-static ftun_linux_route_reply_t pending_reply;
+static ftun_route_reply_t pending_reply;
 static bool has_reply;
 
 static bool auto_route(void)
@@ -54,36 +55,36 @@ const ftun_app_runtime_support_t *__wrap_ftun_app_runtime_support(void)
 }
 
 /* 实际路由事务使用无宿主副作用的后端，仍验证 apply/release 对称。 */
-static ftun_status_t apply(void *context, const ftun_linux_route_resource_t *resource)
+static ftun_status_t apply(void *context, const ftun_route_resource_t *resource)
 { (void)context; (void)resource; applied++; return FTUN_OK; }
-static ftun_status_t remove_route(void *context, const ftun_linux_route_resource_t *resource)
+static ftun_status_t remove_route(void *context, const ftun_route_resource_t *resource)
 { (void)context; (void)resource; removed++; return FTUN_OK; }
 
-ftun_status_t __wrap_ftun_linux_route_prepare(const ftun_route_policy_t *policy,
+ftun_status_t __wrap_ftun_route_prepare(const ftun_route_policy_t *policy,
   ftun_route_transaction_t **out)
 {
-  const ftun_linux_route_io_t io = {apply, remove_route, NULL};
-  return ftun_linux_route_prepare_with_io(policy, &io, out);
+  const ftun_route_io_t io = {apply, remove_route, NULL};
+  return ftun_route_prepare_with_io(policy, &io, out);
 }
 
-ftun_status_t __wrap_ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
+ftun_status_t __wrap_ftun_route_prepare_with_budget(ftun_budget_t *budget,
   const ftun_route_policy_t *policy, ftun_route_transaction_t **out)
 {
-  const ftun_linux_route_io_t io = {apply, remove_route, NULL};
-  return ftun_linux_route_prepare_with_io_and_budget(budget, policy, &io, out);
+  const ftun_route_io_t io = {apply, remove_route, NULL};
+  return ftun_route_prepare_with_io_and_budget(budget, policy, &io, out);
 }
 
-static ftun_status_t submit(void *context, const ftun_linux_route_request_t *request)
+static ftun_status_t submit(void *context, const ftun_route_request_t *request)
 {
   (void)context;
   if (request->kind != FTUN_LINUX_ROUTE_REQUEST_REMOVE || has_reply) return FTUN_E_INVALID;
   removed++;
-  pending_reply = (ftun_linux_route_reply_t){request->sequence, FTUN_OK, false};
+  pending_reply = (ftun_route_reply_t){request->sequence, FTUN_OK, false};
   has_reply = true;
   return FTUN_OK;
 }
 
-static ftun_status_t receive_reply(void *context, ftun_linux_route_reply_t *reply)
+static ftun_status_t receive_reply(void *context, ftun_route_reply_t *reply)
 {
   (void)context;
   if (!has_reply) return FTUN_E_AGAIN;
@@ -92,13 +93,13 @@ static ftun_status_t receive_reply(void *context, ftun_linux_route_reply_t *repl
   return FTUN_OK;
 }
 
-ftun_status_t __wrap_ftun_linux_route_async_adopt(ftun_route_transaction_t **source,
+ftun_status_t __wrap_ftun_route_async_adopt(ftun_route_transaction_t **source,
   ftun_event_loop_t *loop, uint64_t now_ms, uint64_t step_timeout_ms,
-  uint64_t deadline_ms, ftun_linux_route_async_t **out)
+  uint64_t deadline_ms, ftun_route_async_t **out)
 {
-  const ftun_linux_route_async_io_t io = {submit, receive_reply, NULL};
+  const ftun_route_async_io_t io = {submit, receive_reply, NULL};
   (void)loop;
-  return ftun_linux_route_async_adopt_with_io(source, &io, now_ms,
+  return ftun_route_async_adopt_with_io(source, &io, now_ms,
     step_timeout_ms, deadline_ms, 1u, out);
 }
 

@@ -11,7 +11,7 @@ function(ftun_add_layer name)
     "$<INSTALL_INTERFACE:include>"
     )
   target_link_libraries(ftun_${name} PUBLIC ftun_options ${ARGN})
-  target_compile_definitions(ftun_${name} PRIVATE ${ftun_module_definitions} FTUN_HAVE_EPOLL=1)
+  target_compile_definitions(ftun_${name} PRIVATE ${ftun_module_definitions})
   if(FTUN_LTO)
     set_property(TARGET ftun_${name} PROPERTY INTERPROCEDURAL_OPTIMIZATION TRUE)
   endif()

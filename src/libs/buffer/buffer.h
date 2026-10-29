@@ -85,12 +85,13 @@ ftun_status_t ftun_buffer_pool_trim(ftun_buffer_pool_t *pool, size_t target_idle
 ftun_status_t ftun_buffer_pool_destroy(ftun_buffer_pool_t **pool);
 ftun_status_t ftun_buffer_retain(ftun_buffer_t *buffer);
 ftun_status_t ftun_buffer_data(ftun_buffer_t *buffer, uint8_t **data, size_t *capacity);
-ftun_status_t ftun_buffer_release(ftun_buffer_t **buffer);
+/* 释放消费拥有引用；存储地址必须有效，空引用幂等；引用/池计数是不变量。 */
+void ftun_buffer_release(ftun_buffer_t **buffer);
 ftun_status_t ftun_buffer_slice(ftun_buffer_t *buffer, size_t offset, size_t length,
                                 ftun_buffer_slice_t *out);
 /* slice 是只能通过 clone 复制的所有权值，不得逐字段或 memcpy 复制。 */
 ftun_status_t ftun_buffer_slice_clone(const ftun_buffer_slice_t *source,
                                       ftun_buffer_slice_t *out);
 ftun_status_t ftun_buffer_slice_data(const ftun_buffer_slice_t *slice, ftun_bytes_t *out);
-ftun_status_t ftun_buffer_slice_release(ftun_buffer_slice_t *slice);
+void ftun_buffer_slice_release(ftun_buffer_slice_t *slice);
 #endif

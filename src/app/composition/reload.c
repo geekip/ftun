@@ -125,7 +125,7 @@ ftun_status_t ftun_core_state_schedule(
   status = ftun_worker_submit(control->state_worker, &job,
     ftun_core_state_completed, control, &operation);
   free((void *)job.input.data);
-  (void)ftun_reservation_release(&input_reservation);
+  ftun_reservation_release(&input_reservation);
   return status;
 }
 
@@ -381,8 +381,7 @@ ftun_status_t ftun_core_reload_transaction_cleanup(
   if (status != FTUN_OK) return status;
   status = ftun_core_owned_path_destroy(&owned->next_path);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned);
   *transaction = NULL;
   return FTUN_OK;
@@ -453,7 +452,7 @@ ftun_status_t ftun_core_reload_prepare_transaction(
   transaction = (ftun_core_reload_transaction_t *)calloc(
     1u, sizeof(*transaction));
   if (transaction == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   transaction->reservation = reservation;
@@ -676,7 +675,7 @@ static ftun_status_t ftun_core_reload_publish_schedule(
   status = ftun_worker_submit(control->reload_worker, &job,
     ftun_core_reload_publish_completed, task, &operation);
   free((void *)job.input.data);
-  (void)ftun_reservation_release(&input_reservation);
+  ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) {
     ftun_mutex_lock(&task->mutex);
     task->reload_transaction = NULL;
@@ -776,7 +775,7 @@ ftun_status_t ftun_core_reload_schedule(ftun_core_control_t *control,
     return FTUN_E_LIMIT;
   }
   status = ftun_budget_get_usage(control->budget, &usage);
-  if (status != FTUN_OK || usage.normal_available < 512u * 1024u) {
+  if (status != FTUN_OK || usage.normal_available_resources.memory_bytes < 512u * 1024u) {
     return status == FTUN_OK ? FTUN_E_LIMIT : status;
   }
   input_length = sizeof(*work) + path_length + 1u;
@@ -784,12 +783,12 @@ ftun_status_t ftun_core_reload_schedule(ftun_core_control_t *control,
   if (status != FTUN_OK) return status;
   input = (uint8_t *)calloc(1u, input_length);
   if (input == NULL) {
-    (void)ftun_reservation_release(&input_reservation);
+    ftun_reservation_release(&input_reservation);
     return FTUN_E_LIMIT;
   }
   work = (ftun_core_reload_work_t *)input;
   work->magic = FTUN_CORE_RELOAD_WORK_MAGIC;
-  work->maximum_bytes = usage.normal_available / 2u;
+  work->maximum_bytes = usage.normal_available_resources.memory_bytes / 2u;
   work->service_descriptor = (uintptr_t)control->service_descriptor;
   work->owner = (uintptr_t)control;
   /* 独立线程安全计数器，不借 Core/logger；App 在全部 Worker 及其拥有型
@@ -830,7 +829,7 @@ ftun_status_t ftun_core_reload_schedule(ftun_core_control_t *control,
   status = ftun_worker_submit(control->reload_worker, &job,
     ftun_core_reload_worker_completed, task, &prepare_operation);
   free(input);
-  (void)ftun_reservation_release(&input_reservation);
+  ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) {
     ftun_mutex_lock(&task->mutex);
     task->async_started = 0;

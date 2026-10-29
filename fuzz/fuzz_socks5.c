@@ -1,7 +1,7 @@
 #include "fuzz_common.h"
 
-#include "libs/transport/socks5_codec.h"
-#include "libs/transport/socks5_client.h"
+#include "proxy/protocol/socks5_codec.h"
+#include "proxy/protocol/socks5_client.h"
 
 #include <string.h>
 

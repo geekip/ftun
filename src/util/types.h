@@ -57,7 +57,7 @@ typedef struct ftun_reservation ftun_reservation_t;
 typedef struct ftun_resolve_request ftun_resolve_request_t;
 typedef struct ftun_relay ftun_relay_t;
 typedef struct ftun_route_policy ftun_route_policy_t;
-typedef struct ftun_linux_route_async ftun_linux_route_async_t;
+typedef struct ftun_route_async ftun_route_async_t;
 typedef struct ftun_route_table ftun_route_table_t;
 typedef struct ftun_route_transaction ftun_route_transaction_t;
 typedef struct ftun_rule ftun_rule_t;
@@ -70,6 +70,7 @@ typedef struct ftun_tls_options ftun_tls_options_t;
 typedef struct ftun_tun_spec ftun_tun_spec_t;
 typedef struct ftun_worker_job ftun_worker_job_t;
 typedef struct ftun_worker ftun_worker_t;
+typedef intptr_t ftun_handle_t; /* 平台拥有的文件/监听句柄；-1 表示无句柄。 */
 typedef uintptr_t ftun_native_socket_t; /* 仅内部平台包装，不假定为 POSIX fd。 */
 typedef struct { const char *data; size_t length; } ftun_string_t;
 typedef struct { const uint8_t *data; size_t length; } ftun_bytes_t;

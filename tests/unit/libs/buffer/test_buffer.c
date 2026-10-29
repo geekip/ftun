@@ -63,21 +63,21 @@ static int test_class_selection_cost(void)
   CHECK(ftun_buffer_pool_create_waitable(budget, 0u, 0u, BLOCKED + 1u, 1u, &pool) == FTUN_OK);
   waiter.pool = pool;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   for (i = 0u; i < BLOCKED; i++) {
     CHECK(ftun_buffer_pool_wait(pool, 65536u, unavailable_ready, NULL, &tokens[i]) == FTUN_OK);
   }
   CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &waiter, &tokens[BLOCKED]) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(hold),
-    (ftun_budget_resources_t){usage.normal_available - 512u, 0u, 0u}) == FTUN_OK);
+    (ftun_budget_resources_t){usage.normal_available_resources.memory_bytes - 512u, 0u, 0u}) == FTUN_OK);
   CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiter.calls == 1u && waiter.status == FTUN_OK && waiter.buffer != NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &cost) == FTUN_OK &&
     cost.waiting == BLOCKED && cost.max_availability_probes == 2u &&
     cost.max_selection_steps <= 5u);
   for (i = 0u; i < BLOCKED; i++) CHECK(ftun_buffer_pool_wait_cancel(&tokens[i]) == FTUN_OK);
-  CHECK(ftun_buffer_release(&waiter.buffer) == FTUN_OK);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_buffer_release(&waiter.buffer);
+  ftun_reservation_release(&hold);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -104,7 +104,7 @@ static int test_class_boundaries(void)
   CHECK(ftun_budget_create(NULL, 8192u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_buffer_pool_create_waitable(budget, 0u, 0u, 2u, 1u, &pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   pool->next_waiter_generation = UINT64_MAX - 1u;
   CHECK(ftun_buffer_pool_wait(pool, 256u, unavailable_ready, NULL, &first) == FTUN_OK &&
     first.generation == UINT64_MAX);
@@ -113,7 +113,7 @@ static int test_class_boundaries(void)
     rejected.pool == NULL && rejected.generation == 0u);
   CHECK(ftun_buffer_pool_wait_cancel(&first) == FTUN_OK);
   CHECK(ftun_buffer_pool_wait_cancel(&stale) == FTUN_E_STALE);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -136,17 +136,17 @@ static int test_waiter_budget(void)
   CHECK(ftun_budget_reserve_resources(root, (ftun_budget_resources_t){0u, 0u, 2u},
     &queue_pressure) == FTUN_OK);
   CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_E_LIMIT && pool == NULL);
-  CHECK(ftun_reservation_release(&queue_pressure) == FTUN_OK);
+  ftun_reservation_release(&queue_pressure);
   for (allocation = 1u; allocation <= 2u; allocation++) {
     fail_calloc_after = allocation;
     CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_E_LIMIT && pool == NULL);
     CHECK(fail_calloc_after == 0u);
     CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
-      usage.used == 0u && usage.used_resources.queue_slots == 0u);
+      usage.used_resources.memory_bytes == 0u && usage.used_resources.queue_slots == 0u);
   }
   CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(child, &usage) == FTUN_OK && usage.used_resources.queue_slots == 2u);
-  CHECK(ftun_budget_reserve(child, usage.normal_available, &memory_pressure) == FTUN_OK);
+  CHECK(ftun_budget_reserve(child, usage.normal_available_resources.memory_bytes, &memory_pressure) == FTUN_OK);
   CHECK(ftun_budget_reserve_resources(root, (ftun_budget_resources_t){0u, 0u, 1u},
     &queue_pressure) == FTUN_OK);
   waiter.pool = pool;
@@ -158,21 +158,21 @@ static int test_waiter_budget(void)
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK && usage.used_resources.queue_slots == 3u);
   CHECK(ftun_budget_reserve_cleanup_resources(root, (ftun_budget_resources_t){0u, 0u, 1u}, &cleanup) == FTUN_OK);
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
-  CHECK(ftun_reservation_release(&memory_pressure) == FTUN_OK);
+  ftun_reservation_release(&cleanup);
+  ftun_reservation_release(&memory_pressure);
   /* 队列正常额度仍满，已准入等待者照常唤醒，不再申请推进槽。 */
   CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiter.calls == 1u && waiter.status == FTUN_OK && waiter.buffer != NULL);
   CHECK(ftun_buffer_pool_wait_cancel(&second) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
   CHECK(ftun_budget_get_usage(child, &usage) == FTUN_OK && usage.used_resources.queue_slots == 2u);
-  CHECK(ftun_buffer_release(&waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&waiter.buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(child, &usage) == FTUN_OK &&
-    usage.used == 0u && usage.used_resources.queue_slots == 0u);
+    usage.used_resources.memory_bytes == 0u && usage.used_resources.queue_slots == 0u);
   CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&queue_pressure) == FTUN_OK);
+  ftun_reservation_release(&queue_pressure);
   CHECK(ftun_budget_destroy(&child) == FTUN_OK);
   CHECK(ftun_budget_destroy(&root) == FTUN_OK);
   return 0;
@@ -212,7 +212,7 @@ static int test_waiters(void)
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &first) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &second) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available,
+  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available_resources.memory_bytes,
                             &blocker) == FTUN_OK);
 
   CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &first_waiter,
@@ -228,8 +228,8 @@ static int test_waiters(void)
   CHECK(rejected_token.pool == NULL && rejected_token.generation == 0u);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
 
-  CHECK(ftun_buffer_release(&first) == FTUN_OK);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK);
+  ftun_buffer_release(&first);
+  ftun_buffer_release(&second);
   CHECK(wakeups == 1u);
   CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK);
   CHECK(usage.waiter_capacity == 3u && usage.waiting == 3u &&
@@ -246,7 +246,7 @@ static int test_waiters(void)
         second_waiter.status == FTUN_OK && second_waiter.buffer != NULL);
   CHECK(cancelled_waiter.calls == 0u && wakeups == 2u);
 
-  CHECK(ftun_buffer_release(&first_waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&first_waiter.buffer);
   CHECK(wakeups == 3u);
   CHECK(ftun_buffer_pool_wait_cancel(&cancelled_token) == FTUN_OK);
   CHECK(cancelled_token.pool == NULL && cancelled_token.generation == 0u);
@@ -265,7 +265,7 @@ static int test_waiters(void)
    * registration and release must produce a fresh notification. */
   CHECK(ftun_buffer_pool_wait(pool, 256u, waiter_ready, &cancelled_waiter,
                               &cancelled_token) == FTUN_OK);
-  CHECK(ftun_buffer_release(&available) == FTUN_OK);
+  ftun_buffer_release(&available);
   CHECK(wakeups == 4u);
   CHECK(ftun_buffer_pool_wait_cancel(&cancelled_token) == FTUN_OK);
   CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK &&
@@ -273,9 +273,9 @@ static int test_waiters(void)
   CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK &&
         usage.waiting == 0u && usage.cancelled_waiters == 2u &&
         usage.notifications == 4u);
-  CHECK(ftun_buffer_release(&second_waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&second_waiter.buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK && pool == NULL);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -303,7 +303,7 @@ static void mixed_ready(void *user)
   if (callbacks != 0u) state->recursive = FTUN_E_STATE_CORRUPT;
   state->status = ftun_buffer_pool_acquire(state->pool, state->capacity, &state->buffer);
   if (state->status == FTUN_OK && state->release)
-    state->status = ftun_buffer_release(&state->buffer);
+    ftun_buffer_release(&state->buffer);
 }
 
 static int test_mixed_waiters(void)
@@ -324,7 +324,7 @@ static int test_mixed_waiters(void)
   for (index = 0u; index < 2u; index++)
     CHECK(ftun_buffer_pool_acquire(pool, 256u, &small[index]) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   for (index = 0u; index < 4u; index++) {
     waiters[index].pool = pool;
     waiters[index].capacity = index % 2u == 0u ? 512u : 256u;
@@ -335,8 +335,8 @@ static int test_mixed_waiters(void)
     CHECK(ftun_buffer_pool_wait(pool, waiters[index].capacity, mixed_ready,
       &waiters[index], &tokens[index]) == FTUN_OK);
   }
-  CHECK(ftun_buffer_release(&small[0]) == FTUN_OK && wakeups == 1u);
-  CHECK(ftun_buffer_release(&small[1]) == FTUN_OK && wakeups == 1u);
+  ftun_buffer_release(&small[0]); CHECK(wakeups == 1u);
+  ftun_buffer_release(&small[1]); CHECK(wakeups == 1u);
   CHECK(ftun_buffer_pool_wait_cancel(&tokens[2]) == FTUN_OK);
   for (index = 0u; index < 3u; index++) {
     CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK);
@@ -357,8 +357,8 @@ static int test_mixed_waiters(void)
   CHECK(ftun_buffer_pool_get_usage(pool, &usage) == FTUN_OK && usage.waiting == 0u &&
         usage.cancelled_waiters == 1u && usage.wake_callbacks == 3u && usage.notifications == 3u);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used == 0u);
+  ftun_reservation_release(&blocker);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -378,13 +378,13 @@ static int test_split_and_rebind(void)
   CHECK(ftun_buffer_pool_set_wakeup(pool, pool_wakeup, &first_wakeups) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 512u, &large) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   for (index = 0u; index < 2u; index++) {
     waiters[index].pool = pool;
     waiters[index].capacity = 256u;
     CHECK(ftun_buffer_pool_wait(pool, 256u, mixed_ready, &waiters[index], &tokens[index]) == FTUN_OK);
   }
-  CHECK(ftun_buffer_release(&large) == FTUN_OK && first_wakeups == 1u);
+  ftun_buffer_release(&large); CHECK(first_wakeups == 1u);
   CHECK(ftun_buffer_pool_set_wakeup(pool, NULL, NULL) == FTUN_OK);
   CHECK(ftun_buffer_pool_set_wakeup(pool, pool_wakeup, &second_wakeups) == FTUN_OK);
   CHECK(ftun_buffer_pool_set_wakeup(pool, pool_wakeup, &second_wakeups) == FTUN_OK);
@@ -393,12 +393,12 @@ static int test_split_and_rebind(void)
   CHECK(ftun_buffer_pool_dispatch(pool, 8u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiters[0].calls == 1u && waiters[0].status == FTUN_OK && waiters[1].calls == 0u);
   CHECK(second_wakeups == 1u);
-  CHECK(ftun_buffer_release(&waiters[0].buffer) == FTUN_OK && second_wakeups == 2u);
+  ftun_buffer_release(&waiters[0].buffer); CHECK(second_wakeups == 2u);
   CHECK(ftun_buffer_pool_dispatch(pool, 8u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiters[1].calls == 1u && waiters[1].status == FTUN_OK && second_wakeups == 2u);
-  CHECK(ftun_buffer_release(&waiters[1].buffer) == FTUN_OK);
+  ftun_buffer_release(&waiters[1].buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -420,24 +420,24 @@ static int test_cleanup_ceiling(void)
   for (index = 0u; index < 2u; index++)
     CHECK(ftun_buffer_pool_acquire(pool, 256u, &small[index]) == FTUN_OK);
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(root, usage.normal_available, &normal) == FTUN_OK);
+  CHECK(ftun_budget_reserve(root, usage.normal_available_resources.memory_bytes, &normal) == FTUN_OK);
   CHECK(ftun_budget_reserve_cleanup(root, 1024u, &cleanup) == FTUN_OK);
   waiter.pool = pool;
   waiter.capacity = 512u;
   CHECK(ftun_buffer_pool_wait(pool, 512u, mixed_ready, &waiter, &token) == FTUN_OK);
-  for (index = 0u; index < 2u; index++) CHECK(ftun_buffer_release(&small[index]) == FTUN_OK);
+  for (index = 0u; index < 2u; index++) ftun_buffer_release(&small[index]);
   CHECK(wakeups == 0u);
   for (index = 0u; index < 20u; index++)
     CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 0u);
   CHECK(wakeups == 0u && waiter.calls == 0u);
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+  ftun_reservation_release(&cleanup);
   CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiter.status == FTUN_OK);
-  CHECK(ftun_buffer_release(&waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&waiter.buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&normal) == FTUN_OK);
+  ftun_reservation_release(&normal);
   CHECK(ftun_budget_destroy(&child) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&root) == FTUN_OK);
   return 0;
 }
@@ -462,23 +462,23 @@ static int test_wait_with_live_slice(void)
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &second) == FTUN_OK);
   CHECK(ftun_buffer_slice(first, 0u, 16u, &slice) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   waiter.pool = pool;
   waiter.capacity = 512u;
   CHECK(ftun_buffer_pool_wait(pool, 512u, mixed_ready, &waiter, &token) == FTUN_OK);
-  CHECK(ftun_buffer_release(&first) == FTUN_OK);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK && wakeups == 0u);
+  ftun_buffer_release(&first);
+  ftun_buffer_release(&second); CHECK(wakeups == 0u);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK &&
         pool_usage.active_buffers == 1u && pool_usage.idle_buffers == 1u &&
         pool_usage.pressure_trims == 0u);
   CHECK(ftun_buffer_pool_trim(pool, 0u) == FTUN_OK && wakeups == 0u);
   CHECK(ftun_buffer_slice_data(&slice, &bytes) == FTUN_OK && bytes.length == 16u);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK && wakeups == 1u);
+  ftun_buffer_slice_release(&slice); CHECK(wakeups == 1u);
   CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(waiter.status == FTUN_OK);
-  CHECK(ftun_buffer_release(&waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&waiter.buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -503,7 +503,7 @@ static void *compete_for_budget(void *user)
   while (state->phase == 1)
     (void)pthread_cond_wait(&state->condition, &state->mutex);
   (void)pthread_mutex_unlock(&state->mutex);
-  state->status = ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation); state->status = FTUN_OK;
   return NULL;
 }
 
@@ -525,15 +525,15 @@ static int test_budget_competition(void)
   for (index = 0u; index < 2u; index++)
     CHECK(ftun_buffer_pool_acquire(pool, 256u, &small[index]) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   waiter.pool = pool;
   waiter.capacity = 512u;
   CHECK(ftun_buffer_pool_wait(pool, 512u, mixed_ready, &waiter, &token) == FTUN_OK);
-  for (index = 0u; index < 2u; index++) CHECK(ftun_buffer_release(&small[index]) == FTUN_OK);
+  for (index = 0u; index < 2u; index++) ftun_buffer_release(&small[index]);
   CHECK(wakeups == 1u);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
   competitor.budget = budget;
-  competitor.amount = usage.normal_available;
+  competitor.amount = usage.normal_available_resources.memory_bytes;
   CHECK(pthread_mutex_init(&competitor.mutex, NULL) == 0);
   CHECK(pthread_cond_init(&competitor.condition, NULL) == 0);
   CHECK(pthread_create(&thread, NULL, compete_for_budget, &competitor) == 0);
@@ -558,9 +558,9 @@ static int test_budget_competition(void)
   CHECK(pthread_join(thread, NULL) == 0 && competitor.status == FTUN_OK);
   CHECK(pthread_cond_destroy(&competitor.condition) == 0);
   CHECK(pthread_mutex_destroy(&competitor.mutex) == 0);
-  CHECK(ftun_buffer_release(&waiter.buffer) == FTUN_OK);
+  ftun_buffer_release(&waiter.buffer);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -596,22 +596,22 @@ int main(void)
   memcpy(data, "hello", 5u);
   CHECK(ftun_buffer_slice(buffer, 1u, 3u, &slice) == FTUN_OK);
   CHECK(ftun_buffer_slice_clone(&slice, &clone) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
+  ftun_buffer_release(&buffer); CHECK(buffer == NULL);
   CHECK(ftun_buffer_slice_data(&slice, &bytes) == FTUN_OK);
   CHECK(bytes.length == 3u && memcmp(bytes.data, "ell", 3u) == 0);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used > 0u);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  CHECK(budget_usage.used_resources.memory_bytes > 0u);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_buffer_slice_data(&clone, &bytes) == FTUN_OK);
   CHECK(bytes.length == 3u && memcmp(bytes.data, "ell", 3u) == 0);
-  CHECK(ftun_buffer_slice_release(&clone) == FTUN_OK);
+  ftun_buffer_slice_release(&clone);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used == 0u);
+  CHECK(budget_usage.used_resources.memory_bytes == 0u);
 
   CHECK(ftun_buffer_pool_create(budget, 512u, 2u, &pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  pool_baseline = budget_usage.used;
+  pool_baseline = budget_usage.used_resources.memory_bytes;
   CHECK(pool_baseline > 0u);
   CHECK(ftun_buffer_pool_acquire(pool, 10u, &first) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &second) == FTUN_OK);
@@ -620,8 +620,8 @@ int main(void)
   CHECK(pool_usage.idle_limit_bytes == 512u && pool_usage.idle_limit_buffers == 2u &&
         pool_usage.active_buffers == 2u && pool_usage.idle_buffers == 0u);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
-  CHECK(ftun_buffer_release(&first) == FTUN_OK && first == NULL);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK && second == NULL);
+  ftun_buffer_release(&first); CHECK(first == NULL);
+  ftun_buffer_release(&second); CHECK(second == NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.active_buffers == 0u && pool_usage.idle_buffers == 2u &&
         pool_usage.idle_bytes == 512u);
@@ -629,11 +629,11 @@ int main(void)
   CHECK((uintptr_t)second == second_identity);
   CHECK(ftun_buffer_pool_acquire(pool, 257u, &large) == FTUN_OK);
   CHECK(ftun_buffer_data(large, &data, &capacity) == FTUN_OK && capacity == 512u);
-  CHECK(ftun_buffer_release(&large) == FTUN_OK && large == NULL);
+  ftun_buffer_release(&large); CHECK(large == NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.active_buffers == 1u && pool_usage.idle_buffers == 1u &&
         pool_usage.idle_bytes == 256u);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK && second == NULL);
+  ftun_buffer_release(&second); CHECK(second == NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.active_buffers == 0u && pool_usage.idle_buffers == 2u &&
         pool_usage.idle_bytes == 512u);
@@ -642,37 +642,37 @@ int main(void)
   CHECK(pool_usage.idle_buffers == 1u && pool_usage.idle_bytes == 256u);
   CHECK(ftun_buffer_pool_trim(pool, 0u) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used == pool_baseline);
+  CHECK(budget_usage.used_resources.memory_bytes == pool_baseline);
 
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &first) == FTUN_OK);
   CHECK(ftun_buffer_retain(first) == FTUN_OK);
   second = first;
-  CHECK(ftun_buffer_release(&first) == FTUN_OK && first == NULL);
+  ftun_buffer_release(&first); CHECK(first == NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.active_buffers == 1u && pool_usage.idle_buffers == 0u);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK && second == NULL);
+  ftun_buffer_release(&second); CHECK(second == NULL);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.active_buffers == 0u && pool_usage.idle_buffers == 1u);
 
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK && pool == NULL);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used == 0u);
+  CHECK(budget_usage.used_resources.memory_bytes == 0u);
 
   CHECK(ftun_buffer_pool_create(budget, 1024u, 1u, &pool) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 1u, &first) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 1u, &second) == FTUN_OK);
-  CHECK(ftun_buffer_release(&first) == FTUN_OK);
-  CHECK(ftun_buffer_release(&second) == FTUN_OK);
+  ftun_buffer_release(&first);
+  ftun_buffer_release(&second);
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.idle_buffers == 1u && pool_usage.idle_bytes == 256u);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
 
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, budget_usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   buffer = (ftun_buffer_t *)(uintptr_t)1;
   CHECK(ftun_buffer_acquire(budget, 1u, &buffer) == FTUN_E_LIMIT && buffer == NULL);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
 
   buffer = (ftun_buffer_t *)(uintptr_t)1;
   CHECK(ftun_buffer_acquire(budget, 0u, &buffer) == FTUN_E_INVALID && buffer == NULL);
@@ -689,9 +689,9 @@ int main(void)
   CHECK(ftun_buffer_slice_clone(NULL, &clone) == FTUN_E_INVALID);
   CHECK(clone.owner == NULL && clone.offset == 0u && clone.length == 0u);
   CHECK(ftun_buffer_slice_data(&slice, &bytes) == FTUN_OK && bytes.length == 0u);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer); CHECK(buffer == NULL);
+  ftun_buffer_release(&buffer);
 
   data = (uint8_t *)(uintptr_t)1;
   capacity = 99u;
@@ -706,21 +706,19 @@ int main(void)
   CHECK(pool_usage.idle_bytes == 0u && pool_usage.active_buffers == 0u);
   CHECK(ftun_buffer_pool_trim(NULL, 0u) == FTUN_E_INVALID);
   CHECK(ftun_buffer_pool_destroy(NULL) == FTUN_E_INVALID);
-  CHECK(ftun_buffer_release(NULL) == FTUN_E_INVALID);
-  CHECK(ftun_buffer_slice_release(NULL) == FTUN_E_INVALID);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   CHECK(ftun_budget_create(NULL, 90u * 1024u, 0u, &pressure_budget) == FTUN_OK);
   CHECK(ftun_buffer_pool_create(pressure_budget, 90u * 1024u, 4u,
                                 &pressure_pool) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pressure_pool, 64u * 1024u, &buffer) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
+  ftun_buffer_release(&buffer); CHECK(buffer == NULL);
   CHECK(ftun_buffer_pool_acquire(pressure_pool, 32u * 1024u, &buffer) == FTUN_OK);
   CHECK(ftun_buffer_pool_get_usage(pressure_pool, &pool_usage) == FTUN_OK);
   CHECK(pool_usage.cache_misses == 2u && pool_usage.pressure_trims == 1u &&
         pool_usage.pressure_trimmed_buffers == 1u &&
         pool_usage.pressure_trimmed_bytes == 64u * 1024u);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK && buffer == NULL);
+  ftun_buffer_release(&buffer); CHECK(buffer == NULL);
   CHECK(ftun_buffer_pool_destroy(&pressure_pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&pressure_budget) == FTUN_OK);
   CHECK(test_waiter_budget() == 0);

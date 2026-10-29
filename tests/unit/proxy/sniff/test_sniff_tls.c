@@ -87,10 +87,10 @@ int main(void)
     CHECK(ftun_budget_reserve(budget, 65537u, &hold) == FTUN_OK);
     CHECK(ftun_sniff_domain_with_budget(budget, &metadata, input, &result) == FTUN_E_LIMIT);
     CHECK(!result.found && result.domain.data == NULL);
-    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 65537u);
-    CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 65537u);
+    ftun_reservation_release(&hold);
     CHECK(ftun_sniff_domain_with_budget(budget, &metadata, input, &result) == FTUN_OK && result.found);
-    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u &&
       usage.high_watermarks.memory_bytes >= 65536u);
     CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   }

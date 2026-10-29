@@ -1,4 +1,5 @@
 #include "libs/transport/datagram.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -142,7 +143,7 @@ static void ftun_datagram_unlink(ftun_datagram_send_t *send)
 static void ftun_datagram_release_send(ftun_datagram_send_t *send)
 {
   ftun_datagram_t *owner = send->owner;
-  (void)ftun_packet_release(&send->packet);
+  ftun_packet_release(&send->packet);
   memset(send, 0, sizeof(*send));
   send->owner = owner;
   send->free_next = owner->free_head;
@@ -205,13 +206,11 @@ ftun_status_t ftun_packet_view(const ftun_packet_t *packet, ftun_bytes_t *out)
   return ftun_buffer_slice_data(&packet->payload, out);
 }
 
-ftun_status_t ftun_packet_release(ftun_packet_t *packet)
+void ftun_packet_release(ftun_packet_t *packet)
 {
-  ftun_status_t status;
-  if (packet == NULL) return FTUN_E_INVALID;
-  status = ftun_buffer_slice_release(&packet->payload);
-  if (status == FTUN_OK) packet->source_id = 0u;
-  return status;
+  assert(packet != NULL);
+  ftun_buffer_slice_release(&packet->payload);
+  packet->source_id = 0u;
 }
 
 ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
@@ -246,7 +245,7 @@ ftun_status_t ftun_datagram_create(const ftun_datagram_options_t *options,
   if (channel == NULL || channel->storage == NULL) {
     if (channel != NULL) free(channel->storage);
     free(channel);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   channel->budget = options->budget;
@@ -405,16 +404,15 @@ ftun_status_t ftun_datagram_retain(ftun_datagram_t *channel)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_datagram_release(ftun_datagram_t **channel)
+void ftun_datagram_release(ftun_datagram_t **channel)
 {
   ftun_datagram_t *owned;
-  if (channel == NULL) return FTUN_E_INVALID;
+  assert(channel != NULL);
   owned = *channel;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->reference_count <= 1u) return FTUN_E_STATE_CORRUPT;
+  if (owned == NULL) return;
+  assert(owned->reference_count > 1u);
   owned->reference_count--;
   *channel = NULL;
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_datagram_stop(ftun_datagram_t *channel)
@@ -466,7 +464,6 @@ ftun_status_t ftun_datagram_destroy(ftun_datagram_t **channel)
 {
   ftun_datagram_t *owned;
   ftun_reservation_t reservation;
-  ftun_status_t status;
   if (channel == NULL) return FTUN_E_INVALID;
   owned = *channel;
   if (owned == NULL) return FTUN_OK;
@@ -476,8 +473,7 @@ ftun_status_t ftun_datagram_destroy(ftun_datagram_t **channel)
       owned->pending_packets != 0u || owned->pending_bytes != 0u ||
       owned->head != NULL || owned->tail != NULL) return FTUN_E_AGAIN;
   reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   owned->destroying = 1;
   owned->backend_calls++;

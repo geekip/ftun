@@ -1,5 +1,6 @@
-#include "libs/tun/linux/routes.h"
-#include "libs/tun/linux/device.h"
+#include "platform/linux/route.h"
+#include "libs/tun/routes.h"
+#include "libs/tun/port.h"
 #include "platform/linux/uapi.h"
 #include "core/limits.h"
 #include <stdint.h>
@@ -15,8 +16,8 @@
 } while (0)
 
 typedef struct {
-  ftun_linux_route_resource_t applied[FTUN_LINUX_ROUTE_MAX_RESOURCES];
-  ftun_linux_route_resource_t removed[FTUN_LINUX_ROUTE_MAX_RESOURCES * 2u];
+  ftun_route_resource_t applied[FTUN_LINUX_ROUTE_MAX_RESOURCES];
+  ftun_route_resource_t removed[FTUN_LINUX_ROUTE_MAX_RESOURCES * 2u];
   size_t apply_calls;
   size_t remove_calls;
   size_t fail_apply_call;
@@ -26,7 +27,7 @@ typedef struct {
 } route_mock_t;
 
 static ftun_status_t mock_apply(void *context,
-                                const ftun_linux_route_resource_t *resource)
+                                const ftun_route_resource_t *resource)
 {
   route_mock_t *mock = (route_mock_t *)context;
   if (mock->apply_calls < FTUN_LINUX_ROUTE_MAX_RESOURCES) {
@@ -38,7 +39,7 @@ static ftun_status_t mock_apply(void *context,
 }
 
 static ftun_status_t mock_remove(void *context,
-                                 const ftun_linux_route_resource_t *resource)
+                                 const ftun_route_resource_t *resource)
 {
   route_mock_t *mock = (route_mock_t *)context;
   if (mock->remove_calls < FTUN_LINUX_ROUTE_MAX_RESOURCES * 2u) {
@@ -52,9 +53,9 @@ static ftun_status_t mock_remove(void *context,
   return FTUN_OK;
 }
 
-static ftun_linux_route_io_t mock_io(route_mock_t *mock)
+static ftun_route_io_t mock_io(route_mock_t *mock)
 {
-  ftun_linux_route_io_t io;
+  ftun_route_io_t io;
   io.apply = mock_apply;
   io.remove = mock_remove;
   io.context = mock;
@@ -72,10 +73,10 @@ static ftun_route_policy_t route_policy(bool lan, bool strict_route)
   policy.tun_ipv4[2] = 0u;
   policy.tun_ipv4[3] = 1u;
   policy.tun_prefix_length = 30u;
-  policy.route_table = 100u;
-  policy.rule_priority = 12340u;
-  policy.protection_mark = UINT32_C(0x46000001);
-  policy.protection_mark_mask = UINT32_MAX;
+  policy.routing_domain = 100u;
+  policy.precedence = 12340u;
+  policy.bypass_tag = UINT32_C(0x46000001);
+  policy.bypass_mask = UINT32_MAX;
   policy.manage_local = true;
   if (lan) {
     policy.lan_interface.data = "lan0";
@@ -128,33 +129,86 @@ static int real_smoke(void)
   ftun_route_policy_t policy = route_policy(false, true);
   ftun_route_transaction_t *transaction = NULL;
   ftun_route_transaction_t *duplicate = NULL;
-  ftun_linux_route_info_t info;
+  ftun_route_info_t info;
   tun_spec.name = policy.tun_interface;
   tun_spec.mtu = 1400u;
-  CHECK(ftun_linux_tun_open(&tun_spec, &port) == FTUN_OK && port != NULL);
-  CHECK(ftun_linux_route_prepare(&policy, &transaction) == FTUN_OK &&
+  CHECK(ftun_tun_port_open(&tun_spec, &port) == FTUN_OK && port != NULL);
+  CHECK(ftun_route_prepare(&policy, &transaction) == FTUN_OK &&
         transaction != NULL);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.resource_count == 5u && info.active_count == 5u &&
         info.strict_route);
-  CHECK(ftun_linux_route_prepare(&policy, &duplicate) == FTUN_E_REJECTED &&
+  CHECK(ftun_route_prepare(&policy, &duplicate) == FTUN_E_REJECTED &&
         duplicate == NULL);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
-  CHECK(ftun_linux_route_prepare(&policy, &transaction) == FTUN_OK);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_route_prepare(&policy, &transaction) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK);
   lan_spec.name.data = "lan0";
   lan_spec.name.length = strlen(lan_spec.name.data);
   lan_spec.mtu = 1400u;
-  CHECK(ftun_linux_tun_open(&lan_spec, &lan_port) == FTUN_OK && lan_port != NULL);
+  CHECK(ftun_tun_port_open(&lan_spec, &lan_port) == FTUN_OK && lan_port != NULL);
   policy = route_policy(true, true);
   policy.manage_local = false;
-  CHECK(ftun_linux_route_prepare(&policy, &transaction) == FTUN_OK);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_prepare(&policy, &transaction) == FTUN_OK);
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.resource_count == 5u && info.active_count == 5u &&
         info.strict_route);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
-  CHECK(ftun_linux_tun_close(&lan_port) == FTUN_OK);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_tun_port_close(&lan_port) == FTUN_OK);
+  CHECK(ftun_tun_port_close(&port) == FTUN_OK);
+  return 0;
+}
+
+static bool intercept_system_prepare, system_charged;
+static size_t system_calls;
+static ftun_budget_t *system_budget;
+ftun_status_t __real_ftun_platform_route_prepare(const ftun_route_policy_t *policy,
+  ftun_platform_route_transaction_t **out);
+ftun_status_t __wrap_ftun_platform_route_prepare(const ftun_route_policy_t *policy,
+  ftun_platform_route_transaction_t **out)
+{
+  ftun_budget_usage_t usage;
+  if (!intercept_system_prepare) return __real_ftun_platform_route_prepare(policy, out);
+  system_calls++;
+  system_charged = ftun_budget_get_usage(system_budget, &usage) == FTUN_OK &&
+    usage.used_resources.descriptors == 2u;
+  *out = NULL;
+  return FTUN_E_IO;
+}
+/* 表锁和 Netlink socket 必须同时准入；本夹具不执行宿主网络操作。 */
+static int system_admission(void)
+{
+  ftun_budget_options_t options = {{65536u, 1u, 0u}, {0}, {0}};
+  ftun_route_transaction_t *transaction = NULL;
+  ftun_route_policy_t policy = route_policy(false, false);
+  ftun_budget_usage_t usage;
+  unsigned int limit;
+  intercept_system_prepare = true;
+  for (limit = 1u; limit <= 2u; limit++) {
+    options.limit.descriptors = limit;
+    CHECK(ftun_budget_create_resources(NULL, &options, &system_budget) == FTUN_OK);
+    CHECK(ftun_route_prepare_with_budget(system_budget, &policy, &transaction) ==
+      (limit == 1u ? FTUN_E_LIMIT : FTUN_E_IO));
+    CHECK(transaction == NULL && system_calls == limit - 1u);
+    CHECK(limit == 1u || system_charged);
+    CHECK(ftun_budget_get_usage(system_budget, &usage) == FTUN_OK &&
+      usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
+    CHECK(ftun_budget_destroy(&system_budget) == FTUN_OK);
+  }
+  intercept_system_prepare = false;
+  return 0;
+}
+
+/* 通用 CIDR 的地址家族不能被截断成 IPv4 策略。 */
+static int prefix_family(void)
+{
+  ftun_cidr_t prefix = {{FTUN_IP_V6, {0x20u, 1u, 0x0du, 0xb8u}}, 32u};
+  ftun_route_plan_t plan;
+  CHECK(ftun_platform_route_guard_plan(&prefix, 1u, 1000u, 1000u, &plan) == FTUN_E_UNSUPPORTED);
+  CHECK(plan.resource_count == 0u);
+  CHECK(ftun_platform_route_overlay_plan(&prefix, 1u,
+    (ftun_string_t){"ftun-test", 9u}, 1000u, 1u, &plan) == FTUN_E_UNSUPPORTED);
+  CHECK(plan.resource_count == 0u);
   return 0;
 }
 
@@ -168,35 +222,35 @@ static int owned_budget(void)
   ftun_route_transaction_t *transaction = NULL;
   ftun_route_policy_t policy = route_policy(false, false);
   route_mock_t mock = {0};
-  ftun_linux_route_io_t io = mock_io(&mock);
+  ftun_route_io_t io = mock_io(&mock);
   options.limit = (ftun_budget_resources_t){65536u, 2u, 1u};
   options.cleanup_reserve.descriptors = 1u;
   CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
   CHECK(ftun_budget_reserve_resources(budget,
     (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
-  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+  CHECK(ftun_route_prepare_with_io_and_budget(budget, &policy, &io,
     &transaction) == FTUN_E_LIMIT && transaction == NULL && mock.apply_calls == 0u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
-  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+  ftun_reservation_release(&hold);
+  CHECK(ftun_route_prepare_with_io_and_budget(budget, &policy, &io,
     &transaction) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u &&
     usage.used_resources.descriptors == 0u);
   CHECK(ftun_budget_reserve_resources(budget,
     (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u &&
     usage.used_resources.descriptors == 1u && usage.high_watermarks.descriptors == 2u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   memset(&mock, 0, sizeof(mock));
   mock.fail_apply_call = 2u;
   mock.fail_apply_status = FTUN_E_IO;
   mock.fail_remove_call = 1u;
   mock.fail_remove_status = FTUN_E_IO;
-  CHECK(ftun_linux_route_prepare_with_io_and_budget(budget, &policy, &io,
+  CHECK(ftun_route_prepare_with_io_and_budget(budget, &policy, &io,
     &transaction) == FTUN_E_STATE_CORRUPT && transaction != NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u &&
     usage.used_resources.descriptors == 0u);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -204,30 +258,32 @@ static int owned_budget(void)
 int main(int argc, char **argv)
 {
   route_mock_t mock;
-  ftun_linux_route_io_t io;
-  ftun_linux_route_io_t incomplete;
+  ftun_route_io_t io;
+  ftun_route_io_t incomplete;
   ftun_route_policy_t policy = route_policy(true, true);
   ftun_route_transaction_t *transaction = NULL;
-  ftun_linux_route_info_t info;
+  ftun_route_info_t info;
   size_t index;
 
   if (argc == 2 && strcmp(argv[1], "--real") == 0) return real_smoke();
   CHECK(argc == 1);
+  CHECK(system_admission() == 0);
+  CHECK(prefix_family() == 0);
   CHECK(owned_budget() == 0);
   memset(&mock, 0, sizeof(mock));
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK &&
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK &&
         transaction != NULL);
   CHECK(check_resource_plan(&mock) == 0);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK);
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK);
   CHECK(info.resource_count == 7u && info.active_count == 7u && info.strict_route);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
   CHECK(mock.remove_calls == 7u);
   for (index = 0u; index < 7u; index++) {
     CHECK(memcmp(&mock.removed[index], &mock.applied[6u - index],
                  sizeof(mock.removed[index])) == 0);
   }
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK);
 
   for (index = 1u; index <= 7u; index++) {
     size_t removed_index;
@@ -235,7 +291,7 @@ int main(int argc, char **argv)
     mock.fail_apply_call = index;
     mock.fail_apply_status = index == 1u ? FTUN_E_REJECTED : FTUN_E_IO;
     io = mock_io(&mock);
-    CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+    CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
           mock.fail_apply_status);
     CHECK(transaction == NULL && mock.remove_calls == index - 1u);
     for (removed_index = 0u; removed_index < mock.remove_calls; removed_index++) {
@@ -251,15 +307,15 @@ int main(int argc, char **argv)
   mock.fail_apply_call = 3u;
   mock.fail_apply_status = FTUN_E_STALE;
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.active_count == 7u && mock.apply_calls == 7u);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && mock.remove_calls == 7u);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && mock.remove_calls == 7u);
   memset(&mock, 0, sizeof(mock));
   mock.fail_apply_call = 1u;
   mock.fail_apply_status = FTUN_E_STALE;
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_E_STALE &&
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_E_STALE &&
         transaction == NULL && mock.remove_calls == 0u);
 
   memset(&mock, 0, sizeof(mock));
@@ -268,82 +324,82 @@ int main(int argc, char **argv)
   mock.fail_remove_call = 2u;
   mock.fail_remove_status = FTUN_E_IO;
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_STATE_CORRUPT && transaction != NULL);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.active_count == 1u);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
 
   memset(&mock, 0, sizeof(mock));
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
   mock.fail_remove_call = 1u;
   mock.fail_remove_status = FTUN_E_STALE;
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
 
   memset(&mock, 0, sizeof(mock));
   io = mock_io(&mock);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
   mock.fail_remove_call = 1u;
   mock.fail_remove_status = FTUN_E_REJECTED;
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_E_REJECTED &&
+  CHECK(ftun_route_release(&transaction) == FTUN_E_REJECTED &&
         transaction != NULL);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.active_count == 1u);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK && transaction == NULL);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL);
 
   memset(&mock, 0, sizeof(mock));
   io = mock_io(&mock);
   policy = route_policy(false, false);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
-  CHECK(ftun_linux_route_get_info(transaction, &info) == FTUN_OK &&
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(ftun_route_get_info(transaction, &info) == FTUN_OK &&
         info.resource_count == 4u && !info.strict_route);
-  CHECK(ftun_linux_route_release(&transaction) == FTUN_OK);
+  CHECK(ftun_route_release(&transaction) == FTUN_OK);
 
   policy = route_policy(false, false);
   policy.manage_local = false;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID && transaction == NULL);
   policy = route_policy(false, false);
-  policy.route_table = FTUN_RT_TABLE_MAIN;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  policy.routing_domain = FTUN_RT_TABLE_MAIN;
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
-  policy.rule_priority = UINT32_MAX;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  policy.precedence = UINT32_MAX;
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
-  policy.protection_mark = 0u;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  policy.bypass_tag = 0u;
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
-  policy.protection_mark_mask = UINT32_C(0x0000ffff);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  policy.bypass_mask = UINT32_C(0x0000ffff);
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
   policy.tun_prefix_length = 0u;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(true, false);
   policy.lan_interface = policy.tun_interface;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(true, false);
   policy.lan_interface.data = "lo";
   policy.lan_interface.length = 2u;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
   incomplete = io;
   incomplete.remove = NULL;
   transaction = (ftun_route_transaction_t *)(uintptr_t)1;
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &incomplete, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(&policy, &incomplete, &transaction) ==
         FTUN_E_INVALID && transaction == NULL);
-  CHECK(ftun_linux_route_prepare_with_io(NULL, &io, &transaction) ==
+  CHECK(ftun_route_prepare_with_io(NULL, &io, &transaction) ==
         FTUN_E_INVALID && transaction == NULL);
-  CHECK(ftun_linux_route_prepare_with_io(&policy, &io, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_linux_route_get_info(NULL, &info) == FTUN_E_INVALID);
+  CHECK(ftun_route_prepare_with_io(&policy, &io, NULL) == FTUN_E_INVALID);
+  CHECK(ftun_route_get_info(NULL, &info) == FTUN_E_INVALID);
   CHECK(info.resource_count == 0u && info.active_count == 0u && !info.strict_route);
-  CHECK(ftun_linux_route_release(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_route_release(NULL) == FTUN_E_INVALID);
   return 0;
 }

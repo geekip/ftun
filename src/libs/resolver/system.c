@@ -164,7 +164,7 @@ static void ftun_system_resolver_completed(ftun_operation_t *operation,
   context->reservation = (ftun_reservation_t){0};
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_system_resolver_context_release(
@@ -175,7 +175,7 @@ static void ftun_system_resolver_context_release(
   reservation = context->reservation;
   context->reservation = (ftun_reservation_t){0};
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 /* 有界系统解析适配。 */
@@ -202,7 +202,7 @@ ftun_status_t ftun_system_resolve_with_execute(
   if (status != FTUN_OK) return status;
   context = (ftun_system_resolve_context_t *)calloc(1u, allocation_size);
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->reservation = reservation;

@@ -215,12 +215,12 @@ ftun_status_t ftun_event_log_create(ftun_budget_t *budget, ftun_event_log_t **ou
   if (status != FTUN_OK) return status;
   log = calloc(1u, sizeof(*log));
   if (log == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   if (ftun_mutex_init(&log->mutex) != FTUN_OK) {
     free(log);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   log->reservation = reservation;
@@ -489,7 +489,8 @@ ftun_status_t ftun_event_log_destroy(ftun_event_log_t **log)
   reservation = owned->reservation;
   free(owned);
   *log = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_lifecycle_emit(ftun_core_t *core,

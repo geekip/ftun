@@ -335,7 +335,7 @@ static void ftun_cache_entry_clear(ftun_dns_cache_t *cache, size_t slot)
   entry->heap_index = SIZE_MAX;
   if (cache->entry_count != 0u) cache->entry_count--;
   cache->free_slots[cache->free_count++] = slot;
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static size_t ftun_cache_slot(ftun_dns_cache_t *cache, uint64_t now)
@@ -389,7 +389,7 @@ static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
   if (status != FTUN_OK) return status;
   block = (uint8_t *)malloc(bytes == 0u ? 1u : bytes);
   if (block == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   slot = ftun_cache_slot(cache, now);
@@ -421,7 +421,7 @@ static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
     memset(entry, 0, sizeof(*entry));
     entry->heap_index = SIZE_MAX;
     cache->free_slots[cache->free_count++] = slot;
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   ftun_cache_heap_push(cache, slot);
@@ -490,7 +490,7 @@ fail:
     free(cache->entries);
     free(cache);
   }
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -589,7 +589,7 @@ ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache,
   if (status != FTUN_OK) return status;
   block = (uint8_t *)calloc(1u, bytes);
   if (block == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   answer = (ftun_dns_answer_t *)block;
@@ -625,7 +625,8 @@ ftun_status_t ftun_dns_answer_release(ftun_dns_answer_t **answer)
   reservation = owned->reservation;
   free(owned->owned_block);
   *answer = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_dns_cache_get_usage(const ftun_dns_cache_t *cache,
@@ -665,5 +666,6 @@ ftun_status_t ftun_dns_cache_destroy(ftun_dns_cache_t **cache)
   free(owned->entries);
   free(owned);
   *cache = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

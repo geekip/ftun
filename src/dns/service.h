@@ -9,6 +9,7 @@
 #include "core/event/loop.h"
 #include "util/types.h"
 #include "libs/transport/path.h"
+#include "libs/transport/protocol.h"
 
 #include <stdbool.h>
 
@@ -34,6 +35,7 @@ typedef struct {
   uint64_t generation;
   uint32_t socket_mark;
   ftun_path_provider_ops_t path;
+  const ftun_transport_protocol_t *protocol;
   void *context;
 } ftun_dns_runtime_network_t;
 
@@ -93,7 +95,7 @@ ftun_status_t ftun_dns_runtime_quiesce(ftun_dns_runtime_t *dns);
 /* Takes ownership of descriptor on success and attaches it to the same
  * policy DNS protocol used by TUN UDP/53 hijack. */
 ftun_status_t ftun_dns_runtime_hijack_tcp(ftun_dns_runtime_t *dns,
-                                         int descriptor);
+                                         ftun_handle_t descriptor);
 ftun_status_t ftun_dns_runtime_hijack_udp(
   ftun_dns_runtime_t *dns, ftun_datagram_t *inbound,
   const ftun_endpoint_t *client, const ftun_packet_t *packet);

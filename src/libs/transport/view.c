@@ -1,5 +1,6 @@
 #include "libs/transport/view.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -203,23 +204,15 @@ ftun_status_t ftun_network_view_retain(ftun_network_view_t *view)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_network_view_release(ftun_network_view_t **view)
+void ftun_network_view_release(ftun_network_view_t **view)
 {
   ftun_network_view_t *owned;
-  if (view == NULL) return FTUN_E_INVALID;
+  assert(view != NULL);
   owned = *view;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->magic != FTUN_NETWORK_VIEW_MAGIC || owned->references == 0u) {
-    return FTUN_E_INVALID;
-  }
+  if (owned == NULL) return;
+  assert(owned->magic == FTUN_NETWORK_VIEW_MAGIC && owned->references != 0u);
   *view = NULL;
-  owned->references--;
-  if (owned->references == 0u) {
-    owned->magic = 0u;
-    memset(owned, 0, sizeof(*owned));
-    free(owned);
-  }
-  return FTUN_OK;
+  if (--owned->references == 0u) free(owned);
 }
 
 ftun_status_t ftun_network_view_get_info(const ftun_network_view_t *view,

@@ -35,7 +35,7 @@ ftun_status_t ftun_dns_runtime_bootstrap_endpoint(
     (ftun_budget_resources_t){0u, 1u, 0u}, &reservation);
   if (status != FTUN_OK) return status;
   status = ftun_system_nameserver(out);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -100,7 +100,7 @@ ftun_status_t ftun_dns_runtime_resolve_upstream(
   size_t index;
   ptrdiff_t received;
   uint64_t deadline;
-  int descriptor = -1;
+  ftun_handle_t descriptor = -1;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_status_t status;
   if (config == NULL || text == NULL || out == NULL) return FTUN_E_INVALID;
@@ -165,8 +165,8 @@ ftun_status_t ftun_dns_runtime_resolve_upstream(
 
 done:
   (void)ftun_dns_message_release(&message);
-  if (descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
-  (void)ftun_reservation_release(&reservation);
+  if (descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)descriptor);
+  ftun_reservation_release(&reservation);
   return status;
 }
 

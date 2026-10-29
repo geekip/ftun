@@ -65,8 +65,8 @@ static int test_retirement(void)
   CHECK(pthread_cond_init(&writer.condition, NULL) == 0);
   CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_log_ledger_create(budget, &ledger) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used > 0u);
-  ledger_bytes = resources.used;
+  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used_resources.memory_bytes > 0u);
+  ledger_bytes = resources.used_resources.memory_bytes;
   options.level = FTUN_LOG_ERROR;
   options.queue_capacity = 2u;
   options.line_capacity = 128u;
@@ -96,7 +96,7 @@ static int test_retirement(void)
   CHECK(ftun_logger_write(slow, FTUN_LOG_ERROR, &diagnostic) == FTUN_E_CANCELLED);
   CHECK(ftun_log_ledger_destroy(&ledger) == FTUN_E_AGAIN && ledger != NULL);
   CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK &&
-    resources.used > ledger_bytes && resources.used_resources.queue_slots == 2u &&
+    resources.used_resources.memory_bytes > ledger_bytes && resources.used_resources.queue_slots == 2u &&
     resources.used_resources.descriptors == 0u);
   CHECK(ftun_log_ledger_get_usage(ledger, &totals) == FTUN_OK);
   CHECK(totals.created == 2u && totals.destroyed == 1u && totals.instances == 1u &&
@@ -109,7 +109,7 @@ static int test_retirement(void)
   (void)pthread_mutex_unlock(&writer.mutex);
   CHECK(ftun_logger_destroy(&slow) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK &&
-    resources.used == ledger_bytes && resources.used_resources.queue_slots == 0u);
+    resources.used_resources.memory_bytes == ledger_bytes && resources.used_resources.queue_slots == 0u);
   CHECK(ftun_log_ledger_get_usage(ledger, &totals) == FTUN_OK);
   CHECK(totals.created == 2u && totals.destroyed == 2u && totals.instances == 0u &&
     totals.capacity == 0u && totals.queued == 0u && totals.written == 2u &&
@@ -130,7 +130,7 @@ static int test_retirement(void)
     totals.capacity == 0u && totals.queued == 0u && totals.io_errors == 2u &&
     totals.close_errors == 1u && totals.emitted == 4u && totals.redacted == 2u);
   CHECK(ftun_log_ledger_destroy(&ledger) == FTUN_OK && ledger == NULL);
-  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(pthread_cond_destroy(&writer.condition) == 0);
   CHECK(pthread_mutex_destroy(&writer.mutex) == 0);
@@ -158,13 +158,13 @@ static int test_admission(void)
   options.path = "/dev/null";
   options.ledger = ledger;
   CHECK(ftun_logger_create(&options, &first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > base.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > base.used_resources.memory_bytes &&
     usage.used_resources.descriptors == 1u && usage.used_resources.queue_slots == 2u);
-  logger_bytes = usage.used - base.used;
+  logger_bytes = usage.used_resources.memory_bytes - base.used_resources.memory_bytes;
   /* 文件 FD 达限，在 open/线程创建之前拒绝候选，旧 sink 仍存活。 */
   CHECK(ftun_logger_create(&options, &second) == FTUN_E_LIMIT && second == NULL);
   CHECK(ftun_log_ledger_get_usage(ledger, &totals) == FTUN_OK && totals.created == 1u && totals.instances == 1u);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used + logger_bytes &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes + logger_bytes &&
     usage.used_resources.descriptors == 1u && usage.used_resources.queue_slots == 2u);
   CHECK(ftun_logger_destroy(&first) == FTUN_OK);
   options.path = NULL;
@@ -174,22 +174,22 @@ static int test_admission(void)
   CHECK(ftun_logger_create(&options, &second) == FTUN_E_LIMIT && second == NULL);
   options.queue_capacity = 2u;
   CHECK(ftun_logger_create(&options, &second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used + 2u * logger_bytes &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes + 2u * logger_bytes &&
     usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 4u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN);
   CHECK(ftun_logger_destroy(&first) == FTUN_OK && ftun_logger_destroy(&second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == 0u && usage.used_resources.descriptors == 0u);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available - 1u, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes - 1u, &hold) == FTUN_OK);
   CHECK(ftun_logger_create(&options, &first) == FTUN_E_LIMIT && first == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   options.writer = NULL;
   options.path = "/no/such/directory/ledger";
   CHECK(ftun_logger_create(&options, &first) == FTUN_E_IO && first == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == 0u && usage.used_resources.descriptors == 0u);
   CHECK(ftun_log_ledger_destroy(&ledger) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

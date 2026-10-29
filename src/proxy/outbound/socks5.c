@@ -1,7 +1,7 @@
 #define _GNU_SOURCE 1
 #include "proxy/outbound/socks5.h"
 #include "libs/transport/channel_internal.h"
-#include "libs/transport/socks5_client.h"
+#include "proxy/protocol/socks5_client.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -278,12 +278,12 @@ static ftun_status_t ftun_socks5_system_send(
   size_t *out_sent)
 {
   ptrdiff_t result;
-  int descriptor;
+  ftun_handle_t descriptor;
   (void)user;
   if (out_sent != NULL) *out_sent = 0u;
   if (out_sent == NULL || data == NULL || length == 0u ||
-      socket > (ftun_native_socket_t)INT_MAX) return FTUN_E_INVALID;
-  descriptor = (int)socket;
+      socket == FTUN_INVALID_SOCKET) return FTUN_E_INVALID;
+  descriptor = (ftun_handle_t)socket;
   ftun_status_t status;
   result = ftun_socket_stream_send(descriptor, data, length, &status);
   if (result < 0) return status;
@@ -297,12 +297,12 @@ static ftun_status_t ftun_socks5_system_receive(
   size_t *out_received)
 {
   ptrdiff_t result;
-  int descriptor;
+  ftun_handle_t descriptor;
   (void)user;
   if (out_received != NULL) *out_received = 0u;
   if (out_received == NULL || data == NULL || capacity == 0u ||
-      socket > (ftun_native_socket_t)INT_MAX) return FTUN_E_INVALID;
-  descriptor = (int)socket;
+      socket == FTUN_INVALID_SOCKET) return FTUN_E_INVALID;
+  descriptor = (ftun_handle_t)socket;
   ftun_status_t status;
   result = ftun_socket_stream_receive(descriptor, data, capacity, &status);
   if (result < 0) return status;
@@ -348,8 +348,7 @@ static ftun_status_t ftun_socks5_close_sockets(
       status = ftun_operation_cancel(connection->write_operation);
       return status == FTUN_OK || status == FTUN_E_STALE ? FTUN_E_AGAIN : status;
     }
-    status = ftun_buffer_slice_release(&connection->output_slice);
-    if (status != FTUN_OK) return status;
+    ftun_buffer_slice_release(&connection->output_slice);
     if (ftun_channel_transport(&connection->datagram) != 0) {
       status = ftun_channel_stop(&connection->datagram);
       if (status == FTUN_OK) status = ftun_channel_destroy(&connection->datagram);
@@ -427,11 +426,11 @@ static void ftun_socks5_release_context(
   network_view = connection->network_view;
   connection->reservation = (ftun_reservation_t){0};
   connection->network_view = NULL;
-  (void)ftun_path_scope_release(&connection->scope);
+  ftun_path_scope_release(&connection->scope);
   memset(connection, 0, sizeof(*connection));
   free(connection);
-  (void)ftun_network_view_release(&network_view);
-  (void)ftun_reservation_release(&reservation);
+  ftun_network_view_release(&network_view);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_socks5_completed(ftun_operation_t *operation,
@@ -726,7 +725,7 @@ static ftun_status_t ftun_socks5_process_write(
           memcpy(data, connection->output, connection->output_length);
           status = ftun_buffer_slice(buffer, 0u, connection->output_length, &connection->output_slice);
         }
-        (void)ftun_buffer_release(&buffer);
+        ftun_buffer_release(&buffer);
         if (status != FTUN_OK) return status;
       }
       slice = connection->output_slice;
@@ -737,8 +736,7 @@ static ftun_status_t ftun_socks5_process_write(
       if (status == FTUN_OK) connection->output_offset += sent;
       return status == FTUN_OK ? FTUN_E_AGAIN : status;
     }
-    status = ftun_buffer_slice_release(&connection->output_slice);
-    if (status != FTUN_OK) return status;
+    ftun_buffer_slice_release(&connection->output_slice);
   } else {
     if (connection->output_offset >= connection->output_length) return FTUN_E_STATE_CORRUPT;
     remaining = connection->output_length - connection->output_offset;
@@ -1102,9 +1100,9 @@ static ftun_status_t ftun_socks5_datagram_send_start(void *user,
     status = ftun_channel_send(connection->wire_datagram, &connection->relay, &wire);
     if (status != FTUN_OK) memset(&connection->datagram_send, 0, sizeof(connection->datagram_send));
   }
-  (void)ftun_packet_release(&wire);
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_packet_release(&wire);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   connection->busy = was_busy;
   return status;
 }
@@ -1191,7 +1189,7 @@ static ftun_status_t ftun_socks5_wire_receive(ftun_datagram_t *channel,
   connection->busy = true;
   if (status == FTUN_OK) status = ftun_channel_deliver(&connection->datagram,
     &connection->target, &logical);
-  (void)ftun_packet_release(&logical);
+  ftun_packet_release(&logical);
   connection->busy = was_busy;
   return status;
 }
@@ -1284,7 +1282,7 @@ static ftun_status_t ftun_socks5_connect_internal(
   if (status != FTUN_OK) return status;
   connection = (ftun_socks5_connection_t *)calloc(1u, allocation_size);
   if (connection == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   connection->core = core;

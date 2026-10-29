@@ -245,8 +245,8 @@ static void ftun_bootstrap_release_context(ftun_bootstrap_context_t *context)
   context->network_view = NULL;
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_network_view_release(&network_view);
-  (void)ftun_reservation_release(&reservation);
+  ftun_network_view_release(&network_view);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_bootstrap_completed(ftun_operation_t *operation,
@@ -652,7 +652,7 @@ static ftun_status_t ftun_bootstrap_explicit(
   if (status != FTUN_OK) return status;
   context = (ftun_bootstrap_context_t *)calloc(1u, allocation_size);
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->core = core;

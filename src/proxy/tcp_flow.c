@@ -146,10 +146,8 @@ ftun_status_t ftun_proxy_runtime_object_admit(
 ftun_status_t ftun_proxy_runtime_object_release(
   ftun_budget_t **budget, ftun_reservation_t *admission)
 {
-  ftun_status_t status;
   if (budget == NULL || admission == NULL) return FTUN_E_INVALID;
-  status = ftun_reservation_release(admission);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(admission);
   return ftun_budget_destroy(budget);
 }
 
@@ -410,7 +408,7 @@ void ftun_proxy_runtime_stream_destroy(void *user)
     (ftun_proxy_runtime_socket_stream_t *)user;
   if (socket_stream == NULL) return;
   if (socket_stream->descriptor >= 0) {
-    (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)socket_stream->descriptor);
+    (void)ftun_socket_close((ftun_native_socket_t)socket_stream->descriptor);
   }
   socket_stream->descriptor = -1;
   memset(&socket_stream->pending, 0, sizeof(socket_stream->pending));
@@ -448,7 +446,7 @@ void ftun_proxy_runtime_stream_progress(void *user)
 
 ftun_status_t ftun_proxy_runtime_stream_create(
   ftun_proxy_runtime_flow_t *flow, ftun_proxy_runtime_socket_stream_t *socket_stream,
-  int descriptor, ftun_stream_t **out)
+  ftun_handle_t descriptor, ftun_stream_t **out)
 {
   ftun_stream_options_t options;
   ftun_stream_backend_t backend;
@@ -516,7 +514,7 @@ ftun_status_t ftun_proxy_runtime_build_inbound_spec(
     if (status != FTUN_OK) return status;
     users = (ftun_inbound_user_t *)calloc(config->user_count, sizeof(*users));
     if (users == NULL) {
-      (void)ftun_reservation_release(out_reservation);
+      ftun_reservation_release(out_reservation);
       return FTUN_E_LIMIT;
     }
     for (index = 0u; index < config->user_count; index++) {
@@ -587,7 +585,8 @@ ftun_status_t ftun_proxy_runtime_preread_release(ftun_proxy_runtime_flow_t *flow
   flow->preread_capacity = 0u;
   flow->preread_offset = 0u;
   flow->preread_length = 0u;
-  return ftun_reservation_release(&flow->preread_reservation);
+  ftun_reservation_release(&flow->preread_reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_proxy_runtime_preread_ensure(ftun_proxy_runtime_flow_t *flow,
@@ -611,18 +610,14 @@ ftun_status_t ftun_proxy_runtime_preread_ensure(ftun_proxy_runtime_flow_t *flow,
     if (status != FTUN_OK) return status;
     storage = (uint8_t *)malloc(capacity);
     if (storage == NULL) {
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return FTUN_E_LIMIT;
     }
     if (flow->preread_length != 0u) {
       memcpy(storage, flow->preread, flow->preread_length);
     }
     free(flow->preread);
-    if (ftun_reservation_release(&flow->preread_reservation) != FTUN_OK) {
-      free(storage);
-      (void)ftun_reservation_release(&reservation);
-      return FTUN_E_STATE_CORRUPT;
-    }
+    ftun_reservation_release(&flow->preread_reservation);
     flow->preread = storage;
     flow->preread_reservation = reservation;
     flow->preread_capacity = capacity;
@@ -674,8 +669,7 @@ ftun_status_t ftun_proxy_runtime_flush_preread(ftun_proxy_runtime_flow_t *flow)
   if (flow->preread_operation != NULL) return FTUN_E_AGAIN;
   if (flow->preread_status != FTUN_OK) return flow->preread_status;
   if (flow->preread_offset == flow->preread_length) {
-    status = ftun_buffer_slice_release(&flow->preread_slice);
-    if (status != FTUN_OK) return status;
+    ftun_buffer_slice_release(&flow->preread_slice);
     return ftun_proxy_runtime_preread_release(flow);
   }
   if (flow->preread_slice.owner == NULL) {
@@ -689,7 +683,7 @@ ftun_status_t ftun_proxy_runtime_flush_preread(ftun_proxy_runtime_flow_t *flow)
       memcpy(data, flow->preread, flow->preread_length);
       status = ftun_buffer_slice(buffer, 0u, flow->preread_length, &flow->preread_slice);
     }
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_release(&buffer);
     if (status != FTUN_OK) return status;
   }
   remaining = flow->preread_slice;
@@ -935,7 +929,7 @@ void ftun_proxy_runtime_downstream_failed(ftun_proxy_runtime_flow_t *flow,
 }
 
 ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
-                                              int descriptor)
+                                              ftun_handle_t descriptor)
 {
   const ftun_relay_options_t relay_options = {
     FTUN_RELAY_DEFAULT_HIGH_WATER,
@@ -950,7 +944,7 @@ ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
   status = ftun_proxy_runtime_stream_create(flow, &flow->remote_socket, descriptor,
                                      &flow->remote);
   if (status != FTUN_OK) {
-    (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+    (void)ftun_socket_close((ftun_native_socket_t)descriptor);
     flow->remote_socket.descriptor = -1;
     return status;
   }
@@ -973,7 +967,7 @@ ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
                                         &remote_interests);
     if (status == FTUN_OK) {
       status = ftun_event_io_start(flow->engine->loop,
-        (ftun_native_socket_t)(unsigned int)descriptor, remote_interests,
+        (ftun_native_socket_t)descriptor, remote_interests,
         ftun_proxy_runtime_flow_remote_ready, flow, &flow->remote_source);
     }
     if (status == FTUN_OK && flow->client_source != NULL) {
@@ -1531,7 +1525,7 @@ ftun_status_t ftun_proxy_runtime_protocol_drive(ftun_proxy_runtime_flow_t *flow,
     ftun_proxy_runtime_downstream_failed(flow, status);
     status = FTUN_OK;
   }
-  (void)ftun_buffer_slice_release(&event.preread);
+  ftun_buffer_slice_release(&event.preread);
   if (status == FTUN_OK || status == FTUN_E_AGAIN) {
     ftun_status_t current = ftun_proxy_runtime_protocol_update(flow);
     if (current != FTUN_OK) status = current;
@@ -1541,7 +1535,7 @@ ftun_status_t ftun_proxy_runtime_protocol_drive(ftun_proxy_runtime_flow_t *flow,
 
 ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
                                               ftun_proxy_runtime_listener_t *listener,
-                                              int descriptor,
+                                              ftun_handle_t descriptor,
                                               const ftun_endpoint_t *peer)
 {
   ftun_proxy_runtime_flow_t *flow = NULL;
@@ -1555,7 +1549,7 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
   uint64_t now;
   status = ftun_proxy_runtime_flow_slot_acquire(engine, &flow);
   if (status != FTUN_OK) {
-    (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+    (void)ftun_socket_close((ftun_native_socket_t)descriptor);
     return status;
   }
   flow->engine = engine;
@@ -1566,7 +1560,7 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
     (ftun_budget_resources_t){0u, 1u, 1u},
     &flow->budget, &flow->admission);
   if (status != FTUN_OK) {
-    (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+    (void)ftun_socket_close((ftun_native_socket_t)descriptor);
     (void)ftun_proxy_runtime_flow_slot_release(&flow);
     return status;
   }
@@ -1599,11 +1593,11 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
   }
   free(users);
   users = NULL;
-  (void)ftun_reservation_release(&users_reservation);
+  ftun_reservation_release(&users_reservation);
   (void)ftun_runtime_release(&runtime);
   if (status == FTUN_OK) {
     status = ftun_event_io_start(engine->loop,
-      (ftun_native_socket_t)(unsigned int)descriptor,
+      (ftun_native_socket_t)descriptor,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR,
       ftun_proxy_runtime_flow_client_ready, flow, &flow->client_source);
   }
@@ -1615,7 +1609,7 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
 
 fail:
   free(users);
-  (void)ftun_reservation_release(&users_reservation);
+  ftun_reservation_release(&users_reservation);
   (void)ftun_runtime_release(&runtime);
   (void)ftun_event_source_cancel(&flow->client_source);
   (void)ftun_event_source_cancel(&flow->remote_source);
@@ -1628,7 +1622,7 @@ fail:
     (void)ftun_stream_stop(flow->client);
     (void)ftun_stream_destroy(&flow->client);
   } else if (descriptor >= 0) {
-    (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+    (void)ftun_socket_close((ftun_native_socket_t)descriptor);
   }
   if (ftun_proxy_runtime_preread_release(flow) != FTUN_OK) {
     status = FTUN_E_STATE_CORRUPT;
@@ -1738,11 +1732,9 @@ ftun_status_t ftun_proxy_runtime_flow_finalize(ftun_proxy_runtime_flow_t *flow)
     status = ftun_stream_destroy(&flow->remote);
     if (status != FTUN_OK) return status;
   }
-  status = ftun_buffer_slice_release(&flow->preread_slice);
-  if (status != FTUN_OK) return status;
-  status = ftun_path_scope_release(&flow->path_scope);
-  if (status == FTUN_OK) status = ftun_resolver_scope_release(&flow->resolver_scope);
-  if (status != FTUN_OK) return status;
+  ftun_buffer_slice_release(&flow->preread_slice);
+  ftun_path_scope_release(&flow->path_scope);
+  ftun_resolver_scope_release(&flow->resolver_scope);
   status = ftun_proxy_runtime_preread_release(flow);
   if (status != FTUN_OK) return status;
   status = ftun_proxy_runtime_object_release(&flow->budget, &flow->admission);

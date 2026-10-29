@@ -124,7 +124,7 @@ if(BUILD_TESTING)
     add_executable(ftun-runtime-tun-async-test tests/unit/core/config/test_app_composition.c tests/support/runtime_tun_async.c)
     target_compile_definitions(ftun-runtime-tun-async-test PRIVATE FTUN_TEST_TUN_ADMISSION=1 FTUN_TEST_TUN_ASYNC=1)
     foreach(operation ftun_tun_ingress_bind ftun_l3_provider_acquire
-        ftun_linux_route_prepare ftun_linux_route_prepare_with_budget ftun_linux_route_async_start ftun_linux_route_async_adopt)
+        ftun_route_prepare ftun_route_prepare_with_budget ftun_route_async_start ftun_route_async_adopt)
       target_link_options(ftun-runtime-tun-async-test PRIVATE "-Wl,--wrap=${operation}")
     endforeach()
     list(APPEND ftun_composition_test_targets ftun-runtime-tun-async-test)
@@ -149,13 +149,14 @@ if(BUILD_TESTING)
     add_executable(ftun-app-control-policy-test tests/unit/core/config/test_app_composition.c tests/support/app_control_policy.c)
     target_compile_definitions(ftun-app-control-policy-test PRIVATE FTUN_TEST_CONTROL_POLICY=1)
     target_link_options(ftun-app-control-policy-test PRIVATE
-      -Wl,--wrap=ftun_app_runtime_support -Wl,--wrap=ftun_linux_route_prepare
-      -Wl,--wrap=ftun_linux_route_prepare_with_budget
-      -Wl,--wrap=ftun_linux_route_async_adopt)
+      -Wl,--wrap=ftun_app_runtime_support -Wl,--wrap=ftun_route_prepare
+      -Wl,--wrap=ftun_route_prepare_with_budget
+      -Wl,--wrap=ftun_route_async_adopt)
     list(APPEND ftun_composition_test_targets ftun-app-control-policy-test)
     foreach(route true false)
       add_test(NAME app-control-policy-${route} COMMAND ftun-app-control-policy-test)
       set_tests_properties(app-control-policy-${route} PROPERTIES TIMEOUT 15
+        RESOURCE_LOCK ftun_host_socket
         ENVIRONMENT "FTUN_TEST_CONTROL_AUTO_ROUTE=${route}")
     endforeach()
   endif()
@@ -223,7 +224,7 @@ if(BUILD_TESTING)
     endforeach()
     target_link_options(ftun-proxy-owned-memory-test PRIVATE
       -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=ftun_worker_submit
-      -Wl,--wrap=ftun_inbound_adapter_destroy)
+      -Wl,--wrap=ftun_inbound_adapter_destroy -Wl,--wrap=ftun_http_fetch)
     if(FTUN_STATIC)
       target_link_options(ftun-proxy-owned-memory-test PRIVATE -static)
     endif()
@@ -310,7 +311,7 @@ if(BUILD_TESTING)
     target_compile_options(ftun-app-proxy-memory-test PRIVATE
       -fno-builtin-malloc -fno-builtin-calloc -fno-builtin-free)
     target_link_options(ftun-app-proxy-memory-test PRIVATE
-      -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=open
+      -Wl,--wrap=malloc -Wl,--wrap=calloc -Wl,--wrap=free -Wl,--wrap=open -Wl,--wrap=__open_2
       -Wl,--wrap=ftun_route_table_destroy -Wl,--wrap=read
       -Wl,--wrap=close -Wl,--wrap=mkstemp)
     if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
@@ -442,7 +443,7 @@ if(BUILD_TESTING)
   if(FTUN_MODULE_FAKEIP STREQUAL "BUILTIN")
     target_compile_definitions(ftun-cli-preflight-test PRIVATE FTUN_HAVE_MODULE_FAKEIP=1)
     target_link_options(ftun-cli-preflight-test PRIVATE
-      -Wl,--wrap=getrandom -Wl,--wrap=open -Wl,--wrap=close)
+      -Wl,--wrap=ftun_random_bytes -Wl,--wrap=ftun_random_device_bytes)
   endif()
   if(FTUN_STATIC)
     target_link_options(ftun-cli-preflight-test PRIVATE -static)
@@ -882,7 +883,7 @@ if(BUILD_TESTING)
     if(FTUN_MODULE_FRS STREQUAL "BUILTIN")
       target_sources(ftun-route-memory-test PRIVATE tests/support/frs_fixture.c)
       target_compile_definitions(ftun-route-memory-test PRIVATE FTUN_HAVE_MODULE_FRS=1)
-      target_link_options(ftun-route-memory-test PRIVATE -Wl,--wrap=open -Wl,--wrap=read)
+      target_link_options(ftun-route-memory-test PRIVATE -Wl,--wrap=ftun_file_open -Wl,--wrap=read)
     endif()
     if(FTUN_STATIC)
       target_link_options(ftun-route-memory-test PRIVATE -static)
@@ -1225,6 +1226,7 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME platform-linux-tun COMMAND ftun-platform-linux-tun-test)
     add_executable(ftun-platform-linux-route-test tests/unit/libs/tun/linux/test_platform_linux_route.c)
+    target_link_options(ftun-platform-linux-route-test PRIVATE -Wl,--wrap=ftun_platform_route_prepare)
     target_include_directories(ftun-platform-linux-route-test PRIVATE src)
     target_link_libraries(ftun-platform-linux-route-test PRIVATE ftun_runtime ftun_options)
     if(FTUN_STATIC)

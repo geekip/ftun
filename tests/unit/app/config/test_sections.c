@@ -134,7 +134,7 @@ int main(void)
           group.members.count = 1u;
           CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
           CHECK(ftun_config_validate_outbounds(budget, &group, 1u, &diagnostic) == FTUN_E_INVALID);
-          CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used &&
+          CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes &&
             after.metadata_bytes == before.metadata_bytes);
         }
       }
@@ -146,7 +146,7 @@ int main(void)
       }
       ftun_config_json_close(&json);
       CHECK(ftun_config_destroy(&config) == FTUN_OK);
-      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
       CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
     }
   }

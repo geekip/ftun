@@ -107,7 +107,7 @@ static int run_case(int current)
   CHECK(ftun_fakeip_service_destroy(&engine.fakeip) == FTUN_OK);
   CHECK(ftun_fakeip_store_destroy(&engine.fakeip_store) == FTUN_OK);
   CHECK(ftun_worker_destroy(&engine.fakeip_worker) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   for (index = 0u; index < sizeof(files) / sizeof(files[0]); index++) {
     CHECK(snprintf(path, sizeof(path), "%s/%s", directory, files[index]) > 0);

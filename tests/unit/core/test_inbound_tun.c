@@ -262,7 +262,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_operation_queue_stop(fixture->operations) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   return ftun_budget_destroy(&fixture->budget) == FTUN_OK ? 0 : 1;
 }
 
@@ -281,14 +281,14 @@ static ftun_status_t input_packet(fixture_t *fixture, const uint8_t *bytes,
   memcpy(storage, bytes, length);
   if (ftun_buffer_slice(buffer, 0u, length, &slice) != FTUN_OK ||
       ftun_packet_init(&packet, &slice, source_id) != FTUN_OK) {
-    (void)ftun_buffer_slice_release(&slice);
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_slice_release(&slice);
+    ftun_buffer_release(&buffer);
     return FTUN_E_LIMIT;
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   status = ftun_tun_ingress(fixture->ingress, &packet);
-  if (ftun_packet_release(&packet) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
+  ftun_packet_release(&packet);
   return status;
 }
 
@@ -368,11 +368,11 @@ static int test_tcp_stream(void)
         capacity >= sizeof(reply));
   memcpy(storage, reply, sizeof(reply));
   CHECK(ftun_buffer_slice(buffer, 0u, sizeof(reply), &slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_release(&buffer);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK &&
         accepted == sizeof(reply) && operation != NULL);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_stream_get_usage(fixture.stream, &stream_usage) == FTUN_OK &&
         stream_usage.pending_writes == 1u);
   for (index = fixture.output_count; index != 0u; index--) {
@@ -434,11 +434,11 @@ static int test_close_pending_tcp_write(void)
         capacity >= sizeof(reply));
   memcpy(storage, reply, sizeof(reply));
   CHECK(ftun_buffer_slice(buffer, 0u, sizeof(reply), &slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_release(&buffer);
   CHECK(ftun_stream_write_ref(fixture.stream, &slice, &accepted,
                               &operation) == FTUN_OK &&
         accepted == sizeof(reply) && operation != NULL);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   CHECK(ftun_tun_ingress_close(&fixture.ingress) == FTUN_E_AGAIN);
   CHECK(ftun_operation_dispatch(fixture.operations, 8u, &dispatched) ==
         FTUN_OK && dispatched == 1u && fixture.write_completions == 1u &&
@@ -461,8 +461,9 @@ static int packet_from_payload(ftun_budget_t *budget, const uint8_t *data,
   if (length != 0u) memcpy(storage, data, length);
   if (ftun_buffer_slice(buffer, 0u, length, &slice) != FTUN_OK ||
       ftun_packet_init(packet, &slice, 99u) != FTUN_OK) return 1;
-  (void)ftun_buffer_slice_release(&slice);
-  return ftun_buffer_release(&buffer) == FTUN_OK ? 0 : 1;
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
+  return 0;
 }
 
 static int test_udp_datagram(void)
@@ -503,7 +504,7 @@ static int test_udp_datagram(void)
         FTUN_E_REJECTED);
   CHECK(ftun_datagram_send(fixture.datagram,
         &fixture.udp_metadata.source, &response) == FTUN_OK);
-  CHECK(ftun_packet_release(&response) == FTUN_OK);
+  ftun_packet_release(&response);
   CHECK(fixture.output_count == 1u);
   output = fixture.outputs[0];
   header_length = (size_t)(output[0] & 0x0fu) * 4u;
@@ -523,8 +524,8 @@ static int test_udp_datagram(void)
   CHECK(packet_from_payload(fixture.budget, reply, sizeof(reply), &response) == 0);
   CHECK(ftun_datagram_send(fixture.datagram, &fixture.udp_metadata.source,
         &response) == FTUN_E_CANCELLED && fixture.output_count == 1u);
-  CHECK(ftun_packet_release(&response) == FTUN_OK);
-  CHECK(ftun_datagram_release(&fixture.datagram) == FTUN_OK);
+  ftun_packet_release(&response);
+  ftun_datagram_release(&fixture.datagram);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }
@@ -554,9 +555,9 @@ static int test_bounded_udp_close(void)
   CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_E_AGAIN && work == 1u);
   CHECK(ftun_tun_ingress_get_usage(fixture.ingress, &usage) == FTUN_OK && usage.udp_channels == 1u);
   CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_E_AGAIN && work == 1u);
-  CHECK(ftun_datagram_release(&held) == FTUN_OK);
+  ftun_datagram_release(&held);
   CHECK(ftun_tun_ingress_close_step(&fixture.ingress, 1u, &work) == FTUN_OK && work == 1u && fixture.ingress == NULL);
-  CHECK(ftun_packet_release(&reply) == FTUN_OK);
+  ftun_packet_release(&reply);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }

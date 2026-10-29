@@ -18,43 +18,23 @@
 static bool force_random_fallback;
 static ftun_budget_t *random_budget;
 static size_t random_opens;
-static int random_fd = -1;
-ssize_t __real_getrandom(void *buffer, size_t size, unsigned int flags);
-ssize_t __wrap_getrandom(void *buffer, size_t size, unsigned int flags)
+ftun_status_t __real_ftun_random_bytes(void *buffer, size_t length);
+ftun_status_t __wrap_ftun_random_bytes(void *buffer, size_t length)
 {
-  if (!force_random_fallback) return __real_getrandom(buffer, size, flags);
-  errno = ENOSYS;
-  return -1;
+  return force_random_fallback ? FTUN_E_IO : __real_ftun_random_bytes(buffer, length);
 }
-int __real_open(const char *path, int flags, ...);
-int __real_close(int descriptor);
-int __wrap_open(const char *path, int flags, ...)
+ftun_status_t __real_ftun_random_device_bytes(void *buffer, size_t length);
+ftun_status_t __wrap_ftun_random_device_bytes(void *buffer, size_t length)
 {
-  mode_t mode = 0;
-  int descriptor;
-  if ((flags & O_CREAT) != 0) {
-    va_list args; va_start(args, flags); mode = (mode_t)va_arg(args, int); va_end(args);
-  }
-  if (random_budget != NULL && strcmp(path, "/dev/urandom") == 0) {
-    ftun_budget_usage_t usage;
-    if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
-        usage.used_resources.descriptors != 1u) abort();
-    random_opens++;
-    descriptor = __real_open(path, flags, mode);
-    random_fd = descriptor;
-    return descriptor;
-  }
-  return __real_open(path, flags, mode);
-}
-int __wrap_close(int descriptor)
-{
-  if (random_budget != NULL && descriptor == random_fd) {
-    ftun_budget_usage_t usage;
-    if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
-        usage.used_resources.descriptors != 1u) abort();
-    random_fd = -1;
-  }
-  return __real_close(descriptor);
+  ftun_budget_usage_t usage;
+  ftun_status_t status;
+  if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
+      usage.used_resources.descriptors != 1u) abort();
+  random_opens++;
+  status = __real_ftun_random_device_bytes(buffer, length);
+  if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
+      usage.used_resources.descriptors != 1u) abort();
+  return status;
 }
 #endif
 
@@ -123,7 +103,7 @@ static int ownership(const char *path)
   CHECK(checked.config->plan != NULL && (checked.config->plan->reservation).budget != NULL);
   bytes = checked.config->document.owned_bytes + checked.config->plan->owned_bytes;
   CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
-  CHECK(before.used >= bytes && before.used_resources.descriptors == 0u);
+  CHECK(before.used_resources.memory_bytes >= bytes && before.used_resources.descriptors == 0u);
   core = checked.core;
   config = checked.config;
   CHECK(ftun_cli_check_config(path, 0, &checked) == FTUN_E_INVALID);
@@ -134,12 +114,12 @@ static int ownership(const char *path)
   hold_config = 1;
   CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_E_AGAIN);
   CHECK(core_destroy_calls == 0u && checked.core == core && checked.config == config);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes);
   hold_config = 0;
   hold_core = 1;
   CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_E_AGAIN);
   CHECK(checked.config == NULL && checked.core == core && core_destroy_calls == 1u);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used + bytes == before.used);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes + bytes == before.used_resources.memory_bytes);
   hold_core = 0;
   CHECK(ftun_cli_checked_config_destroy(&checked) == FTUN_OK);
   CHECK(checked.core == NULL && checked.config == NULL);
@@ -184,10 +164,10 @@ static int random_resources(void)
   options.limit.descriptors = 1u;
   CHECK(ftun_budget_create_resources(NULL, &options, &random_budget) == FTUN_OK);
   CHECK(ftun_budget_get_usage(random_budget, &before) == FTUN_OK);
-  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_OK && random_opens == 1u && random_fd == -1);
+  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_OK && random_opens == 1u);
   CHECK((uuid[6] & 0xf0u) == 0x40u && (uuid[8] & 0xc0u) == 0x80u);
   CHECK(ftun_budget_get_usage(random_budget, &usage) == FTUN_OK &&
-    usage.used == 0u && usage.metadata_bytes == before.metadata_bytes && usage.used_resources.descriptors == 0u);
+    usage.used_resources.memory_bytes == 0u && usage.metadata_bytes == before.metadata_bytes && usage.used_resources.descriptors == 0u);
   CHECK(ftun_budget_destroy(&random_budget) == FTUN_OK);
   force_random_fallback = false;
 #endif

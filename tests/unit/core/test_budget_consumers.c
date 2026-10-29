@@ -67,7 +67,7 @@ static ftun_status_t prepare(ftun_core_t *core, ftun_budget_t *budget,
   status = ftun_budget_get_usage(state.budget, &usage);
   if (status != FTUN_OK) return status;
   state.initial_metadata = usage.metadata_bytes;
-  state.initial_used = usage.used;
+  state.initial_used = usage.used_resources.memory_bytes;
   status = ftun_worker_create(state.budget, 16u, &state.workers[0]);
   if (status != FTUN_OK) return status;
   status = ftun_worker_create(state.budget, 16u, &state.workers[1]);
@@ -103,10 +103,10 @@ static ftun_status_t run_once(void *implementation, bool block,
     out->work += callbacks;
   }
   if (ftun_budget_get_usage(state.budget, &usage) != FTUN_OK ||
-      usage.used > usage.limit || usage.metadata_bytes < state.initial_metadata) {
+      usage.used_resources.memory_bytes > usage.limits.memory_bytes || usage.metadata_bytes < state.initial_metadata) {
     return FTUN_E_STATE_CORRUPT;
   }
-  if (ftun_budget_get_usage(state.root, &usage) != FTUN_OK || usage.used > usage.limit)
+  if (ftun_budget_get_usage(state.root, &usage) != FTUN_OK || usage.used_resources.memory_bytes > usage.limits.memory_bytes)
     return FTUN_E_STATE_CORRUPT;
   (void)sched_yield();
   return FTUN_OK;
@@ -140,10 +140,10 @@ static ftun_status_t destroy(void **implementation, uint64_t deadline)
     if (status != FTUN_OK) return status;
   }
   status = ftun_budget_get_usage(state.budget, &usage);
-  if (status != FTUN_OK || usage.used != state.initial_used ||
+  if (status != FTUN_OK || usage.used_resources.memory_bytes != state.initial_used ||
       usage.metadata_bytes != state.initial_metadata) {
     fprintf(stderr, "service budget mismatch: status=%d used=%zu/%zu metadata=%zu/%zu\n",
-      (int)status, usage.used, state.initial_used, usage.metadata_bytes, state.initial_metadata);
+      (int)status, usage.used_resources.memory_bytes, state.initial_used, usage.metadata_bytes, state.initial_metadata);
     return FTUN_E_STATE_CORRUPT;
   }
   status = ftun_budget_destroy(&state.budget);

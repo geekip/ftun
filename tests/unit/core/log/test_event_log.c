@@ -67,7 +67,7 @@ static int test_early(void)
   CHECK(ftun_budget_create(NULL, 131072u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_event_log_create(budget, &log) == FTUN_OK);
   CHECK(ftun_event_log_module_name(log, 0u, "app") == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used > 0u &&
+  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used_resources.memory_bytes > 0u &&
     resources.used_resources.queue_slots == FTUN_EVENT_LOG_EARLY_CAPACITY);
   CHECK(ftun_event_log_begin(log) == FTUN_OK);
   CHECK(ftun_event_log_reconfigure(log, NULL, true) == FTUN_E_STALE);
@@ -112,7 +112,7 @@ static int test_early(void)
   CHECK(ftun_event_log_get_usage(log, &usage) == FTUN_OK && usage.early_dropped == 2u &&
     usage.has_error && usage.last_error.status == FTUN_E_INVALID);
   CHECK(ftun_event_log_destroy(&log) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used == 0u &&
+  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used_resources.memory_bytes == 0u &&
     resources.used_resources.queue_slots == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
@@ -230,7 +230,7 @@ static int test_limits(void)
   options.limit.queue_slots = 15u;
   CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
   CHECK(ftun_event_log_create(budget, &log) == FTUN_E_LIMIT && log == NULL);
-  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used == 0u &&
+  CHECK(ftun_budget_get_usage(budget, &resources) == FTUN_OK && resources.used_resources.memory_bytes == 0u &&
     resources.used_resources.queue_slots == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   options.limit.memory_bytes = 1u;

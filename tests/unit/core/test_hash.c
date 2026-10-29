@@ -87,7 +87,7 @@ static int test_entropy_failure_and_retry(void)
   CHECK(ftun_index_create(budget, 1u, 2u, NULL, NULL, &index) == FTUN_E_IO &&
         index == NULL);
   entropy_failure = 0;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   before = entropy_calls;
   entropy_interrupts = 1;
   CHECK(ftun_index_create(budget, 1u, 2u, NULL, NULL, &index) == FTUN_OK &&
@@ -135,7 +135,7 @@ static int test_full_key_collision_and_growth(void)
         usage.key_bytes != 0u);
   CHECK(ftun_index_destroy(&index) == FTUN_OK && index == NULL);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

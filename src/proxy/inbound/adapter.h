@@ -2,7 +2,7 @@
 #define FTUN_PROXY_INBOUND_ADAPTER_H
 
 #include "proxy/inbound/inbound.h"
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 #include "libs/transport/stream.h"
 
 typedef struct ftun_inbound_adapter ftun_inbound_adapter_t;

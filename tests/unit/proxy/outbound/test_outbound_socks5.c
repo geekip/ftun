@@ -370,7 +370,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_event_loop_destroy(&fixture->loop) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   return ftun_budget_destroy(&fixture->budget) == FTUN_OK ? 0 : 1;
 }
 
@@ -692,7 +692,7 @@ static int test_overlay_udp_domain_sticky(void)
         &info) == FTUN_OK && info.proxy_domain == FTUN_DIAL_DOMAIN_OVERLAY &&
         info.network_generation == 23u && info.relay.address[0] == 198u);
   CHECK(fixture_stop(&fixture) == 0);
-  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  ftun_network_view_release(&view);
   return 0;
 }
 

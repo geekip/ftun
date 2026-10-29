@@ -34,7 +34,7 @@ static int check_budget(ftun_budget_t *budget, size_t used)
 {
   ftun_budget_usage_t usage;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(usage.used == used);
+  CHECK(usage.used_resources.memory_bytes == used);
   return 0;
 }
 
@@ -73,10 +73,10 @@ int main(void)
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_attach(NULL, 1u, SIZE_MAX) == FTUN_E_INVALID);
   CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_runtime_manager_attach(core, 2u, 4096u) == FTUN_E_LIMIT);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_runtime_manager_attach(core, 2u, 4096u) == FTUN_OK);
   CHECK(ftun_runtime_manager_attach(core, 3u, 8192u) == FTUN_E_STALE);
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK &&
@@ -95,8 +95,8 @@ int main(void)
   CHECK(ftun_runtime_manager_clear(core) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u);
-  manager_bytes = usage.used;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u);
+  manager_bytes = usage.used_resources.memory_bytes;
   CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK);
   CHECK(manager_info.generation == 0u && !manager_info.has_active &&
         !manager_info.has_candidate && manager_info.retained_limit == 1u &&
@@ -284,15 +284,15 @@ int main(void)
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  manager_bytes = usage.used;
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  manager_bytes = usage.used_resources.memory_bytes;
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   first = make_config(first_text);
   CHECK(first != NULL);
   candidate = (ftun_runtime_t *)(uintptr_t)1;
   CHECK(ftun_runtime_prepare(core, first, &candidate) == FTUN_E_LIMIT &&
         candidate == NULL && first->document.reference_count == 1u);
   CHECK(check_budget(budget, 1024u * 1024u) == 0);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(check_budget(budget, manager_bytes) == 0);
   CHECK(ftun_config_destroy(&first) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);

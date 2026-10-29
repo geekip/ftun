@@ -61,7 +61,7 @@ bool bridge_has_hijack(
 }
 
 ftun_status_t bridge_tcp(
-  const ftun_proxy_dns_runtime_adapter_t *adapter, int descriptor)
+  const ftun_proxy_dns_runtime_adapter_t *adapter, ftun_handle_t descriptor)
 {
   ftun_dns_runtime_t *dns = NULL;
   ftun_status_t status = ftun_proxy_dns_runtime_get(adapter, &dns);
@@ -106,7 +106,7 @@ bool bridge_has_hijack(
 }
 
 ftun_status_t bridge_tcp(
-  const ftun_proxy_dns_runtime_adapter_t *adapter, int descriptor)
+  const ftun_proxy_dns_runtime_adapter_t *adapter, ftun_handle_t descriptor)
 {
   (void)adapter;
   (void)descriptor;

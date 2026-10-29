@@ -90,7 +90,7 @@ size_t ftun_netmon_parse(const uint8_t *data, size_t length,
   return messages;
 }
 
-ftun_status_t ftun_iface_subscribe(int *descriptor)
+ftun_status_t ftun_iface_subscribe(ftun_handle_t *descriptor)
 {
   struct ftun_sockaddr_nl address = {0};
   int fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, FTUN_NETLINK_ROUTE);
@@ -105,9 +105,9 @@ ftun_status_t ftun_iface_subscribe(int *descriptor)
   *descriptor = fd;
   return FTUN_OK;
 }
-ftun_status_t ftun_iface_receive(int descriptor, void *data, size_t capacity, size_t *received)
+ftun_status_t ftun_iface_receive(ftun_handle_t descriptor, void *data, size_t capacity, size_t *received)
 {
-  ssize_t length = recv(descriptor, data, capacity, MSG_DONTWAIT);
+  ssize_t length = recv((int)descriptor, data, capacity, MSG_DONTWAIT);
   *received = 0u;
   if (length < 0) {
     if (errno == EINTR) return FTUN_OK;

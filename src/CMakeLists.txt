@@ -12,6 +12,7 @@ add_subdirectory(libs)
 # 配置读写独立于业务运行目标，裁剪构建仍保留旧字段的校验语义。
 add_subdirectory(dns/config)
 add_subdirectory(proxy/config)
+add_subdirectory(proxy/protocol)
 if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
   add_subdirectory(dns)
 endif()
@@ -25,7 +26,7 @@ target_include_directories(ftun_runtime INTERFACE
 target_link_libraries(ftun_runtime INTERFACE ftun_app)
 set(ftun_layer_targets ftun_util ftun_platform ftun_core
   ftun_lib_buffer ftun_lib_transport ftun_lib_resolver ftun_lib_tun_config ftun_dns_config ftun_proxy_config ftun_app_config ftun_app)
-foreach(target ftun_dns ftun_proxy ftun_lib_tun)
+foreach(target ftun_dns ftun_proxy ftun_proxy_protocol ftun_lib_tun)
   if(TARGET ${target})
     list(APPEND ftun_layer_targets ${target})
   endif()

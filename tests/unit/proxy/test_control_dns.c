@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include <fcntl.h>
 #include "proxy/http_route.h"
+#include "proxy/protocol/socks5_transport.h"
 #include "libs/transport/socket_path.h"
 #include "platform/clock.h"
 
@@ -72,6 +73,7 @@ int main(int argc, char **argv)
   spec.resolver.tcp = strcmp(argv[2], "tcp") == 0;
   memcpy(spec.resolver.upstream, argv[3], strlen(argv[3]) + 1u);
   memcpy(spec.resolver.proxy, argv[4], strlen(argv[4]) + 1u);
+  spec.resolver.query = ftun_resolver_socks5_query_blocking;
   spec.resolver.use_proxy = argv[4][0] != '\0';
   if (atoi(argv[6]) != 0) {
     memcpy(spec.resolver.proxy_username, "user", 5u);
@@ -91,7 +93,7 @@ int main(int argc, char **argv)
   if (result.length != 0u) (void)fwrite(result.data, 1u, result.length, stdout);
   ftun_http_fetch_release(&result);
   if (strcmp(argv[2], "system") != 0 && system_calls != 0u) return 5;
-  if (ftun_budget_get_usage(budget, &after) != FTUN_OK || after.used != before.used ||
+  if (ftun_budget_get_usage(budget, &after) != FTUN_OK || after.used_resources.memory_bytes != before.used_resources.memory_bytes ||
       after.metadata_bytes != before.metadata_bytes || after.used_resources.descriptors != 0u ||
       ftun_budget_destroy(&budget) != FTUN_OK) return 6;
   return 0;

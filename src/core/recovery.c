@@ -140,7 +140,7 @@ ftun_status_t ftun_recovery_scheduler_create(ftun_budget_t *budget,
   }
   if (scheduler == NULL || scheduler->slots == NULL) {
     free(scheduler);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   scheduler->reservation = reservation;
@@ -183,7 +183,7 @@ ftun_status_t ftun_recovery_scheduler_destroy(
   reservation = owned->reservation;
   free(owned->slots);
   free(owned);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   *scheduler = NULL;
   return FTUN_OK;
 }

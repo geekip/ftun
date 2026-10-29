@@ -193,7 +193,7 @@ static ftun_status_t limited_round(const ftun_core_info_t *info)
     test.step = 2u;
   } else if (test.step == 2u && test.posts == 1u) {
     /* 控制完成发生在 FD 仍耗尽时；归还额度后同一 reload 可恢复。 */
-    REQUIRE(ftun_reservation_release(&test.hold) == FTUN_OK);
+    ftun_reservation_release(&test.hold);
     REQUIRE(reload(1u) == FTUN_OK);
     test.step = 3u;
   } else if (test.step == 3u && test.callbacks == 2u) {

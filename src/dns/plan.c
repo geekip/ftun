@@ -26,13 +26,13 @@ ftun_status_t ftun_dns_runtime_plan_prepare(ftun_budget_t *budget, const ftun_co
   if (status != FTUN_OK) return status;
   plan = (ftun_dns_runtime_plan_t *)calloc(1u, sizeof(*plan));
   if (plan == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   status = ftun_config_retain((ftun_config_t *)config);
   if (status != FTUN_OK) {
     free(plan);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   plan->reservation = reservation;
@@ -111,8 +111,7 @@ ftun_status_t ftun_dns_runtime_plan_destroy(ftun_dns_runtime_plan_t **plan_ptr)
   if (plan == NULL) return FTUN_OK;
   status = ftun_config_destroy(&plan->config);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&plan->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&plan->reservation);
   free(plan->proxies);
   free(plan->proxy_valid);
   memset(plan, 0, sizeof(*plan));

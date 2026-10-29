@@ -47,7 +47,7 @@ ftun_status_t ftun_upstream_set_create(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   set = (ftun_upstream_set_t *)calloc(1u, sizeof(*set));
   if (set == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   set->reservation = reservation;
@@ -89,7 +89,7 @@ ftun_status_t ftun_upstream_set_destroy(ftun_upstream_set_t **out)
   reservation = set->reservation;
   memset(set, 0, sizeof(*set));
   free(set);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   *out = NULL;
   return FTUN_OK;
 }

@@ -236,7 +236,7 @@ static int fixture_destroy(fixture_t *fixture, int stop_relay)
       ftun_stream_destroy(&fixture->right) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   if (ftun_budget_destroy(&fixture->budget) != FTUN_OK) return 1;
   return 0;
 }
@@ -401,14 +401,14 @@ static int test_lazy_budget_and_error(void)
   fixture.left_backend.input[0] = 'z';
   fixture.left_backend.input_length = 1u;
   CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK &&
-        usage.normal_available > 0u);
-  CHECK(ftun_budget_reserve(fixture.budget, usage.normal_available,
+        usage.normal_available_resources.memory_bytes > 0u);
+  CHECK(ftun_budget_reserve(fixture.budget, usage.normal_available_resources.memory_bytes,
                             &blocker) == FTUN_OK);
   CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_READ, 0u,
                            &work) == FTUN_E_LIMIT && work == 0u);
   CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK &&
         !relay_usage.stopped && relay_usage.left_to_right_buffered == 0u);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(process(&fixture, FTUN_EVENT_READ, 0u, 2u) == 0);
   CHECK(fixture.right_backend.write.stream != NULL);
   CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_ERROR, 0u,
@@ -522,7 +522,7 @@ static int test_pool_wait_resume_and_cancel(void)
     &fixture.relay) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &held) == FTUN_OK);
   CHECK(ftun_budget_get_usage(fixture.budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available,
+  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available_resources.memory_bytes,
                             &blocker) == FTUN_OK);
   fixture.left_backend.input[0] = 'x';
   fixture.left_backend.input_length = 1u;
@@ -536,7 +536,7 @@ static int test_pool_wait_resume_and_cancel(void)
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK &&
         pool_usage.waiting == 1u);
 
-  CHECK(ftun_buffer_release(&held) == FTUN_OK && wakeups == 1u);
+  ftun_buffer_release(&held); CHECK(wakeups == 1u);
   CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK &&
         callbacks == 1u && progress_calls == 1u);
   CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK &&
@@ -547,14 +547,14 @@ static int test_pool_wait_resume_and_cancel(void)
         work == 1u && fixture.left_backend.read_calls == 1);
   CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
   CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
 
   CHECK(ftun_relay_start_with_pool_options(NULL, fixture.left, fixture.right,
     pool, &options, relay_progress, &progress_calls,
     &fixture.relay) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &held) == FTUN_OK);
   CHECK(ftun_budget_get_usage(fixture.budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available,
+  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available_resources.memory_bytes,
                             &blocker) == FTUN_OK);
   fixture.left_backend.input[1] = 'y';
   fixture.left_backend.input_length = 2u;
@@ -567,10 +567,10 @@ static int test_pool_wait_resume_and_cancel(void)
   CHECK(ftun_buffer_pool_get_usage(pool, &pool_usage) == FTUN_OK &&
         pool_usage.waiting == 0u && pool_usage.cancelled_waiters == 1u &&
         pool_usage.wake_callbacks == 1u);
-  CHECK(ftun_buffer_release(&held) == FTUN_OK);
+  ftun_buffer_release(&held);
   CHECK(ftun_buffer_pool_dispatch(pool, SIZE_MAX, &callbacks) == FTUN_OK &&
         callbacks == 0u && progress_calls == 1u);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(fixture_destroy(&fixture, 0) == 0);
   return 0;
@@ -597,13 +597,13 @@ static int test_mixed_pool_resume(void)
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &held[0]) == FTUN_OK);
   CHECK(ftun_buffer_pool_acquire(pool, 256u, &held[1]) == FTUN_OK);
   CHECK(ftun_budget_get_usage(fixture.budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available_resources.memory_bytes, &blocker) == FTUN_OK);
   fixture.left_backend.input[0] = 'm';
   fixture.left_backend.input_length = 1u;
   CHECK(ftun_relay_process(fixture.relay, FTUN_EVENT_READ, 0u, &work) == FTUN_OK && work == 0u);
   CHECK(ftun_relay_get_usage(fixture.relay, &relay_usage) == FTUN_OK && relay_usage.left_buffer_waiting);
-  CHECK(ftun_buffer_release(&held[0]) == FTUN_OK && wakeups == 0u);
-  CHECK(ftun_buffer_release(&held[1]) == FTUN_OK && wakeups == 1u);
+  ftun_buffer_release(&held[0]); CHECK(wakeups == 0u);
+  ftun_buffer_release(&held[1]); CHECK(wakeups == 1u);
   CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 1u);
   CHECK(progress_calls == 1u);
   /* 两个小块触发恢复；不再提供新的 FD readiness。 */
@@ -615,7 +615,7 @@ static int test_mixed_pool_resume(void)
   CHECK(ftun_relay_stop(fixture.relay) == FTUN_OK);
   CHECK(ftun_relay_destroy(&fixture.relay) == FTUN_OK);
   CHECK(ftun_buffer_pool_dispatch(pool, 1u, &callbacks) == FTUN_OK && callbacks == 0u);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
+  ftun_reservation_release(&blocker);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(fixture_destroy(&fixture, 0) == 0);
   return 0;

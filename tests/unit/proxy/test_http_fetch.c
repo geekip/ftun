@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "proxy/protocol/socks5.h"
 #include "libs/http/http.h"
 #include "libs/tls/tls.h"
 #include "platform/clock.h"
@@ -26,7 +27,7 @@ static void *observed_malloc(size_t size)
   void *value;
   size_t index;
   if (ftun_budget_get_usage(observed_budget, &usage) != FTUN_OK ||
-      usage.used < live_bytes + size) {
+      usage.used_resources.memory_bytes < live_bytes + size) {
     fprintf(stderr, "HTTP allocation was not admitted\n");
     abort();
   }
@@ -81,19 +82,19 @@ static int memory_contract(void)
       (ftun_string_t){base, sizeof(base) - 1u}, locations[index], &text, &reservation) == FTUN_OK);
     CHECK(strcmp(text, expected[index]) == 0);
     CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
-      usage.used == strlen(text) + 1u && live_bytes == usage.used);
+      usage.used_resources.memory_bytes == strlen(text) + 1u && live_bytes == usage.used_resources.memory_bytes);
     observed_free(text); text = NULL;
-    CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
+    ftun_reservation_release(&reservation);
   }
   memcpy(wire, response, sizeof(response));
   CHECK(ftun_http_fetch_parse_response(observed_budget, wire, sizeof(response) - 1u,
     1024u, &result, &text, &reservation) == FTUN_OK);
   CHECK(strcmp(result.etag, "second") == 0 && strcmp(text, "/b") == 0);
   CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&
-    usage.used == sizeof("second") + sizeof("/b") && usage.used == live_bytes);
+    usage.used_resources.memory_bytes == sizeof("second") + sizeof("/b") && usage.used_resources.memory_bytes == live_bytes);
   ftun_http_fetch_release(&result);
   observed_free(text); text = NULL;
-  CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
+  ftun_reservation_release(&reservation);
   memcpy(wire, last_etag, sizeof(last_etag));
   CHECK(ftun_http_fetch_parse_response(observed_budget, wire, sizeof(last_etag) - 1u,
     1024u, &result, &text, &reservation) == FTUN_OK);
@@ -103,8 +104,8 @@ static int memory_contract(void)
   CHECK(ftun_http_redirect_url(observed_budget,
     (ftun_string_t){base, sizeof(base) - 1u}, "/a", &text, &reservation) == FTUN_E_LIMIT);
   CHECK(!fail_allocation && text == NULL && (reservation).budget == NULL && live_bytes == 0u);
-  CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK && usage.used == 0u);
-  CHECK(ftun_budget_reserve(observed_budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
+  CHECK(ftun_budget_reserve(observed_budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   calls = allocation_calls;
   CHECK(ftun_http_redirect_url(observed_budget,
     (ftun_string_t){base, sizeof(base) - 1u}, "/a", &text, &reservation) == FTUN_E_LIMIT);
@@ -113,12 +114,13 @@ static int memory_contract(void)
     1024u, &result, &text, &reservation) == FTUN_E_LIMIT);
   CHECK(calls == allocation_calls && result.etag == NULL && (reservation).budget == NULL);
   ftun_http_fetch_release(&result);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_budget_destroy(&observed_budget) == FTUN_OK);
   return 0;
 }
 
 static const char *test_ca;
+static size_t context_opens;
 
 ftun_status_t __real_ftun_tls_context_open(const ftun_tls_options_t *options,
   ftun_tls_context_t **out);
@@ -126,6 +128,7 @@ ftun_status_t __wrap_ftun_tls_context_open(const ftun_tls_options_t *options,
   ftun_tls_context_t **out)
 {
   ftun_tls_options_t copy = *options;
+  context_opens++;
   if (test_ca != NULL && test_ca[0] != '\0') copy.ca_file = test_ca;
   return __real_ftun_tls_context_open(&copy, out);
 }
@@ -135,6 +138,7 @@ int main(int argc, char **argv)
   ftun_budget_t *budget = NULL;
   ftun_budget_options_t options = {{8u * 1024u * 1024u, 16u, 4096u}, {128u, 0u, 0u}, {0}};
   ftun_http_fetch_spec_t spec = {0};
+  ftun_tls_context_t *shared_context = NULL;
   ftun_http_fetch_result_t result;
   ftun_budget_usage_t before, after;
   ftun_status_t status;
@@ -156,6 +160,7 @@ int main(int argc, char **argv)
   spec.if_none_match = (ftun_string_t){"\"control-test\"", 14u};
   if (atoi(argv[2]) != 0) {
     spec.use_proxy = true;
+    spec.protocol = &ftun_socks5_protocol;
     spec.proxy.kind = FTUN_ADDRESS_IPV4;
     spec.proxy.port = (uint16_t)atoi(argv[2]);
     spec.proxy.address[0] = 127u;
@@ -165,9 +170,22 @@ int main(int argc, char **argv)
       spec.proxy_password = (ftun_string_t){"pass", 4u};
     }
   }
+  if (!spec.use_proxy && strncmp(argv[1], "https://", 8u) == 0) {
+    spec.tls_context = &shared_context;
+  }
   status = ftun_http_fetch(&spec, &result);
+  if (status == FTUN_OK && shared_context != NULL) {
+    unsigned int http_status = result.status;
+    ftun_http_fetch_release(&result);
+    /* 第二次拉取不能重新读取 CA；context 必须由 owner 保留。 */
+    test_ca = "/nonexistent-ftun-context-reuse-ca.pem";
+    status = ftun_http_fetch(&spec, &result);
+    if (status != FTUN_OK || result.status != http_status ||
+        !result.tls_verified || context_opens != 1u) return 8;
+  }
+  if (ftun_tls_context_destroy(&shared_context) != FTUN_OK) return 9;
   if (ftun_budget_get_usage(budget, &after) != FTUN_OK ||
-      after.used != live_bytes || after.used != result.length +
+      after.used_resources.memory_bytes != live_bytes || after.used_resources.memory_bytes != result.length +
         (result.etag == NULL ? 0u : strlen(result.etag) + 1u) ||
       after.used_resources.descriptors != 0u ||
       after.used_resources.queue_slots != 0u) return 6;
@@ -177,7 +195,7 @@ int main(int argc, char **argv)
   ftun_http_fetch_release(&result);
   if (live_bytes != 0u) return 7;
   if (ftun_budget_get_usage(budget, &after) != FTUN_OK ||
-      after.used != before.used || after.metadata_bytes != before.metadata_bytes ||
+      after.used_resources.memory_bytes != before.used_resources.memory_bytes || after.metadata_bytes != before.metadata_bytes ||
       ftun_budget_destroy(&budget) != FTUN_OK) return 4;
   observed_budget = NULL;
   return 0;

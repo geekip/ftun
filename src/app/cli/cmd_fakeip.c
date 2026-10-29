@@ -29,7 +29,7 @@ static ftun_status_t ftun_cli_random_uuid(ftun_budget_t *budget,
       (ftun_budget_resources_t){0u, 1u, 0u}, &reservation);
     if (status != FTUN_OK) return status;
     status = ftun_random_device_bytes(uuid, FTUN_FAKEIP_UUID_BYTES);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     if (status != FTUN_OK) return status;
   }
   uuid[6] = (uint8_t)((uuid[6] & 0x0fu) | 0x40u);
@@ -88,7 +88,7 @@ int ftun_cli_fakeip_init(const char *path)
   }
   directory = (char *)malloc(length + sizeof(".fakeip"));
   if (directory == NULL) {
-    (void)ftun_reservation_release(&directory_reservation);
+    ftun_reservation_release(&directory_reservation);
     (void)ftun_cli_checked_config_destroy(&checked);
     return ftun_cli_error("fakeip init", FTUN_E_LIMIT);
   }
@@ -97,7 +97,7 @@ int ftun_cli_fakeip_init(const char *path)
   status = ftun_fakeip_store_initialize_budget(config->document.budget, directory, &identity);
   if (status == FTUN_OK) printf("FakeIP state initialized: %s\n", directory);
   free(directory);
-  (void)ftun_reservation_release(&directory_reservation);
+  ftun_reservation_release(&directory_reservation);
   {
     ftun_status_t cleanup_status = ftun_cli_checked_config_destroy(&checked);
     if (status == FTUN_OK) status = cleanup_status;

@@ -1,4 +1,4 @@
-#include "libs/transport/socks5_client.h"
+#include "proxy/protocol/socks5_client.h"
 
 #include <stdio.h>
 #include <string.h>

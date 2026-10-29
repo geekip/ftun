@@ -1,6 +1,7 @@
 #include "libs/resolver/resolver.h"
 #include "platform/clock.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -100,7 +101,7 @@ ftun_status_t ftun_resolver_provider_create(
   if (status != FTUN_OK) return status;
   provider = (ftun_resolver_provider_t *)calloc(1u, sizeof(*provider));
   if (provider == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   provider->budget = spec->budget;
@@ -124,7 +125,7 @@ static void ftun_resolver_pending_release(ftun_resolver_pending_t *pending)
   if (pending->next != NULL) pending->next->previous = pending->previous;
   provider->pending_count--;
   free(pending);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_resolver_pending_completed(ftun_operation_t *operation,
@@ -185,7 +186,7 @@ static ftun_status_t ftun_resolver_provider_start_internal(
   status = ftun_budget_reserve(request->system.budget, sizeof(*pending), &reservation);
   if (status != FTUN_OK) return status;
   pending = calloc(1u, sizeof(*pending));
-  if (pending == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (pending == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   pending->provider = provider;
   pending->reservation = reservation;
   pending->completion = request->system.completion;
@@ -235,7 +236,7 @@ ftun_status_t ftun_resolver_provider_scope(ftun_resolver_provider_t *provider,
   status = ftun_budget_reserve(provider->budget, sizeof(*scope), &reservation);
   if (status != FTUN_OK) return status;
   scope = calloc(1u, sizeof(*scope));
-  if (scope == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (scope == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   scope->provider = provider;
   scope->reservation = reservation;
   scope->generation = generation;
@@ -253,20 +254,19 @@ ftun_status_t ftun_resolver_scope_retain(ftun_resolver_scope_t *scope)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_resolver_scope_release(ftun_resolver_scope_t **scope)
+void ftun_resolver_scope_release(ftun_resolver_scope_t **scope)
 {
   ftun_resolver_scope_t *owned;
-  ftun_status_t status;
-  if (scope == NULL) return FTUN_E_INVALID;
+  assert(scope != NULL);
   owned = *scope;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->references > 1u) { owned->references--; *scope = NULL; return FTUN_OK; }
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
-  owned->provider->scope_count--;
-  free(owned);
+  if (owned == NULL) return;
+  assert(owned->references != 0u);
   *scope = NULL;
-  return FTUN_OK;
+  if (--owned->references != 0u) return;
+  assert(owned->provider->scope_count != 0u);
+  owned->provider->scope_count--;
+  ftun_reservation_release(&owned->reservation);
+  free(owned);
 }
 
 ftun_status_t ftun_resolver_scope_generation(const ftun_resolver_scope_t *scope,
@@ -416,5 +416,6 @@ ftun_status_t ftun_resolver_provider_destroy(
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *provider = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

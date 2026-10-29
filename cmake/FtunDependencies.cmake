@@ -60,10 +60,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   endif()
 endif()
 if(CMAKE_C_COMPILER_ID STREQUAL "GNU" AND
-   CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 14)
-  # wolfSSL 5.8.4's constant-time HMAC loop triggers GCC 14's conservative
-  # object-size diagnostic at -O3. Keep all other upstream -Werror checks.
-  target_compile_options(wolfssl PRIVATE -Wno-error=stringop-overflow)
+   CMAKE_C_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+  # 常量时间 HMAC 的 macLen 来自已选摘要算法；GCC 13/14 的向量化
+  # 对 innerHash 报对象大小误告警。仅此上游源文件不将该告警升级为错误。
+  set_property(SOURCE "${PROJECT_SOURCE_DIR}/third_party/wolfssl/src/tls.c"
+    DIRECTORY third_party/wolfssl APPEND
+    PROPERTY COMPILE_OPTIONS -Wno-error=stringop-overflow)
 endif()
 target_compile_options(wolfssl PRIVATE ${FTUN_EXTRA_COMPILE_OPTIONS})
 list(APPEND ftun_internal_dependencies wolfssl::wolfssl)

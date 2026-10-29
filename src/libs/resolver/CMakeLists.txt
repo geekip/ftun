@@ -1,7 +1,6 @@
 set(ftun_sources_lib_resolver
   basic.c
   control.c
-  socks5_transport.c
   control_channel.c
   control_transport.c
   dnswire.c

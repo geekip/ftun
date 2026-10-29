@@ -39,7 +39,7 @@ static void flush(void *user)
     state->notify(state->path, FTUN_PATH_READABLE | FTUN_PATH_WRITABLE,
       (ftun_error_t){FTUN_OK, 0u, 0}, state->notify_user);
   }
-  (void)ftun_path_release(&held);
+  ftun_path_release(&held);
 }
 
 static ftun_status_t stop(void *user)
@@ -142,8 +142,8 @@ static ftun_status_t send_packet(void *user, ftun_datagram_send_token_t token,
     status = ftun_buffer_slice(buffer, 0u, query.length + (negative ? 0u : sizeof(record)), &response.payload);
   }
   if (status == FTUN_OK) status = ftun_datagram_deliver(state->datagram, target, &response);
-  (void)ftun_packet_release(&response);
-  (void)ftun_buffer_release(&buffer);
+  ftun_packet_release(&response);
+  ftun_buffer_release(&buffer);
   if (status != FTUN_OK) return status;
   if (negative) fprintf(stderr, "control memory dns negative\n");
   return ftun_datagram_send_complete(token, (ftun_error_t){FTUN_OK, 0u, 0});
@@ -161,7 +161,7 @@ static void destroy(void *user)
   memory_t *state = user;
   ftun_reservation_t reservation = state->reservation;
   free(state);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void opened(ftun_operation_t *operation, ftun_error_t error, void *user)
@@ -192,7 +192,7 @@ ftun_status_t __wrap_ftun_socket_path_open(void *context, ftun_core_t *core,
   status = ftun_budget_reserve(request->dial.budget, sizeof(*state), &reservation);
   if (status != FTUN_OK) return status;
   state = calloc(1u, sizeof(*state));
-  if (state == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (state == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   state->reservation = reservation;
   state->budget = request->dial.budget;
   state->loop = request->dial.loop;

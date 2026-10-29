@@ -1,5 +1,6 @@
 #include "core/limits.h"
 #include "proxy/netstack/lwip_adapter.h"
+#include "proxy/netstack/lwipopts.h"
 #include "libs/buffer/buffer.h"
 
 #include <stdio.h>
@@ -171,14 +172,14 @@ static ftun_status_t input_bytes(ftun_lwip_t *stack, ftun_budget_t *budget,
   memcpy(storage, bytes, length);
   if (ftun_buffer_slice(buffer, 0u, length, &slice) != FTUN_OK ||
       ftun_packet_init(&packet, &slice, 17u) != FTUN_OK) {
-    (void)ftun_buffer_slice_release(&slice);
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_slice_release(&slice);
+    ftun_buffer_release(&buffer);
     return FTUN_E_LIMIT;
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   status = ftun_lwip_input(stack, &packet);
-  if (ftun_packet_release(&packet) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
+  ftun_packet_release(&packet);
   return status;
 }
 
@@ -267,7 +268,7 @@ static int test_tcp_lifecycle(void)
   other_spec.budget = other_budget;
   CHECK(ftun_lwip_create(&other_spec, &other) == FTUN_E_INVALID && other == NULL);
   CHECK(ftun_budget_get_usage(other_budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_lwip_tick(stack, 999u) == FTUN_E_INVALID);
   CHECK(ftun_lwip_tick(stack, 2000u) == FTUN_OK);
   CHECK(ftun_lwip_next_deadline(stack, &deadline_ms) == FTUN_OK &&
@@ -303,10 +304,10 @@ static int test_tcp_lifecycle(void)
   CHECK(send_capacity >= sizeof(reply));
   memcpy(send_storage, reply, sizeof(reply));
   CHECK(ftun_buffer_slice(send_buffer, 0u, sizeof(reply), &send_slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&send_buffer) == FTUN_OK);
+  ftun_buffer_release(&send_buffer);
   CHECK(ftun_lwip_tcp_write_ref(context.flow, &send_slice, &accepted) == FTUN_OK);
   CHECK(accepted == sizeof(reply));
-  CHECK(ftun_buffer_slice_release(&send_slice) == FTUN_OK);
+  ftun_buffer_slice_release(&send_slice);
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK &&
         usage.retained_send_bytes == sizeof(reply));
   for (index = context.output_count; index != 0u; index--) {
@@ -341,9 +342,9 @@ static int test_tcp_lifecycle(void)
   CHECK(ftun_buffer_data(send_buffer, &send_storage, &send_capacity) == FTUN_OK);
   memcpy(send_storage, reply, sizeof(reply));
   CHECK(ftun_buffer_slice(send_buffer, 0u, sizeof(reply), &send_slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&send_buffer) == FTUN_OK);
+  ftun_buffer_release(&send_buffer);
   CHECK(ftun_lwip_tcp_write_ref(context.flow, &send_slice, &accepted) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&send_slice) == FTUN_OK);
+  ftun_buffer_slice_release(&send_slice);
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK &&
         usage.retained_send_bytes == sizeof(reply));
   CHECK(ftun_lwip_tcp_shutdown_write(context.flow) == FTUN_OK);
@@ -356,9 +357,9 @@ static int test_tcp_lifecycle(void)
         deadline_ms == 1250u);
   CHECK(ftun_lwip_destroy(&other) == FTUN_OK && other == NULL);
   CHECK(ftun_budget_get_usage(other_budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&other_budget) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -385,7 +386,7 @@ static int test_failure_and_cancel(void)
   spec.user = &context;
   CHECK(ftun_lwip_create(&spec, &stack) == FTUN_E_LIMIT && stack == NULL);
   CHECK(ftun_budget_get_usage(small_budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&small_budget) == FTUN_OK);
 
   CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u, &budget) == FTUN_OK);
@@ -398,7 +399,7 @@ static int test_failure_and_cancel(void)
   CHECK(context.accepts == 1u && context.flow == NULL && context.callback_failed == 0);
   CHECK(ftun_lwip_get_usage(stack, &usage) == FTUN_OK && usage.tcp_flows == 0u);
   CHECK(ftun_lwip_destroy(&stack) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK && budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -458,8 +459,41 @@ static int keepalive_case(bool enabled)
   return 0;
 }
 
+/* 外部额度耗尽后，小对象仍使用已准入的本地信用；不能越额扩容。 */
+static int test_allocation_credit(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_lwip_t *stack = NULL;
+  ftun_lwip_spec_t spec = {0};
+  ftun_budget_usage_t usage;
+  ftun_reservation_t pressure = {0};
+  test_context_t context = {0};
+  size_t i;
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  spec.budget = budget;
+  spec.mtu = 1500u;
+  spec.output = capture_output;
+  spec.accept = accept_tcp;
+  spec.user = &context;
+  CHECK(ftun_lwip_create(&spec, &stack) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &pressure) == FTUN_OK);
+  for (i = 0u; i < 100u; i++) {
+    void *value = ftun_lwip_port_malloc(32u);
+    CHECK(value != NULL);
+    ftun_lwip_port_free(value);
+  }
+  CHECK(ftun_lwip_port_malloc(1024u * 1024u) == NULL);
+  ftun_reservation_release(&pressure);
+  CHECK(ftun_lwip_destroy(&stack) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
+  CHECK(test_allocation_credit() == 0);
   CHECK(test_tcp_lifecycle() == 0);
   CHECK(test_failure_and_cancel() == 0);
   CHECK(keepalive_case(true) == 0);

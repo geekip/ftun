@@ -80,7 +80,7 @@ void ftun_dns_runtime_pending_clear(ftun_dns_runtime_t *dns,
       dns->listeners[pending->listener_index].pending_count != 0u) {
     dns->listeners[pending->listener_index].pending_count--;
   }
-  (void)ftun_datagram_release(&pending->inbound);
+  ftun_datagram_release(&pending->inbound);
   if (dns->pending_count != 0u) dns->pending_count--;
   memset(pending, 0, sizeof(*pending));
   pending->descriptor = -1;
@@ -133,7 +133,7 @@ void ftun_dns_runtime_reply(ftun_dns_transport_t transport,
     }
     queued = (ftun_dns_runtime_response_t *)malloc(bytes);
     if (queued == NULL) {
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       connection->peer_eof = true;
       ftun_dns_runtime_tcp_set_ready(connection, true);
       return;
@@ -173,11 +173,11 @@ void ftun_dns_runtime_reply(ftun_dns_transport_t transport,
         if (ftun_buffer_slice(buffer, 0u, response.length, &slice) == FTUN_OK &&
             ftun_packet_init(&packet, &slice, 0u) == FTUN_OK) {
           (void)ftun_datagram_send(pending->inbound, &pending->client, &packet);
-          (void)ftun_packet_release(&packet);
+          ftun_packet_release(&packet);
         }
       }
-      (void)ftun_buffer_slice_release(&slice);
-      (void)ftun_buffer_release(&buffer);
+      ftun_buffer_slice_release(&slice);
+      ftun_buffer_release(&buffer);
     }
   }
   ftun_dns_runtime_pending_clear(dns, pending);
@@ -239,7 +239,7 @@ ftun_status_t ftun_dns_runtime_protocol_create(
 }
 
 ftun_status_t ftun_dns_runtime_socket_open(const char *text,
-  ftun_dial_transport_t type, int *out, ftun_socket_bind_issue_t *issue)
+  ftun_dial_transport_t type, ftun_handle_t *out, ftun_socket_bind_issue_t *issue)
 {
   ftun_endpoint_t endpoint;
   ftun_status_t status = ftun_dns_runtime_parse_endpoint(text, &endpoint);
@@ -259,7 +259,7 @@ ftun_status_t ftun_dns_runtime_listener_bind(
     status = ftun_dns_runtime_socket_open(listen, FTUN_DIAL_TCP,
       &slot->tcp_descriptor, &error_code);
     if (status != FTUN_OK) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)slot->descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)slot->descriptor);
       slot->descriptor = -1;
     }
   }
@@ -367,7 +367,7 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
   if (status != FTUN_OK) return status;
   dns = (ftun_dns_runtime_t *)calloc(1u, sizeof(*dns));
   if (dns == NULL) {
-    (void)ftun_reservation_release(&listener_reservation);
+    ftun_reservation_release(&listener_reservation);
     return FTUN_E_LIMIT;
   }
   for (index = 0u; index < FTUN_DNS_RUNTIME_MAX_LISTENERS; index++) {
@@ -392,6 +392,7 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
   dns->socket_mark = socket_mark;
   dns->liveness = ftun_dns_config_binding(config).liveness;
   dns->generation = network->generation;
+  dns->protocol = network->protocol;
   path_spec.budget = budget;
   path_spec.generation = network->generation;
   path_spec.ops = network->path;
@@ -642,7 +643,7 @@ int ftun_dns_runtime_listener_reusable(
   return 0;
 }
 
-ftun_status_t ftun_dns_runtime_socket_duplicate(int descriptor, int *out)
+ftun_status_t ftun_dns_runtime_socket_duplicate(ftun_handle_t descriptor, ftun_handle_t *out)
 {
   if (descriptor < 0 || out == NULL) return FTUN_E_INVALID;
   return ftun_socket_duplicate(descriptor, out);
@@ -758,7 +759,7 @@ ftun_status_t ftun_dns_runtime_quiesce(ftun_dns_runtime_t *dns)
     /* UDP fd 还是已接收请求的回复通道；等旧代 inflight 清零再关闭。 */
     if (dns->listeners[index].tcp_source == NULL &&
         dns->listeners[index].tcp_descriptor >= 0) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)dns->listeners[index].tcp_descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)dns->listeners[index].tcp_descriptor);
       dns->listeners[index].tcp_descriptor = -1;
     }
     (void)ftun_dns_listener_stop(dns->listeners[index].protocol);
@@ -820,13 +821,13 @@ ftun_status_t ftun_dns_runtime_slot_sources_start(
   ftun_status_t status = FTUN_OK;
   if (slot->descriptor >= 0) {
     status = ftun_event_io_start(dns->loop,
-      (ftun_native_socket_t)(unsigned int)slot->descriptor,
+      (ftun_native_socket_t)slot->descriptor,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_dns_runtime_listener_ready,
       slot, &slot->source);
   }
   if (status == FTUN_OK && slot->tcp_descriptor >= 0) {
     status = ftun_event_io_start(dns->loop,
-      (ftun_native_socket_t)(unsigned int)slot->tcp_descriptor,
+      (ftun_native_socket_t)slot->tcp_descriptor,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR,
       ftun_dns_runtime_listener_tcp_ready, slot, &slot->tcp_source);
   }
@@ -881,17 +882,17 @@ ftun_status_t ftun_dns_runtime_tcp_disconnect(
     ftun_reservation_t reservation = response->reservation;
     connection->response_head = response->next;
     free(response);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
   }
   connection->response_tail = NULL;
   connection->response_count = 0u;
   free(connection->input);
   connection->input = NULL;
-  (void)ftun_reservation_release(&connection->input_reservation);
+  ftun_reservation_release(&connection->input_reservation);
   connection->input_offset = 0u;
   connection->input_length = 0u;
   connection->prefix_length = 0u;
-  if (connection->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)connection->descriptor);
+  if (connection->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)connection->descriptor);
   connection->descriptor = -1;
   return FTUN_OK;
 }
@@ -924,7 +925,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
   if (now_ms < listener->accept_after_ms) return FTUN_OK;
   while (accepted < quota) {
     ftun_dns_runtime_tcp_t *connection = NULL;
-    int descriptor;
+    ftun_handle_t descriptor;
     size_t index;
     ftun_socket_accept_disposition_t disposition;
     status = ftun_socket_accept(listener->tcp_descriptor, &descriptor, NULL, &disposition);
@@ -960,7 +961,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
     {
       ftun_socket_liveness_t liveness = dns->liveness;
       if (ftun_socket_apply_liveness(descriptor, &liveness) != FTUN_OK) {
-        (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+        (void)ftun_socket_close((ftun_native_socket_t)descriptor);
         continue;
       }
     }
@@ -971,7 +972,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
       }
     }
     if (connection == NULL) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)descriptor);
       return FTUN_OK;
     }
     memset(connection, 0, sizeof(*connection));
@@ -987,7 +988,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
       if (status != FTUN_OK) return status;
     } else {
       status = ftun_event_io_start(dns->loop,
-        (ftun_native_socket_t)(unsigned int)descriptor,
+        (ftun_native_socket_t)descriptor,
         FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_dns_runtime_tcp_ready,
         connection, &connection->source);
       if (status != FTUN_OK) {
@@ -1002,7 +1003,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
 }
 
 ftun_status_t ftun_dns_runtime_hijack_tcp(ftun_dns_runtime_t *dns,
-                                         int descriptor)
+                                         ftun_handle_t descriptor)
 {
   ftun_dns_runtime_tcp_t *connection = NULL;
   size_t index;
@@ -1030,7 +1031,7 @@ ftun_status_t ftun_dns_runtime_hijack_tcp(ftun_dns_runtime_t *dns,
     connection->active = false;
   } else {
     status = ftun_event_io_start(dns->loop,
-      (ftun_native_socket_t)(unsigned int)descriptor,
+      (ftun_native_socket_t)descriptor,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_dns_runtime_tcp_ready,
       connection, &connection->source);
     if (status != FTUN_OK) {
@@ -1063,7 +1064,7 @@ ftun_status_t ftun_dns_runtime_tcp_drive(
         }
         if (connection->response_count != 0u) connection->response_count--;
         free(response);
-        (void)ftun_reservation_release(&reservation);
+        ftun_reservation_release(&reservation);
       }
     } else if (sent == 0 || (io_status != FTUN_E_AGAIN)) {
       connection->peer_eof = true;
@@ -1093,7 +1094,7 @@ ftun_status_t ftun_dns_runtime_tcp_drive(
         } else {
           connection->input = (uint8_t *)malloc(payload + 2u);
           if (connection->input == NULL) {
-            (void)ftun_reservation_release(&connection->input_reservation);
+            ftun_reservation_release(&connection->input_reservation);
             connection->peer_eof = true;
           } else {
             memcpy(connection->input, connection->prefix, 2u);
@@ -1126,7 +1127,7 @@ ftun_status_t ftun_dns_runtime_tcp_drive(
           frames == 1u) {
         free(connection->input);
         connection->input = NULL;
-        (void)ftun_reservation_release(&connection->input_reservation);
+        ftun_reservation_release(&connection->input_reservation);
         connection->input_offset = 0u;
         connection->input_length = 0u;
         connection->prefix_length = 0u;
@@ -1237,8 +1238,8 @@ ftun_status_t ftun_dns_runtime_slot_close(
   slot->events = 0u;
   slot->tcp_events = 0u;
   slot->accept_after_ms = 0u;
-  if (slot->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)slot->descriptor);
-  if (slot->tcp_descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)slot->tcp_descriptor);
+  if (slot->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)slot->descriptor);
+  if (slot->tcp_descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)slot->tcp_descriptor);
   slot->descriptor = -1;
   slot->tcp_descriptor = -1;
   return FTUN_OK;
@@ -1275,7 +1276,7 @@ ftun_status_t ftun_dns_runtime_slot_recover(void *user,
   if (status == FTUN_OK) status = ftun_dns_runtime_slot_sources_start(dns, slot);
   if (status != FTUN_OK) {
     (void)ftun_dns_runtime_slot_close(slot);
-    if (slot->descriptor >= 0) { (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)slot->descriptor); slot->descriptor = -1; }
+    if (slot->descriptor >= 0) { (void)ftun_socket_close((ftun_native_socket_t)slot->descriptor); slot->descriptor = -1; }
   } else {
     slot->waiting = false;
   }
@@ -1636,11 +1637,11 @@ ftun_status_t ftun_dns_runtime_stop_slice(ftun_dns_runtime_t *dns,
   if (dns->request_head != NULL) return FTUN_E_AGAIN;
   for (index = 0u; index < dns->listener_count; index++) {
     if (dns->listeners[index].descriptor >= 0) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)dns->listeners[index].descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)dns->listeners[index].descriptor);
       dns->listeners[index].descriptor = -1;
     }
     if (dns->listeners[index].tcp_descriptor >= 0) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)dns->listeners[index].tcp_descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)dns->listeners[index].tcp_descriptor);
       dns->listeners[index].tcp_descriptor = -1;
     }
   }
@@ -1712,8 +1713,7 @@ ftun_status_t ftun_dns_runtime_destroy(ftun_dns_runtime_t **dns_ptr)
   status = ftun_path_provider_destroy(&dns->paths);
   if (status != FTUN_OK) return status;
   if (ftun_config_destroy(&dns->config) != FTUN_OK) return FTUN_E_AGAIN;
-  status = ftun_reservation_release(&dns->listener_reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&dns->listener_reservation);
   free(dns->proxy_endpoints);
   free(dns->proxy_endpoint_valid);
   memset(dns, 0, sizeof(*dns));

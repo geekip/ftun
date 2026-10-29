@@ -117,7 +117,7 @@ ftun_status_t ftun_proxy_runtime_tun_accept(
 {
   ftun_proxy_runtime_t *engine = (ftun_proxy_runtime_t *)user;
   ftun_proxy_runtime_flow_t *flow = NULL;
-  int dns_pair[2] = {-1, -1};
+  ftun_handle_t dns_pair[2] = {-1, -1};
   bool dns_hijack = false;
   ftun_status_t status;
   if (engine == NULL || metadata == NULL || stream == NULL) {
@@ -156,7 +156,7 @@ ftun_status_t ftun_proxy_runtime_tun_accept(
     if (status == FTUN_OK) {
       status = ftun_proxy_dns_hijack_tcp(engine->dns_adapter, dns_pair[1]);
       if (status == FTUN_OK) {
-        int remote = dns_pair[0];
+        ftun_handle_t remote = dns_pair[0];
         dns_pair[1] = -1;
         /* relay_ready 在成功和失败时均消费 FD；不得由局部清理再次关闭。 */
         dns_pair[0] = -1;
@@ -177,8 +177,8 @@ ftun_status_t ftun_proxy_runtime_tun_accept(
     flow->accept_failure = status;
     ftun_proxy_runtime_flow_schedule(flow);
   }
-  if (dns_pair[0] >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)dns_pair[0]);
-  if (dns_pair[1] >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)dns_pair[1]);
+  if (dns_pair[0] >= 0) (void)ftun_socket_close((ftun_native_socket_t)dns_pair[0]);
+  if (dns_pair[1] >= 0) (void)ftun_socket_close((ftun_native_socket_t)dns_pair[1]);
   return FTUN_OK;
 }
 

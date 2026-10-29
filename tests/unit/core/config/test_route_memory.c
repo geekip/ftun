@@ -4,6 +4,7 @@
 #include "app/config/model.h"
 #include "app/config/parser.h"
 #include "core/limits.h"
+#include "platform/file.h"
 #include "proxy/runtime_state.h"
 #include "proxy/route/router.h"
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -148,7 +149,7 @@ static int usage(ftun_budget_t *budget, size_t memory, size_t descriptors)
 {
   ftun_budget_usage_t current;
   CHECK(ftun_budget_get_usage(budget, &current) == FTUN_OK);
-  CHECK(current.used == memory && current.used_resources.descriptors == descriptors);
+  CHECK(current.used_resources.memory_bytes == memory && current.used_resources.descriptors == descriptors);
   return 0;
 }
 
@@ -166,10 +167,10 @@ static int view_allocations(ftun_bytes_t bytes)
   CHECK(ftun_frs_open_bytes_budget(child, bytes, &view) == FTUN_OK);
   attempts = allocation_calls;
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(live_bytes == after.used + after.metadata_bytes - before.metadata_bytes && !tracker_failed);
+  CHECK(live_bytes == after.used_resources.memory_bytes + after.metadata_bytes - before.metadata_bytes && !tracker_failed);
   CHECK(ftun_frs_view_bind_budget(view, budget) == FTUN_OK);
   CHECK(ftun_frs_view_bind_budget(view, child) == FTUN_OK);
-  CHECK(usage(budget, after.used, 0u) == 0 && usage(child, after.used, 0u) == 0);
+  CHECK(usage(budget, after.used_resources.memory_bytes, 0u) == 0 && usage(child, after.used_resources.memory_bytes, 0u) == 0);
   CHECK(ftun_frs_view_bind_budget(view, foreign) == FTUN_E_INVALID && usage(foreign, 0u, 0u) == 0);
   CHECK(ftun_frs_view_release(&view) == FTUN_OK && live_bytes == 0u && usage(budget, 0u, 0u) == 0);
   for (i = 1u; i <= attempts; i++) {
@@ -180,8 +181,8 @@ static int view_allocations(ftun_bytes_t bytes)
   fail_at = 0u; tracking = false;
   /* 独立视图后绑定同样只收一次实际保留容量。 */
   CHECK(ftun_frs_open_bytes(bytes, &view) == FTUN_OK);
-  CHECK(ftun_frs_view_bind_budget(view, child) == FTUN_OK && usage(budget, after.used, 0u) == 0);
-  CHECK(ftun_frs_view_bind_budget(view, budget) == FTUN_OK && usage(budget, after.used, 0u) == 0);
+  CHECK(ftun_frs_view_bind_budget(view, child) == FTUN_OK && usage(budget, after.used_resources.memory_bytes, 0u) == 0);
+  CHECK(ftun_frs_view_bind_budget(view, budget) == FTUN_OK && usage(budget, after.used_resources.memory_bytes, 0u) == 0);
   CHECK(ftun_frs_view_release(&view) == FTUN_OK);
   CHECK(ftun_budget_destroy(&child) == FTUN_OK && ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_budget_destroy(&foreign) == FTUN_OK);
@@ -192,24 +193,19 @@ static ftun_budget_t *fd_budget;
 static bool watch_fd, fd_charged, fail_read;
 static size_t open_calls;
 static int last_fd;
-int __real_open(const char *path, int flags, ...);
-int __wrap_open(const char *path, int flags, ...)
+ftun_status_t __real_ftun_file_open(const char *path, ftun_file_open_mode_t mode, ftun_handle_t *out);
+ftun_status_t __wrap_ftun_file_open(const char *path, ftun_file_open_mode_t mode, ftun_handle_t *out)
 {
-  int fd;
-  mode_t mode = 0;
-  if ((flags & O_CREAT) != 0) {
-    va_list arguments;
-    va_start(arguments, flags); mode = (mode_t)va_arg(arguments, int); va_end(arguments);
-  }
+  ftun_status_t status;
   if (watch_fd) {
     ftun_budget_usage_t current;
     open_calls++;
     if (ftun_budget_get_usage(fd_budget, &current) != FTUN_OK ||
         current.used_resources.descriptors != 1u) fd_charged = false;
   }
-  fd = __real_open(path, flags, mode);
-  if (watch_fd) last_fd = fd;
-  return fd;
+  status = __real_ftun_file_open(path, mode, out);
+  if (watch_fd && status == FTUN_OK) last_fd = (int)*out;
+  return status;
 }
 ssize_t __real_read(int fd, void *data, size_t bytes);
 ssize_t __wrap_read(int fd, void *data, size_t bytes)
@@ -241,20 +237,20 @@ static int file_admission(ftun_bytes_t bytes)
     } else {
       CHECK(ftun_frs_open(core, path, &view) == FTUN_OK && fd_charged && open_calls == 1u);
       CHECK(fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
-      CHECK(ftun_frs_view_release(&view) == FTUN_OK && usage(fd_budget, before.used, 0u) == 0);
+      CHECK(ftun_frs_view_release(&view) == FTUN_OK && usage(fd_budget, before.used_resources.memory_bytes, 0u) == 0);
       CHECK(ftun_frs_open_mode(core, path, FTUN_FRS_OPEN_READ, &view) == FTUN_OK);
-      CHECK(ftun_frs_view_release(&view) == FTUN_OK && usage(fd_budget, before.used, 0u) == 0);
+      CHECK(ftun_frs_view_release(&view) == FTUN_OK && usage(fd_budget, before.used_resources.memory_bytes, 0u) == 0);
       fail_read = true;
       CHECK(ftun_frs_open_mode(core, path, FTUN_FRS_OPEN_READ, &view) == FTUN_E_IO && view == NULL);
       CHECK(fcntl(last_fd, F_GETFD) == -1 && errno == EBADF);
-      CHECK(usage(fd_budget, before.used, 0u) == 0);
+      CHECK(usage(fd_budget, before.used_resources.memory_bytes, 0u) == 0);
       fail_read = false;
-      CHECK(ftun_budget_reserve(fd_budget, before.normal_available - 256u, &blocker) == FTUN_OK);
+      CHECK(ftun_budget_reserve(fd_budget, before.normal_available_resources.memory_bytes - 256u, &blocker) == FTUN_OK);
       CHECK(ftun_frs_open(core, path, &view) == FTUN_E_LIMIT && view == NULL);
-      CHECK(ftun_reservation_release(&blocker) == FTUN_OK && usage(fd_budget, before.used, 0u) == 0);
+      ftun_reservation_release(&blocker); CHECK(usage(fd_budget, before.used_resources.memory_bytes, 0u) == 0);
       CHECK(unlink(path) == 0);
       CHECK(ftun_frs_open(core, path, &view) == FTUN_E_EOF && view == NULL && fd_charged);
-      CHECK(usage(fd_budget, before.used, 0u) == 0);
+      CHECK(usage(fd_budget, before.used_resources.memory_bytes, 0u) == 0);
     }
     watch_fd = false;
     CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK && usage(fd_budget, 0u, 0u) == 0);
@@ -282,12 +278,12 @@ static int prebound_runtime(ftun_bytes_t bytes)
   CHECK(ftun_runtime_prepare_detached_frs(config, view, &prepared) == FTUN_OK);
   view = NULL;
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, after.normal_available - 128u, &blocker) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, after.normal_available_resources.memory_bytes - 128u, &blocker) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
   CHECK(ftun_runtime_attach_prepared(core, &prepared, &candidate) == FTUN_OK && prepared == NULL);
-  CHECK(usage(budget, after.used, 0u) == 0);
-  CHECK(ftun_reservation_release(&blocker) == FTUN_OK);
-  CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && usage(budget, before.used, 0u) == 0);
+  CHECK(usage(budget, after.used_resources.memory_bytes, 0u) == 0);
+  ftun_reservation_release(&blocker);
+  CHECK(ftun_runtime_abort(core, &candidate) == FTUN_OK && usage(budget, before.used_resources.memory_bytes, 0u) == 0);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && ftun_runtime_manager_destroy(&core) == FTUN_OK);
   CHECK(usage(budget, 0u, 0u) == 0 && ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;

@@ -1,4 +1,5 @@
 /* 在真实协议、事件源和 Operation 上注入单个系统调用的失败。 */
+#include "proxy/protocol/socks5.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -317,7 +318,7 @@ static int fixture_start(fixture_t *fixture)
   CHECK(fixture->config != NULL);
   CHECK(ftun_dns_runtime_prepare(fixture->core, fixture->budget,
     fixture->operations, fixture->loop, fixture->config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture->dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_activate(fixture->dns) == FTUN_OK);
   return 0;
@@ -331,7 +332,7 @@ static int fixture_destroy(fixture_t *fixture)
   CHECK(ftun_dns_runtime_destroy(&fixture->dns) == FTUN_OK);
   CHECK(ftun_config_destroy(&fixture->config) == FTUN_OK);
   CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK);
-  CHECK(usage.used == fixture->baseline.used);
+  CHECK(usage.used_resources.memory_bytes == fixture->baseline.used_resources.memory_bytes);
   CHECK(usage.metadata_bytes == fixture->baseline.metadata_bytes);
   CHECK(usage.used_resources.descriptors == fixture->baseline.used_resources.descriptors);
   CHECK(usage.used_resources.queue_slots == fixture->baseline.used_resources.queue_slots);
@@ -371,7 +372,7 @@ static int connection_open(fixture_t *fixture, bool hijack, int *out_client,
     int client = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
     CHECK(client >= 0);
     CHECK(setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) == 0);
-    CHECK(getsockname(dns->listeners[0].tcp_descriptor,
+    CHECK(getsockname((int)dns->listeners[0].tcp_descriptor,
       (struct sockaddr *)&address, &length) == 0);
     CHECK(connect(client, (const struct sockaddr *)&address, length) == 0);
     CHECK(fcntl(client, F_SETFL, O_NONBLOCK) == 0);
@@ -481,7 +482,7 @@ static int reload_start(fixture_t *fixture, ftun_dns_runtime_t **retired)
   CHECK(ftun_dns_runtime_prepare_reload_planned(fixture->dns, fixture->core,
     fixture->budget, fixture->operations, fixture->loop, fixture->config,
     &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &prepared) == FTUN_OK);
   CHECK(ftun_dns_runtime_commit_reload(&fixture->dns, &prepared, retired) == FTUN_OK);
   CHECK(prepared == NULL && *retired != NULL);
@@ -503,7 +504,7 @@ static int fatal_case(int fault, bool cancel_retry, bool reload, bool pending)
   int other_client;
   CHECK(fixture_start(&fixture) == 0);
   CHECK(connection_open(&fixture, false, &client, &connection) == 0);
-  watched_fd = connection->descriptor;
+  watched_fd = (int)connection->descriptor;
   close_calls = 0u;
   send_calls = 0u;
   CHECK(submit_query(&fixture, client) == 0);
@@ -594,7 +595,7 @@ static int reset_read_case(bool body)
   int client;
   CHECK(fixture_start(&fixture) == 0);
   CHECK(connection_open(&fixture, false, &client, &connection) == 0);
-  watched_fd = connection->descriptor;
+  watched_fd = (int)connection->descriptor;
   send_calls = 0u;
   close_calls = 0u;
   CHECK(submit_query(&fixture, client) == 0);
@@ -631,7 +632,7 @@ static int half_close_case(bool reload, bool hijack)
   int client;
   CHECK(fixture_start(&fixture) == 0);
   CHECK(connection_open(&fixture, hijack, &client, &connection) == 0);
-  watched_fd = connection->descriptor;
+  watched_fd = (int)connection->descriptor;
   close_calls = 0u;
   send_calls = 0u;
   CHECK(submit_query(&fixture, client) == 0);
@@ -729,9 +730,9 @@ static int hijack_udp_retained(void)
   CHECK(fixture.dns->pending_count == 0u);
   CHECK(ftun_datagram_get_usage(channel, &usage) == FTUN_OK && usage.reference_count == 1u);
   CHECK(ftun_datagram_destroy(&channel) == FTUN_OK && destroyed == 1u);
-  CHECK(ftun_packet_release(&packet) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_packet_release(&packet);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   CHECK(fixture_destroy(&fixture) == 0);
   puts("UDP hijack retains stopped inbound until late response passed");
   return 0;
@@ -804,11 +805,11 @@ static int prepare_case(bool cache, bool planned, int fault)
   status = planned ? ftun_dns_runtime_prepare_reload_planned(NULL,
     fixture.core, fixture.budget, fixture.operations, fixture.loop,
     fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &fixture.dns) :
     ftun_dns_runtime_prepare(fixture.core, fixture.budget, fixture.operations,
       fixture.loop, fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture.dns);
   block_socket = false;
   fail_cache = false;
@@ -887,12 +888,12 @@ static int bootstrap_budget(void)
   blocked_sockets = 0u;
   CHECK(ftun_dns_runtime_resolve_upstream(budget, &config, "example.com:53", 0u,
     &endpoint) == FTUN_E_LIMIT && blocked_sockets == 0u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_dns_runtime_resolve_upstream(budget, &config, "example.com:53", 0u,
     &endpoint) != FTUN_OK && blocked_sockets == 1u);
   block_socket = false;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
-    usage.used == 0u && usage.used_resources.descriptors == 0u);
+    usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -912,7 +913,7 @@ static int listener_recovery(void)
   dns = fixture.dns;
   slot = &dns->listeners[0];
   CHECK(slot->descriptor >= 0 && slot->tcp_descriptor >= 0 && !slot->waiting);
-  CHECK(getsockname(slot->tcp_descriptor, (struct sockaddr *)&address, &length) == 0);
+  CHECK(getsockname((int)slot->tcp_descriptor, (struct sockaddr *)&address, &length) == 0);
   slot->events |= FTUN_EVENT_ERROR;
   CHECK(ftun_dns_runtime_step_listener(dns, ftun_dns_runtime_now(NULL), &work) == FTUN_OK);
   CHECK(work && slot->waiting && slot->descriptor == -1 && slot->tcp_descriptor == -1);
@@ -936,7 +937,7 @@ static int listener_recovery(void)
   {
     struct sockaddr_in again;
     socklen_t again_length = (socklen_t)sizeof(again);
-    CHECK(getsockname(slot->tcp_descriptor, (struct sockaddr *)&again, &again_length) == 0);
+    CHECK(getsockname((int)slot->tcp_descriptor, (struct sockaddr *)&again, &again_length) == 0);
     CHECK(again.sin_port == address.sin_port);
   }
   return fixture_destroy(&fixture);
@@ -957,7 +958,7 @@ static int listener_startup_waiting(void)
   CHECK(fixture.config != NULL);
   CHECK(ftun_dns_runtime_prepare(fixture.core, fixture.budget,
     fixture.operations, fixture.loop, fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture.dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_activate(fixture.dns) == FTUN_OK);
   slot = &fixture.dns->listeners[0];

@@ -24,6 +24,8 @@ def allowed(layer, dependency):
     return dependency in {'core', 'platform', 'util'} or dependency.startswith('libs/')
 
 def check_include(layer, header):
+    if layer != 'platform' and re.match(r'platform/(linux|posix|bsd)/', header):
+        return False
     return allowed(layer, owner(header))
 
 def direct_thread_api(layer, source):
@@ -58,6 +60,8 @@ def audit(root, database):
         for config_layer in ['app', 'dns', 'proxy']:
             if relative.as_posix().startswith(config_layer + '/config/'):
                 expected = 'ftun_' + config_layer + '_config'
+        if relative.as_posix().startswith('proxy/protocol/'):
+            expected = 'ftun_proxy_protocol'
         if relative.as_posix().startswith('libs/tun/config/'):
             expected = 'ftun_lib_tun_config'
         if actual != expected:
@@ -110,6 +114,11 @@ def main():
     root = args.root.resolve()
     errors, seen = audit(root, json.loads(args.commands.read_text()))
     if args.self_test == 'illegal-include':
+        for layer in ['core', 'libs/tun', 'dns', 'proxy', 'app']:
+            assert not check_include(layer, 'platform/linux/route.h')
+            assert not check_include(layer, 'platform/posix/error.h')
+            assert not check_include(layer, 'platform/bsd/poller.h')
+            assert check_include(layer, 'platform/route.h')
         assert not check_include('core', 'proxy/runtime.h')
         assert not check_include('dns', 'proxy/runtime.h')
         assert not check_include('platform', 'core/limits.h')

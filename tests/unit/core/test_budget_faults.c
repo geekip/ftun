@@ -99,11 +99,11 @@ static int allocation_failures(void)
   fail_calloc = 1;
   CHECK(ftun_budget_reserve(root, 1u, &reservation) == FTUN_OK);
   CHECK(live_allocations == 1u);
-  CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
+  ftun_reservation_release(&reservation);
   CHECK(ftun_budget_reserve(root, 2u, &reservation) == FTUN_E_LIMIT && reservation.budget == NULL);
   fail_calloc = 0;
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
-  CHECK(usage.used == 0u && usage.child_count == 0u &&
+  CHECK(usage.used_resources.memory_bytes == 0u && usage.child_count == 0u &&
         usage.rejected_reservations == 1u &&
         usage.metadata_bytes == sizeof(struct ftun_budget_root));
   CHECK(live_allocations == 1u);
@@ -114,7 +114,7 @@ static int allocation_failures(void)
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
   CHECK(usage.metadata_bytes == sizeof(struct ftun_budget_root) +
         sizeof(struct ftun_budget_domain));
-  CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
+  ftun_reservation_release(&reservation);
   CHECK(ftun_budget_destroy(&child) == FTUN_OK);
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
   CHECK(usage.metadata_bytes == sizeof(struct ftun_budget_root));
@@ -173,12 +173,12 @@ static int deterministic_admission(int kind)
   CHECK(states[0].status == FTUN_OK && states[1].status == FTUN_E_LIMIT);
   CHECK((states[1].reservation).budget == NULL && states[1].child == NULL);
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
-  CHECK(usage.used == (kind == 1 ? 1u : 0u));
+  CHECK(usage.used_resources.memory_bytes == (kind == 1 ? 1u : 0u));
   CHECK(usage.child_count == (kind == 2 ? 1u : 0u));
-  CHECK(ftun_reservation_release(&states[0].reservation) == FTUN_OK);
+  ftun_reservation_release(&states[0].reservation);
   CHECK(ftun_budget_destroy(&states[0].child) == FTUN_OK);
   CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
-  CHECK(usage.used == 0u && usage.child_count == 0u &&
+  CHECK(usage.used_resources.memory_bytes == 0u && usage.child_count == 0u &&
         usage.metadata_bytes == sizeof(struct ftun_budget_root));
   CHECK(ftun_budget_destroy(&root) == FTUN_OK && live_allocations == 0u);
   return 0;
@@ -227,7 +227,7 @@ static int independent_domains(void)
   ftun_mutex_unlock(&root->domain->mutex);
   ftun_mutex_unlock(&root->root->registry_mutex);
   CHECK(pthread_join(thread, NULL) == 0);
-  CHECK(ftun_reservation_release(&progress.reservation) == FTUN_OK);
+  ftun_reservation_release(&progress.reservation);
   CHECK(ftun_budget_destroy(&right) == FTUN_OK);
   CHECK(ftun_budget_destroy(&left) == FTUN_OK);
   CHECK(ftun_budget_destroy(&root) == FTUN_OK);

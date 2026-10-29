@@ -1,4 +1,5 @@
 #include "libs/transport/stream.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -105,7 +106,6 @@ static void ftun_stream_write_dispatched(ftun_operation_t *operation,
 {
   ftun_stream_write_t *write = (ftun_stream_write_t *)user;
   ftun_stream_t *stream;
-  ftun_status_t release_status;
   if (write == NULL || write->stream == NULL) return;
   stream = write->stream;
   if (stream->pending_writes == 0u ||
@@ -115,8 +115,7 @@ static void ftun_stream_write_dispatched(ftun_operation_t *operation,
     stream->pending_writes--;
     stream->pending_bytes -= write->slice.length;
   }
-  release_status = ftun_buffer_slice_release(&write->slice);
-  if (release_status != FTUN_OK) error.status = release_status;
+  ftun_buffer_slice_release(&write->slice);
   write->operation = NULL;
   write->stream = NULL;
   stream->completions++;
@@ -133,7 +132,7 @@ static void ftun_stream_write_release(ftun_stream_write_t *write)
   ftun_stream_t *stream;
   if (write == NULL) return;
   stream = write->stream;
-  (void)ftun_buffer_slice_release(&write->slice);
+  ftun_buffer_slice_release(&write->slice);
   memset(write, 0, sizeof(*write));
   write->free_next = stream->free_head;
   stream->free_head = write;
@@ -180,7 +179,7 @@ ftun_status_t ftun_stream_create(const ftun_stream_options_t *options,
   if (stream == NULL || stream->storage == NULL) {
     if (stream != NULL) free(stream->storage);
     free(stream);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   stream->budget = options->budget;
@@ -382,16 +381,15 @@ ftun_status_t ftun_stream_retain(ftun_stream_t *stream)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_stream_release(ftun_stream_t **stream)
+void ftun_stream_release(ftun_stream_t **stream)
 {
   ftun_stream_t *owned;
-  if (stream == NULL) return FTUN_E_INVALID;
+  assert(stream != NULL);
   owned = *stream;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->reference_count <= 1u) return FTUN_E_STATE_CORRUPT;
+  if (owned == NULL) return;
+  assert(owned->reference_count > 1u);
   owned->reference_count--;
   *stream = NULL;
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_stream_write_data(ftun_stream_write_token_t token,
@@ -483,7 +481,6 @@ ftun_status_t ftun_stream_destroy(ftun_stream_t **stream)
 {
   ftun_stream_t *owned;
   ftun_reservation_t reservation;
-  ftun_status_t status;
   size_t index;
   if (stream == NULL) return FTUN_E_INVALID;
   owned = *stream;
@@ -499,8 +496,7 @@ ftun_status_t ftun_stream_destroy(ftun_stream_t **stream)
     if (owned->storage[index].stream != NULL) return FTUN_E_AGAIN;
   }
   reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   owned->destroying = 1;
   owned->backend_calls++;

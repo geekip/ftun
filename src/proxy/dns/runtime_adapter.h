@@ -10,7 +10,7 @@ typedef struct ftun_dns_service_slot ftun_dns_service_slot_t;
 typedef struct ftun_proxy_dns_runtime_adapter ftun_proxy_dns_runtime_adapter_t;
 typedef struct {
   bool (*has_hijack)(const ftun_proxy_dns_runtime_adapter_t *adapter);
-  ftun_status_t (*tcp)(const ftun_proxy_dns_runtime_adapter_t *adapter, int descriptor);
+  ftun_status_t (*tcp)(const ftun_proxy_dns_runtime_adapter_t *adapter, ftun_handle_t descriptor);
   ftun_status_t (*udp)(const ftun_proxy_dns_runtime_adapter_t *adapter,
     ftun_datagram_t *inbound, const ftun_endpoint_t *client, const ftun_packet_t *packet);
 } ftun_proxy_dns_hooks_t;
@@ -29,7 +29,7 @@ ftun_status_t ftun_proxy_dns_select_member(
 bool ftun_proxy_dns_has_hijack(
   const ftun_proxy_dns_runtime_adapter_t *adapter);
 ftun_status_t ftun_proxy_dns_hijack_tcp(
-  const ftun_proxy_dns_runtime_adapter_t *adapter, int descriptor);
+  const ftun_proxy_dns_runtime_adapter_t *adapter, ftun_handle_t descriptor);
 ftun_status_t ftun_proxy_dns_hijack_udp(
   const ftun_proxy_dns_runtime_adapter_t *adapter, ftun_datagram_t *inbound,
   const ftun_endpoint_t *client, const ftun_packet_t *packet);

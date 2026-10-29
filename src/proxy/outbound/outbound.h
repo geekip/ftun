@@ -1,7 +1,7 @@
 #ifndef FTUN_PROXY_OUTBOUND_OUTBOUND_H
 #define FTUN_PROXY_OUTBOUND_OUTBOUND_H
 
-#include "libs/transport/connector.h"
+#include "proxy/outbound/connector.h"
 #include "proxy/outbound/direct.h"
 #include "proxy/outbound/reject.h"
 #include "proxy/outbound/socks5.h"
@@ -21,7 +21,7 @@ typedef struct {
   bool supports_udp;
 } ftun_outbound_leaf_t;
 
-typedef struct {
+struct ftun_outbound_request {
   const ftun_route_result_t *route;
   const ftun_target_t *target;
   const ftun_outbound_leaf_t *leaf;
@@ -29,7 +29,7 @@ typedef struct {
   const ftun_direct_request_t *direct;
   const ftun_socks5_connect_request_t *socks5;
   const ftun_metadata_t *metadata;
-} ftun_outbound_request_t;
+};
 
 /* 出站分派。
  * route、target 和 leaf 必须同代且精确对应；route.allowed 必须与

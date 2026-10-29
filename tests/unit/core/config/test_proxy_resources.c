@@ -162,10 +162,10 @@ static int admission(unsigned int listener_count, bool udp)
     inbound[index].udp = udp;
   }
   CHECK(ftun_budget_get_usage(budget, &base) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, base.normal_available, &pressure) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, base.normal_available_resources.memory_bytes, &pressure) == FTUN_OK);
   CHECK(ftun_proxy_runtime_prepare(core, budget, operations, &bindings,
     &config, 1u, &runtime) == FTUN_E_LIMIT && runtime == NULL);
-  CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+  ftun_reservation_release(&pressure);
   CHECK(equal_usage(budget, &base) == 0 && fd_count() == baseline + 2u);
 
   if (descriptors != 0u) {
@@ -173,7 +173,7 @@ static int admission(unsigned int listener_count, bool udp)
       (ftun_budget_resources_t){0u, 1u, 0u}, &pressure) == FTUN_OK);
     CHECK(ftun_proxy_runtime_prepare(core, budget, operations, &bindings,
       &config, 1u, &runtime) == FTUN_E_LIMIT && runtime == NULL);
-    CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+    ftun_reservation_release(&pressure);
     CHECK(equal_usage(budget, &base) == 0 && fd_count() == baseline + 2u);
 
     CHECK(ftun_budget_reserve_resources(budget,
@@ -181,7 +181,7 @@ static int admission(unsigned int listener_count, bool udp)
     CHECK(ftun_proxy_runtime_prepare(core, budget, operations, &bindings,
       &config, 1u, &runtime) == FTUN_E_LIMIT);
     CHECK(ftun_proxy_runtime_destroy(&runtime) == FTUN_OK);
-    CHECK(ftun_reservation_release(&pressure) == FTUN_OK);
+    ftun_reservation_release(&pressure);
     CHECK(equal_usage(budget, &base) == 0 && fd_count() == baseline + 2u);
 
     fail_socket = (unsigned int)descriptors;
@@ -197,8 +197,8 @@ static int admission(unsigned int listener_count, bool udp)
     CHECK(running.used_resources.descriptors == 2u + descriptors);
     CHECK(fd_count() == baseline + running.used_resources.descriptors);
     CHECK(running.used_resources.queue_slots == limits.limit.queue_slots);
-    if (index == 0u) short_name_bytes = running.used;
-    else CHECK(running.used == short_name_bytes + (listener_count ? strlen("long-listener-name") - 1u : 0u));
+    if (index == 0u) short_name_bytes = running.used_resources.memory_bytes;
+    else CHECK(running.used_resources.memory_bytes == short_name_bytes + (listener_count ? strlen("long-listener-name") - 1u : 0u));
     if (descriptors != 0u) {
       fail_cancel = true;
       CHECK(ftun_proxy_runtime_destroy(&runtime) != FTUN_OK && runtime != NULL);
@@ -215,7 +215,7 @@ static int admission(unsigned int listener_count, bool udp)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u &&
     usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 0u &&
     usage.child_count == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK && fd_count() == baseline);

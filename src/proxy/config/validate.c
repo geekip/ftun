@@ -349,7 +349,7 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
   colors = (uint8_t *)calloc(outbound_count == 0u ? 1u : outbound_count,
                              sizeof(*colors));
   if (colors == NULL) {
-    (void)ftun_reservation_release(&workspace);
+    ftun_reservation_release(&workspace);
     return ftun_config_diagnostic(out, FTUN_E_LIMIT, "/outbounds",
                                   "cannot allocate outbound graph workspace");
   }
@@ -357,12 +357,12 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
     ftun_status_t status = ftun_validate_group_visit(outbounds, outbound_count, index, colors, 1u, out);
     if (status != FTUN_OK) {
       free(colors);
-      (void)ftun_reservation_release(&workspace);
+      ftun_reservation_release(&workspace);
       return status;
     }
   }
   free(colors);
-  (void)ftun_reservation_release(&workspace);
+  ftun_reservation_release(&workspace);
   return FTUN_OK;
 }
 

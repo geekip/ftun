@@ -388,20 +388,20 @@ static int test_owned_budget(void)
   CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  bytes = usage.used;
+  bytes = usage.used_resources.memory_bytes;
   CHECK(bytes >= sizeof(*message) + message->question.name.length + input.length + sizeof(ftun_reservation_t));
   CHECK(ftun_dns_message_release(&message) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_budget_create(NULL, bytes - 1u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_E_LIMIT && message == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_budget_create(NULL, bytes, 0u, &budget) == FTUN_OK);
   CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == bytes);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == bytes);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN && budget != NULL);
   CHECK(ftun_dns_message_release(&message) == FTUN_OK && message == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

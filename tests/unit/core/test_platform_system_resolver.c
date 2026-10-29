@@ -273,7 +273,7 @@ static int fixture_stop(fixture_t *fixture)
       !wait_for_empty(fixture->worker) ||
       ftun_worker_destroy(&fixture->worker) != FTUN_OK ||
       ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u || ftun_budget_destroy(&fixture->budget) != FTUN_OK) {
+      usage.used_resources.memory_bytes != 0u || ftun_budget_destroy(&fixture->budget) != FTUN_OK) {
     return 1;
   }
   return 0;

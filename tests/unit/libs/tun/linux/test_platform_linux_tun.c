@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
-#include "libs/tun/linux/device.h"
+#include "platform/linux/tun.h"
+#include "libs/tun/port.h"
 #include "platform/linux/uapi.h"
 #include "core/limits.h"
 #include <errno.h>
@@ -182,9 +183,9 @@ static int mock_close(void *context, int descriptor, int *error_code)
   return 0;
 }
 
-static ftun_linux_tun_io_t mock_io(mock_state_t *state)
+static ftun_platform_tun_io_t mock_io(mock_state_t *state)
 {
-  ftun_linux_tun_io_t io;
+  ftun_platform_tun_io_t io;
   io.open_device = mock_open_device;
   io.open_control = mock_open_control;
   io.ioctl_call = mock_ioctl;
@@ -209,14 +210,14 @@ static int check_open_failures(void)
   int stage;
   for (stage = 1; stage <= 7; stage++) {
     mock_state_t state;
-    ftun_linux_tun_io_t io;
+    ftun_platform_tun_io_t io;
     ftun_tun_spec_t spec = test_spec("ftun0", 1500u);
     ftun_packet_port_t *port = (ftun_packet_port_t *)(uintptr_t)1;
     memset(&state, 0, sizeof(state));
     state.fail_stage = stage;
     state.fail_error = EIO;
     io = mock_io(&state);
-    CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_IO);
+    CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_IO);
     CHECK(port == NULL);
     if (stage == 1) {
       CHECK(state.close_calls == 0);
@@ -233,16 +234,16 @@ static int real_smoke(void)
 {
   ftun_tun_spec_t spec = test_spec("ftun-contract0", 1400u);
   ftun_packet_port_t *port = NULL;
-  ftun_linux_tun_info_t info;
+  ftun_tun_port_info_t info;
   struct ifreq request;
   int control;
   int status_flags;
   int descriptor_flags;
-  CHECK(ftun_linux_tun_open(&spec, &port) == FTUN_OK && port != NULL);
-  CHECK(ftun_linux_tun_get_info(port, &info) == FTUN_OK);
+  CHECK(ftun_tun_port_open(&spec, &port) == FTUN_OK && port != NULL);
+  CHECK(ftun_tun_port_get_info(port, &info) == FTUN_OK);
   CHECK(strcmp(info.name, "ftun-contract0") == 0 && info.mtu == 1400u);
-  status_flags = fcntl(info.descriptor, F_GETFL);
-  descriptor_flags = fcntl(info.descriptor, F_GETFD);
+  status_flags = fcntl((int)info.descriptor, F_GETFL);
+  descriptor_flags = fcntl((int)info.descriptor, F_GETFD);
   CHECK(status_flags >= 0 && (status_flags & O_NONBLOCK) != 0);
   CHECK(descriptor_flags >= 0 && (descriptor_flags & FD_CLOEXEC) != 0);
   control = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
@@ -254,7 +255,7 @@ static int real_smoke(void)
   memcpy(request.ifr_name, info.name, strlen(info.name) + 1u);
   CHECK(ioctl(control, SIOCGIFFLAGS, &request) == 0 &&
         (request.ifr_flags & IFF_UP) != 0);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_OK && port == NULL);
+  CHECK(ftun_tun_port_close(&port) == FTUN_OK && port == NULL);
   memset(&request, 0, sizeof(request));
   memcpy(request.ifr_name, info.name, strlen(info.name) + 1u);
   errno = 0;
@@ -272,28 +273,28 @@ static int budget_admission(void)
   ftun_tun_spec_t spec = test_spec("ftun0", 1500u);
   ftun_packet_port_t *port = NULL;
   mock_state_t state = {0};
-  ftun_linux_tun_io_t io = mock_io(&state);
+  ftun_platform_tun_io_t io = mock_io(&state);
   int stage;
   options.limit = (ftun_budget_resources_t){65536u, 1u, 1u};
   CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
-  CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_LIMIT && port == NULL);
+  CHECK(ftun_tun_port_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_LIMIT && port == NULL);
   CHECK(state.open_device_calls == 0 && state.open_control_calls == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   options.limit.descriptors = 2u;
   CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
-  CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_OK);
+  CHECK(ftun_tun_port_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
-    usage.used > 0u && usage.used_resources.descriptors == 1u &&
+    usage.used_resources.memory_bytes > 0u && usage.used_resources.descriptors == 1u &&
     usage.high_watermarks.descriptors == 2u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_OK);
+  CHECK(ftun_tun_port_close(&port) == FTUN_OK);
   for (stage = 1; stage <= 7; stage++) {
     memset(&state, 0, sizeof(state));
     state.fail_stage = stage;
     state.fail_error = EIO;
-    CHECK(ftun_linux_tun_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_IO && port == NULL);
+    CHECK(ftun_tun_port_open_with_io_and_budget(budget, &spec, &io, &port) == FTUN_E_IO && port == NULL);
     CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
-      usage.used == 0u && usage.used_resources.descriptors == 0u);
+      usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
   }
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -302,11 +303,11 @@ static int budget_admission(void)
 int main(int argc, char **argv)
 {
   mock_state_t state;
-  ftun_linux_tun_io_t io;
-  ftun_linux_tun_io_t incomplete;
+  ftun_platform_tun_io_t io;
+  ftun_platform_tun_io_t incomplete;
   ftun_tun_spec_t spec = test_spec("ftun0", 1500u);
   ftun_packet_port_t *port = NULL;
-  ftun_linux_tun_info_t info;
+  ftun_tun_port_info_t info;
   uint8_t packet[1500];
   size_t length = 99u;
   int stage;
@@ -318,7 +319,7 @@ int main(int argc, char **argv)
 
   memset(&state, 0, sizeof(state));
   io = mock_io(&state);
-  status = ftun_linux_tun_open_with_io(&spec, &io, &port);
+  status = ftun_tun_port_open_with_io(&spec, &io, &port);
   if (status != FTUN_OK) {
     fprintf(stderr, "open failed: %s, ioctls=%d closes=%d\n",
             ftun_status_name(status), state.ioctl_calls, state.close_calls);
@@ -338,7 +339,7 @@ int main(int argc, char **argv)
                             FTUN_IFF_TUN_EXCL)) ==
         (FTUN_IFF_TUN | FTUN_IFF_NO_PI | FTUN_IFF_TUN_EXCL));
   CHECK(state.configured_mtu == 1500 && (state.up_flags & IFF_UP) != 0);
-  CHECK(ftun_linux_tun_get_info(port, &info) == FTUN_OK);
+  CHECK(ftun_tun_port_get_info(port, &info) == FTUN_OK);
   CHECK(strcmp(info.name, "ftun0") == 0 && info.mtu == 1500u &&
         info.descriptor == 41);
 
@@ -346,101 +347,101 @@ int main(int argc, char **argv)
   state.read_eintr_once = 1;
   state.read_result = 20;
   memset(state.read_data, 0x45, 20u);
-  CHECK(ftun_linux_tun_read(port, packet, sizeof(packet), &length) == FTUN_OK);
+  CHECK(ftun_tun_port_read(port, packet, sizeof(packet), &length) == FTUN_OK);
   CHECK(length == 20u && state.read_calls == 2 && packet[0] == 0x45u);
-  CHECK(ftun_linux_tun_read(port, packet, sizeof(packet) - 1u, &length) ==
+  CHECK(ftun_tun_port_read(port, packet, sizeof(packet) - 1u, &length) ==
         FTUN_E_LIMIT && length == 0u && state.read_calls == 2);
   state.read_error = EAGAIN;
-  CHECK(ftun_linux_tun_read(port, packet, sizeof(packet), &length) ==
+  CHECK(ftun_tun_port_read(port, packet, sizeof(packet), &length) ==
         FTUN_E_AGAIN && length == 0u);
   state.read_error = 0;
   state.read_result = 0;
-  CHECK(ftun_linux_tun_read(port, packet, sizeof(packet), &length) ==
+  CHECK(ftun_tun_port_read(port, packet, sizeof(packet), &length) ==
         FTUN_E_EOF && length == 0u);
   state.read_result = 1501;
-  CHECK(ftun_linux_tun_read(port, packet, sizeof(packet), &length) ==
+  CHECK(ftun_tun_port_read(port, packet, sizeof(packet), &length) ==
         FTUN_E_PROTOCOL && length == 0u);
 
   memset(packet, 0x5a, 32u);
   state.write_eintr_once = 1;
   state.write_result = -1;
-  CHECK(ftun_linux_tun_write(port, packet, 32u) == FTUN_OK);
+  CHECK(ftun_tun_port_write(port, packet, 32u) == FTUN_OK);
   CHECK(state.write_calls == 2 && state.written_length == 32u &&
         state.written[0] == 0x5au);
   state.write_result = 16;
-  CHECK(ftun_linux_tun_write(port, packet, 32u) == FTUN_E_IO);
+  CHECK(ftun_tun_port_write(port, packet, 32u) == FTUN_E_IO);
   state.write_error = EAGAIN;
-  CHECK(ftun_linux_tun_write(port, packet, 32u) == FTUN_E_AGAIN);
+  CHECK(ftun_tun_port_write(port, packet, 32u) == FTUN_E_AGAIN);
   state.write_error = 0;
-  CHECK(ftun_linux_tun_write(port, packet, 0u) == FTUN_E_INVALID);
-  CHECK(ftun_linux_tun_write(port, packet, sizeof(packet) + 1u) == FTUN_E_LIMIT);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_OK && port == NULL);
+  CHECK(ftun_tun_port_write(port, packet, 0u) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_write(port, packet, sizeof(packet) + 1u) == FTUN_E_LIMIT);
+  CHECK(ftun_tun_port_close(&port) == FTUN_OK && port == NULL);
   CHECK(state.device_close_calls == 1);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_OK);
+  CHECK(ftun_tun_port_close(&port) == FTUN_OK);
 
   CHECK(check_open_failures() == 0);
   for (stage = 1; stage <= 6; stage++) {
     memset(&state, 0, sizeof(state));
     state.eintr_stage = stage;
     io = mock_io(&state);
-    CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_OK);
+    CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_OK);
     CHECK(state.eintr_done == 1);
-    CHECK(ftun_linux_tun_close(&port) == FTUN_OK);
+    CHECK(ftun_tun_port_close(&port) == FTUN_OK);
   }
 
   memset(&state, 0, sizeof(state));
   state.fail_stage = 2;
   state.fail_error = EPERM;
   io = mock_io(&state);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_REJECTED &&
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_REJECTED &&
         port == NULL && state.device_close_calls == 1);
   memset(&state, 0, sizeof(state));
   state.fail_stage = 1;
   state.fail_error = ENODEV;
   io = mock_io(&state);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_UNSUPPORTED);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_UNSUPPORTED);
   memset(&state, 0, sizeof(state));
   state.fail_stage = 1;
   state.fail_error = EMFILE;
   io = mock_io(&state);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_LIMIT);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_LIMIT);
 
   memset(&state, 0, sizeof(state));
   io = mock_io(&state);
   state.fail_stage = 8;
   state.fail_error = EIO;
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_OK);
-  CHECK(ftun_linux_tun_close(&port) == FTUN_E_IO && port == NULL);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_OK);
+  CHECK(ftun_tun_port_close(&port) == FTUN_E_IO && port == NULL);
 
   spec = test_spec("", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec(".", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("bad/name", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("bad:name", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("name too long!!", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("0123456789abcdef", 1500u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("ftun0", FTUN_LINUX_TUN_MIN_MTU - 1u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("ftun0", FTUN_LINUX_TUN_MAX_MTU + 1u);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, &port) == FTUN_E_INVALID);
   spec = test_spec("ftun0", 1500u);
   incomplete = io;
   incomplete.ioctl_call = NULL;
   port = (ftun_packet_port_t *)(uintptr_t)1;
-  CHECK(ftun_linux_tun_open_with_io(&spec, &incomplete, &port) ==
+  CHECK(ftun_tun_port_open_with_io(&spec, &incomplete, &port) ==
         FTUN_E_INVALID && port == NULL);
-  CHECK(ftun_linux_tun_open_with_io(NULL, &io, &port) == FTUN_E_INVALID &&
+  CHECK(ftun_tun_port_open_with_io(NULL, &io, &port) == FTUN_E_INVALID &&
         port == NULL);
-  CHECK(ftun_linux_tun_open_with_io(&spec, &io, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_linux_tun_get_info(NULL, &info) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_open_with_io(&spec, &io, NULL) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_get_info(NULL, &info) == FTUN_E_INVALID);
   CHECK(info.name[0] == '\0' && info.mtu == 0u && info.descriptor == 0);
-  CHECK(ftun_linux_tun_read(NULL, packet, sizeof(packet), &length) ==
+  CHECK(ftun_tun_port_read(NULL, packet, sizeof(packet), &length) ==
         FTUN_E_INVALID && length == 0u);
-  CHECK(ftun_linux_tun_close(NULL) == FTUN_E_INVALID);
+  CHECK(ftun_tun_port_close(NULL) == FTUN_E_INVALID);
   return 0;
 }

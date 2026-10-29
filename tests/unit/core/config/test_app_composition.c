@@ -96,14 +96,14 @@ ftun_status_t __wrap_ftun_packet_port_open_with_budget(ftun_core_t *owner,
   }
   port = calloc(1u, sizeof(*port));
   if (port == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   port->reservation = reservation;
   if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0,
                  port->sockets) != 0) {
     free(port);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   port->mtu = spec->mtu;
@@ -153,7 +153,7 @@ ftun_status_t __wrap_ftun_packet_port_close(ftun_packet_port_t **raw)
   if (port == NULL) return FTUN_OK;
   (void)close(port->sockets[0]);
   (void)close(port->sockets[1]);
-  (void)ftun_reservation_release(&port->reservation);
+  ftun_reservation_release(&port->reservation);
   free(port);
   *raw = NULL;
   closes++;
@@ -320,6 +320,9 @@ int main(void)
     CHECK(!finished);
     CHECK(ftun_core_get_info(core, &info) == FTUN_OK && now_ms() < expires);
     if (info.state == FTUN_CORE_RUNNING) break;
+    if (info.state != FTUN_CORE_CREATED && info.state != FTUN_CORE_STARTING) {
+      fprintf(stderr, "startup state=%u port=%u\n", (unsigned)info.state, port);
+    }
     CHECK(info.state == FTUN_CORE_CREATED || info.state == FTUN_CORE_STARTING);
     pause_once();
   } while (1);

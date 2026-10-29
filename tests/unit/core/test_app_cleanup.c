@@ -117,7 +117,7 @@ static ftun_status_t prepare(ftun_core_t *core, ftun_budget_t *budget,
   }
   instance = calloc(1u, sizeof(*instance));
   if (instance == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   instance->reservation = reservation;
@@ -310,7 +310,7 @@ static ftun_status_t destroy_until(void **out, uint64_t deadline)
   if (instance->config->source_path == NULL ||
       strcmp(instance->config->source_path, test.path)) test.failed = 1;
   if (!test.allow_cleanup) return FTUN_E_AGAIN;
-  (void)ftun_reservation_release(&instance->reservation);
+  ftun_reservation_release(&instance->reservation);
   free(instance);
   *out = NULL;
   test.destroys++;
@@ -407,7 +407,7 @@ static int scenario(app_mode_t mode, const char *path)
           info.state == FTUN_CORE_STOPPED && info.pending_operations == 0u);
     CHECK(ftun_core_post(core, reload_completed, NULL, &rejected) == FTUN_E_STALE &&
           rejected == NULL);
-    CHECK(ftun_reservation_release(&test.held_reservation) == FTUN_OK);
+    ftun_reservation_release(&test.held_reservation);
 #if defined(FTUN_TEST_PROXY)
     if (test.held_runtime != NULL) CHECK(ftun_runtime_release(&test.held_runtime) == FTUN_OK);
 #endif
@@ -429,7 +429,7 @@ static int scenario(app_mode_t mode, const char *path)
         (test.prepared_config->document.reservation).budget != NULL &&
         test.prepared_config->plan != NULL &&
         (test.prepared_config->plan->reservation).budget != NULL);
-      CHECK(usage.used >= test.prepared_config->document.owned_bytes +
+      CHECK(usage.used_resources.memory_bytes >= test.prepared_config->document.owned_bytes +
         test.prepared_config->plan->owned_bytes);
       pause_ms(1);
       if (now_ms() + 950u >= limit) break;

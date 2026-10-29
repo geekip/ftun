@@ -277,7 +277,7 @@ static int retry_cleanup(unsigned mode)
   CHECK(ftun_budget_create(NULL, 65536u, 1024u, &budget) == FTUN_OK);
   CHECK(ftun_worker_create(budget, 1u, &worker) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK);
-  baseline = memory.used;
+  baseline = memory.used_resources.memory_bytes;
   job.execute = mode == 2u ? gate_owned_execute :
     mode == 1u ? failed_owned_execute : owned_execute;
   job.result_capacity = sizeof(void *);
@@ -301,12 +301,12 @@ static int retry_cleanup(unsigned mode)
   CHECK(completion.result_size == (mode == 0u ? sizeof(void *) : 0u));
   CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK &&
     usage.tasks == 1u && usage.cleanup_pending == 1u && usage.running == 0u);
-  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used > baseline);
-  charged = memory.used;
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used_resources.memory_bytes > baseline);
+  charged = memory.used_resources.memory_bytes;
   CHECK(ftun_worker_submit(worker, &job, completed, &unused, &rejected) == FTUN_E_LIMIT && rejected == NULL);
   CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_AGAIN && count == 0u);
   CHECK(retry_result_calls == 2u && retry_freed == 0u && retry_input_calls == 0u);
-  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == charged);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used_resources.memory_bytes == charged);
   retry_result_status = FTUN_OK;
   CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_IO && count == 0u);
   CHECK(retry_result_calls == 3u && retry_freed == 1u && retry_input_calls == 1u);
@@ -315,15 +315,15 @@ static int retry_cleanup(unsigned mode)
   CHECK(ftun_worker_destroy(&worker) == FTUN_E_AGAIN && worker != NULL);
   CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_E_IO);
   CHECK(retry_result_calls == 3u && retry_input_calls == 2u && completion.calls == 1);
-  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == charged);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used_resources.memory_bytes == charged);
   retry_input_status = FTUN_OK;
   CHECK(ftun_worker_poll(worker, 8u, &count) == FTUN_OK && count == 0u);
   CHECK(retry_input_calls == 3u && retry_result_calls == 3u && retry_freed == 1u);
   CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK && usage.tasks == 0u && usage.cleanup_pending == 0u);
   CHECK(!ftun_worker_has_ready(worker));
-  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == baseline);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used_resources.memory_bytes == baseline);
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &memory) == FTUN_OK && memory.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -509,11 +509,11 @@ int main(void)
         usage.exited && usage.joined);
 
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used > 0u);
+  CHECK(budget_usage.used_resources.memory_bytes > 0u);
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK && worker == NULL);
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK);
-  CHECK(budget_usage.used == 0u);
+  CHECK(budget_usage.used_resources.memory_bytes == 0u);
 
   /* Completion ingestion and callback dispatch share a finite owner round.
    * Leaving two completions queued after a quota-one poll proves the worker

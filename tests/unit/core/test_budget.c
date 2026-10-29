@@ -17,9 +17,9 @@ static int check_usage(ftun_budget_t *budget, size_t used, size_t normal,
 {
   ftun_budget_usage_t usage;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(usage.used == used);
-  CHECK(usage.normal_available == normal);
-  CHECK(usage.total_available == total);
+  CHECK(usage.used_resources.memory_bytes == used);
+  CHECK(usage.normal_available_resources.memory_bytes == normal);
+  CHECK(usage.total_available_resources.memory_bytes == total);
   CHECK(usage.child_count == children);
   return 0;
 }
@@ -132,10 +132,10 @@ static int concurrent_admission(void)
           usage.used_resources.queue_slots == 1u &&
           usage.metadata_bytes == tree_metadata);
     for (index = 0u; index < 2u; index++) {
-      CHECK(ftun_reservation_release(&states[index].reservation) == FTUN_OK);
+      ftun_reservation_release(&states[index].reservation);
     }
     CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
-    CHECK(usage.used == 0u && usage.metadata_bytes == tree_metadata);
+    CHECK(usage.used_resources.memory_bytes == 0u && usage.metadata_bytes == tree_metadata);
     barrier_wait(&barrier);
   }
   for (index = 0u; index < 2u; index++) {
@@ -195,9 +195,9 @@ static int run_churn(churn_shared_t *shared)
     }
     CHECK(ftun_budget_reserve_cleanup_resources(leaf,
       (ftun_budget_resources_t){1u, 1u, 1u}, &cleanup) == FTUN_OK);
-    CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+    ftun_reservation_release(&cleanup);
     for (index = 0u; index < 8u; index++)
-      CHECK(ftun_reservation_release(&reservations[index]) == FTUN_OK);
+      ftun_reservation_release(&reservations[index]);
     CHECK(ftun_budget_destroy(&leaf) == FTUN_OK);
     CHECK(ftun_budget_destroy(&module) == FTUN_OK);
   }
@@ -250,7 +250,7 @@ static int concurrent_tree_lifecycle(void)
     CHECK(states[index].result == 0);
   }
   CHECK(ftun_budget_get_usage(shared.root, &usage) == FTUN_OK);
-  CHECK(usage.used == 0u && usage.child_count == 0u && usage.metadata_bytes == metadata);
+  CHECK(usage.used_resources.memory_bytes == 0u && usage.child_count == 0u && usage.metadata_bytes == metadata);
   CHECK(ftun_budget_destroy(&shared.root) == FTUN_OK);
   CHECK(pthread_mutex_destroy(&shared.mutex) == 0);
   return 0;
@@ -270,22 +270,22 @@ static int reservation_resize(void)
   CHECK(ftun_budget_get_usage(root, &before) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){70u, 7u, 7u}) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){71u, 6u, 6u}) == FTUN_E_LIMIT);
-  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used == 70u &&
+  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used_resources.memory_bytes == 70u &&
     after.used_resources.descriptors == 7u && after.used_resources.queue_slots == 7u);
   CHECK(after.metadata_bytes == before.metadata_bytes);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){5u, 8u, 1u}) == FTUN_E_LIMIT);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){20u, 2u, 2u}) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){10u, 3u, 1u}) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used == 10u &&
+  CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK && after.used_resources.memory_bytes == 10u &&
     after.used_resources.descriptors == 3u && after.used_resources.queue_slots == 1u);
   CHECK(ftun_reservation_resize(&(value), (ftun_budget_resources_t){0}) == FTUN_E_INVALID);
   CHECK(ftun_reservation_resize(NULL, (ftun_budget_resources_t){1u, 0u, 0u}) == FTUN_E_INVALID);
-  CHECK(ftun_reservation_release(&value) == FTUN_OK);
+  ftun_reservation_release(&value);
   CHECK(ftun_budget_reserve_cleanup_resources(root, (ftun_budget_resources_t){1u, 1u, 1u}, &cleanup) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(cleanup), (ftun_budget_resources_t){100u, 10u, 10u}) == FTUN_OK);
   CHECK(ftun_reservation_resize(&(cleanup), (ftun_budget_resources_t){101u, 10u, 10u}) == FTUN_E_LIMIT);
   CHECK(ftun_reservation_resize(&(cleanup), (ftun_budget_resources_t){1u, 1u, 1u}) == FTUN_OK);
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+  ftun_reservation_release(&cleanup);
   CHECK(ftun_budget_destroy(&first) == FTUN_OK && ftun_budget_destroy(&second) == FTUN_OK);
   CHECK(ftun_budget_destroy(&root) == FTUN_OK);
   return 0;
@@ -301,11 +301,11 @@ static int independent_dimensions(void)
   CHECK(ftun_budget_reserve_resources(budget, (ftun_budget_resources_t){10u, 1u, 0u}, &normal) == FTUN_OK);
   CHECK(ftun_budget_reserve_cleanup_resources(budget, (ftun_budget_resources_t){0u, 9u, 0u}, &cleanup) == FTUN_OK);
   CHECK(ftun_budget_reserve(budget, 1u, &memory) == FTUN_OK);
-  CHECK(ftun_reservation_release(&memory) == FTUN_OK);
+  ftun_reservation_release(&memory);
   CHECK(ftun_reservation_resize(&(normal), (ftun_budget_resources_t){20u, 0u, 0u}) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 20u && usage.used_resources.descriptors == 9u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 20u && usage.used_resources.descriptors == 9u);
   CHECK(ftun_budget_reserve(budget, 71u, &memory) == FTUN_E_LIMIT && (memory).budget == NULL);
-  CHECK(ftun_reservation_release(&normal) == FTUN_OK && ftun_reservation_release(&cleanup) == FTUN_OK);
+  ftun_reservation_release(&normal); ftun_reservation_release(&cleanup);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -328,9 +328,9 @@ static int cleanup_and_guarantees(void)
   CHECK(ftun_budget_reserve(left, 1u, &rejected) == FTUN_E_LIMIT && rejected.budget == NULL);
   CHECK(ftun_budget_get_usage(root, &after) == FTUN_OK);
   CHECK(memcmp(&before.used_resources, &after.used_resources, sizeof(before.used_resources)) == 0);
-  CHECK(ftun_reservation_release(&first) == FTUN_OK);
-  CHECK(ftun_reservation_release(&second) == FTUN_OK);
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
+  ftun_reservation_release(&first);
+  ftun_reservation_release(&second);
+  ftun_reservation_release(&cleanup);
   CHECK(ftun_budget_destroy(&right) == FTUN_OK);
   CHECK(ftun_budget_destroy(&left) == FTUN_OK);
   CHECK(ftun_budget_destroy(&root) == FTUN_OK);
@@ -376,9 +376,9 @@ int main(void)
   CHECK(ftun_budget_destroy(&module) == FTUN_E_AGAIN && module != NULL);
   CHECK(ftun_budget_destroy(&global) == FTUN_E_AGAIN && global != NULL);
 
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK && (cleanup).budget == NULL);
-  CHECK(ftun_reservation_release(&cleanup) == FTUN_OK);
-  CHECK(ftun_reservation_release(&normal) == FTUN_OK && (normal).budget == NULL);
+  ftun_reservation_release(&cleanup); CHECK((cleanup).budget == NULL);
+  ftun_reservation_release(&cleanup);
+  ftun_reservation_release(&normal); CHECK((normal).budget == NULL);
   CHECK(check_usage(global, 0u, 80u, 100u, 1u) == 0);
   CHECK(check_usage(module, 0u, 50u, 60u, 1u) == 0);
   CHECK(ftun_budget_destroy(&nested) == FTUN_OK && nested == NULL);
@@ -397,7 +397,7 @@ int main(void)
   /* Availability is path-effective: the wider child cannot advertise
    * capacity which its root cannot honor. */
   CHECK(check_usage(module, 56u, 0u, 0u, 0u) == 0);
-  CHECK(ftun_reservation_release(&normal) == FTUN_OK);
+  ftun_reservation_release(&normal);
   CHECK(ftun_budget_destroy(&module) == FTUN_OK);
   CHECK(ftun_budget_destroy(&global) == FTUN_OK);
 
@@ -410,12 +410,11 @@ int main(void)
   CHECK(ftun_budget_reserve(global, 1u, &rejected) == FTUN_E_LIMIT);
   CHECK((rejected).budget == NULL);
   CHECK(ftun_budget_get_usage(NULL, &usage) == FTUN_E_INVALID);
-  CHECK(usage.limit == 0u && usage.used == 0u);
+  CHECK(usage.limits.memory_bytes == 0u && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_get_usage(global, NULL) == FTUN_E_INVALID);
   CHECK(ftun_budget_reserve(NULL, 1u, &rejected) == FTUN_E_INVALID);
   CHECK((rejected).budget == NULL);
   CHECK(ftun_budget_reserve(global, 1u, NULL) == FTUN_E_INVALID);
-  CHECK(ftun_reservation_release(NULL) == FTUN_E_INVALID);
   CHECK(ftun_budget_destroy(NULL) == FTUN_E_INVALID);
   CHECK(ftun_budget_destroy(&global) == FTUN_OK);
 
@@ -424,7 +423,7 @@ int main(void)
   CHECK(check_usage(global, SIZE_MAX, 0u, 0u, 0u) == 0);
   CHECK(ftun_budget_reserve_cleanup(global, 1u, &rejected) == FTUN_E_LIMIT);
   CHECK((rejected).budget == NULL);
-  CHECK(ftun_reservation_release(&normal) == FTUN_OK);
+  ftun_reservation_release(&normal);
   CHECK(ftun_budget_destroy(&global) == FTUN_OK);
 
   /* Global/module/object hierarchy: unused guarantees are protected while
@@ -493,15 +492,15 @@ int main(void)
           usage.high_watermarks.descriptors == 11u &&
           usage.high_watermarks.queue_slots == 10u);
 
-    CHECK(ftun_reservation_release(&emergency) == FTUN_OK);
-    CHECK(ftun_reservation_release(&control_work) == FTUN_OK);
-    CHECK(ftun_reservation_release(&object_minimum) == FTUN_OK);
-    CHECK(ftun_reservation_release(&data_borrow) == FTUN_OK);
+    ftun_reservation_release(&emergency);
+    ftun_reservation_release(&control_work);
+    ftun_reservation_release(&object_minimum);
+    ftun_reservation_release(&data_borrow);
     CHECK(ftun_budget_destroy(&object) == FTUN_OK);
     CHECK(ftun_budget_destroy(&data) == FTUN_OK);
     CHECK(ftun_budget_destroy(&control) == FTUN_OK);
     CHECK(ftun_budget_get_usage(global, &usage) == FTUN_OK &&
-          usage.used == 0u && usage.child_count == 0u);
+          usage.used_resources.memory_bytes == 0u && usage.child_count == 0u);
     CHECK(ftun_budget_destroy(&global) == FTUN_OK);
   }
   CHECK(concurrent_admission() == 0);

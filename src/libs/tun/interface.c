@@ -1,6 +1,6 @@
-#include "libs/tun/linux/interface.h"
-#include "libs/tun/linux/routes.h"
-#include "libs/tun/linux/routes_internal.h"
+#include "libs/tun/interface_backend.h"
+#include "libs/tun/routes.h"
+#include "libs/tun/routes_internal.h"
 #include "core/limits.h"
 #include <stdlib.h>
 #include <string.h>
@@ -14,14 +14,14 @@ static ftun_status_t restore(void *context, const ftun_interface_spec_t *spec, v
   route.tun_interface = spec->name;
   memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
   route.tun_prefix_length = spec->prefix_length;
-  route.route_table = spec->route_table;
-  route.rule_priority = spec->rule_priority;
-  route.protection_mark = spec->protection_mark;
-  route.protection_mark_mask = UINT32_MAX;
+  route.routing_domain = spec->route_table;
+  route.precedence = spec->rule_priority;
+  route.bypass_tag = spec->protection_mark;
+  route.bypass_mask = UINT32_MAX;
   route.manage_local = true;
   route.strict_route = spec->strict_route;
-  status = context == NULL ? ftun_linux_route_prepare_with_budget(spec->budget, &route, &transaction)
-    : ftun_linux_route_prepare_with_io_and_budget(spec->budget, &route, context, &transaction);
+  status = context == NULL ? ftun_route_prepare_with_budget(spec->budget, &route, &transaction)
+    : ftun_route_prepare_with_io_and_budget(spec->budget, &route, context, &transaction);
   *state = transaction;
   return status;
 }
@@ -33,13 +33,13 @@ static ftun_status_t withdraw(void *context, void **state)
   (void)context;
   if (state == NULL) return FTUN_E_INVALID;
   transaction = *state;
-  status = ftun_linux_route_release(&transaction);
+  status = ftun_route_release(&transaction);
   *state = transaction;
   return status;
 }
 
 typedef struct {
-  ftun_linux_route_async_t *operation;
+  ftun_route_async_t *operation;
   ftun_reservation_t reservation;
 } ftun_linux_interface_async_t;
 
@@ -50,7 +50,7 @@ static ftun_status_t async_allocate(void *context,
   ftun_linux_interface_async_t *state;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_budget_resources_t resources = {
-    sizeof(*state) + ftun_linux_route_async_allocation_size(), context == NULL ? 1u : 0u, 0u};
+    sizeof(*state) + ftun_route_async_allocation_size(), context == NULL ? 2u : 0u, 0u};
   ftun_status_t status;
   if (options == NULL || options->budget == NULL || options->loop == NULL ||
       options->step_timeout_ms == 0u || options->deadline_ms <= options->now_ms) return FTUN_E_INVALID;
@@ -60,7 +60,7 @@ static ftun_status_t async_allocate(void *context,
   if (status != FTUN_OK) return status;
   state = calloc(1u, sizeof(*state));
   if (state == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   state->reservation = reservation;
@@ -72,7 +72,7 @@ static ftun_status_t async_publish(ftun_linux_interface_async_t *owned,
   ftun_status_t status, void **out)
 {
   if (status != FTUN_OK) {
-    (void)ftun_reservation_release(&owned->reservation);
+    ftun_reservation_release(&owned->reservation);
     free(owned);
   } else *out = owned;
   return status;
@@ -90,16 +90,16 @@ static ftun_status_t async_start(void *context, const ftun_interface_spec_t *spe
   route.tun_interface = spec->name;
   memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
   route.tun_prefix_length = spec->prefix_length;
-  route.route_table = spec->route_table;
-  route.rule_priority = spec->rule_priority;
-  route.protection_mark = spec->protection_mark;
-  route.protection_mark_mask = UINT32_MAX;
+  route.routing_domain = spec->route_table;
+  route.precedence = spec->rule_priority;
+  route.bypass_tag = spec->protection_mark;
+  route.bypass_mask = UINT32_MAX;
   route.manage_local = true;
   route.strict_route = spec->strict_route;
   status = context == NULL
-    ? ftun_linux_route_async_start(&route, options->loop, options->now_ms,
+    ? ftun_route_async_start(&route, options->loop, options->now_ms,
         options->step_timeout_ms, options->deadline_ms, &owned->operation)
-    : ftun_linux_route_async_start_with_io(&route, context, options->now_ms,
+    : ftun_route_async_start_with_io(&route, context, options->now_ms,
         options->step_timeout_ms, options->deadline_ms, 1u, &owned->operation);
   return async_publish(owned, status, out);
 }
@@ -115,9 +115,9 @@ static ftun_status_t async_adopt(void *context, void **source,
   if (status != FTUN_OK) return status;
   transaction = *source;
   status = context == NULL
-    ? ftun_linux_route_async_adopt(&transaction, options->loop, options->now_ms,
+    ? ftun_route_async_adopt(&transaction, options->loop, options->now_ms,
         options->step_timeout_ms, options->deadline_ms, &owned->operation)
-    : ftun_linux_route_async_adopt_with_io(&transaction, context, options->now_ms,
+    : ftun_route_async_adopt_with_io(&transaction, context, options->now_ms,
         options->step_timeout_ms, options->deadline_ms, 1u, &owned->operation);
   *source = transaction;
   return async_publish(owned, status, out);
@@ -129,7 +129,7 @@ static ftun_status_t async_withdraw(void *context, void *state,
   ftun_linux_interface_async_t *owned = state;
   (void)context;
   return owned == NULL ? FTUN_E_INVALID :
-    ftun_linux_route_async_release(owned->operation, now_ms, deadline_ms);
+    ftun_route_async_release(owned->operation, now_ms, deadline_ms);
 }
 
 static ftun_status_t async_run(void *context, void *state, uint64_t now_ms,
@@ -139,28 +139,28 @@ static ftun_status_t async_run(void *context, void *state, uint64_t now_ms,
   (void)context;
   if (out_work != NULL) *out_work = 0u;
   return owned == NULL ? FTUN_E_INVALID :
-    ftun_linux_route_async_run(owned->operation, now_ms, quota, out_work);
+    ftun_route_async_run(owned->operation, now_ms, quota, out_work);
 }
 
 static ftun_status_t async_query(void *context, const void *state,
   ftun_interface_async_info_t *out)
 {
   const ftun_linux_interface_async_t *owned = state;
-  ftun_linux_route_async_info_t info;
+  ftun_route_async_info_t info;
   ftun_status_t status;
   (void)context;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (owned == NULL || out == NULL) return FTUN_E_INVALID;
-  status = ftun_linux_route_async_get_info(owned->operation, &info);
+  status = ftun_route_async_get_info(owned->operation, &info);
   if (status != FTUN_OK) return status;
   switch (info.state) {
-  case FTUN_LINUX_ROUTE_ASYNC_APPLYING: out->state = FTUN_INTERFACE_INSTALLING; break;
-  case FTUN_LINUX_ROUTE_ASYNC_READY: out->state = FTUN_INTERFACE_READY; break;
-  case FTUN_LINUX_ROUTE_ASYNC_COMPENSATING:
-  case FTUN_LINUX_ROUTE_ASYNC_RELEASING: out->state = FTUN_INTERFACE_REMOVING; break;
-  case FTUN_LINUX_ROUTE_ASYNC_FAILED: out->state = FTUN_INTERFACE_FAILED; break;
-  case FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED: out->state = FTUN_INTERFACE_RETAINED; break;
-  case FTUN_LINUX_ROUTE_ASYNC_RELEASED: out->state = FTUN_INTERFACE_RELEASED; break;
+  case FTUN_ROUTE_ASYNC_APPLYING: out->state = FTUN_INTERFACE_INSTALLING; break;
+  case FTUN_ROUTE_ASYNC_READY: out->state = FTUN_INTERFACE_READY; break;
+  case FTUN_ROUTE_ASYNC_COMPENSATING:
+  case FTUN_ROUTE_ASYNC_RELEASING: out->state = FTUN_INTERFACE_REMOVING; break;
+  case FTUN_ROUTE_ASYNC_FAILED: out->state = FTUN_INTERFACE_FAILED; break;
+  case FTUN_ROUTE_ASYNC_CLEANUP_FAILED: out->state = FTUN_INTERFACE_RETAINED; break;
+  case FTUN_ROUTE_ASYNC_RELEASED: out->state = FTUN_INTERFACE_RELEASED; break;
   default: return FTUN_E_STATE_CORRUPT;
   }
   out->result = info.result;
@@ -172,7 +172,7 @@ static ftun_status_t async_query(void *context, const void *state,
   out->repair_runs = info.repair_runs;
   out->repairs = info.repairs;
   out->repair_failures = info.repair_failures;
-  return ftun_linux_route_async_next_deadline(owned->operation,
+  return ftun_route_async_next_deadline(owned->operation,
     &out->next_deadline_ms, &out->has_deadline);
 }
 
@@ -182,7 +182,7 @@ static ftun_status_t async_repair(void *context, void *state, uint64_t now_ms,
   ftun_linux_interface_async_t *owned = state;
   (void)context;
   return owned == NULL ? FTUN_E_INVALID :
-    ftun_linux_route_async_repair(owned->operation, now_ms, deadline_ms);
+    ftun_route_async_repair(owned->operation, now_ms, deadline_ms);
 }
 
 static ftun_status_t async_destroy(void *context, void **state)
@@ -193,16 +193,15 @@ static ftun_status_t async_destroy(void *context, void **state)
   if (state == NULL) return FTUN_E_INVALID;
   owned = *state;
   if (owned == NULL) return FTUN_OK;
-  status = ftun_linux_route_async_destroy(&owned->operation);
+  status = ftun_route_async_destroy(&owned->operation);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned);
   *state = NULL;
   return FTUN_OK;
 }
 
-const ftun_interface_ops_t ftun_linux_interface_ops = {
+const ftun_interface_ops_t ftun_interface_default_ops = {
   restore, withdraw, NULL,
   {async_start, async_adopt, async_withdraw, async_run, async_query, async_destroy, async_repair, NULL}
 };

@@ -1,6 +1,7 @@
 #include "libs/tun/internal.h"
 
 #include <limits.h>
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -98,30 +99,20 @@ ftun_status_t ftun_tun_service_interests(ftun_tun_service_t *service)
   return ftun_event_io_update(service->source, interests);
 }
 
-static ftun_status_t ftun_tun_service_packet_clear(
+static void ftun_tun_service_packet_clear(
   ftun_tun_service_packet_t *entries, size_t capacity, size_t *head,
   size_t *count, size_t *bytes, size_t *service_count, size_t *service_bytes,
   size_t *dropped)
 {
-  ftun_status_t result = FTUN_OK;
-  if (entries == NULL || capacity == 0u || head == NULL || count == NULL ||
-      bytes == NULL || service_count == NULL || service_bytes == NULL ||
-      dropped == NULL) return FTUN_E_INVALID;
+  assert(entries != NULL && capacity != 0u);
   while (*count != 0u) {
     ftun_tun_service_packet_t *entry = &entries[*head];
-    ftun_status_t status = ftun_buffer_release(&entry->buffer);
-    if (status != FTUN_OK && result == FTUN_OK) result = status;
-    if (*bytes < entry->length || *service_bytes < entry->length ||
-        *service_count == 0u) {
-      result = FTUN_E_STATE_CORRUPT;
-      *bytes = 0u;
-      *service_bytes = 0u;
-      *service_count = 0u;
-    } else {
-      *bytes -= entry->length;
-      *service_bytes -= entry->length;
-      (*service_count)--;
-    }
+    assert(*bytes >= entry->length && *service_bytes >= entry->length);
+    assert(*service_count != 0u);
+    ftun_buffer_release(&entry->buffer);
+    *bytes -= entry->length;
+    *service_bytes -= entry->length;
+    (*service_count)--;
     entry->length = 0u;
     entry->lease_generation = 0u;
     entry->path_generation = 0u;
@@ -131,7 +122,6 @@ static ftun_status_t ftun_tun_service_packet_clear(
   }
   *head = 0u;
   *bytes = 0u;
-  return result;
 }
 
 static void ftun_tun_service_add_drops(ftun_tun_service_t *service,
@@ -144,69 +134,57 @@ static void ftun_tun_service_add_drops(ftun_tun_service_t *service,
   }
 }
 
-ftun_status_t ftun_tun_service_consumer_clear(
+void ftun_tun_service_consumer_clear(
   ftun_tun_service_t *service, ftun_tun_service_consumer_t *consumer)
 {
   size_t input_count = consumer->input_count;
   size_t output_count = consumer->output_count;
-  ftun_status_t result;
-  ftun_status_t status;
-  result = ftun_tun_service_packet_clear(
+  ftun_tun_service_packet_clear(
     consumer->input, service->input_capacity, &consumer->input_head,
     &consumer->input_count, &consumer->input_bytes,
     &service->queued_inputs, &service->queued_input_bytes,
     &consumer->packets_dropped);
-  status = ftun_tun_service_packet_clear(
+  ftun_tun_service_packet_clear(
     consumer->output, service->output_capacity, &consumer->output_head,
     &consumer->output_count, &consumer->output_bytes,
     &service->queued_outputs, &service->queued_output_bytes,
     &consumer->packets_dropped);
-  if (status != FTUN_OK && result == FTUN_OK) result = status;
   ftun_tun_service_add_drops(service, input_count);
   ftun_tun_service_add_drops(service, output_count);
   consumer->blocked = false;
   consumer->dispatch_ready = false;
-  return result;
 }
 
-static ftun_status_t ftun_tun_service_all_outputs_clear(
-  ftun_tun_service_t *service)
+static void ftun_tun_service_all_outputs_clear(ftun_tun_service_t *service)
 {
   size_t index;
-  ftun_status_t result = FTUN_OK;
   for (index = 0u; index < service->consumer_capacity; index++) {
     ftun_tun_service_consumer_t *consumer = &service->consumers[index];
     size_t count = consumer->output_count;
-    ftun_status_t status = ftun_tun_service_packet_clear(
+    ftun_tun_service_packet_clear(
       consumer->output, service->output_capacity, &consumer->output_head,
       &consumer->output_count, &consumer->output_bytes,
       &service->queued_outputs, &service->queued_output_bytes,
       &consumer->packets_dropped);
-    if (status != FTUN_OK && result == FTUN_OK) result = status;
     ftun_tun_service_add_drops(service, count);
   }
-  return result;
 }
 
-static ftun_status_t ftun_tun_service_all_inputs_clear(
-  ftun_tun_service_t *service)
+static void ftun_tun_service_all_inputs_clear(ftun_tun_service_t *service)
 {
   size_t index;
-  ftun_status_t result = FTUN_OK;
   for (index = 0u; index < service->consumer_capacity; index++) {
     ftun_tun_service_consumer_t *consumer = &service->consumers[index];
     size_t count = consumer->input_count;
-    ftun_status_t status = ftun_tun_service_packet_clear(
+    ftun_tun_service_packet_clear(
       consumer->input, service->input_capacity, &consumer->input_head,
       &consumer->input_count, &consumer->input_bytes,
       &service->queued_inputs, &service->queued_input_bytes,
       &consumer->packets_dropped);
     consumer->blocked = false;
     consumer->dispatch_ready = false;
-    if (status != FTUN_OK && result == FTUN_OK) result = status;
     ftun_tun_service_add_drops(service, count);
   }
-  return result;
 }
 
 static ftun_status_t ftun_tun_service_network_withdraw(ftun_tun_service_t *service)
@@ -340,7 +318,7 @@ ftun_status_t ftun_tun_service_create_with_ops(
   if (status != FTUN_OK) return status;
   service = (ftun_tun_service_t *)calloc(1u, sizeof(*service));
   if (service == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   service->consumers = (ftun_tun_service_consumer_t *)calloc(
@@ -357,7 +335,7 @@ ftun_status_t ftun_tun_service_create_with_ops(
     free(service->input_entries);
     free(service->consumers);
     free(service);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   for (index = 0u; index < consumer_capacity; index++) {
@@ -396,7 +374,7 @@ ftun_status_t ftun_tun_service_create_with_ops(
     free(service->input_entries);
     free(service->consumers);
     free(service);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   *out = service;
@@ -515,8 +493,8 @@ ftun_status_t ftun_tun_service_rebuild(ftun_tun_service_t *service)
   service->rebuilding = true;
   service->accepting = false;
   status = ftun_event_source_cancel(&service->source);
-  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
-  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   if (status == FTUN_OK) status = ftun_tun_service_device_close(service);
   if (status == FTUN_OK) status = ftun_tun_service_device_open(service);
   if (status == FTUN_OK) {
@@ -553,8 +531,8 @@ ftun_status_t ftun_tun_service_refresh_network(
   service->rebuilding = true;
   service->accepting = false;
   status = ftun_event_source_cancel(&service->source);
-  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
-  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   if (status == FTUN_OK) status = ftun_tun_service_network_withdraw(service);
   if (status == FTUN_OK) {
     service->network_started = true;
@@ -595,8 +573,8 @@ static ftun_status_t ftun_tun_service_change_pause(
   service->rebuild_port_ready = false;
   service->accepting = false;
   status = ftun_event_source_cancel(&service->source);
-  if (status == FTUN_OK) status = ftun_tun_service_all_outputs_clear(service);
-  if (status == FTUN_OK) status = ftun_tun_service_all_inputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
+  if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;
   service->network_paused = status == FTUN_OK;
   ftun_tun_service_broadcast(service, status == FTUN_OK
@@ -679,7 +657,7 @@ ftun_status_t ftun_tun_service_network_finish(
 
 ftun_status_t ftun_tun_service_quiesce_io(ftun_tun_service_t *service)
 {
-  ftun_status_t result, status;
+  ftun_status_t result;
   bool was_quiesced;
   if (service == NULL) return FTUN_E_INVALID;
   if (service->callback_depth != 0u || service->rebuilding) return FTUN_E_AGAIN;
@@ -687,10 +665,8 @@ ftun_status_t ftun_tun_service_quiesce_io(ftun_tun_service_t *service)
   service->quiesced = true;
   service->accepting = false;
   result = ftun_event_source_cancel(&service->source);
-  status = ftun_tun_service_all_outputs_clear(service);
-  if (status != FTUN_OK && result == FTUN_OK) result = status;
-  status = ftun_tun_service_all_inputs_clear(service);
-  if (status != FTUN_OK && result == FTUN_OK) result = status;
+  ftun_tun_service_all_outputs_clear(service);
+  ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;
   if (result == FTUN_OK && !was_quiesced) {
     ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_QUIESCED, FTUN_OK);
@@ -709,10 +685,8 @@ ftun_status_t ftun_tun_service_quiesce(ftun_tun_service_t *service)
   service->quiesced = true;
   service->accepting = false;
   result = ftun_event_source_cancel(&service->source);
-  status = ftun_tun_service_all_outputs_clear(service);
-  if (status != FTUN_OK && result == FTUN_OK) result = status;
-  status = ftun_tun_service_all_inputs_clear(service);
-  if (status != FTUN_OK && result == FTUN_OK) result = status;
+  ftun_tun_service_all_outputs_clear(service);
+  ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;
   status = ftun_tun_service_network_withdraw(service);
   if (status != FTUN_OK && result == FTUN_OK) result = status;
@@ -799,10 +773,8 @@ ftun_status_t ftun_tun_service_destroy(ftun_tun_service_t **service)
       owned->callback_depth != 0u) return FTUN_E_AGAIN;
   status = ftun_event_source_cancel(&owned->source);
   if (status != FTUN_OK) return status;
-  status = ftun_tun_service_all_outputs_clear(owned);
-  if (status != FTUN_OK) return status;
-  status = ftun_tun_service_all_inputs_clear(owned);
-  if (status != FTUN_OK) return status;
+  ftun_tun_service_all_outputs_clear(owned);
+  ftun_tun_service_all_inputs_clear(owned);
   status = ftun_tun_service_device_close(owned);
   if (status != FTUN_OK) return status;
   reservation = owned->reservation;
@@ -813,5 +785,6 @@ ftun_status_t ftun_tun_service_destroy(ftun_tun_service_t **service)
   free(owned->consumers);
   free(owned);
   *service = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

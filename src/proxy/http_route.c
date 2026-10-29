@@ -1,4 +1,5 @@
 #include "proxy/http_route.h"
+#include "proxy/protocol/socks5.h"
 #include "proxy/outbound_id.h"
 #include <string.h>
 
@@ -45,6 +46,7 @@ ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
     if (status != FTUN_OK) return status;
     spec->generation = info.generation;
   }
+  spec->protocol = &ftun_socks5_protocol;
   spec->use_proxy = false;
   memset(&spec->proxy, 0, sizeof(spec->proxy));
   memset(spec->proxy_domain, 0, sizeof(spec->proxy_domain));

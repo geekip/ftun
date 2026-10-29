@@ -1,4 +1,5 @@
 #include "libs/buffer/buffer.h"
+#include <assert.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -159,7 +160,7 @@ static ftun_status_t ftun_buffer_allocate(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   buffer = (ftun_buffer_t *)malloc(charge);
   if (buffer == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   memset(buffer, 0, sizeof(*buffer));
@@ -172,18 +173,12 @@ static ftun_status_t ftun_buffer_allocate(ftun_budget_t *budget,
   return FTUN_OK;
 }
 
-static ftun_status_t ftun_buffer_free(ftun_buffer_t *buffer)
+static void ftun_buffer_free(ftun_buffer_t *buffer)
 {
   ftun_reservation_t reservation = buffer->reservation;
-  ftun_status_t status;
   buffer->reservation = (ftun_reservation_t){0};
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) {
-    buffer->reservation = reservation;
-    return status;
-  }
+  ftun_reservation_release(&reservation);
   free(buffer);
-  return FTUN_OK;
 }
 
 static int ftun_buffer_pool_idle_class(ftun_buffer_pool_t *pool, size_t capacity)
@@ -396,7 +391,7 @@ ftun_status_t ftun_buffer_pool_create_waitable(
   if (pool == NULL || (waiter_capacity != 0u && pool->waiters == NULL)) {
     if (pool != NULL) free(pool->waiters);
     free(pool);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   pool->budget = budget;
@@ -492,7 +487,7 @@ ftun_status_t ftun_buffer_pool_acquire(ftun_buffer_pool_t *pool, size_t capacity
   if (pool->active_buffers == SIZE_MAX) {
     buffer = *out;
     *out = NULL;
-    (void)ftun_buffer_free(buffer);
+    ftun_buffer_free(buffer);
     if (trimmed) ftun_buffer_pool_notify(pool);
     return FTUN_E_LIMIT;
   }
@@ -667,7 +662,6 @@ static ftun_status_t ftun_buffer_pool_trim_idle(
   if (pool == NULL) return FTUN_E_INVALID;
   while (pool->idle != NULL && pool->idle_bytes > target_idle_bytes) {
     ftun_buffer_t *buffer = pool->idle;
-    ftun_status_t status;
     if (pool->idle_buffers == 0u || pool->idle_bytes < buffer->capacity) {
       return FTUN_E_STATE_CORRUPT;
     }
@@ -675,14 +669,7 @@ static ftun_status_t ftun_buffer_pool_trim_idle(
     buffer->next = NULL;
     pool->idle_buffers--;
     pool->idle_bytes -= buffer->capacity;
-    status = ftun_buffer_free(buffer);
-    if (status != FTUN_OK) {
-      buffer->next = pool->idle;
-      pool->idle = buffer;
-      pool->idle_buffers++;
-      pool->idle_bytes += buffer->capacity;
-      return status;
-    }
+    ftun_buffer_free(buffer);
   }
   return FTUN_OK;
 }
@@ -710,8 +697,7 @@ ftun_status_t ftun_buffer_pool_destroy(ftun_buffer_pool_t **pool)
     return FTUN_E_STATE_CORRUPT;
   }
   reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   free(owned->waiters);
   owned->waiters = NULL;
@@ -741,58 +727,31 @@ ftun_status_t ftun_buffer_data(ftun_buffer_t *buffer, uint8_t **data, size_t *ca
   return FTUN_OK;
 }
 
-ftun_status_t ftun_buffer_release(ftun_buffer_t **buffer)
+void ftun_buffer_release(ftun_buffer_t **buffer)
 {
   ftun_buffer_t *owned;
   ftun_buffer_pool_t *pool;
-  ftun_status_t status;
-  if (buffer == NULL) return FTUN_E_INVALID;
+  assert(buffer != NULL);
   owned = *buffer;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->references == 0u) return FTUN_E_STATE_CORRUPT;
+  if (owned == NULL) return;
+  assert(owned->references != 0u);
   owned->references--;
   *buffer = NULL;
-  if (owned->references != 0u) return FTUN_OK;
+  if (owned->references != 0u) return;
   pool = owned->pool;
-  if (pool == NULL) {
-    status = ftun_buffer_free(owned);
-    if (status != FTUN_OK) {
-      owned->references = 1u;
-      *buffer = owned;
-    }
-    return status;
-  }
-  if (pool->active_buffers == 0u) {
-    owned->references = 1u;
-    *buffer = owned;
-    return FTUN_E_STATE_CORRUPT;
-  }
+  if (pool == NULL) { ftun_buffer_free(owned); return; }
+  assert(pool->active_buffers != 0u);
+  assert(pool->idle_buffers <= pool->idle_limit_buffers);
+  assert(pool->idle_bytes <= pool->idle_limit_bytes);
   pool->active_buffers--;
-  if (pool->idle_buffers > pool->idle_limit_buffers ||
-      pool->idle_bytes > pool->idle_limit_bytes) {
-    pool->active_buffers++;
-    owned->references = 1u;
-    *buffer = owned;
-    return FTUN_E_STATE_CORRUPT;
-  }
   if (pool->idle_buffers < pool->idle_limit_buffers &&
       owned->capacity <= pool->idle_limit_bytes - pool->idle_bytes) {
     owned->next = pool->idle;
     pool->idle = owned;
     pool->idle_buffers++;
     pool->idle_bytes += owned->capacity;
-    if (pool->waiting != 0u) ftun_buffer_pool_notify(pool);
-    return FTUN_OK;
-  }
-  status = ftun_buffer_free(owned);
-  if (status != FTUN_OK) {
-    pool->active_buffers++;
-    owned->references = 1u;
-    *buffer = owned;
-  } else {
-    if (pool->waiting != 0u) ftun_buffer_pool_notify(pool);
-  }
-  return status;
+  } else ftun_buffer_free(owned);
+  if (pool->waiting != 0u) ftun_buffer_pool_notify(pool);
 }
 
 ftun_status_t ftun_buffer_slice(ftun_buffer_t *buffer, size_t offset, size_t length,
@@ -841,12 +800,11 @@ ftun_status_t ftun_buffer_slice_data(const ftun_buffer_slice_t *slice, ftun_byte
   return FTUN_OK;
 }
 
-ftun_status_t ftun_buffer_slice_release(ftun_buffer_slice_t *slice)
+void ftun_buffer_slice_release(ftun_buffer_slice_t *slice)
 {
   ftun_buffer_t *owner;
-  if (slice == NULL) return FTUN_E_INVALID;
+  assert(slice != NULL);
   owner = slice->owner;
   memset(slice, 0, sizeof(*slice));
-  if (owner == NULL) return FTUN_OK;
-  return ftun_buffer_release(&owner);
+  ftun_buffer_release(&owner);
 }

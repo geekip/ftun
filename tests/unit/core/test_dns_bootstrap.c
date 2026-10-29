@@ -384,7 +384,7 @@ static int fixture_stop(fixture_t *fixture)
       ftun_event_loop_destroy(&fixture->loop) != FTUN_OK ||
       ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK ||
       ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u || ftun_budget_destroy(&fixture->budget) != FTUN_OK) {
+      usage.used_resources.memory_bytes != 0u || ftun_budget_destroy(&fixture->budget) != FTUN_OK) {
     return 1;
   }
   return 0;
@@ -708,7 +708,7 @@ static int test_system_branch(void)
   CHECK(ftun_worker_stop(worker) == FTUN_OK);
   CHECK(ftun_worker_join(worker) == FTUN_OK);
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

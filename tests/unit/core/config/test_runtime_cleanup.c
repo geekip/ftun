@@ -51,7 +51,7 @@ static ftun_config_t *make_config(void)
 static int memory(ftun_budget_t *budget, size_t expected)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == expected);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == expected);
   return 0;
 }
 
@@ -69,13 +69,13 @@ static int retirement(unsigned mode)
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 2u, &core) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  baseline = usage.used;
+  baseline = usage.used_resources.memory_bytes;
   CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
   if (mode != 0u) CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   if (mode == 3u) CHECK(ftun_runtime_active_acquire(core, &old) == FTUN_OK);
   if (mode >= 2u) CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  charged = usage.used;
+  charged = usage.used_resources.memory_bytes;
   fail_routes = true;
   route_failures = 0u;
   if (mode == 0u) {
@@ -209,10 +209,10 @@ static int mapping(void)
   free(fixture);
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_runtime_manager_create(budget, 2u, &core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); baseline = usage.used;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); baseline = usage.used_resources.memory_bytes;
   CHECK(ftun_frs_open(core, path, &view) == FTUN_OK);
   CHECK(ftun_frs_view_get_info(view, &info) == FTUN_OK && info.storage == FTUN_FRS_STORAGE_MMAP);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); charged = usage.used;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); charged = usage.used_resources.memory_bytes;
   fail_unmap = true;
   CHECK(ftun_frs_view_release(&view) == FTUN_E_IO && view != NULL && failed_unmaps == 1u);
   CHECK(memory(budget, charged) == 0);
@@ -233,7 +233,7 @@ static int mapping(void)
     CHECK(ftun_frs_open(core, path, &view) == FTUN_OK);
     CHECK(ftun_runtime_prepare_with_frs(core, config, view, &candidate) == FTUN_OK);
     CHECK(ftun_frs_view_release(&view) == FTUN_OK && view == NULL);
-    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); charged = usage.used;
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK); charged = usage.used_resources.memory_bytes;
     fail_unmap = true;
     CHECK(ftun_runtime_abort(core, &candidate) == FTUN_E_IO && candidate == NULL);
     CHECK(ftun_runtime_manager_get_info(core, &manager_info) == FTUN_OK && manager_info.has_cleanup);
@@ -283,7 +283,7 @@ static int construction(unsigned mode)
   CHECK(ftun_runtime_prepare(core, healthy, &candidate) == FTUN_OK);
   CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  baseline = usage.used;
+  baseline = usage.used_resources.memory_bytes;
   fail_unmap = true;
   failed_unmaps = 0u;
   released = released_maps;
@@ -301,8 +301,8 @@ static int construction(unsigned mode)
     CHECK(ftun_runtime_release(&active) == FTUN_OK && active == NULL);
   }
   CHECK(failed_unmaps >= 1u && released_maps == released);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > baseline);
-  charged = usage.used;
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > baseline);
+  charged = usage.used_resources.memory_bytes;
   if (mode == 2u) CHECK(ftun_frs_view_release(&view) == FTUN_E_IO && view != NULL);
   else {
     CHECK(ftun_runtime_prepare(core, healthy, &candidate) == FTUN_E_IO && candidate == NULL);
@@ -359,8 +359,8 @@ static int construction_allocations(void)
         size_t charged;
         retained++;
         CHECK(view != NULL && failed_unmaps == 1u);
-        CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > baseline.used);
-        charged = usage.used;
+        CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > baseline.used_resources.memory_bytes);
+        charged = usage.used_resources.memory_bytes;
         CHECK(ftun_frs_view_release(&view) == FTUN_E_IO && view != NULL);
         CHECK(memory(budget, charged) == 0);
       } else { early++; CHECK(view == NULL); }
@@ -369,7 +369,7 @@ static int construction_allocations(void)
     CHECK(ftun_frs_view_release(&view) == FTUN_OK && view == NULL);
     CHECK(released_maps == released + (failed_unmaps != 0u || !allocation_failed ? 1u : 0u));
     CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-    CHECK(usage.used == baseline.used && usage.metadata_bytes == baseline.metadata_bytes);
+    CHECK(usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes && usage.metadata_bytes == baseline.metadata_bytes);
     CHECK(usage.used_resources.descriptors == baseline.used_resources.descriptors);
     if (!allocation_failed) break;
   }

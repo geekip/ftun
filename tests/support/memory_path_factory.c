@@ -36,7 +36,7 @@ static void notify(memory_path_t *state, uint32_t events, ftun_status_t status)
   ftun_path_t *held = state->path;
   if (state->notify == NULL || ftun_path_retain(held) != FTUN_OK) return;
   state->notify(held, events, (ftun_error_t){status, 0u, 0}, state->notify_user);
-  (void)ftun_path_release(&held);
+  ftun_path_release(&held);
 }
 
 static void flush(void *user)
@@ -57,12 +57,12 @@ static void flush(void *user)
     ftun_status_t delivered = state->stopped ? FTUN_E_CANCELLED :
       ftun_datagram_deliver(state->datagram, &state->endpoint, &state->packet);
     if (delivered != FTUN_E_AGAIN && delivered != FTUN_E_LIMIT) {
-      (void)ftun_packet_release(&state->packet);
+      ftun_packet_release(&state->packet);
       state->packet_pending = false;
     } else notify(state, FTUN_PATH_ERROR, delivered);
   }
   notify(state, FTUN_PATH_READABLE | FTUN_PATH_WRITABLE, FTUN_OK);
-  (void)ftun_path_release(&held);
+  ftun_path_release(&held);
 }
 
 static ftun_status_t resume(void *user)
@@ -220,9 +220,9 @@ static void destroy(void *user)
 {
   memory_path_t *state = user;
   ftun_reservation_t reservation = state->reservation;
-  (void)ftun_packet_release(&state->packet);
+  ftun_packet_release(&state->packet);
   free(state);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t send_packet(void *user, ftun_datagram_send_token_t send,
@@ -252,12 +252,12 @@ static ftun_status_t send_packet(void *user, ftun_datagram_send_token_t send,
       status = ftun_buffer_slice(buffer, 0u, wire.length, &slice);
     }
     if (status == FTUN_OK) status = ftun_packet_init(&state->packet, &slice, 0u);
-    (void)ftun_buffer_slice_release(&slice);
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_slice_release(&slice);
+    ftun_buffer_release(&buffer);
   } else status = ftun_packet_clone(packet, &state->packet);
   if (status != FTUN_OK) return status;
   status = resume(state);
-  if (status != FTUN_OK) { (void)ftun_packet_release(&state->packet); return status; }
+  if (status != FTUN_OK) { ftun_packet_release(&state->packet); return status; }
   state->send = send;
   state->endpoint = *target;
   state->packet_pending = true;
@@ -270,7 +270,7 @@ static ftun_status_t cancel_packet(void *user, ftun_datagram_send_token_t send)
   if (state->send.channel != send.channel || state->send.slot != send.slot ||
       state->send.generation != send.generation) return FTUN_E_STALE;
   memset(&state->send, 0, sizeof(state->send));
-  (void)ftun_packet_release(&state->packet);
+  ftun_packet_release(&state->packet);
   state->packet_pending = false;
   return FTUN_OK;
 }
@@ -320,7 +320,7 @@ ftun_status_t __wrap_ftun_socket_path_open(void *context, ftun_core_t *core,
   status = ftun_budget_reserve(request->dial.budget, sizeof(*state), &reservation);
   if (status != FTUN_OK) return status;
   state = calloc(1u, sizeof(*state));
-  if (state == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (state == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   state->reservation = reservation;
   state->loop = request->dial.loop;
   state->phase = request->dial.purpose == FTUN_DIAL_PURPOSE_PROXY ? 1u : 0u;

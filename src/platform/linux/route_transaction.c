@@ -1,7 +1,6 @@
 #define _GNU_SOURCE 1
-#include "libs/tun/linux/routes.h"
-#include "core/limits.h"
-#include "libs/tun/linux/routes_internal.h"
+#include "platform/route.h"
+#include "platform/linux/route_transaction.h"
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -63,7 +62,7 @@ static int ftun_route_network_normalized(const uint8_t address[4],
 }
 
 static int ftun_route_resource_valid(
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   if (resource == NULL || resource->protocol != FTUN_LINUX_ROUTE_PROTOCOL) {
     return 0;
@@ -111,8 +110,8 @@ static int ftun_route_resource_valid(
 }
 
 static int ftun_route_resource_equal(
-  const ftun_linux_route_resource_t *left,
-  const ftun_linux_route_resource_t *right)
+  const ftun_route_resource_t *left,
+  const ftun_route_resource_t *right)
 {
   return left->kind == right->kind && left->family == right->family &&
     strcmp(left->interface_name, right->interface_name) == 0 &&
@@ -123,7 +122,7 @@ static int ftun_route_resource_equal(
     left->metric == right->metric && left->protocol == right->protocol;
 }
 
-int ftun_linux_route_plan_valid(const ftun_linux_route_plan_t *plan)
+int ftun_route_plan_valid(const ftun_route_plan_t *plan)
 {
   size_t index;
   size_t previous;
@@ -139,93 +138,90 @@ int ftun_linux_route_plan_valid(const ftun_linux_route_plan_t *plan)
   return 1;
 }
 
-ftun_status_t ftun_linux_route_guard_plan(
-  const ftun_network_view_t *view, uint32_t table, uint32_t first_priority,
-  ftun_linux_route_plan_t *out)
+ftun_status_t ftun_platform_route_guard_plan(
+  const ftun_cidr_t *prefixes, size_t prefix_count, uint32_t table, uint32_t first_priority,
+  ftun_route_plan_t *out)
 {
-  ftun_network_view_info_t info;
   size_t index;
   if (out != NULL) memset(out, 0, sizeof(*out));
-  if (view == NULL || out == NULL || table == FTUN_ROUTE_TABLE_UNSPEC ||
+  if (prefixes == NULL || out == NULL || table == FTUN_ROUTE_TABLE_UNSPEC ||
       table == FTUN_ROUTE_TABLE_DEFAULT || table == FTUN_ROUTE_TABLE_MAIN ||
       table == FTUN_ROUTE_TABLE_LOCAL || first_priority == 0u ||
-      ftun_network_view_get_info(view, &info) != FTUN_OK ||
-      info.protected_prefix_count == 0u ||
-      info.protected_prefix_count >
+      prefix_count == 0u ||
+      prefix_count >
         FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES / 2u ||
-      info.protected_prefix_count - 1u > UINT32_MAX - first_priority) {
+      prefix_count - 1u > UINT32_MAX - first_priority) {
     return FTUN_E_INVALID;
   }
-  for (index = 0u; index < info.protected_prefix_count; index++) {
-    ftun_network_prefix_t prefix;
-    ftun_linux_route_resource_t *resource;
-    if (ftun_network_view_get_protected(view, index, &prefix) != FTUN_OK) {
+  for (index = 0u; index < prefix_count; index++) {
+    const ftun_cidr_t *prefix = &prefixes[index];
+    if (prefix->address.family != FTUN_IP_V4) {
       memset(out, 0, sizeof(*out));
-      return FTUN_E_STATE_CORRUPT;
+      return FTUN_E_UNSUPPORTED;
     }
+    ftun_route_resource_t *resource;
     resource = &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_UNREACHABLE;
     resource->family = FTUN_ROUTE_FAMILY_IPV4;
-    memcpy(resource->address, prefix.network, 4u);
-    resource->prefix_length = prefix.prefix_length;
+    memcpy(resource->address, prefix->address.bytes, 4u);
+    resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->metric = UINT32_C(32767);
     resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
     resource = &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_PROTECT_RULE;
     resource->family = FTUN_ROUTE_FAMILY_IPV4;
-    memcpy(resource->address, prefix.network, 4u);
-    resource->prefix_length = prefix.prefix_length;
+    memcpy(resource->address, prefix->address.bytes, 4u);
+    resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->priority = first_priority + (uint32_t)index;
     resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
   }
-  return ftun_linux_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
+  return ftun_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
 }
 
-ftun_status_t ftun_linux_route_overlay_plan(
-  const ftun_network_view_t *view, ftun_string_t tun_interface,
-  uint32_t table, uint32_t metric, ftun_linux_route_plan_t *out)
+ftun_status_t ftun_platform_route_overlay_plan(
+  const ftun_cidr_t *prefixes, size_t prefix_count, ftun_string_t tun_interface,
+  uint32_t table, uint32_t metric, ftun_route_plan_t *out)
 {
-  ftun_network_view_info_t info;
   size_t index;
   if (out != NULL) memset(out, 0, sizeof(*out));
-  if (view == NULL || out == NULL ||
+  if (prefixes == NULL || out == NULL ||
       !ftun_route_name_valid(tun_interface, false) ||
       table == FTUN_ROUTE_TABLE_UNSPEC || table == FTUN_ROUTE_TABLE_DEFAULT ||
       table == FTUN_ROUTE_TABLE_MAIN || table == FTUN_ROUTE_TABLE_LOCAL ||
-      metric == 0u || ftun_network_view_get_info(view, &info) != FTUN_OK ||
-      info.overlay_route_count == 0u ||
-      info.overlay_route_count > FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES) {
+      metric == 0u ||
+      prefix_count == 0u ||
+      prefix_count > FTUN_LINUX_ROUTE_PLAN_MAX_RESOURCES) {
     return FTUN_E_INVALID;
   }
-  for (index = 0u; index < info.overlay_route_count; index++) {
-    ftun_network_route_t route;
-    ftun_linux_route_resource_t *resource =
-      &out->resources[out->resource_count++];
-    if (ftun_network_view_get_route(view, index, &route) != FTUN_OK) {
+  for (index = 0u; index < prefix_count; index++) {
+    const ftun_cidr_t *prefix = &prefixes[index];
+    if (prefix->address.family != FTUN_IP_V4) {
       memset(out, 0, sizeof(*out));
-      return FTUN_E_STATE_CORRUPT;
+      return FTUN_E_UNSUPPORTED;
     }
+    ftun_route_resource_t *resource =
+      &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_OVERLAY;
     resource->family = FTUN_ROUTE_FAMILY_IPV4;
     memcpy(resource->interface_name, tun_interface.data,
            tun_interface.length);
-    memcpy(resource->address, route.prefix.network, 4u);
-    resource->prefix_length = route.prefix.prefix_length;
+    memcpy(resource->address, prefix->address.bytes, 4u);
+    resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->metric = metric;
     resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
   }
-  return ftun_linux_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
+  return ftun_route_plan_valid(out) ? FTUN_OK : FTUN_E_INVALID;
 }
 
 int ftun_route_policy_valid(const ftun_route_policy_t *policy)
 {
   uint32_t offset;
   if (policy == NULL) return 0;
-  offset = policy->capture_priority_offset == 0u ? 1u :
-           policy->capture_priority_offset;
+  offset = policy->capture_offset == 0u ? 1u :
+           policy->capture_offset;
   if (!ftun_route_name_valid(policy->tun_interface, false) ||
       !ftun_route_name_valid(policy->lan_interface, true) ||
       ftun_route_name_equals(policy->tun_interface, "lo") ||
@@ -233,15 +229,15 @@ int ftun_route_policy_valid(const ftun_route_policy_t *policy)
       ftun_route_names_equal(policy->tun_interface, policy->lan_interface) ||
       (!policy->manage_local && policy->lan_interface.length == 0u) ||
       policy->tun_prefix_length == 0u || policy->tun_prefix_length > 32u ||
-      policy->route_table == FTUN_ROUTE_TABLE_UNSPEC ||
-      policy->route_table == FTUN_ROUTE_TABLE_DEFAULT ||
-      policy->route_table == FTUN_ROUTE_TABLE_MAIN ||
-      policy->route_table == FTUN_ROUTE_TABLE_LOCAL ||
-      policy->rule_priority == 0u ||
-      offset == 0u || offset > UINT32_MAX - policy->rule_priority ||
-      policy->rule_priority + offset > UINT32_MAX - 1u ||
-      policy->protection_mark == 0u || policy->protection_mark_mask == 0u ||
-      (policy->protection_mark & ~policy->protection_mark_mask) != 0u) return 0;
+      policy->routing_domain == FTUN_ROUTE_TABLE_UNSPEC ||
+      policy->routing_domain == FTUN_ROUTE_TABLE_DEFAULT ||
+      policy->routing_domain == FTUN_ROUTE_TABLE_MAIN ||
+      policy->routing_domain == FTUN_ROUTE_TABLE_LOCAL ||
+      policy->precedence == 0u ||
+      offset == 0u || offset > UINT32_MAX - policy->precedence ||
+      policy->precedence + offset > UINT32_MAX - 1u ||
+      policy->bypass_tag == 0u || policy->bypass_mask == 0u ||
+      (policy->bypass_tag & ~policy->bypass_mask) != 0u) return 0;
   return 1;
 }
 
@@ -252,11 +248,11 @@ static void ftun_route_copy_name(char out[FTUN_LINUX_ROUTE_NAME_BYTES],
   if (name.length != 0u) memcpy(out, name.data, name.length);
 }
 
-static ftun_linux_route_resource_t *ftun_route_append(
-  ftun_route_transaction_t *transaction, ftun_linux_route_resource_kind_t kind,
+static ftun_route_resource_t *ftun_route_append(
+  ftun_platform_route_transaction_t *transaction, ftun_route_resource_kind_t kind,
   int family)
 {
-  ftun_linux_route_resource_t *resource;
+  ftun_route_resource_t *resource;
   if (transaction->resource_count >= FTUN_LINUX_ROUTE_MAX_RESOURCES) return NULL;
   resource = &transaction->resources[transaction->resource_count++];
   memset(resource, 0, sizeof(*resource));
@@ -267,12 +263,12 @@ static ftun_linux_route_resource_t *ftun_route_append(
 }
 
 int ftun_route_build(const ftun_route_policy_t *policy,
-                     ftun_route_transaction_t *transaction)
+                     ftun_platform_route_transaction_t *transaction)
 {
-  ftun_linux_route_resource_t *resource;
-  uint32_t offset = policy->capture_priority_offset == 0u ? 1u :
-                    policy->capture_priority_offset;
-  uint32_t local_priority = policy->rule_priority + offset;
+  ftun_route_resource_t *resource;
+  uint32_t offset = policy->capture_offset == 0u ? 1u :
+                    policy->capture_offset;
+  uint32_t local_priority = policy->precedence + offset;
   uint32_t lan_priority = local_priority + 1u;
   resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_ADDRESS, FTUN_ROUTE_FAMILY_IPV4);
   if (resource == NULL) return 0;
@@ -283,21 +279,21 @@ int ftun_route_build(const ftun_route_policy_t *policy,
   resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_MARK_RULE, FTUN_ROUTE_FAMILY_IPV4);
   if (resource == NULL) return 0;
   resource->table = FTUN_ROUTE_TABLE_MAIN;
-  resource->priority = policy->rule_priority;
-  resource->mark = policy->protection_mark;
-  resource->mark_mask = policy->protection_mark_mask;
+  resource->priority = policy->precedence;
+  resource->mark = policy->bypass_tag;
+  resource->mark_mask = policy->bypass_mask;
 
   resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_DEFAULT, FTUN_ROUTE_FAMILY_IPV4);
   if (resource == NULL) return 0;
   ftun_route_copy_name(resource->interface_name, policy->tun_interface);
-  resource->table = policy->route_table;
+  resource->table = policy->routing_domain;
 
   if (policy->manage_local) {
     resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_CAPTURE_RULE,
                                  FTUN_ROUTE_FAMILY_IPV4);
     if (resource == NULL) return 0;
     memcpy(resource->interface_name, "lo", 3u);
-    resource->table = policy->route_table;
+    resource->table = policy->routing_domain;
     resource->priority = local_priority;
   }
   if (policy->lan_interface.length != 0u) {
@@ -305,7 +301,7 @@ int ftun_route_build(const ftun_route_policy_t *policy,
                                  FTUN_ROUTE_FAMILY_IPV4);
     if (resource == NULL) return 0;
     ftun_route_copy_name(resource->interface_name, policy->lan_interface);
-    resource->table = policy->route_table;
+    resource->table = policy->routing_domain;
     resource->priority = lan_priority;
   }
   if (policy->strict_route && policy->manage_local) {
@@ -327,7 +323,7 @@ int ftun_route_build(const ftun_route_policy_t *policy,
 }
 
 static ftun_status_t ftun_route_remove_active(
-  ftun_route_transaction_t *transaction)
+  ftun_platform_route_transaction_t *transaction)
 {
   ftun_status_t first = FTUN_OK;
   size_t index = transaction->resource_count;
@@ -351,41 +347,33 @@ static ftun_status_t ftun_route_remove_active(
 /* 有所有权的路由事务。 */
 /* sweep 仅用于真实系统接口：先取得表互斥锁，再清理上次崩溃遗留的同表同优先级
  * 协议号 186 对象（可能与本次计划选择子不同），之后才安装。 */
-static ftun_status_t ftun_route_prepare(ftun_budget_t *budget,
-  const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
-  bool sweep, ftun_route_transaction_t **out)
+static ftun_status_t ftun_route_prepare(
+  const ftun_route_policy_t *policy, const ftun_route_io_t *io,
+  bool sweep, ftun_platform_route_transaction_t **out)
 {
-  ftun_route_transaction_t *transaction = NULL;
-  ftun_reservation_t reservation = (ftun_reservation_t){0}, descriptor = (ftun_reservation_t){0};
+  ftun_platform_route_transaction_t *transaction = NULL;
   ftun_status_t status;
-  int lock_descriptor = -1;
+  ftun_handle_t lock_descriptor = -1;
   size_t index;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_route_policy_valid(policy) || io == NULL ||
       io->apply == NULL || io->remove == NULL) return FTUN_E_INVALID;
-  if (budget != NULL) {
-    status = ftun_budget_reserve(budget, sizeof(*transaction), &reservation);
-    if (status == FTUN_OK) status = ftun_budget_reserve_resources(budget,
-      (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
-    if (status != FTUN_OK) goto fail;
-  }
+
   if (sweep) {
-    status = ftun_linux_route_lock_table(policy->route_table, &lock_descriptor);
+    status = ftun_route_lock_table(policy->routing_domain, &lock_descriptor);
     if (status != FTUN_OK) goto fail;
   }
-  transaction = (ftun_route_transaction_t *)calloc(1u, sizeof(*transaction));
+  transaction = (ftun_platform_route_transaction_t *)calloc(1u, sizeof(*transaction));
   if (transaction == NULL) { status = FTUN_E_LIMIT; goto fail; }
   transaction->lock_descriptor = lock_descriptor;
   transaction->magic = FTUN_LINUX_ROUTE_MAGIC;
-  transaction->budget = budget;
-  transaction->reservation = reservation;
   transaction->io = *io;
   if (!ftun_route_build(policy, transaction)) {
     status = FTUN_E_LIMIT;
     goto fail;
   }
   for (index = 0u; sweep && index < transaction->resource_count; index++) {
-    ftun_linux_route_resource_t stray = transaction->resources[index];
+    ftun_route_resource_t stray = transaction->resources[index];
     size_t removed;
     if (stray.kind == FTUN_LINUX_ROUTE_ADDRESS) continue;
     stray.stray = true;
@@ -409,7 +397,6 @@ static ftun_status_t ftun_route_prepare(ftun_budget_t *budget,
       ftun_status_t rollback = ftun_route_remove_active(transaction);
       if (rollback != FTUN_OK) {
         *out = transaction;
-        (void)ftun_reservation_release(&descriptor);
         return FTUN_E_STATE_CORRUPT;
       }
       goto fail;
@@ -418,43 +405,31 @@ static ftun_status_t ftun_route_prepare(ftun_budget_t *budget,
     transaction->active_count++;
   }
   *out = transaction;
-  (void)ftun_reservation_release(&descriptor);
   return FTUN_OK;
 fail:
   if (lock_descriptor >= 0) (void)ftun_platform_route_close(lock_descriptor);
   free(transaction);
-  (void)ftun_reservation_release(&descriptor);
-  (void)ftun_reservation_release(&reservation);
   return status;
 }
 
-ftun_status_t ftun_linux_route_prepare_with_io_and_budget(ftun_budget_t *budget,
-  const ftun_route_policy_t *policy, const ftun_linux_route_io_t *io,
-  ftun_route_transaction_t **out)
+
+
+ftun_status_t ftun_platform_route_prepare_with_io(const ftun_route_policy_t *policy,
+  const ftun_route_io_t *io, ftun_platform_route_transaction_t **out)
 {
-  return ftun_route_prepare(budget, policy, io, false, out);
+  return ftun_route_prepare(policy, io, false, out);
 }
 
-ftun_status_t ftun_linux_route_prepare_with_io(const ftun_route_policy_t *policy,
-  const ftun_linux_route_io_t *io, ftun_route_transaction_t **out)
+
+
+ftun_status_t ftun_platform_route_prepare(const ftun_route_policy_t *policy,
+  ftun_platform_route_transaction_t **out)
 {
-  return ftun_linux_route_prepare_with_io_and_budget(NULL, policy, io, out);
+  return ftun_route_prepare(policy, ftun_platform_route_io(), true, out);
 }
 
-ftun_status_t ftun_linux_route_prepare_with_budget(ftun_budget_t *budget,
-  const ftun_route_policy_t *policy, ftun_route_transaction_t **out)
-{
-  return ftun_route_prepare(budget, policy, ftun_platform_route_io(), true, out);
-}
-
-ftun_status_t ftun_linux_route_prepare(const ftun_route_policy_t *policy,
-  ftun_route_transaction_t **out)
-{
-  return ftun_linux_route_prepare_with_budget(NULL, policy, out);
-}
-
-ftun_status_t ftun_linux_route_get_info(
-  const ftun_route_transaction_t *transaction, ftun_linux_route_info_t *out)
+ftun_status_t ftun_platform_route_get_info(
+  const ftun_platform_route_transaction_t *transaction, ftun_route_info_t *out)
 {
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (transaction == NULL || transaction->magic != FTUN_LINUX_ROUTE_MAGIC ||
@@ -465,32 +440,55 @@ ftun_status_t ftun_linux_route_get_info(
   return FTUN_OK;
 }
 
-ftun_status_t ftun_linux_route_release(
-  ftun_route_transaction_t **transaction)
+ftun_status_t ftun_platform_route_release(
+  ftun_platform_route_transaction_t **transaction)
 {
-  ftun_route_transaction_t *owned;
+  ftun_platform_route_transaction_t *owned;
   ftun_status_t status;
-  ftun_reservation_t reservation, descriptor = (ftun_reservation_t){0};
   if (transaction == NULL) return FTUN_E_INVALID;
   owned = *transaction;
   if (owned == NULL) return FTUN_OK;
   if (owned->magic != FTUN_LINUX_ROUTE_MAGIC || owned->io.remove == NULL) {
     return FTUN_E_INVALID;
   }
-  if (owned->budget != NULL && owned->active_count != 0u) {
-    status = ftun_budget_reserve_cleanup_resources(owned->budget,
-      (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
-    if (status != FTUN_OK) return status;
-  }
   status = ftun_route_remove_active(owned);
-  (void)ftun_reservation_release(&descriptor);
   if (status != FTUN_OK) return status;
   owned->magic = 0u;
   memset(&owned->io, 0, sizeof(owned->io));
-  reservation = owned->reservation;
   /* 关闭描述符即释放表互斥锁。 */
   if (owned->lock_descriptor >= 0) (void)ftun_platform_route_close(owned->lock_descriptor);
   free(owned);
   *transaction = NULL;
-  return ftun_reservation_release(&reservation);
+  return FTUN_OK;
+}
+
+size_t ftun_platform_route_transaction_allocation_size(void)
+{
+  return sizeof(ftun_platform_route_transaction_t);
+}
+size_t ftun_platform_route_plan_allocation_size(void)
+{
+  return sizeof(ftun_route_plan_t);
+}
+
+bool ftun_platform_route_prepare_valid(const ftun_route_policy_t *policy,
+  const ftun_route_io_t *io, bool system)
+{
+  if (system) io = ftun_platform_route_io();
+  return ftun_route_policy_valid(policy) && io != NULL &&
+    io->apply != NULL && io->remove != NULL;
+}
+
+ftun_route_settings_t ftun_platform_route_defaults(void)
+{
+  return (ftun_route_settings_t){18004u, 11000u};
+}
+
+const char *ftun_platform_route_config_error(ftun_route_settings_t settings)
+{
+  if (settings.routing_domain < 256u || settings.routing_domain > UINT32_C(0xfffffff0) ||
+      settings.precedence == 0u || settings.precedence > 32000u) {
+    return "TUN route-table must be 256..4294967280 and rule-priority 1..32000";
+  }
+  return NULL;
 }

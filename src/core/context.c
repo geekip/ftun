@@ -14,12 +14,12 @@ ftun_status_t ftun_core_context_create(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   core = (ftun_core_t *)calloc(1u, sizeof(*core));
   if (core == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   if (ftun_mutex_init(&core->logger_mutex) != FTUN_OK) {
     free(core);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   ftun_atomic_init(&core->generation, 0u);
@@ -284,5 +284,6 @@ ftun_status_t ftun_core_context_destroy(ftun_core_t **core)
   owned->budget = NULL;
   free(owned);
   *core = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

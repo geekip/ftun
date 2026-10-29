@@ -49,6 +49,17 @@ def main():
         config.write_text(json.dumps({'dns': {'enable': False}}))
         run([build / 'ftun', 'check', '-c', config])
         print(profile + ': passed', flush=True)
+    # 编译替换后端会明确拒绝运行，不把本检查计作 BSD/macOS 产品验收。
+    build = Path(args.build) / 'kqueue-compile'
+    flags = [f'-DFTUN_MODULE_{m}=BUILTIN' for m in MODULES]
+    run([args.cmake, '-S', root, '-B', build, '-G', args.generator,
+        '-DCMAKE_C_COMPILER=' + args.compiler, '-DCMAKE_BUILD_TYPE=Debug',
+        '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', '-DBUILD_TESTING=OFF',
+        '-DFTUN_POLLER_BACKEND=kqueue'] + flags)
+    run([args.cmake, '--build', build, '--target', 'ftun', '--parallel', '4'])
+    run([sys.executable, root / 'tests/layering/include_policy.py', root,
+        build / 'compile_commands.json', build / 'ftun-build-targets.txt'])
+    print('kqueue: compile-only passed (runtime unsupported)', flush=True)
     invalid = Path(args.build) / 'invalid'
     result = subprocess.run([args.cmake, '-S', root, '-B', invalid,
         '-DFTUN_MODULE_PROXY=OFF', '-DFTUN_MODULE_DNS=OFF', '-DFTUN_MODULE_FAKEIP=BUILTIN'], capture_output=True, text=True)

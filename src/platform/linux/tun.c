@@ -73,7 +73,7 @@ static int ftun_system_close(void *context, int descriptor, int *error_code)
   return result;
 }
 
-static const ftun_linux_tun_io_t ftun_system_io = {
+static const ftun_platform_tun_io_t ftun_system_io = {
   ftun_system_open_device,
   ftun_system_open_control,
   ftun_system_ioctl,
@@ -96,14 +96,14 @@ static ftun_status_t ftun_linux_error_status(int error_code)
   return FTUN_E_IO;
 }
 
-static int ftun_linux_tun_io_valid(const ftun_linux_tun_io_t *io)
+static int ftun_tun_port_io_valid(const ftun_platform_tun_io_t *io)
 {
   return io != NULL && io->open_device != NULL && io->open_control != NULL &&
          io->ioctl_call != NULL && io->read_call != NULL &&
          io->write_call != NULL && io->close_call != NULL;
 }
 
-static int ftun_linux_tun_name_valid(ftun_string_t name)
+static int ftun_tun_port_name_valid(ftun_string_t name)
 {
   size_t index;
   if (name.data == NULL || name.length == 0u ||
@@ -118,7 +118,7 @@ static int ftun_linux_tun_name_valid(ftun_string_t name)
   return 1;
 }
 
-static int ftun_linux_open_device(const ftun_linux_tun_io_t *io,
+static int ftun_linux_open_device(const ftun_platform_tun_io_t *io,
                                   const char *path, int flags,
                                   int *error_code)
 {
@@ -130,7 +130,7 @@ static int ftun_linux_open_device(const ftun_linux_tun_io_t *io,
   return result;
 }
 
-static int ftun_linux_open_control(const ftun_linux_tun_io_t *io,
+static int ftun_linux_open_control(const ftun_platform_tun_io_t *io,
                                    int *error_code)
 {
   int result;
@@ -142,7 +142,7 @@ static int ftun_linux_open_control(const ftun_linux_tun_io_t *io,
   return result;
 }
 
-static int ftun_linux_ioctl(const ftun_linux_tun_io_t *io, int descriptor,
+static int ftun_linux_ioctl(const ftun_platform_tun_io_t *io, int descriptor,
                             unsigned long request, void *argument,
                             int *error_code)
 {
@@ -155,7 +155,7 @@ static int ftun_linux_ioctl(const ftun_linux_tun_io_t *io, int descriptor,
   return result;
 }
 
-static void ftun_linux_close_ignored(const ftun_linux_tun_io_t *io,
+static void ftun_linux_close_ignored(const ftun_platform_tun_io_t *io,
                                      int descriptor)
 {
   int ignored = 0;
@@ -168,14 +168,14 @@ static void ftun_linux_ifreq_name(struct ifreq *request, const char *name)
   memcpy(request->ifr_name, name, strlen(name) + 1u);
 }
 
-const ftun_linux_tun_io_t *ftun_platform_tun_default_io(void) { return &ftun_system_io; }
-bool ftun_platform_tun_spec_valid(const ftun_tun_spec_t *spec, const ftun_linux_tun_io_t *io)
+const ftun_platform_tun_io_t *ftun_platform_tun_default_io(void) { return &ftun_system_io; }
+bool ftun_platform_tun_spec_valid(const ftun_tun_spec_t *spec, const ftun_platform_tun_io_t *io)
 {
-  return spec != NULL && ftun_linux_tun_io_valid(io) && ftun_linux_tun_name_valid(spec->name) &&
+  return spec != NULL && ftun_tun_port_io_valid(io) && ftun_tun_port_name_valid(spec->name) &&
     spec->mtu >= FTUN_LINUX_TUN_MIN_MTU && spec->mtu <= FTUN_LINUX_TUN_MAX_MTU;
 }
 ftun_status_t ftun_platform_tun_open(const ftun_tun_spec_t *spec,
-  const ftun_linux_tun_io_t *io, ftun_platform_tun_t *port)
+  const ftun_platform_tun_io_t *io, ftun_platform_tun_t *port)
 {
   struct ifreq request;
   int error_code = 0, control;
@@ -290,4 +290,16 @@ ftun_status_t ftun_platform_tun_close(ftun_platform_tun_t *port)
   port->descriptor = -1;
   memset(&port->io, 0, sizeof(port->io));
   return result < 0 ? ftun_linux_error_status(error_code) : FTUN_OK;
+}
+
+size_t ftun_platform_tun_allocation_size(void)
+{
+  return sizeof(ftun_platform_tun_t);
+}
+
+void ftun_platform_tun_get_info(const ftun_platform_tun_t *port, ftun_packet_port_info_t *out)
+{
+  memcpy(out->name, port->name, sizeof(out->name));
+  out->mtu = port->mtu;
+  out->native_socket = (ftun_native_socket_t)(unsigned int)port->descriptor;
 }

@@ -171,14 +171,14 @@ ftun_status_t ftun_mixed_connection_create(const ftun_inbound_spec_t *spec,
   }
   connection = (ftun_mixed_connection_t *)calloc(1u, sizeof(*connection));
   if (connection == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   connection->reservation = reservation;
   status = ftun_socks5_server_create(spec, &connection->socks5);
   if (status != FTUN_OK) {
     free(connection);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   connection->state = FTUN_MIXED_DETECT;
@@ -391,8 +391,7 @@ ftun_status_t ftun_mixed_connection_destroy(
   if (owned == NULL) return FTUN_OK;
   status = ftun_socks5_server_destroy(&owned->socks5);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *connection = NULL;

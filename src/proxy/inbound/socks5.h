@@ -2,7 +2,7 @@
 #define FTUN_PROXY_INBOUND_SOCKS5_H
 /* ftun_socks5_server_create。 */
 #include "proxy/inbound/inbound.h"
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 
 typedef struct ftun_socks5_server ftun_socks5_server_t;
 

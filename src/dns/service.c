@@ -219,7 +219,7 @@ ftun_status_t ftun_dns_runtime_tcp_source_update(
   if (connection->response_head != NULL) interests |= FTUN_EVENT_WRITE;
   if (connection->source == NULL) {
     return ftun_event_io_start(connection->dns->loop,
-      (ftun_native_socket_t)(unsigned int)connection->descriptor, interests,
+      (ftun_native_socket_t)connection->descriptor, interests,
       ftun_dns_runtime_tcp_ready, connection, &connection->source);
   }
   return ftun_event_io_update(connection->source, interests);
@@ -380,11 +380,11 @@ void ftun_dns_runtime_request_release(
     return;
   }
   ftun_dns_runtime_request_unlink(request);
-  if (request->received_present) (void)ftun_packet_release(&request->received);
+  if (request->received_present) ftun_packet_release(&request->received);
   reservation = request->reservation;
   memset(request, 0, sizeof(*request));
   free(request);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   if (parent != NULL) {
     parent->fallback_children--;
     ftun_dns_runtime_request_release(parent);
@@ -411,7 +411,7 @@ void ftun_dns_runtime_waiter_release(
   ftun_reservation_t reservation = waiter->reservation;
   memset(waiter, 0, sizeof(*waiter));
   free(waiter);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 void ftun_dns_runtime_waiter_finish(
@@ -642,9 +642,9 @@ ftun_status_t ftun_dns_runtime_request_send(
       request->writing_bytes = 0u;
     }
   }
-  (void)ftun_packet_release(&packet);
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_packet_release(&packet);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   if (status != FTUN_OK) return status;
   if (request->write_pending) return FTUN_E_AGAIN;
   return request->io_status;
@@ -667,19 +667,19 @@ ftun_status_t ftun_dns_runtime_request_receive(
 }
 
 /* 握手状态机的下一步：有待发送的帧就编码进请求缓冲等待发送，否则等待回复。 */
-ftun_status_t ftun_dns_runtime_request_socks_next(
+ftun_status_t ftun_dns_runtime_request_handshake_next(
   ftun_dns_runtime_transport_request_t *request)
 {
   request->buffer_offset = 0u;
   request->buffer_length = 0u;
-  if (!ftun_socks5_client_wants_output(&request->socks)) {
-    request->state = FTUN_DNS_RUNTIME_REQUEST_SOCKS_RECV;
+  if (!request->dns->protocol->wants_output(request->protocol_state)) {
+    request->state = FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV;
     return FTUN_OK;
   }
-  if (ftun_socks5_client_output(&request->socks, request->buffer,
+  if (request->dns->protocol->output(request->protocol_state, request->buffer,
         FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES,
         &request->buffer_length) != FTUN_OK) return FTUN_E_PROTOCOL;
-  request->state = FTUN_DNS_RUNTIME_REQUEST_SOCKS_SEND;
+  request->state = FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND;
   return FTUN_OK;
 }
 
@@ -695,9 +695,9 @@ ftun_status_t ftun_dns_runtime_request_dns_send(
     request->buffer[1] = (uint8_t)request->query_length;
     memcpy(request->buffer + 2u, request->query, request->query_length);
     request->buffer_length = request->query_length + 2u;
-  } else if (request->mode == FTUN_DNS_RUNTIME_SOCKS5) {
+  } else if (request->mode == FTUN_DNS_RUNTIME_PROXY) {
     written = 0u;
-    if (ftun_socks5_encode_udp_datagram(&request->upstream,
+    if (request->dns->protocol->encode_datagram(&request->upstream,
         (ftun_bytes_t){request->query, request->query_length},
         request->buffer, FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES,
         &written) != FTUN_OK) return FTUN_E_PROTOCOL;
@@ -759,7 +759,7 @@ ftun_status_t ftun_dns_runtime_outbound(
   if (dns->proxy_endpoint_valid == NULL ||
       (dns->proxy_endpoint_valid[index] & 1u) == 0u) return FTUN_E_RESOLVE;
   *proxy = dns->proxy_endpoints[index];
-  *mode = FTUN_DNS_RUNTIME_SOCKS5;
+  *mode = FTUN_DNS_RUNTIME_PROXY;
   *username = item->username;
   *password = item->password;
   return FTUN_OK;
@@ -868,17 +868,17 @@ ftun_status_t ftun_dns_runtime_request_drive_connected(
     return ftun_dns_runtime_request_dns_send(request);
   }
   {
-    ftun_socks5_client_options_t options = {0};
+    ftun_transport_protocol_options_t options = {0};
     options.username = (ftun_bytes_t){request->username, request->username_length};
     options.password = (ftun_bytes_t){request->password, request->password_length};
-    options.command = request->transport == FTUN_DNS_TRANSPORT_UDP
-      ? FTUN_SOCKS5_COMMAND_UDP_ASSOCIATE : FTUN_SOCKS5_COMMAND_CONNECT;
+    options.datagram = request->transport == FTUN_DNS_TRANSPORT_UDP;
+    options.peer = request->proxy;
     options.target = request->upstream;
-    if (ftun_socks5_client_init(&request->socks, &options) != FTUN_OK) {
+    if (request->dns->protocol->init(request->protocol_state, &options) != FTUN_OK) {
       return FTUN_E_PROTOCOL;
     }
   }
-  return ftun_dns_runtime_request_socks_next(request);
+  return ftun_dns_runtime_request_handshake_next(request);
 }
 
 ftun_status_t ftun_dns_runtime_request_drive(
@@ -895,40 +895,36 @@ ftun_status_t ftun_dns_runtime_request_drive(
       case FTUN_DNS_RUNTIME_REQUEST_CONNECT:
         status = ftun_dns_runtime_request_drive_connected(request);
         break;
-      case FTUN_DNS_RUNTIME_REQUEST_SOCKS_SEND:
+      case FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND:
         status = ftun_dns_runtime_request_send(request);
         if (status == FTUN_OK) {
-          status = ftun_socks5_client_output_done(&request->socks);
-          if (status == FTUN_OK) status = ftun_dns_runtime_request_socks_next(request);
+          status = request->dns->protocol->output_done(request->protocol_state);
+          if (status == FTUN_OK) status = ftun_dns_runtime_request_handshake_next(request);
         }
         break;
-      case FTUN_DNS_RUNTIME_REQUEST_SOCKS_RECV:
+      case FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV:
       {
-        size_t needed = ftun_socks5_client_needed(&request->socks);
+        size_t needed = request->dns->protocol->needed(request->protocol_state);
         if (needed == 0u || needed > FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES) {
           return FTUN_E_STATE_CORRUPT;
         }
         status = ftun_dns_runtime_request_receive(request, needed);
         if (status == FTUN_OK) {
-          ftun_socks5_client_result_t result;
+          ftun_endpoint_t bound;
           size_t consumed = 0u;
-          status = ftun_socks5_client_input(&request->socks,
-            (ftun_bytes_t){request->buffer, needed}, &consumed, &result);
+          status = request->dns->protocol->input(request->protocol_state,
+            (ftun_bytes_t){request->buffer, needed}, &consumed, &bound);
           request->buffer_length = 0u;
           if (status == FTUN_E_AGAIN) {
-            status = ftun_dns_runtime_request_socks_next(request);
+            status = ftun_dns_runtime_request_handshake_next(request);
           } else if (status != FTUN_OK) {
             return status;
           } else if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
             status = ftun_dns_runtime_request_dns_send(request);
           } else {
-            ftun_endpoint_t relay = result.bound;
+            ftun_endpoint_t relay = bound;
             if (relay.kind != FTUN_ADDRESS_IPV4 || relay.port == 0u) {
               return FTUN_E_UNSUPPORTED;
-            }
-            if (relay.address[0] == 0u && relay.address[1] == 0u &&
-                relay.address[2] == 0u && relay.address[3] == 0u) {
-              memcpy(relay.address, request->proxy.address, 4u);
             }
             status = ftun_dns_runtime_request_open(request, FTUN_DIAL_UDP,
                                                    &relay, false);
@@ -952,10 +948,10 @@ ftun_status_t ftun_dns_runtime_request_drive(
         if (!request->received_present) return FTUN_E_AGAIN;
         status = ftun_packet_view(&request->received, &wire);
         if (status != FTUN_OK) return status;
-        if (request->mode == FTUN_DNS_RUNTIME_SOCKS5) {
-          ftun_socks5_udp_datagram_t datagram;
+        if (request->mode == FTUN_DNS_RUNTIME_PROXY) {
+          ftun_transport_datagram_t datagram;
           size_t consumed = 0u;
-          status = ftun_socks5_decode_udp_datagram(wire, &datagram, &consumed);
+          status = request->dns->protocol->decode_datagram(wire, &datagram, &consumed);
           if (status != FTUN_OK) return status;
           if (consumed != wire.length ||
               datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
@@ -971,7 +967,7 @@ ftun_status_t ftun_dns_runtime_request_drive(
          * （交付给等待者之前会按各自的 ID 回填，所以这里是唯一的校验点）。 */
         if (wire.length >= 2u &&
             (wire.data[0] != request->query[0] || wire.data[1] != request->query[1])) {
-          (void)ftun_packet_release(&request->received);
+          ftun_packet_release(&request->received);
           request->received_present = false;
           return FTUN_E_AGAIN;
         }
@@ -1058,7 +1054,7 @@ ftun_status_t ftun_dns_runtime_waiter_create(
   waiter = (ftun_dns_runtime_transport_waiter_t *)calloc(1u,
                                                         sizeof(*waiter));
   if (waiter == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   waiter->request = request;
@@ -1115,6 +1111,7 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   status = ftun_dns_runtime_outbound(dns, binding->leaf_id, &mode, &proxy,
                                     &username, &password);
   if (status != FTUN_OK) return status;
+  if (mode == FTUN_DNS_RUNTIME_PROXY && dns->protocol == NULL) return FTUN_E_UNSUPPORTED;
   username_length = username == NULL ? 0u : strlen(username);
   password_length = password == NULL ? 0u : strlen(password);
   if (username_length > UINT8_MAX || password_length > UINT8_MAX ||
@@ -1159,12 +1156,13 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   }
   if (dns->request_count >= FTUN_DNS_RUNTIME_MAX_PENDING) return FTUN_E_LIMIT;
   bytes = sizeof(*request) + query.length +
-          FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES;
+          FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES +
+          (mode == FTUN_DNS_RUNTIME_PROXY ? dns->protocol->state_bytes : 0u);
   status = ftun_budget_reserve(dns->budget, bytes, &reservation);
   if (status != FTUN_OK) return status;
   request = (ftun_dns_runtime_transport_request_t *)calloc(1u, bytes);
   if (request == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   request->dns = dns;
@@ -1172,7 +1170,9 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   request->upstream = *upstream;
   request->proxy = proxy;
   request->deadline_ms = deadline_ms;
-  request->query = (uint8_t *)(request + 1);
+  request->protocol_state = request + 1;
+  request->query = (uint8_t *)(request + 1) +
+    (mode == FTUN_DNS_RUNTIME_PROXY ? dns->protocol->state_bytes : 0u);
   request->buffer = request->query + query.length;
   request->query_length = query.length;
   request->username_length = username_length;
@@ -1194,10 +1194,10 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   dns->request_tail = request;
   dns->request_count++;
   status = ftun_dns_runtime_request_open(request,
-    mode == FTUN_DNS_RUNTIME_SOCKS5 || transport == FTUN_DNS_TRANSPORT_TCP
+    mode == FTUN_DNS_RUNTIME_PROXY || transport == FTUN_DNS_TRANSPORT_TCP
       ? FTUN_DIAL_TCP : FTUN_DIAL_UDP,
-    mode == FTUN_DNS_RUNTIME_SOCKS5 ? &request->proxy : &request->upstream,
-    mode == FTUN_DNS_RUNTIME_SOCKS5);
+    mode == FTUN_DNS_RUNTIME_PROXY ? &request->proxy : &request->upstream,
+    mode == FTUN_DNS_RUNTIME_PROXY);
   if (status != FTUN_OK) {
     ftun_dns_runtime_request_release(request);
     return status;
@@ -1346,7 +1346,7 @@ ftun_status_t ftun_dns_runtime_dispatcher(ftun_dns_runtime_t *dns,
 ftun_status_t ftun_dns_runtime_quiesce(ftun_dns_runtime_t *dns)
 { (void)dns; return FTUN_OK; }
 ftun_status_t ftun_dns_runtime_hijack_tcp(ftun_dns_runtime_t *dns,
-                                         int descriptor)
+                                         ftun_handle_t descriptor)
 { (void)dns; (void)descriptor; return FTUN_E_UNSUPPORTED; }
 ftun_status_t ftun_dns_runtime_hijack_udp(
   ftun_dns_runtime_t *dns, ftun_datagram_t *inbound,

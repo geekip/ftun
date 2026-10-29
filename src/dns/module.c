@@ -107,7 +107,7 @@ static ftun_status_t ftun_dns_service_prepare(
   if (status != FTUN_OK) return status;
   service = (ftun_dns_service_instance_t *)calloc(1u, sizeof(*service));
   if (service == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   service->reservation = reservation;
@@ -122,13 +122,14 @@ static ftun_status_t ftun_dns_service_prepare(
   service->network.generation = generation;
   service->network.socket_mark = bindings->socket_mark;
   service->network.path = bindings->path;
+  service->network.protocol = bindings->protocol;
   service->network.context = bindings->path_context;
   status = ftun_dns_runtime_prepare(core, budget, operations, service->loop,
     config, &service->adapter, &service->network,
     &service->active);
   if (status != FTUN_OK && service->active == NULL) {
     free(service);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   /* 失败且仍拥有 runtime 时，仅可由上层 cleanup-only service 销毁。 */
@@ -406,7 +407,8 @@ static ftun_status_t ftun_dns_service_destroy_until(
   memset(service, 0, sizeof(*service));
   free(service);
   *implementation = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 static void ftun_dns_service_network_changed(void *implementation,

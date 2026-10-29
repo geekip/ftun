@@ -15,14 +15,14 @@
 #include "dns/server.h"
 #include "libs/resolver/dnswire.h"
 #include "core/config/document.h"
-#include "libs/transport/socks5_client.h"
+#include "libs/transport/protocol.h"
 #include "libs/transport/datagram.h"
 #include "platform/socket.h"
-#include "platform/posix/error.h"
+#include "platform/socket.h"
 #include "libs/buffer/buffer.h"
 #include "platform/clock.h"
 #include "libs/transport/config.h"
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 
 #include <stdio.h>
 #include <stdint.h>
@@ -53,7 +53,7 @@ typedef char ftun_dns_tcp_mask_fits[
 
 enum {
   FTUN_DNS_RUNTIME_DIRECT = 1,
-  FTUN_DNS_RUNTIME_SOCKS5 = 2
+  FTUN_DNS_RUNTIME_PROXY = 2
 };
 
 /* DNS 内部出口编号只在本 service 的配置快照中使用；不依赖 Proxy 私有 ID。 */
@@ -78,8 +78,8 @@ struct ftun_dns_runtime_plan {
 
 typedef enum {
   FTUN_DNS_RUNTIME_REQUEST_CONNECT = 1,
-  FTUN_DNS_RUNTIME_REQUEST_SOCKS_SEND,
-  FTUN_DNS_RUNTIME_REQUEST_SOCKS_RECV,
+  FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND,
+  FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV,
   FTUN_DNS_RUNTIME_REQUEST_DNS_SEND,
   FTUN_DNS_RUNTIME_REQUEST_DNS_RECV_UDP,
   FTUN_DNS_RUNTIME_REQUEST_DNS_RECV_PREFIX,
@@ -124,8 +124,7 @@ typedef struct ftun_dns_runtime_transport_request {
   size_t buffer_length;
   size_t buffer_offset;
   size_t receive_needed;
-  /* 到 SOCKS5 代理的握手：与数据面、阻塞驱动共用同一个状态机。 */
-  ftun_socks5_client_t socks;
+  void *protocol_state;
   size_t response_length;
   size_t username_length;
   size_t password_length;
@@ -161,8 +160,8 @@ struct ftun_dns_runtime_transport_waiter {
 
 typedef struct ftun_dns_runtime_listener_slot {
   struct ftun_dns_runtime *dns;
-  int descriptor;
-  int tcp_descriptor;
+  ftun_handle_t descriptor;
+  ftun_handle_t tcp_descriptor;
   ftun_event_source_t *source;
   ftun_event_source_t *tcp_source;
   ftun_dns_listener_t *protocol;
@@ -180,7 +179,7 @@ typedef struct ftun_dns_runtime_listener_slot {
 
 typedef struct {
   struct ftun_dns_runtime *dns;
-  int descriptor;
+  ftun_handle_t descriptor;
   ftun_event_source_t *source;
   ftun_dns_connection_t *protocol;
   uint64_t peer_id;
@@ -217,7 +216,7 @@ typedef enum {
 typedef struct {
   uint64_t id;
   ftun_dns_runtime_pending_kind_t kind;
-  int descriptor;
+  ftun_handle_t descriptor;
   ftun_endpoint_t peer;
   ftun_datagram_t *inbound;
   ftun_endpoint_t client;
@@ -226,6 +225,7 @@ typedef struct {
 } ftun_dns_runtime_pending_t;
 
 struct ftun_dns_runtime {
+  const ftun_transport_protocol_t *protocol;
   ftun_core_t *core;
   ftun_budget_t *budget;
   ftun_reservation_t listener_reservation;
@@ -401,7 +401,7 @@ void ftun_dns_runtime_request_release(
   ftun_dns_runtime_transport_request_t *request);
 ftun_status_t ftun_dns_runtime_request_send(
   ftun_dns_runtime_transport_request_t *request);
-ftun_status_t ftun_dns_runtime_request_socks_next(
+ftun_status_t ftun_dns_runtime_request_handshake_next(
   ftun_dns_runtime_transport_request_t *request);
 void ftun_dns_runtime_request_unlink(
   ftun_dns_runtime_transport_request_t *request);
@@ -421,10 +421,10 @@ ftun_status_t ftun_dns_runtime_slot_recover(void *user,
                                                    ftun_recovery_id_t id);
 ftun_status_t ftun_dns_runtime_slot_sources_start(
   ftun_dns_runtime_t *dns, ftun_dns_runtime_listener_slot_t *slot);
-ftun_status_t ftun_dns_runtime_socket_duplicate(int descriptor,
-                                                       int *out);
+ftun_status_t ftun_dns_runtime_socket_duplicate(ftun_handle_t descriptor,
+                                                       ftun_handle_t *out);
 ftun_status_t ftun_dns_runtime_socket_open(const char *text,
-                                                  ftun_dial_transport_t type, int *out,
+                                                  ftun_dial_transport_t type, ftun_handle_t *out,
                                                   ftun_socket_bind_issue_t *error_code);
 ftun_status_t ftun_dns_runtime_step_deadline(ftun_dns_runtime_t *dns,
                                                    uint64_t now_ms,

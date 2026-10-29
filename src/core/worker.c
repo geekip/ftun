@@ -112,8 +112,7 @@ static ftun_status_t ftun_worker_task_dispose(ftun_worker_task_t *task)
     if (status != FTUN_OK) return status;
     task->input_cleanup = NULL;
   }
-  status = ftun_reservation_release(&task->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&task->reservation);
   free(task->result);
   free(task->input);
   task->result = NULL;
@@ -248,7 +247,7 @@ ftun_status_t ftun_worker_create(ftun_budget_t *budget, size_t capacity,
   if (status != FTUN_OK) return status;
   worker = (ftun_worker_t *)calloc(1u, sizeof(*worker));
   if (worker == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   worker->budget = budget;
@@ -277,7 +276,7 @@ status_error:
   if (mutex_ready) ftun_mutex_destroy(&worker->mutex);
   reservation = worker->reservation;
   worker->reservation = (ftun_reservation_t){0};
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   free(worker);
   return status;
 
@@ -343,7 +342,7 @@ ftun_status_t ftun_worker_submit(ftun_worker_t *worker, const ftun_worker_job_t 
   }
   task = (ftun_worker_task_t *)calloc(1u, sizeof(*task));
   if (task == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     ftun_mutex_unlock(&worker->mutex);
     return FTUN_E_LIMIT;
   }
@@ -387,7 +386,7 @@ allocation_error:
   free(task->result);
   free(task->input);
   free(task);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   ftun_mutex_unlock(&worker->mutex);
   return status == FTUN_OK ? FTUN_E_LIMIT : status;
 }
@@ -554,8 +553,7 @@ ftun_status_t ftun_worker_destroy(ftun_worker_t **worker)
   status = ftun_operation_queue_destroy(&owned->operations);
   if (status != FTUN_OK) return status;
   reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   ftun_condition_destroy(&owned->ready);
   ftun_mutex_destroy(&owned->mutex);

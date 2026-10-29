@@ -1,4 +1,5 @@
 /* 使用真实 loopback Bootstrap 记录 prepare 实际解析集合。 */
+#include "proxy/protocol/socks5.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -219,7 +220,7 @@ static int fixture_finish(fixture_t *fixture)
   ftun_event_loop_usage_t events;
   ftun_operation_queue_usage_t operations;
   CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK);
-  CHECK(usage.used == fixture->baseline.used &&
+  CHECK(usage.used_resources.memory_bytes == fixture->baseline.used_resources.memory_bytes &&
         usage.metadata_bytes == fixture->baseline.metadata_bytes &&
         usage.used_resources.descriptors == fixture->baseline.used_resources.descriptors &&
         usage.used_resources.queue_slots == fixture->baseline.used_resources.queue_slots);
@@ -270,11 +271,11 @@ static ftun_status_t prepare(fixture_t *fixture, ftun_config_t *config,
   if (planned) return ftun_dns_runtime_prepare_reload_planned(NULL,
     fixture->core, fixture->budget, fixture->operations, fixture->loop,
     config, NULL,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, *plan, out);
   return ftun_dns_runtime_prepare(fixture->core, fixture->budget,
     fixture->operations, fixture->loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, out);
 }
 
@@ -456,16 +457,16 @@ static int plan_pairing(bootstrap_t *server)
   CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &plan) == FTUN_E_AGAIN && plan == saved);
   CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, different, NULL,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &dns) == FTUN_E_STALE);
   CHECK(dns == NULL && different->document.reference_count == 1u && queries(server, NULL) == 0u);
   CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &second) == FTUN_OK);
   CHECK(config->document.reference_count == 4u);
   CHECK(ftun_dns_runtime_destroy(&second) == FTUN_OK && config->document.reference_count == 3u);
@@ -582,24 +583,24 @@ static int plan_budget(bootstrap_t *server)
   bootstrap_reset(server, "");
   CHECK(ftun_dns_runtime_plan_prepare(child, config, 0u, &first) == FTUN_E_LIMIT);
   CHECK(first == NULL && config->document.reference_count == 1u && queries(server, NULL) == 0u);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes);
   CHECK(ftun_budget_destroy(&child) == FTUN_OK);
   CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used + charge);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes + charge);
   CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used + 2u * charge);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes + 2u * charge);
   destroy_target = config;
   destroy_failures = 1u;
   CHECK(ftun_dns_runtime_plan_destroy(&first) == FTUN_E_AGAIN && first != NULL);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used + 2u * charge);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes + 2u * charge);
   CHECK(ftun_dns_runtime_plan_destroy(&first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used + charge);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes + charge);
   CHECK(ftun_dns_runtime_plan_destroy(&second) == FTUN_OK && config->document.reference_count == 1u);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used);
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes);
   destroy_target = NULL;
   config->dns.enable = false;
   CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &first) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used == baseline.used + sizeof(*first));
+  CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes + sizeof(*first));
   CHECK(ftun_dns_runtime_plan_destroy(&first) == FTUN_OK);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(fixture_finish(&fixture) == 0);

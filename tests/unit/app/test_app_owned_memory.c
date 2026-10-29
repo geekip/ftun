@@ -28,7 +28,7 @@ void *__wrap_calloc(size_t count, size_t size)
     if (bytes == watch_calloc_size && bytes != 0u) {
       ftun_budget_usage_t usage;
       watch_failed = ftun_budget_get_usage(watch_budget, &usage) != FTUN_OK;
-      watched_used = watch_failed ? 0u : usage.used;
+      watched_used = watch_failed ? 0u : usage.used_resources.memory_bytes;
       watch_calloc_size = 0u;
     }
     if (bytes == fail_calloc_size && bytes != 0u) {
@@ -61,7 +61,7 @@ ftun_status_t __wrap_ftun_worker_submit(ftun_worker_t *worker,
   if (reject_submit) {
     ftun_budget_usage_t usage;
     watch_failed = ftun_budget_get_usage(watch_budget, &usage) != FTUN_OK;
-    submit_used = watch_failed ? 0u : usage.used;
+    submit_used = watch_failed ? 0u : usage.used_resources.memory_bytes;
     *out = NULL;
     return FTUN_E_LIMIT;
   }
@@ -71,7 +71,7 @@ ftun_status_t __wrap_ftun_worker_submit(ftun_worker_t *worker,
 static int memory(ftun_budget_t *budget, size_t expected)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == expected);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == expected);
   CHECK(usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 0u);
   return 0;
 }
@@ -128,14 +128,14 @@ static int transactions(void)
   control.budget = budget;
   CHECK(ftun_mutex_init(&control.mutex) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  baseline = usage.used;
+  baseline = usage.used_resources.memory_bytes;
   CHECK(ftun_core_owned_path_copy(budget, text, &result.source_path) == FTUN_OK);
   original = result.source_path.value;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_core_reload_prepare_transaction(core, &control, &result, &transaction, NULL) == FTUN_E_LIMIT);
   CHECK(transaction == NULL && result.source_path.value == original);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_calloc_size = sizeof(*transaction);
   CHECK(ftun_core_reload_prepare_transaction(core, &control, &result, &transaction, NULL) == FTUN_E_LIMIT);
   CHECK(transaction == NULL && fail_calloc_size == 0u && result.source_path.value == original);
@@ -167,7 +167,7 @@ static int transactions(void)
     uint64_t generation = 0u, reserved = 99u;
     CHECK(ftun_core_context_generation(core, &generation) == FTUN_OK &&
           ftun_core_context_generation_reserved(core, &reserved) == FTUN_OK);
-    CHECK(memory(budget, usage.used) == 0 &&
+    CHECK(memory(budget, usage.used_resources.memory_bytes) == 0 &&
           generation == transaction->next_generation && reserved == 0u &&
           !transaction->generation_reserved);
   }

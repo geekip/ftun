@@ -29,7 +29,7 @@ static ftun_status_t ftun_file_parent(ftun_budget_t *budget,
   }
   parent = malloc(view.length + 1u);
   if (parent == NULL) {
-    (void)ftun_reservation_release(reservation);
+    ftun_reservation_release(reservation);
     return FTUN_E_LIMIT;
   }
   memcpy(parent, view.data, view.length);
@@ -53,13 +53,13 @@ ftun_status_t ftun_file_lock_acquire_budget(ftun_budget_t *budget,
   }
   lock = calloc(1u, sizeof(*lock));
   if (lock == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   status = ftun_platform_file_lock_acquire(path, &lock->native);
   if (status != FTUN_OK) {
     free(lock);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   lock->reservation = reservation;
@@ -83,7 +83,7 @@ ftun_status_t ftun_file_lock_release(ftun_file_lock_t **lock)
   status = ftun_platform_file_lock_release(&owned->native);
   reservation = owned->reservation;
   free(owned);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   *lock = NULL;
   return status;
 }
@@ -108,8 +108,8 @@ static ftun_status_t ftun_file_replace_internal(
   status = ftun_platform_file_replace(temporary, destination, parent, hook, hook_user, published);
 done:
   free(parent);
-  (void)ftun_reservation_release(&parent_reservation);
-  (void)ftun_reservation_release(&fd_reservation);
+  ftun_reservation_release(&parent_reservation);
+  ftun_reservation_release(&fd_reservation);
   return status;
 }
 
@@ -160,7 +160,7 @@ ftun_status_t ftun_file_write_atomic_budget(ftun_budget_t *budget,
     if (status != FTUN_OK) goto done;
   }
   status = ftun_platform_file_write_temporary(temporary, contents, mode, &created);
-  (void)ftun_reservation_release(&fd_reservation);
+  ftun_reservation_release(&fd_reservation);
   if (status != FTUN_OK) goto done;
   status = ftun_file_replace_internal(budget, temporary, destination, hook, hook_user, &published);
 
@@ -168,9 +168,9 @@ done:
   if (created && !published) ftun_platform_file_remove_temporary(temporary);
   free(temporary);
   free(parent);
-  (void)ftun_reservation_release(&temporary_reservation);
-  (void)ftun_reservation_release(&parent_reservation);
-  (void)ftun_reservation_release(&fd_reservation);
+  ftun_reservation_release(&temporary_reservation);
+  ftun_reservation_release(&parent_reservation);
+  ftun_reservation_release(&fd_reservation);
   return status;
 }
 

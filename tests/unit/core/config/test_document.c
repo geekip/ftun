@@ -50,7 +50,7 @@ static int ownership(void)
   CHECK(ftun_config_document_modules(config) == &modules);
   CHECK(ftun_config_document_modules(config)->required_modules == UINT32_C(0x80000000));
   bytes = sizeof(*config) + 16u;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == bytes);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == bytes);
   CHECK(ftun_config_retain(config) == FTUN_OK);
   alias = config;
   CHECK(ftun_config_destroy(&alias) == FTUN_OK && alias == NULL);
@@ -58,12 +58,12 @@ static int ownership(void)
   config->pending = true;
   CHECK(ftun_config_destroy(&config) == FTUN_E_AGAIN && config != NULL);
   CHECK(config->document.reference_count == 1u && prepares == 1u && destroys == 0u);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == bytes);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == bytes);
   config->pending = false;
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
   CHECK(prepares == 2u && destroys == 1u);
   CHECK(ftun_config_destroy(&config) == FTUN_OK && prepares == 2u && destroys == 1u);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -91,11 +91,11 @@ static int json_boundary(void)
     CHECK(status == (valid ? FTUN_OK : FTUN_E_INVALID));
     if (valid) {
       CHECK(cJSON_GetObjectItemCaseSensitive(document.root, "new_module") != NULL);
-      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 0u);
+      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u);
       ftun_config_json_close(&document);
       ftun_config_json_close(&document);
     } else CHECK(document.root == NULL && (document.reservation).budget == NULL);
-    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+    CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   }
   ftun_config_json_close(NULL);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);

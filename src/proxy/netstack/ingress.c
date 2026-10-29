@@ -174,9 +174,7 @@ static void ftun_tun_tcp_destroy(void *user)
   bridge->stream = NULL;
   bridge->context = NULL;
   free(bridge);
-  if (ftun_reservation_release(&reservation) != FTUN_OK) {
-    context->corrupt = true;
-  }
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_tun_tcp_stream_progress(void *user)
@@ -212,7 +210,7 @@ static ftun_status_t ftun_tun_tcp_accept(
   if (status != FTUN_OK) return status;
   bridge = (ftun_tun_tcp_bridge_t *)calloc(1u, sizeof(*bridge));
   if (bridge == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   bridge->context = context;
@@ -237,7 +235,7 @@ static ftun_status_t ftun_tun_tcp_accept(
   status = ftun_stream_create(&options, &backend, &bridge->stream);
   if (status != FTUN_OK) {
     free(bridge);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   bridge->next = context->tcp_streams;
@@ -374,9 +372,7 @@ static void ftun_tun_udp_destroy(void *user)
   bridge->channel = NULL;
   bridge->context = NULL;
   free(bridge);
-  if (ftun_reservation_release(&reservation) != FTUN_OK) {
-    context->corrupt = true;
-  }
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_tun_udp_deliver(
@@ -410,7 +406,7 @@ static ftun_status_t ftun_tun_udp_accept(
   if (status != FTUN_OK) return status;
   bridge = (ftun_tun_udp_bridge_t *)calloc(1u, sizeof(*bridge));
   if (bridge == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   bridge->context = context;
@@ -431,7 +427,7 @@ static ftun_status_t ftun_tun_udp_accept(
   status = ftun_datagram_create(&options, &backend, &bridge->channel);
   if (status != FTUN_OK) {
     free(bridge);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   bridge->next = context->udp_channels;
@@ -500,7 +496,7 @@ ftun_status_t ftun_tun_ingress_bind(
   if (status != FTUN_OK) return status;
   context = (ftun_tun_ingress_context_t *)calloc(1u, sizeof(*context));
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->budget = spec->budget;
@@ -538,7 +534,7 @@ ftun_status_t ftun_tun_ingress_bind(
   status = ftun_lwip_create(&lwip, &context->stack);
   if (status != FTUN_OK) {
     free(context);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   *out = context;
@@ -599,12 +595,10 @@ ftun_status_t ftun_tun_ingress_bytes(ftun_tun_ingress_context_t *context,
   if (status == FTUN_OK) {
     status = ftun_packet_init(&packet, &slice, context->inbound_id);
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   if (status == FTUN_OK) status = ftun_tun_ingress(context, &packet);
-  if (ftun_packet_release(&packet) != FTUN_OK && status == FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
+  ftun_packet_release(&packet);
   return status;
 }
 
@@ -746,11 +740,7 @@ ftun_status_t ftun_tun_ingress_close_step(ftun_tun_ingress_context_t **context,
   reservation = owned->reservation;
   owned->reservation = (ftun_reservation_t){0};
   *context = NULL;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) {
-    free(owned);
-    return status;
-  }
+  ftun_reservation_release(&reservation);
   status = owned->corrupt ? FTUN_E_STATE_CORRUPT : FTUN_OK;
   memset(owned, 0, sizeof(*owned));
   free(owned);

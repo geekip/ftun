@@ -128,7 +128,7 @@ static ftun_status_t ftun_proxy_slot_slab_create(
   if (status != FTUN_OK) return status;
   slab = (ftun_proxy_slot_slab_t *)calloc(1u, bytes);
   if (slab == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   slab->reservation = reservation;
@@ -155,7 +155,6 @@ static ftun_status_t ftun_proxy_slot_slab_destroy(
   ftun_proxy_slot_pool_t *pool, ftun_proxy_slot_slab_t *slab)
 {
   ftun_reservation_t reservation;
-  ftun_status_t status;
   if (pool == NULL || slab == NULL || slab->free_count != slab->slot_count ||
       slab->index >= pool->maximum_slabs || pool->slabs[slab->index] != slab) {
     return FTUN_E_INVALID;
@@ -166,8 +165,8 @@ static ftun_status_t ftun_proxy_slot_slab_destroy(
   reservation = slab->reservation;
   slab->reservation = (ftun_reservation_t){0};
   free(slab);
-  status = ftun_reservation_release(&reservation);
-  return status;
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_proxy_slot_pool_create(
@@ -221,7 +220,7 @@ ftun_status_t ftun_proxy_slot_pool_create(
     free(pool->generations);
     free(pool->slabs);
     free(pool);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   pool->budget = budget;
@@ -432,5 +431,6 @@ ftun_status_t ftun_proxy_slot_pool_destroy(ftun_proxy_slot_pool_t **pool)
   free(owned->slabs);
   free(owned);
   *pool = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

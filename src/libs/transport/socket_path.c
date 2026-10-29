@@ -1,5 +1,5 @@
 #include "libs/transport/socket_path.h"
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 
 #include <limits.h>
 #include <stdlib.h>
@@ -30,7 +30,7 @@ typedef struct {
   size_t offset;
   ftun_status_t failure;
   ftun_status_t send_result;
-  int socket;
+  ftun_handle_t socket;
   bool stopped;
   bool read_armed;
   bool receiving;
@@ -96,10 +96,10 @@ static void ftun_socket_destroy(void *user)
 {
   ftun_socket_path_t *driver = (ftun_socket_path_t *)user;
   ftun_reservation_t reservation = driver->reservation;
-  if (driver->received_pending) (void)ftun_packet_release(&driver->received);
+  if (driver->received_pending) ftun_packet_release(&driver->received);
   if (driver->socket >= 0) (void)ftun_socket_close((ftun_native_socket_t)driver->socket);
   free(driver);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_socket_local_endpoint(void *user, ftun_endpoint_t *out)
@@ -322,7 +322,7 @@ static void ftun_socket_flush_ready(ftun_event_source_t *source,
   if (driver->stopped || ftun_path_retain(held) != FTUN_OK) return;
   /* owner 任务一次最多发送 64KiB，只有实际背压才订阅内核 WRITE。 */
   ftun_socket_flush(driver);
-  (void)ftun_path_release(&held);
+  ftun_path_release(&held);
 }
 
 static ftun_status_t ftun_socket_receive_one(ftun_socket_path_t *driver)
@@ -348,8 +348,8 @@ static ftun_status_t ftun_socket_receive_one(ftun_socket_path_t *driver)
     status = ftun_packet_init(&driver->received, &slice, 0u);
     if (status == FTUN_OK) driver->received_pending = true;
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   return status;
 }
 
@@ -362,7 +362,7 @@ static void ftun_socket_receive(ftun_socket_path_t *driver)
     if (status == FTUN_OK) {
       status = ftun_datagram_deliver(driver->datagram, &driver->peer, &driver->received);
       if (status != FTUN_E_AGAIN && status != FTUN_E_LIMIT) {
-        (void)ftun_packet_release(&driver->received);
+        ftun_packet_release(&driver->received);
         driver->received_pending = false;
       }
     }
@@ -393,7 +393,7 @@ static void ftun_socket_ready(ftun_event_source_t *source, uint32_t events, void
       ftun_socket_notify(driver, status == FTUN_OK ? FTUN_PATH_READABLE : FTUN_PATH_ERROR, status);
     }
   }
-  (void)ftun_path_release(&held);
+  ftun_path_release(&held);
 }
 
 static void ftun_socket_connected(ftun_operation_t *operation, ftun_error_t error,
@@ -403,10 +403,10 @@ static void ftun_socket_connected(ftun_operation_t *operation, ftun_error_t erro
   ftun_path_completion_fn completion = driver->completion;
   void *completion_user = driver->completion_user;
   if (error.status == FTUN_OK) {
-    if (result == NULL || result->socket > (ftun_native_socket_t)INT_MAX) {
+    if (result == NULL || result->socket == FTUN_INVALID_SOCKET) {
       error.status = FTUN_E_STATE_CORRUPT;
     } else {
-      driver->socket = (int)result->socket;
+      driver->socket = (ftun_handle_t)result->socket;
       error.status = ftun_event_io_start(driver->loop, result->socket,
         ftun_socket_interests(driver), ftun_socket_ready, driver, &driver->source);
     }
@@ -444,7 +444,7 @@ ftun_status_t ftun_socket_path_open(void *context, ftun_core_t *core,
   status = ftun_budget_reserve_resources(request->dial.budget, resources, &reservation);
   if (status != FTUN_OK) return status;
   driver = (ftun_socket_path_t *)calloc(1u, sizeof(*driver));
-  if (driver == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (driver == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   driver->reservation = reservation;
   driver->budget = request->dial.budget;
   driver->receive_pool = spec->receive_pool;

@@ -52,7 +52,7 @@ struct ftun_cli_result_sink {
   ftun_status_t rejection_status;
   uint64_t undelivered;
   unsigned int references;
-  int descriptor;
+  ftun_handle_t descriptor;
   int accepting;
   int stopping;
   int failed;
@@ -92,7 +92,7 @@ static void ftun_cli_result_release(ftun_cli_result_sink_t *sink)
   ftun_mutex_destroy(&sink->mutex);
   memset(sink, 0, sizeof(*sink));
   free(sink);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   (void)ftun_budget_destroy(&budget);
 }
 
@@ -251,7 +251,7 @@ static void *ftun_cli_result_writer(void *user)
   }
 }
 
-ftun_status_t ftun_cli_result_sink_create(int descriptor,
+ftun_status_t ftun_cli_result_sink_create(ftun_handle_t descriptor,
                                           ftun_cli_result_sink_t **out)
 {
   ftun_cli_result_sink_t *sink;
@@ -271,7 +271,7 @@ ftun_status_t ftun_cli_result_sink_create(int descriptor,
   }
   sink = (ftun_cli_result_sink_t *)calloc(1u, sizeof(*sink));
   if (sink == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     (void)ftun_budget_destroy(&budget);
     return FTUN_E_LIMIT;
   }
@@ -304,7 +304,7 @@ mutex_io:
   ftun_mutex_destroy(&sink->mutex);
 io:
   free(sink);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   (void)ftun_budget_destroy(&budget);
   return FTUN_E_IO;
 }

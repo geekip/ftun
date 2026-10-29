@@ -55,7 +55,7 @@ static ftun_status_t ftun_inbound_adapter_copy(ftun_inbound_adapter_t *adapter,
     if (tail.length != 0u) memcpy(data + first.length, tail.data, tail.length);
     status = ftun_buffer_slice(buffer, 0u, first.length + tail.length, out);
   }
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_release(&buffer);
   return status;
 }
 
@@ -100,11 +100,11 @@ static ftun_status_t ftun_inbound_adapter_flush(ftun_inbound_adapter_t *adapter)
   if (adapter->operation != NULL) return FTUN_E_AGAIN;
   if (adapter->reply.owner == NULL) return FTUN_OK;
   if (adapter->reply_offset == adapter->reply.length) {
-    status = ftun_buffer_slice_release(&adapter->reply);
+    ftun_buffer_slice_release(&adapter->reply);
     adapter->reply_offset = 0u;
     adapter->deadline = adapter->request_kind == FTUN_INBOUND_EVENT_NONE
       ? adapter->handshake_deadline : 0u;
-    return status;
+    return FTUN_OK;
   }
   /* 仅借用描述符；write_ref 自行 clone 接纳前缀。 */
   remaining = adapter->reply;
@@ -180,7 +180,7 @@ static ftun_status_t ftun_inbound_adapter_feed(ftun_inbound_adapter_t *adapter,
     } else if (status == FTUN_OK) status = FTUN_E_STATE_CORRUPT;
   }
   if ((status == FTUN_OK || status == FTUN_E_AGAIN) && consumed != bytes.length) {
-    (void)ftun_buffer_slice_release(&out->preread);
+    ftun_buffer_slice_release(&out->preread);
     memset(out, 0, sizeof(*out));
     return FTUN_E_STATE_CORRUPT;
   }
@@ -223,7 +223,7 @@ ftun_status_t ftun_inbound_adapter_create_with_pool(ftun_stream_t *client,
   status = ftun_budget_reserve(spec->budget, sizeof(*adapter), &reservation);
   if (status != FTUN_OK) return status;
   adapter = (ftun_inbound_adapter_t *)calloc(1u, sizeof(*adapter));
-  if (adapter == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (adapter == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   adapter->reservation = reservation;
   adapter->budget = spec->budget;
   adapter->pool = pool;
@@ -240,7 +240,7 @@ ftun_status_t ftun_inbound_adapter_create_with_pool(ftun_stream_t *client,
     (void)ftun_socks5_server_destroy(&adapter->socks);
     (void)ftun_mixed_connection_destroy(&adapter->mixed);
     free(adapter);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   adapter->client = client;
@@ -363,16 +363,13 @@ ftun_status_t ftun_inbound_adapter_destroy(ftun_inbound_adapter_t **adapter)
   owned = *adapter;
   if (owned == NULL) return FTUN_OK;
   if (!owned->stopped || owned->busy || owned->operation != NULL) return FTUN_E_AGAIN;
-  status = ftun_stream_release(&owned->client);
-  if (status != FTUN_OK) return status;
-  status = ftun_buffer_slice_release(&owned->reply);
-  if (status != FTUN_OK) return status;
+  ftun_stream_release(&owned->client);
+  ftun_buffer_slice_release(&owned->reply);
   status = ftun_socks5_server_destroy(&owned->socks);
   if (status != FTUN_OK) return status;
   status = ftun_mixed_connection_destroy(&owned->mixed);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned);
   *adapter = NULL;
   return FTUN_OK;

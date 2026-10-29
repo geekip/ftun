@@ -295,7 +295,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_event_loop_destroy(&fixture->loop) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   return ftun_budget_destroy(&fixture->budget) == FTUN_OK ? 0 : 1;
 }
 
@@ -390,7 +390,7 @@ static int test_sync_failures_and_udp_boundary(void)
   CHECK(operation == NULL && fixture.completion.calls == 0);
   CHECK(fixture.socket.open_calls == 2u && fixture.socket.close_calls == 2u);
   CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK &&
-        after.used == before.used);
+        after.used_resources.memory_bytes == before.used_resources.memory_bytes);
   CHECK(fixture_stop(&fixture) == 0);
 
   CHECK(fixture_start(&fixture, 32768u, 4u) == 0);

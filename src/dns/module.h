@@ -18,6 +18,7 @@ typedef struct {
   ftun_dns_runtime_adapter_t adapter;
   uint32_t socket_mark;
   ftun_path_provider_ops_t path;
+  const ftun_transport_protocol_t *protocol;
   void *path_context;
 } ftun_dns_service_binding_t;
 

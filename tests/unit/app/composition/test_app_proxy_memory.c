@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "platform/file.h"
 /* 真实组合附件及其叶对象；只替换分配观察、下载源和失败释放。 */
 #include <fcntl.h>
 #include <sys/types.h>
@@ -37,8 +38,8 @@ static void descriptor_admission(void)
   if (!tracking) return;
   if (ftun_budget_get_usage(budget, &usage) != FTUN_OK ||
       usage.used_resources.descriptors < live_descriptors + 1u ||
-      usage.used < tracked_baseline.used || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
-      live_bytes > usage.used - tracked_baseline.used + usage.metadata_bytes - tracked_baseline.metadata_bytes) broken = true;
+      usage.used_resources.memory_bytes < tracked_baseline.used_resources.memory_bytes || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
+      live_bytes > usage.used_resources.memory_bytes - tracked_baseline.used_resources.memory_bytes + usage.metadata_bytes - tracked_baseline.metadata_bytes) broken = true;
 }
 static int descriptor_record(int descriptor)
 {
@@ -86,7 +87,7 @@ void *__wrap_calloc(size_t count, size_t size)
   if (eligible && watch_size != 0u && bytes == watch_size) {
     ftun_budget_usage_t usage;
     if (ftun_budget_get_usage(budget, &usage) != FTUN_OK) abort();
-    watched_used = usage.used; watch_size = 0u;
+    watched_used = usage.used_resources.memory_bytes; watch_size = 0u;
   }
   if (eligible && fail_size != 0u && bytes == fail_size) { fail_size = 0u; return NULL; }
   allocation_depth++;
@@ -96,8 +97,8 @@ void *__wrap_calloc(size_t count, size_t size)
   if (tracking && value != NULL) {
     ftun_budget_usage_t usage;
     if (ftun_budget_get_usage(budget, &usage) != FTUN_OK ||
-        usage.used < tracked_baseline.used || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
-        live_bytes > usage.used - tracked_baseline.used + usage.metadata_bytes - tracked_baseline.metadata_bytes) broken = true;
+        usage.used_resources.memory_bytes < tracked_baseline.used_resources.memory_bytes || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
+        live_bytes > usage.used_resources.memory_bytes - tracked_baseline.used_resources.memory_bytes + usage.metadata_bytes - tracked_baseline.metadata_bytes) broken = true;
   }
   return value;
 }
@@ -127,6 +128,11 @@ int __wrap_open(const char *path, int flags, ...)
   descriptor_admission();
   return descriptor_record(__real_open(path, flags, mode));
 }
+/* FORTIFY 将无 mode 的 open 调用改名，仍须统计真实 FD。 */
+int __wrap___open_2(const char *path, int flags)
+{
+  return __wrap_open(path, flags);
+}
 int __real_mkstemp(char *path);
 int __wrap_mkstemp(char *path)
 {
@@ -149,8 +155,8 @@ ssize_t __wrap_read(int descriptor, void *data, size_t length)
     ftun_budget_usage_t usage;
     verified_reads++;
     if (ftun_budget_get_usage(budget, &usage) != FTUN_OK ||
-        usage.used < tracked_baseline.used || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
-        live_bytes != usage.used - tracked_baseline.used + usage.metadata_bytes - tracked_baseline.metadata_bytes) {
+        usage.used_resources.memory_bytes < tracked_baseline.used_resources.memory_bytes || usage.metadata_bytes < tracked_baseline.metadata_bytes ||
+        live_bytes != usage.used_resources.memory_bytes - tracked_baseline.used_resources.memory_bytes + usage.metadata_bytes - tracked_baseline.metadata_bytes) {
       broken = true;
     }
   }
@@ -168,8 +174,8 @@ static int balance(const ftun_budget_usage_t *before)
 {
   ftun_budget_usage_t after;
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(!broken && after.used >= before->used && after.metadata_bytes >= before->metadata_bytes);
-  CHECK(live_bytes == after.used - before->used + after.metadata_bytes - before->metadata_bytes);
+  CHECK(!broken && after.used_resources.memory_bytes >= before->used_resources.memory_bytes && after.metadata_bytes >= before->metadata_bytes);
+  CHECK(live_bytes == after.used_resources.memory_bytes - before->used_resources.memory_bytes + after.metadata_bytes - before->metadata_bytes);
   CHECK(after.used_resources.descriptors == before->used_resources.descriptors);
   CHECK(live_descriptors == 0u);
   return 0;
@@ -203,14 +209,14 @@ static int attachments(void)
   CHECK(ftun_runtime_prepare(core, config, &active) == FTUN_OK);
   CHECK(ftun_runtime_commit(core, &active) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, before.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, before.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   watch_size = sizeof(*attachment);
   CHECK(ftun_proxy_attachment_create(budget, config, &attachment) == FTUN_E_LIMIT && attachment == NULL);
   CHECK(watch_size != 0u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_size = sizeof(*attachment);
   CHECK(ftun_proxy_attachment_create(budget, config, &attachment) == FTUN_E_LIMIT && attachment == NULL);
-  CHECK(fail_size == 0u && watch_size == 0u && watched_used == before.used + sizeof(*attachment));
+  CHECK(fail_size == 0u && watch_size == 0u && watched_used == before.used_resources.memory_bytes + sizeof(*attachment));
   tracked_baseline = before;
   tracking = true;
   CHECK(ftun_proxy_support_prepare(budget, config, 1024u * 1024u, &context, &attachment, &publish) == FTUN_OK);
@@ -296,7 +302,7 @@ static int frs_prepare(void)
   CHECK(ftun_proxy_support_prepare(budget, config, 1024u * 1024u, &context, &attachment, &publish) == FTUN_E_LIMIT);
   CHECK(open_calls == 2u && attachment != NULL && downloads == 0u);
   CHECK(ftun_proxy_support_release(NULL, &attachment) == FTUN_OK);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(live_bytes == 0u && balance(&before) == 0);
   CHECK(unlink(path) == 0);
   CHECK(ftun_proxy_support_prepare(budget, config, 1024u * 1024u, &context, &attachment, &publish) == FTUN_OK);
@@ -315,7 +321,7 @@ static int frs_prepare(void)
     CHECK(result_length == sizeof(result) && result.status == FTUN_OK && result.published);
     CHECK(balance(&before) == 0 && peak_descriptors == 2u);
     free((void *)job.input.data);
-    CHECK(ftun_reservation_release(&input_reservation) == FTUN_OK);
+    ftun_reservation_release(&input_reservation);
     CHECK(ftun_proxy_support_release(core, &attachment) == FTUN_OK);
     CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK && live_bytes == 0u);
     CHECK(unlink(path) == 0);
@@ -368,7 +374,7 @@ static int persistence(void)
   CHECK(job.execute(job.input, NULL, 0u, &result_size) == FTUN_OK && result_size == 0u);
   CHECK(balance(&before) == 0 && peak_descriptors == 2u);
   free((void *)job.input.data);
-  CHECK(ftun_reservation_release(&input_reservation) == FTUN_OK && live_bytes == 0u);
+  ftun_reservation_release(&input_reservation); CHECK(live_bytes == 0u);
   memset(&job, 0, sizeof(job));
   CHECK(ftun_proxy_support_prepare(budget, config, 1024u * 1024u, &context, &attachment, &publish) == FTUN_OK);
   ftun_proxy_support_load_state(attachment);
@@ -383,18 +389,18 @@ static int persistence(void)
   CHECK(ftun_budget_reserve_resources(budget, both, &hold) == FTUN_OK);
   CHECK(ftun_file_write_atomic_budget(budget, path, (ftun_bytes_t){(const uint8_t *)"bad", 3u}, 0600u, NULL, NULL) == FTUN_E_LIMIT);
   CHECK(access(sentinel, F_OK) == 0);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK && live_bytes == 0u);
+  ftun_reservation_release(&hold); CHECK(live_bytes == 0u);
   CHECK(ftun_budget_reserve_resources(budget, one, &hold) == FTUN_OK);
   CHECK(ftun_file_write_atomic_budget(budget, path, (ftun_bytes_t){(const uint8_t *)"bad", 3u}, 0600u, NULL, NULL) == FTUN_E_LIMIT);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK && live_bytes == 0u);
+  ftun_reservation_release(&hold); CHECK(live_bytes == 0u);
   CHECK(ftun_group_cache_load_budget(budget, path, &snapshot) == FTUN_OK);
   CHECK(snapshot->record_count == 1u && (snapshot->reservation).budget != NULL && balance(&before) == 0);
   CHECK(ftun_group_cache_destroy(&snapshot) == FTUN_OK && live_bytes == 0u);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_proxy_support_state_job(core, budget, path, UINT64_MAX, &job, &input_reservation) == FTUN_E_LIMIT);
   CHECK((input_reservation).budget == NULL && job.input.data == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK && live_bytes == 0u);
+  ftun_reservation_release(&hold); CHECK(live_bytes == 0u);
   CHECK(balance(&before) == 0);
   tracking = false;
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);

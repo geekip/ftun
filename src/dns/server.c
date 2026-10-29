@@ -146,7 +146,7 @@ static void ftun_dns_server_operation_completed(ftun_operation_t *operation,
   if (server->inflight != 0u) server->inflight--;
   memset(context, 0, sizeof(*context));
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_dns_server_cancel(void *user)
@@ -367,7 +367,7 @@ ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
   if (status != FTUN_OK) return status;
   server = (ftun_dns_server_t *)calloc(1u, sizeof(*server));
   if (server == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   server->budget = options->budget;
@@ -457,7 +457,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   context = (ftun_dns_exchange_context_t *)calloc(1u, bytes);
   if (context == NULL) {
     (void)ftun_dns_answer_release(&cached);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->server = server;
@@ -509,7 +509,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
 fail:
   (void)ftun_dns_answer_release(&cached);
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -524,5 +524,6 @@ ftun_status_t ftun_dns_server_destroy(ftun_dns_server_t **server)
   reservation = owned->reservation;
   free(owned);
   *server = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

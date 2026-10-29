@@ -1,9 +1,9 @@
-#include "libs/resolver/socks5_transport.h"
+#include "proxy/protocol/socks5_transport.h"
 
 #if defined(FTUN_HAVE_MODULE_DNS)
 
 #include "libs/resolver/dnswire.h"
-#include "libs/transport/socks5_client.h"
+#include "proxy/protocol/socks5_client.h"
 #include <string.h>
 
 #define FTUN_RESOLVER_SOCKS5_TIMEOUT_MS UINT64_C(5000)
@@ -22,7 +22,7 @@ static ftun_status_t ftun_resolver_socks5_read(void *context, uint8_t *data,
 
 static ftun_status_t ftun_resolver_socks5_open(
   const ftun_control_execution_t *execution,
-  const ftun_resolver_socks5_query_t *query,
+  const ftun_resolver_transport_query_t *query,
   ftun_control_channel_t **control, ftun_control_channel_t **data,
   ftun_endpoint_t *relay)
 {
@@ -68,7 +68,7 @@ static ftun_status_t ftun_resolver_socks5_open(
 
 ftun_status_t ftun_resolver_socks5_query_blocking(
   const ftun_control_execution_t *execution,
-  const ftun_resolver_socks5_query_t *query, ftun_bytes_t wire,
+  const ftun_resolver_transport_query_t *query, ftun_bytes_t wire,
   uint8_t *response, size_t response_capacity, size_t *out_response_size)
 {
   ftun_endpoint_t relay, source;
@@ -133,7 +133,7 @@ done:
 
 ftun_status_t ftun_resolver_socks5_query_blocking(
   const ftun_control_execution_t *execution,
-  const ftun_resolver_socks5_query_t *query, ftun_bytes_t wire,
+  const ftun_resolver_transport_query_t *query, ftun_bytes_t wire,
   uint8_t *response, size_t response_capacity, size_t *out_response_size)
 {
   (void)execution;

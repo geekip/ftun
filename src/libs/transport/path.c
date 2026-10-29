@@ -2,6 +2,7 @@
 #include "libs/transport/channel_internal.h"
 #include "platform/clock.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -134,14 +135,14 @@ static ftun_status_t ftun_path_allocate(const ftun_path_spec_t *spec,
   if (status != FTUN_OK) return status;
   path = (ftun_path_t *)calloc(1u, sizeof(*path));
   if (path == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   if (spec->network_view != NULL) {
     status = ftun_network_view_retain(spec->network_view);
     if (status != FTUN_OK) {
       free(path);
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return status;
     }
   }
@@ -223,14 +224,15 @@ ftun_status_t ftun_path_retain(ftun_path_t *path)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_path_release(ftun_path_t **path)
+void ftun_path_release(ftun_path_t **path)
 {
-  if (path == NULL) return FTUN_E_INVALID;
-  if (*path == NULL) return FTUN_OK;
-  if ((*path)->info.references <= 1u) return FTUN_E_STATE_CORRUPT;
-  (*path)->info.references--;
+  ftun_path_t *owned;
+  assert(path != NULL);
+  owned = *path;
+  if (owned == NULL) return;
+  assert(owned->info.references > 1u);
+  owned->info.references--;
   *path = NULL;
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_path_get_info(const ftun_path_t *path, ftun_path_info_t *out)
@@ -313,10 +315,8 @@ ftun_status_t ftun_path_destroy(ftun_path_t **path)
   status = ftun_channel_destroy(&owned->channel);
   owned->busy = false;
   if (status != FTUN_OK) return status;
-  status = ftun_network_view_release(&owned->network_view);
-  if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_network_view_release(&owned->network_view);
+  ftun_reservation_release(&owned->reservation);
   ftun_path_untrack(owned);
   memset(owned, 0, sizeof(*owned));
   free(owned);
@@ -350,7 +350,7 @@ ftun_status_t ftun_path_provider_create(
   if (status != FTUN_OK) return status;
   provider = (ftun_path_provider_t *)calloc(1u, sizeof(*provider));
   if (provider == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   provider->budget = spec->budget;
@@ -428,8 +428,8 @@ static void ftun_path_open_release(ftun_path_open_t *open)
   else provider->opens = open->next;
   if (open->next != NULL) open->next->previous = open->previous;
   provider->pending_count--;
-  (void)ftun_network_view_release(&open->result_spec.network_view);
-  (void)ftun_reservation_release(&open->reservation);
+  ftun_network_view_release(&open->result_spec.network_view);
+  ftun_reservation_release(&open->reservation);
   free(open);
 }
 
@@ -537,7 +537,7 @@ static ftun_status_t ftun_path_provider_open_channel_internal(ftun_path_provider
   if (status != FTUN_OK) return status;
   open = (ftun_path_open_t *)calloc(1u, sizeof(*open));
   if (open == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   open->result_spec.network_view = (ftun_network_view_t *)request->dial.network_view;
@@ -545,7 +545,7 @@ static ftun_status_t ftun_path_provider_open_channel_internal(ftun_path_provider
     status = ftun_network_view_retain(open->result_spec.network_view);
     if (status != FTUN_OK) {
       free(open);
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return status;
     }
   }
@@ -610,7 +610,7 @@ ftun_status_t ftun_path_provider_scope(ftun_path_provider_t *provider,
   status = ftun_budget_reserve(provider->budget, sizeof(*scope), &reservation);
   if (status != FTUN_OK) return status;
   scope = (ftun_path_scope_t *)calloc(1u, sizeof(*scope));
-  if (scope == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (scope == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   scope->provider = provider;
   scope->reservation = reservation;
   scope->generation = configuration_generation;
@@ -628,20 +628,19 @@ ftun_status_t ftun_path_scope_retain(ftun_path_scope_t *scope)
   return FTUN_OK;
 }
 
-ftun_status_t ftun_path_scope_release(ftun_path_scope_t **scope)
+void ftun_path_scope_release(ftun_path_scope_t **scope)
 {
   ftun_path_scope_t *owned;
-  ftun_status_t status;
-  if (scope == NULL) return FTUN_E_INVALID;
+  assert(scope != NULL);
   owned = *scope;
-  if (owned == NULL) return FTUN_OK;
-  if (owned->references > 1u) { owned->references--; *scope = NULL; return FTUN_OK; }
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
-  owned->provider->scope_count--;
-  free(owned);
+  if (owned == NULL) return;
+  assert(owned->references != 0u);
   *scope = NULL;
-  return FTUN_OK;
+  if (--owned->references != 0u) return;
+  assert(owned->provider->scope_count != 0u);
+  owned->provider->scope_count--;
+  ftun_reservation_release(&owned->reservation);
+  free(owned);
 }
 
 ftun_status_t ftun_path_scope_generation(const ftun_path_scope_t *scope, uint64_t *out)
@@ -874,5 +873,6 @@ ftun_status_t ftun_path_provider_destroy(ftun_path_provider_t **provider)
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *provider = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

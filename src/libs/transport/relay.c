@@ -62,7 +62,7 @@ static int ftun_relay_options_valid(const ftun_relay_options_t *options)
 static void ftun_relay_release_buffer(ftun_relay_direction_t *direction)
 {
   if (direction->buffer != NULL) {
-    (void)ftun_buffer_release(&direction->buffer);
+    ftun_buffer_release(&direction->buffer);
   }
   direction->offset = 0u;
   direction->length = 0u;
@@ -291,7 +291,7 @@ static ftun_status_t ftun_relay_progress_direction(
     status = ftun_stream_write_ref_ex(
       direction->destination, &slice, ftun_relay_write_completed, direction,
       &accepted, &operation, &limit);
-    (void)ftun_buffer_slice_release(&slice);
+    ftun_buffer_slice_release(&slice);
     *did_work = 1;
     if (status == FTUN_E_AGAIN) {
       direction->write_blocked = 1;
@@ -387,7 +387,7 @@ ftun_status_t ftun_relay_start_with_options(
   if (status != FTUN_OK) return status;
   relay = (ftun_relay_t *)calloc(1u, sizeof(*relay));
   if (relay == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   relay->budget = left_budget;
@@ -551,7 +551,6 @@ ftun_status_t ftun_relay_destroy(ftun_relay_t **relay)
 {
   ftun_relay_t *owned;
   ftun_reservation_t reservation;
-  ftun_status_t status;
   if (relay == NULL) return FTUN_E_INVALID;
   owned = *relay;
   if (owned == NULL) return FTUN_OK;
@@ -563,8 +562,7 @@ ftun_status_t ftun_relay_destroy(ftun_relay_t **relay)
       owned->left_to_right.buffer_waiting ||
       owned->right_to_left.buffer_waiting) return FTUN_E_AGAIN;
   reservation = owned->reservation;
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   owned->reservation = (ftun_reservation_t){0};
   memset(owned, 0, sizeof(*owned));
   free(owned);

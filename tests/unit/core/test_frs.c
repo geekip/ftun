@@ -178,10 +178,10 @@ int main(int argc, char **argv)
   CHECK(ftun_frs_open_bytes_budget(budget,
         (ftun_bytes_t){fixture, fixture_bytes}, &view) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used > fixture_bytes);
+        budget_usage.used_resources.memory_bytes > fixture_bytes);
   CHECK(ftun_frs_view_release(&view) == FTUN_OK && view == NULL);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
 
   fixture[40] = 1u;

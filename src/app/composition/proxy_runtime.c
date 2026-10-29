@@ -54,7 +54,7 @@ static ftun_status_t ftun_proxy_attachment_create(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   attachment = (ftun_app_runtime_candidate_t *)calloc(1u, sizeof(*attachment));
   if (attachment == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   attachment->budget = budget;
@@ -143,7 +143,7 @@ static ftun_status_t ftun_core_reload_read_file(ftun_budget_t *budget,
   uint8_t *data = NULL;
   size_t length;
   size_t offset = 0u;
-  int descriptor = -1;
+  ftun_handle_t descriptor = -1;
   ftun_reservation_t descriptor_reservation = (ftun_reservation_t){0};
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_budget_resources_t resources = {0u, 1u, 0u};
@@ -197,9 +197,9 @@ static ftun_status_t ftun_core_reload_read_file(ftun_budget_t *budget,
 
 done:
   if (descriptor >= 0) (void)ftun_file_close(descriptor);
-  (void)ftun_reservation_release(&descriptor_reservation);
+  ftun_reservation_release(&descriptor_reservation);
   free(data);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -281,7 +281,7 @@ static ftun_status_t ftun_proxy_support_prepare(
       status = ftun_runtime_prepare_detached(config, NULL, &runtime);
     }
     free(file);
-    (void)ftun_reservation_release(&file_reservation);
+    ftun_reservation_release(&file_reservation);
     {
       ftun_status_t cleanup = ftun_frs_view_release(&view);
       attachment->cleanup_view = view;
@@ -423,10 +423,8 @@ static ftun_status_t ftun_proxy_support_release(ftun_core_t *core,
   free(attachment->group_records);
   attachment->group_records = NULL;
   attachment->group_record_capacity = 0u;
-  status = ftun_reservation_release(&attachment->records_reservation);
-  if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&attachment->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&attachment->records_reservation);
+  ftun_reservation_release(&attachment->reservation);
   free(attachment);
   *attachment_ptr = NULL;
   return FTUN_OK;
@@ -532,8 +530,8 @@ static ftun_status_t ftun_proxy_support_state_job(
 done:
   free(input);
   free(captured);
-  (void)ftun_reservation_release(&reservation);
-  (void)ftun_reservation_release(&captured_reservation);
+  ftun_reservation_release(&reservation);
+  ftun_reservation_release(&captured_reservation);
   return status;
 }
 
@@ -615,7 +613,7 @@ static ftun_status_t ftun_proxy_support_publish_job(
   status = ftun_budget_reserve(transaction->budget, input_length, &reservation);
   if (status != FTUN_OK) return status;
   input = (uint8_t *)malloc(input_length);
-  if (input == NULL) { (void)ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  if (input == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
   work = (ftun_core_reload_publish_work_t *)input;
   memset(work, 0, sizeof(*work));
   work->magic = FTUN_CORE_RELOAD_PUBLISH_MAGIC;

@@ -259,7 +259,7 @@ static void release_in_callback(consumer_state_t *state,
       memset(data, 0xee, packet.length);
       if (packet.data[0] != first) state->release_errors++;
     }
-    if (ftun_buffer_release(&other) != FTUN_OK) state->release_errors++;
+    ftun_buffer_release(&other);
   }
   state->release_checks++;
 }
@@ -571,7 +571,7 @@ static int test_path_contract(void)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }
@@ -669,7 +669,7 @@ static int test_callback_packet_borrow(void)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

@@ -291,14 +291,14 @@ ftun_status_t ftun_session_submit(ftun_core_t *core,
   }
   session = (ftun_session_t *)calloc(1u, accounted_bytes);
   if (session == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     (void)ftun_runtime_release(&runtime);
     return FTUN_E_LIMIT;
   }
   status = ftun_stream_retain(inbound);
   if (status != FTUN_OK) {
     free(session);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     (void)ftun_runtime_release(&runtime);
     return status;
   }
@@ -532,14 +532,12 @@ ftun_status_t ftun_session_destroy(ftun_session_t **session)
   if (owned == NULL) return FTUN_OK;
   if (owned->state != FTUN_SESSION_CLOSED ||
       owned->pending_operation != NULL) return FTUN_E_AGAIN;
-  status = ftun_stream_release(&owned->inbound);
-  if (status != FTUN_OK) return status;
+  ftun_stream_release(&owned->inbound);
   status = ftun_runtime_release(&owned->runtime);
   if (status != FTUN_OK) return status;
   reservation = owned->reservation;
   owned->reservation = (ftun_reservation_t){0};
-  status = ftun_reservation_release(&reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&reservation);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *session = NULL;

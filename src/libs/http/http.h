@@ -2,11 +2,14 @@
 #define FTUN_LIBS_HTTP_HTTP_H
 
 #include "core/limits.h"
+#include "libs/transport/protocol.h"
 #include "libs/resolver/control.h"
 #include "util/types.h"
 
 typedef struct {
   ftun_budget_t *budget;
+  /* 可选长寿命 context 槽；同一 worker 串行使用，全部任务退场后由 owner 销毁。 */
+  ftun_tls_context_t **tls_context;
   ftun_string_t url;
   ftun_endpoint_t proxy;
   char proxy_domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
@@ -22,6 +25,7 @@ typedef struct {
   bool allow_system_resolver;
   ftun_control_resolver_plan_t resolver;
   bool use_proxy;
+  const ftun_transport_protocol_t *protocol;
 } ftun_http_fetch_spec_t;
 
 typedef struct {

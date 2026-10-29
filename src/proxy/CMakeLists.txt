@@ -12,6 +12,7 @@ set(ftun_sources_proxy
   listener.c
   maintenance.c
   module.c
+  outbound/connector.c
   outbound/direct.c
   outbound/group/health.c
   outbound/group/url_test.c
@@ -58,7 +59,7 @@ if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
     netstack/lwip_adapter.c
 )
 endif()
-ftun_add_layer(proxy ftun_lib_resolver ftun_lib_transport ftun_lib_http ftun_lib_tls ftun_lib_buffer ftun_core)
+ftun_add_layer(proxy ftun_proxy_protocol ftun_lib_resolver ftun_lib_transport ftun_lib_http ftun_lib_tls ftun_lib_buffer ftun_core)
 if(TARGET ftun_lib_tun)
   target_link_libraries(ftun_proxy PUBLIC ftun_lib_tun)
 endif()

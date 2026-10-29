@@ -1,5 +1,5 @@
 #include "proxy/inbound/http_codec.h"
-#include "libs/transport/socks5_codec.h"
+#include "proxy/protocol/socks5_codec.h"
 #include "proxy/sniff/sniff.h"
 
 #if defined(FTUN_TEST_DNS)

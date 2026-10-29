@@ -121,41 +121,41 @@ static int admission(void)
   CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &base) == FTUN_OK);
   CHECK(ftun_event_loop_create_with_capacity(core, 8u, &loop) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &front) == FTUN_OK && front.used > base.used &&
+  CHECK(ftun_budget_get_usage(budget, &front) == FTUN_OK && front.used_resources.memory_bytes > base.used_resources.memory_bytes &&
     front.used_resources.queue_slots == 256u && front.used_resources.descriptors == 0u);
   CHECK(ftun_event_loop_create(core, &rejected) == FTUN_E_LIMIT && rejected == NULL);
   CHECK(ftun_budget_reserve_resources(budget, (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
   CHECK(ftun_event_backend_attach(loop) == FTUN_E_LIMIT && fd_count() == baseline);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_native = true;
   CHECK(ftun_event_backend_attach(loop) == FTUN_E_LIMIT);
   fail_native = false;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == front.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == front.used_resources.memory_bytes &&
     usage.used_resources.descriptors == 0u);
   CHECK(ftun_event_loop_set_wakeup(loop, wakeup, NULL) == FTUN_OK);
   CHECK(ftun_event_backend_attach(loop) == FTUN_E_AGAIN && fd_count() == baseline);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == front.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == front.used_resources.memory_bytes &&
     usage.used_resources.descriptors == 0u);
   CHECK(ftun_event_loop_set_wakeup(loop, NULL, NULL) == FTUN_OK);
   CHECK(ftun_event_backend_attach(loop) == FTUN_OK && fd_count() == baseline + 2u);
-  CHECK(ftun_budget_get_usage(budget, &attached) == FTUN_OK && attached.used > front.used &&
+  CHECK(ftun_budget_get_usage(budget, &attached) == FTUN_OK && attached.used_resources.memory_bytes > front.used_resources.memory_bytes &&
     attached.used_resources.descriptors == 2u);
   CHECK(ftun_event_backend_attach(loop) == FTUN_E_AGAIN);
   CHECK(ftun_event_task_start(loop, ready, NULL, &task) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
-  source_bytes = usage.used - attached.used;
+  source_bytes = usage.used_resources.memory_bytes - attached.used_resources.memory_bytes;
   CHECK(source_bytes > 0u && usage.used_resources.queue_slots == 257u);
   CHECK(ftun_event_source_cancel(&task) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == attached.used);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available - source_bytes, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == attached.used_resources.memory_bytes);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes - source_bytes, &hold) == FTUN_OK);
   /* 聚合 timer 不逐个分配 native watcher；相同余量的 IO 仍应回滚两层。 */
   CHECK(ftun_event_timer_start(loop, UINT64_MAX, ready, NULL, &timer) == FTUN_OK);
   CHECK(ftun_event_source_cancel(&timer) == FTUN_OK);
   CHECK(pipe(descriptors) == 0);
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)descriptors[0], FTUN_EVENT_READ, ready, NULL, &io) == FTUN_E_LIMIT && io == NULL);
   CHECK(ftun_event_loop_get_usage(loop, &events) == FTUN_OK && events.source_count == 0u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == attached.used &&
+  ftun_reservation_release(&hold);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == attached.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == 256u);
   CHECK(ftun_event_task_start(loop, ready, NULL, &task) == FTUN_OK);
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)descriptors[0], FTUN_EVENT_READ, ready, NULL, &io) == FTUN_OK);
@@ -174,10 +174,10 @@ static int admission(void)
     usage.used_resources.queue_slots == 258u);
   CHECK(ftun_event_source_cancel(&task) == FTUN_OK && ftun_event_source_cancel(&io) == FTUN_OK);
   CHECK(ftun_event_backend_detach(loop) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == front.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == front.used_resources.memory_bytes &&
     usage.used_resources.descriptors == 0u && usage.used_resources.queue_slots == 256u);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == 0u);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
@@ -198,11 +198,11 @@ static int budget_domains(void)
   CHECK(ftun_event_loop_create_with_budget(core, foreign, 8u, &loop) == FTUN_E_INVALID && loop == NULL);
   CHECK(ftun_event_loop_create_with_budget(core, data, 8u, &loop) == FTUN_OK);
   CHECK(ftun_event_loop_budget(loop, &bound) == FTUN_OK && bound == data);
-  CHECK(ftun_budget_get_usage(data, &usage) == FTUN_OK && usage.used > 0u &&
+  CHECK(ftun_budget_get_usage(data, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 0u &&
     usage.used_resources.queue_slots == 256u);
   CHECK(ftun_budget_destroy(&data) == FTUN_E_AGAIN);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK && ftun_event_loop_destroy(&loop) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(data, &usage) == FTUN_OK && usage.used == 0u &&
+  CHECK(ftun_budget_get_usage(data, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u &&
     usage.used_resources.queue_slots == 0u);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&foreign) == FTUN_OK && ftun_budget_destroy(&data) == FTUN_OK);
@@ -228,31 +228,31 @@ static int shared_fd_admission(void)
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)fd, FTUN_EVENT_READ, ready, NULL, &first) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &single) == FTUN_OK);
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)fd, FTUN_EVENT_READ, ready, NULL, &second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &duplicate) == FTUN_OK && duplicate.used > single.used);
-  member_bytes = duplicate.used - single.used;
+  CHECK(ftun_budget_get_usage(budget, &duplicate) == FTUN_OK && duplicate.used_resources.memory_bytes > single.used_resources.memory_bytes);
+  member_bytes = duplicate.used_resources.memory_bytes - single.used_resources.memory_bytes;
   CHECK(ftun_event_source_cancel(&second) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == single.used);
-  CHECK(ftun_budget_reserve(budget, usage.normal_available - member_bytes, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == single.used_resources.memory_bytes);
+  CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes - member_bytes, &hold) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &single) == FTUN_OK);
   /* source与member可分配，但新FD的group额度不足；失败不留下索引或额度。 */
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)other, FTUN_EVENT_READ, ready, NULL, &rejected) == FTUN_E_LIMIT && rejected == NULL);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == single.used &&
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == single.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == single.used_resources.queue_slots);
   CHECK(ftun_event_io_start(loop, (ftun_native_socket_t)fd, FTUN_EVENT_READ, ready, NULL, &second) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &duplicate) == FTUN_OK);
   fail_cancel = true;
   CHECK(ftun_event_source_cancel(&first) == FTUN_E_STATE_CORRUPT && first != NULL);
   fail_cancel = false;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == duplicate.used);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == duplicate.used_resources.memory_bytes);
   CHECK(ftun_event_source_cancel(&first) == FTUN_OK);
   CHECK(ftun_event_source_cancel(&second) == FTUN_OK);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == base.used &&
+  ftun_reservation_release(&hold);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes &&
     usage.used_resources.queue_slots == base.used_resources.queue_slots);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
   CHECK(ftun_event_backend_detach(loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(close(fd) == 0 && close(other) == 0);
   return 0;

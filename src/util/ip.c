@@ -8,9 +8,9 @@
  * 许可原文及原始源码见 third_party/musl。 */
 static int hexval(unsigned c)
 {
-  if (c-'0'<10) return c-'0';
+  if (c-'0'<10) return (int)(c-'0');
   c |= 32;
-  if (c-'a'<6) return c-'a'+10;
+  if (c-'a'<6) return (int)(c-'a'+10);
   return -1;
 }
 
@@ -29,10 +29,10 @@ static int parse_ipv6(const char *s, uint8_t *a)
       if (i==7) return 0;
       continue;
     }
-    for (v=j=0; j<4 && (d=hexval(s[j]))>=0; j++)
+    for (v=j=0; j<4 && (d=hexval((unsigned char)s[j]))>=0; j++)
       v=16*v+d;
     if (j==0) return 0;
-    ip[i&7] = v;
+    ip[i&7] = (uint16_t)v;
     if (!s[j] && (brk>=0 || i==7)) break;
     if (i==7) return 0;
     if (s[j]!=':') {
@@ -45,12 +45,12 @@ static int parse_ipv6(const char *s, uint8_t *a)
     s += j+1;
   }
   if (brk>=0) {
-    memmove(ip+brk+7-i, ip+brk, 2*(i+1-brk));
+    memmove(ip+brk+7-i, ip+brk, (size_t)(2*(i+1-brk)));
     for (j=0; j<7-i; j++) ip[brk+j] = 0;
   }
   for (j=0; j<8; j++) {
-    *a++ = ip[j]>>8;
-    *a++ = ip[j];
+    *a++ = (uint8_t)(ip[j]>>8);
+    *a++ = (uint8_t)ip[j];
   }
   if (need_v4 && !ftun_ipv4_parse(s, strlen(s), a-4)) return 0;
   return 1;
@@ -76,13 +76,13 @@ static const char *format_ipv6(const uint8_t *a, char *s, size_t l)
     /* 压缩最长的连续零块，长度相同则保留最先出现者。 */
     for (i=best=0, max=2; buf[i]; i++) {
       if (i && buf[i] != ':') continue;
-      j = strspn(buf+i, ":0");
+      j = (int)strspn(buf+i, ":0");
 
       if (j>max+(best==0)) best=i, max=j;
     }
     if (max>3) {
       buf[best] = buf[best+1] = ':';
-      memmove(buf+best+2, buf+best+max, i-best-max+1);
+      memmove(buf+best+2, buf+best+max, (size_t)(i-best-max+1));
     }
     if (strlen(buf) < l) {
       strcpy(s, buf);

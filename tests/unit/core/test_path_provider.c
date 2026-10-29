@@ -319,7 +319,7 @@ static int slice(fixture_t *fixture, ftun_buffer_slice_t *out)
   CHECK(ftun_buffer_data(buffer, &data, &capacity) == FTUN_OK && capacity >= 8u);
   memcpy(data, "ab\0defgh", 8u);
   CHECK(ftun_buffer_slice(buffer, 0u, 8u, out) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_release(&buffer);
   return 0;
 }
 
@@ -353,7 +353,7 @@ static int stream_exchange(fixture_t *fixture, ftun_path_t *path, channel_t *cha
     CHECK(ftun_stream_write_complete(channel->write, success) == FTUN_OK);
     CHECK(dispatch(fixture, 1u) == 0);
   }
-  CHECK(ftun_buffer_slice_release(&bytes) == FTUN_OK);
+  ftun_buffer_slice_release(&bytes);
   CHECK(ftun_stream_read(stream, received, sizeof(received), &read_length) == FTUN_OK &&
         read_length == 8u && memcmp(received, "ab\0defgh", 8u) == 0);
   CHECK(channel->completions == 3u && channel->cancelled == 0u);
@@ -369,14 +369,14 @@ static int cleanup(fixture_t *fixture)
   for (index = 0u; index < fixture->channel_count; index++) {
     CHECK(fixture->channels[index].destroyed == 1u);
   }
-  CHECK(ftun_network_view_release(&fixture->views[0]) == FTUN_OK);
-  CHECK(ftun_network_view_release(&fixture->views[1]) == FTUN_OK);
+  ftun_network_view_release(&fixture->views[0]);
+  ftun_network_view_release(&fixture->views[1]);
   CHECK(ftun_buffer_pool_destroy(&fixture->pool) == FTUN_OK);
   CHECK(ftun_event_loop_stop(fixture->loop) == FTUN_OK);
   CHECK(ftun_event_loop_destroy(&fixture->loop) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&fixture->operations) == FTUN_OK);
   CHECK(ftun_core_context_destroy(&fixture->core) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(fixture->budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&fixture->budget) == FTUN_OK);
   return 0;
 }
@@ -423,9 +423,9 @@ static int test_stream_reload_and_identity(void)
   CHECK(ftun_dial_authorize(&request.dial, &decision) == FTUN_E_CANCELLED);
   CHECK(ftun_path_provider_open_channel(fixture.provider, fixture.core, 8u,
         &request, &operation) == FTUN_E_CANCELLED && operation == NULL);
-  CHECK(ftun_network_view_release(&fixture.views[0]) == FTUN_OK);
+  ftun_network_view_release(&fixture.views[0]);
   CHECK(ftun_path_destroy(&first.path) == FTUN_E_AGAIN);
-  CHECK(ftun_path_release(&retained) == FTUN_OK);
+  ftun_path_release(&retained);
   CHECK(ftun_path_destroy(&first.path) == FTUN_OK);
   CHECK(ftun_path_provider_get_info(fixture.provider, &provider_info) == FTUN_OK &&
         provider_info.pending == 0u && provider_info.paths == 1u);
@@ -469,7 +469,7 @@ static int test_datagram_late_and_revoke(void)
   CHECK(ftun_path_datagram(second.path, &datagram) == FTUN_OK);
   CHECK(slice(&fixture, &payload) == 0);
   CHECK(ftun_packet_init(&packet, &payload, 17u) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&payload) == FTUN_OK);
+  ftun_buffer_slice_release(&payload);
   CHECK(ftun_datagram_send(datagram, &request.dial.endpoint, &packet) == FTUN_OK);
   CHECK(ftun_datagram_send(datagram, &request.dial.endpoint, &packet) == FTUN_E_LIMIT);
   CHECK(ftun_datagram_send_view(channel->send, &target, &pending) == FTUN_OK &&
@@ -488,7 +488,7 @@ static int test_datagram_late_and_revoke(void)
   CHECK(ftun_path_provider_revoke_network(fixture.provider, fixture.views[1]) == FTUN_OK);
   CHECK(channel->completions == 2u && channel->cancelled == 1u);
   CHECK(ftun_datagram_send_complete(late, success) == FTUN_E_STALE);
-  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+  ftun_packet_release(&packet);
   CHECK(ftun_path_destroy(&second.path) == FTUN_OK);
   CHECK(first.failures == 0u && second.failures == 0u);
   CHECK(cleanup(&fixture) == 0);
@@ -514,13 +514,13 @@ static int test_admission_and_bad_factory(void)
   fixture.mode = 3;
   CHECK(ftun_path_provider_open_channel(fixture.provider, fixture.core, 7u,
         &request, &operation) == FTUN_E_STATE_CORRUPT && operation == NULL);
-  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK && after.used == before.used);
+  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes);
   fixture.mode = 2;
   CHECK(ftun_path_provider_open_channel(fixture.provider, fixture.core, 7u,
         &request, &operation) == FTUN_E_STATE_CORRUPT && operation == NULL);
   CHECK(ftun_path_provider_get_info(fixture.provider, &info) == FTUN_OK && info.pending == 1u);
   CHECK(dispatch(&fixture, 1u) == 0 && completion.calls == 0u);
-  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK && after.used == before.used);
+  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes);
   fixture.mode = 0;
   CHECK(ftun_path_provider_open_channel(fixture.provider, fixture.core, 7u,
         &request, &operation) == FTUN_OK);
@@ -599,7 +599,7 @@ static int test_stop_pending_stream(void)
   CHECK(slice(&fixture, &payload) == 0);
   CHECK(ftun_stream_write_ref(stream, &payload, &accepted, &operation) == FTUN_OK &&
         accepted == 3u);
-  CHECK(ftun_buffer_slice_release(&payload) == FTUN_OK);
+  ftun_buffer_slice_release(&payload);
   late = fixture.channels[0].write;
   fixture.channels[0].cancel_status = FTUN_E_AGAIN;
   CHECK(ftun_path_provider_stop_until(fixture.provider, 1u) == FTUN_E_TIMEOUT);

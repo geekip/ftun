@@ -123,12 +123,12 @@ ftun_status_t ftun_event_loop_create_with_budget(
   }
   loop = (ftun_event_loop_t *)calloc(1u, allocation_size);
   if (loop == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   if (ftun_mutex_init(&loop->mutex) != FTUN_OK) {
     free(loop);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   loop->core = core;
@@ -262,7 +262,7 @@ static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
   }
   source = (ftun_event_source_t *)calloc(1u, sizeof(*source));
   if (source == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   source->reservation = reservation;
@@ -284,7 +284,7 @@ static void ftun_event_source_free(ftun_event_source_t *source)
 {
   ftun_reservation_t reservation = source->reservation;
   free(source);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void ftun_event_source_unlink(ftun_event_source_t *source)
@@ -877,7 +877,7 @@ ftun_status_t ftun_event_loop_destroy(ftun_event_loop_t **loop)
   owned->core = NULL;
   reservation = owned->reservation;
   free(owned);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   *loop = NULL;
   return FTUN_OK;
 }

@@ -5,6 +5,7 @@
 #include "app/config/compile.h"
 #include "app/config/model.h"
 #include "proxy/runtime.c"
+#include "proxy/protocol/socks5.h"
 #include "app/config/parser.h"
 #include "core/event/backend.h"
 #include "proxy/inbound/socks5.h"
@@ -23,6 +24,24 @@ static size_t http_job_calls;
 static bool http_job_failed;
 static bool health_reject_submit;
 static size_t health_submit_calls;
+static bool handoff_probe, handoff_seen;
+static size_t handoff_calls;
+static ftun_tls_context_t **handoff_slot;
+ftun_status_t __real_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
+  ftun_http_fetch_result_t *out);
+ftun_status_t __wrap_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
+  ftun_http_fetch_result_t *out)
+{
+  if (!handoff_probe) return __real_ftun_http_fetch(spec, out);
+  handoff_calls++;
+  handoff_seen = spec->tls_context == handoff_slot &&
+    spec->protocol == &ftun_socks5_protocol && spec->use_proxy &&
+    spec->proxy.port == 1080u && spec->proxy_username.length == 1u &&
+    spec->proxy_username.data[0] == 'u';
+  memset(out, 0, sizeof(*out));
+  return handoff_seen ? FTUN_E_IO : FTUN_E_STATE_CORRUPT;
+}
+
 ftun_status_t __real_ftun_worker_submit(ftun_worker_t *worker,
   const ftun_worker_job_t *job, ftun_worker_completion_fn callback,
   void *user, ftun_operation_t **out);
@@ -32,6 +51,14 @@ ftun_status_t __wrap_ftun_worker_submit(ftun_worker_t *worker,
 {
   ftun_budget_usage_t usage;
   const ftun_proxy_runtime_http_work_t *header;
+  if (handoff_probe) {
+    uint8_t result[sizeof(ftun_proxy_runtime_http_result_t) + FTUN_PROXY_RUNTIME_HTTP_ETAG_BYTES + 8u];
+    size_t size = SIZE_MAX;
+    ftun_status_t status = job->execute(job->input, result, sizeof(result), &size);
+    *out = NULL;
+    return size == sizeof(ftun_proxy_runtime_http_result_t)
+      ? status : FTUN_E_STATE_CORRUPT;
+  }
   if (health_reject_submit) {
     health_submit_calls++;
     *out = NULL;
@@ -47,7 +74,7 @@ ftun_status_t __wrap_ftun_worker_submit(ftun_worker_t *worker,
       header->budget != (uintptr_t)http_job_budget || job->accounted_extra != 0u ||
       job->input_cleanup == NULL || job->result_cleanup == NULL ||
       ftun_budget_get_usage(http_job_budget, &usage) != FTUN_OK ||
-      usage.used != job->input.length) http_job_failed = true;
+      usage.used_resources.memory_bytes != job->input.length) http_job_failed = true;
   *out = NULL;
   return FTUN_E_LIMIT;
 }
@@ -74,7 +101,7 @@ void *__wrap_calloc(size_t count, size_t size)
 static int memory(ftun_budget_t *budget, size_t expected)
 {
   ftun_budget_usage_t usage;
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == expected);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == expected);
   return 0;
 }
 
@@ -110,11 +137,42 @@ static int http_input(void)
     http_unused, NULL, &operation) == FTUN_E_LIMIT);
   CHECK(fail_calloc_bytes == 0u && http_job_calls == 1u && memory(engine.budget, 0u) == 0);
   CHECK(ftun_budget_get_usage(engine.budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_proxy_runtime_http_submit(&engine, &spec, false, NULL,
     http_unused, NULL, &operation) == FTUN_E_LIMIT);
-  CHECK(http_job_calls == 1u && ftun_reservation_release(&hold) == FTUN_OK);
+  CHECK(http_job_calls == 1u); ftun_reservation_release(&hold);
   http_job_budget = NULL;
+  CHECK(ftun_budget_destroy(&engine.budget) == FTUN_OK);
+  return 0;
+}
+
+/* 提交、序列化和 worker 重建必须保留 owner 的 context 槽与协议实现。 */
+static int http_handoff(void)
+{
+  const char url[] = "https://localhost/probe";
+  ftun_proxy_runtime_t engine = {0};
+  ftun_http_fetch_spec_t spec = {0};
+  ftun_operation_t *operation = NULL;
+  size_t i;
+  CHECK(ftun_budget_create(NULL, 512u * 1024u, 0u, &engine.budget) == FTUN_OK);
+  spec.budget = engine.budget;
+  spec.url = (ftun_string_t){url, sizeof(url) - 1u};
+  spec.maximum_bytes = 8u;
+  spec.deadline_ms = UINT64_MAX;
+  spec.use_proxy = true;
+  spec.proxy.kind = FTUN_ADDRESS_IPV4;
+  spec.proxy.port = 1080u;
+  spec.proxy_username = (ftun_string_t){"u", 1u};
+  spec.proxy_password = (ftun_string_t){"p", 1u};
+  spec.protocol = &ftun_socks5_protocol;
+  handoff_slot = &engine.http_tls_context;
+  handoff_probe = true;
+  for (i = 1u; i <= 2u; i++) {
+    CHECK(ftun_proxy_runtime_http_submit(&engine, &spec, false, NULL,
+      http_unused, NULL, &operation) == FTUN_E_IO);
+    CHECK(operation == NULL && handoff_seen && handoff_calls == i && memory(engine.budget, 0u) == 0);
+  }
+  handoff_probe = false;
   CHECK(ftun_budget_destroy(&engine.budget) == FTUN_OK);
   return 0;
 }
@@ -148,7 +206,7 @@ static int users(void)
   CHECK(ftun_budget_reserve(budget, 65536u, &hold) == FTUN_OK);
   CHECK(ftun_proxy_runtime_build_inbound_spec(&flow, &config, &spec, &copy,
     &reservation) == FTUN_E_LIMIT && copy == NULL && (reservation).budget == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_calloc_bytes = 2u * sizeof(*copy);
   CHECK(ftun_proxy_runtime_build_inbound_spec(&flow, &config, &spec, &copy,
     &reservation) == FTUN_E_LIMIT && copy == NULL && (reservation).budget == NULL);
@@ -157,10 +215,10 @@ static int users(void)
     &reservation) == FTUN_OK);
   CHECK(memory(budget, 2u * sizeof(*copy)) == 0);
   CHECK(ftun_socks5_server_create(&spec, &server) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used > 2u * sizeof(*copy));
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > 2u * sizeof(*copy));
   free(copy);
-  CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
-  CHECK(memory(budget, usage.used - 2u * sizeof(*copy)) == 0);
+  ftun_reservation_release(&reservation);
+  CHECK(memory(budget, usage.used_resources.memory_bytes - 2u * sizeof(*copy)) == 0);
   CHECK(ftun_socks5_server_destroy(&server) == FTUN_OK && memory(budget, 0u) == 0);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -193,17 +251,17 @@ static int health_scratch(void)
     &engine.health_slot_count, &engine.health_reservation) == FTUN_OK);
   CHECK(engine.health_slot_count == 1u && engine.health_group_count == 1u);
   CHECK(ftun_budget_get_usage(engine.budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_proxy_runtime_health_publish(engine.health_slots, 100u) == FTUN_E_LIMIT);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK && memory(engine.budget, usage.used) == 0);
+  ftun_reservation_release(&hold); CHECK(memory(engine.budget, usage.used_resources.memory_bytes) == 0);
   fail_calloc_bytes = sizeof(uint32_t);
   CHECK(ftun_proxy_runtime_health_publish(engine.health_slots, 100u) == FTUN_E_LIMIT);
-  CHECK(fail_calloc_bytes == 0u && memory(engine.budget, usage.used) == 0);
+  CHECK(fail_calloc_bytes == 0u && memory(engine.budget, usage.used_resources.memory_bytes) == 0);
   fail_calloc_bytes = sizeof(ftun_health_sample_t);
   CHECK(ftun_proxy_runtime_health_publish(engine.health_slots, 100u) == FTUN_E_LIMIT);
-  CHECK(fail_calloc_bytes == 0u && memory(engine.budget, usage.used) == 0);
+  CHECK(fail_calloc_bytes == 0u && memory(engine.budget, usage.used_resources.memory_bytes) == 0);
   CHECK(ftun_proxy_runtime_health_publish(engine.health_slots, 100u) == FTUN_OK);
-  CHECK(memory(engine.budget, usage.used) == 0);
+  CHECK(memory(engine.budget, usage.used_resources.memory_bytes) == 0);
   {
     ftun_proxy_runtime_health_slot_t *slot = engine.health_slots;
     ftun_proxy_runtime_health_group_t *group = engine.health_groups;
@@ -244,7 +302,7 @@ static int health_scratch(void)
     slot->schedule.next_due_ms = 1u;
     CHECK(ftun_proxy_runtime_next_deadline(&engine, &deadline, &present) == FTUN_OK &&
       present && deadline == 1u);
-    CHECK(memory(engine.budget, usage.used) == 0);
+    CHECK(memory(engine.budget, usage.used_resources.memory_bytes) == 0);
   }
   CHECK(ftun_proxy_runtime_health_release(&engine.health_groups, &engine.health_slots,
     engine.health_slot_count, &engine.health_reservation) == FTUN_OK);
@@ -344,7 +402,7 @@ static int flow_admission(void)
   for (iteration = 0u; iteration < 3u; iteration++) {
     size_t available = iteration == 0u ? 1u : 12u * 1024u;
     CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) == 0);
-    CHECK(ftun_budget_reserve(budget, baseline.normal_available - available, &hold) == FTUN_OK);
+    CHECK(ftun_budget_reserve(budget, baseline.normal_available_resources.memory_bytes - available, &hold) == FTUN_OK);
     if (iteration == 0u) {
       CHECK(ftun_proxy_runtime_flow_create(&engine, &listener, pair[0], NULL) == FTUN_E_LIMIT);
       CHECK(fcntl(pair[0], F_GETFD) < 0 && errno == EBADF);
@@ -355,13 +413,13 @@ static int flow_admission(void)
       CHECK(flow != NULL && flow->active && flow->protocol != NULL);
       CHECK(ftun_budget_get_usage(flow->budget, &usage) == FTUN_OK &&
         usage.used_resources.queue_slots == 1u);
-      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used <= baseline.used +
-        baseline.normal_available);
+      CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes <= baseline.used_resources.memory_bytes +
+        baseline.normal_available_resources.memory_bytes);
       CHECK(ftun_proxy_runtime_flow_finalize(flow) == FTUN_OK);
       CHECK(fcntl(pair[0], F_GETFD) < 0 && errno == EBADF);
     }
     CHECK(close(pair[1]) == 0);
-    CHECK(ftun_reservation_release(&hold) == FTUN_OK && memory(budget, baseline.used) == 0);
+    ftun_reservation_release(&hold); CHECK(memory(budget, baseline.used_resources.memory_bytes) == 0);
     CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
       usage.child_count == baseline.child_count &&
       usage.used_resources.descriptors == baseline.used_resources.descriptors &&
@@ -609,9 +667,9 @@ static int publish_budget(void)
     CHECK(publish_callbacks == 1u && publish_result.status ==
       (round == 0u ? FTUN_E_LIMIT : FTUN_OK));
     CHECK(publish_result.reached == (round == 0u ? 0u : FTUN_FILE_STAGE_DIRECTORY_SYNCED));
-    CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+    ftun_reservation_release(&hold);
     CHECK(ftun_budget_get_usage(engine.budget, &after) == FTUN_OK &&
-      after.used == before.used && after.metadata_bytes == before.metadata_bytes &&
+      after.used_resources.memory_bytes == before.used_resources.memory_bytes && after.metadata_bytes == before.metadata_bytes &&
       after.used_resources.descriptors == before.used_resources.descriptors &&
       after.used_resources.queue_slots == before.used_resources.queue_slots);
     file = open(path, O_RDONLY);
@@ -711,7 +769,7 @@ static int publish_ownership(void)
             value == (round == 0u ? 1u : 2u));
     }
     CHECK(strcmp(engine.frs_etag, round == 0u ? "old" : "candidate") == 0);
-    CHECK(memory(engine.budget, baseline.used + (round == 0u ? 4u : 10u)) == 0);
+    CHECK(memory(engine.budget, baseline.used_resources.memory_bytes + (round == 0u ? 4u : 10u)) == 0);
   }
   CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK);
   CHECK(ftun_resolver_provider_stop_until(engine.resolver_provider, UINT64_MAX) == FTUN_OK);
@@ -813,10 +871,10 @@ static int etags(void)
   CHECK(ftun_proxy_runtime_replace_etag(&engine, old, sizeof(old) - 1u) == FTUN_OK);
   CHECK(memory(engine.budget, sizeof(old)) == 0);
   CHECK(ftun_budget_get_usage(engine.budget, &usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(engine.budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_proxy_runtime_replace_etag(&engine, next, sizeof(next) - 1u) == FTUN_E_LIMIT);
   CHECK(strcmp(engine.frs_etag, "old") == 0);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_malloc_bytes = sizeof(next);
   CHECK(ftun_proxy_runtime_replace_etag(&engine, next, sizeof(next) - 1u) == FTUN_E_LIMIT);
   CHECK(fail_malloc_bytes == 0u && strcmp(engine.frs_etag, "old") == 0 && memory(engine.budget, sizeof(old)) == 0);
@@ -825,7 +883,7 @@ static int etags(void)
   CHECK(memory(engine.budget, sizeof(old) + sizeof(next)) == 0);
   free(engine.frs_candidate_etag);
   engine.frs_candidate_etag = NULL;
-  CHECK(ftun_reservation_release(&engine.frs_candidate_etag_reservation) == FTUN_OK);
+  ftun_reservation_release(&engine.frs_candidate_etag_reservation);
   CHECK(ftun_proxy_runtime_replace_etag(&engine, next, sizeof(next) - 1u) == FTUN_OK);
   CHECK(strcmp(engine.frs_etag, "new-etag") == 0 && memory(engine.budget, sizeof(next)) == 0);
   CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK && engine.frs_etag == NULL);
@@ -855,7 +913,7 @@ static int fakeip_path(void)
   CHECK(ftun_budget_reserve(budget, 1024u, &hold) == FTUN_OK);
   CHECK(ftun_proxy_runtime_fakeip_prepare(engine, &config) == FTUN_E_LIMIT);
   CHECK(engine->fakeip_directory == NULL && (engine->fakeip_directory_reservation).budget == NULL);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   fail_malloc_bytes = bytes;
   CHECK(ftun_proxy_runtime_fakeip_prepare(engine, &config) == FTUN_E_LIMIT);
   CHECK(fail_malloc_bytes == 0u && memory(budget, 0u) == 0);
@@ -894,8 +952,8 @@ static int pending_tokens(void)
   CHECK(ftun_buffer_pool_acquire(pool, 1u, &buffer) == FTUN_OK);
   CHECK(ftun_buffer_slice(buffer, 0u, 1u, &slice) == FTUN_OK);
   CHECK(ftun_packet_init(&packet, &slice, 1u) == FTUN_OK);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
   slot.active = slot.ready = true;
   slot.remote.kind = FTUN_ADDRESS_IPV4;
@@ -922,8 +980,8 @@ static int pending_tokens(void)
   CHECK(ftun_datagram_stop(slot.channel) == FTUN_OK && slot.pending_count == 0u);
   CHECK(ftun_datagram_destroy(&slot.channel) == FTUN_OK && !slot.active);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
-    usage.used == baseline.used && usage.used_resources.queue_slots == 0u);
-  CHECK(ftun_packet_release(&packet) == FTUN_OK);
+    usage.used_resources.memory_bytes == baseline.used_resources.memory_bytes && usage.used_resources.queue_slots == 0u);
+  ftun_packet_release(&packet);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -958,7 +1016,7 @@ static int blocked_pool_work(void)
   CHECK(ftun_proxy_slot_pool_create(engine.budget, sizeof(ftun_proxy_runtime_udp_slot_t), 1u, 1u, 0u, &engine.udp_pool) == FTUN_OK);
   CHECK(ftun_proxy_slot_pool_create(engine.budget, sizeof(ftun_proxy_runtime_udp_pending_t), 1u, 1u, 0u, &engine.udp_pending_pool) == FTUN_OK);
   CHECK(ftun_budget_get_usage(engine.budget, &budget_usage) == FTUN_OK);
-  CHECK(ftun_budget_reserve(engine.budget, budget_usage.normal_available, &hold) == FTUN_OK);
+  CHECK(ftun_budget_reserve(engine.budget, budget_usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   CHECK(ftun_buffer_pool_wait(engine.relay_pool, 65536u, pool_work_unexpected, &calls, &token) == FTUN_OK);
   CHECK(ftun_buffer_pool_get_usage(engine.relay_pool, &before) == FTUN_OK);
   CHECK(ftun_proxy_runtime_run_once(&engine, false, &usage) == FTUN_OK && calls == 0u);
@@ -968,7 +1026,7 @@ static int blocked_pool_work(void)
   CHECK(engine.health_scan_work == 1u &&
     usage.work >= 1u + after.selection_steps - before.selection_steps + after.availability_probes - before.availability_probes);
   CHECK(ftun_buffer_pool_wait_cancel(&token) == FTUN_OK);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_proxy_slot_pool_destroy(&engine.flow_pool) == FTUN_OK);
   CHECK(ftun_proxy_slot_pool_destroy(&engine.udp_pool) == FTUN_OK);
   CHECK(ftun_proxy_slot_pool_destroy(&engine.udp_pending_pool) == FTUN_OK);
@@ -1068,6 +1126,7 @@ int main(void)
   CHECK(pending_tokens() == 0);
   CHECK(users() == 0);
   CHECK(http_input() == 0);
+  CHECK(http_handoff() == 0);
   CHECK(health_scratch() == 0);
   CHECK(flow_admission() == 0);
   CHECK(flow_quarantine() == 0);

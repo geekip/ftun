@@ -1,7 +1,7 @@
 #define _GNU_SOURCE 1
 
 #include <sys/types.h>
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>

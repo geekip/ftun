@@ -107,7 +107,7 @@ static ftun_status_t ftun_fakeip_add(ftun_fakeip_service_t *service,
   if (status != FTUN_OK) return status;
   copy = (char *)malloc(domain_length + 1u);
   if (copy == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   memcpy(copy, domain, domain_length);
@@ -130,7 +130,7 @@ static ftun_status_t ftun_fakeip_add(ftun_fakeip_service_t *service,
 
 fail:
   free(copy);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -257,12 +257,12 @@ fail:
     (void)ftun_index_destroy(&service->domains);
     for (cursor = 0u; cursor < service->entry_count; cursor++) {
       free(service->entries[cursor].domain);
-      (void)ftun_reservation_release(&service->entries[cursor].reservation);
+      ftun_reservation_release(&service->entries[cursor].reservation);
     }
     free(service->entries);
     free(service);
   }
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 
@@ -294,7 +294,7 @@ static ftun_status_t ftun_fakeip_handle_create(ftun_fakeip_service_t *service,
   if (status != FTUN_OK) return status;
   handle = (ftun_fakeip_handle_t *)calloc(1u, sizeof(*handle));
   if (handle == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   handle->service = service;
@@ -397,7 +397,8 @@ ftun_status_t ftun_fakeip_handle_release(ftun_fakeip_handle_t **handle)
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *handle = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_fakeip_service_snapshot(ftun_fakeip_service_t *service,
@@ -436,7 +437,7 @@ ftun_status_t ftun_fakeip_service_snapshot(ftun_fakeip_service_t *service,
   if (status != FTUN_OK) return status;
   block = (uint8_t *)calloc(1u, allocation);
   if (block == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   snapshot = (ftun_fakeip_snapshot_t *)block;
@@ -475,16 +476,15 @@ ftun_status_t ftun_fakeip_service_destroy(ftun_fakeip_service_t **service)
   for (index = 0u; index < owned->entry_count; index++) {
     ftun_reservation_t entry_reservation = owned->entries[index].reservation;
     free(owned->entries[index].domain);
-    if (ftun_reservation_release(&entry_reservation) != FTUN_OK) {
-      return FTUN_E_STATE_CORRUPT;
-    }
+    ftun_reservation_release(&entry_reservation);
   }
   reservation = owned->reservation;
   free(owned->entries);
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *service = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_fakeip_acquire(ftun_fakeip_service_t *service,

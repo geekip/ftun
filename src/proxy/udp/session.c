@@ -329,8 +329,7 @@ static ftun_status_t ftun_udp_flow_dispose(ftun_udp_flow_t *flow)
     if (status != FTUN_OK) return status;
     flow->outbound = NULL;
   }
-  status = ftun_datagram_release(&flow->inbound);
-  if (status != FTUN_OK) return status;
+  ftun_datagram_release(&flow->inbound);
   status = ftun_runtime_release(&flow->runtime);
   if (status != FTUN_OK) return status;
   ftun_udp_flow_unlink(flow);
@@ -338,7 +337,8 @@ static ftun_status_t ftun_udp_flow_dispose(ftun_udp_flow_t *flow)
   flow->reservation = (ftun_reservation_t){0};
   memset(flow, 0, sizeof(*flow));
   free(flow);
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 static void ftun_udp_flow_result(ftun_datagram_t *channel,
@@ -459,7 +459,7 @@ static ftun_status_t ftun_udp_flow_create(
   }
   flow = (ftun_udp_flow_t *)calloc(1u, sizeof(*flow));
   if (flow == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     (void)ftun_runtime_release(&runtime);
     return FTUN_E_LIMIT;
   }
@@ -470,7 +470,7 @@ static ftun_status_t ftun_udp_flow_create(
   if (status != FTUN_OK) {
     (void)ftun_runtime_release(&runtime);
     free(flow);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   flow->inbound = inbound;
@@ -497,10 +497,10 @@ static ftun_status_t ftun_udp_flow_create(
       (void)ftun_datagram_stop(outbound);
       (void)ftun_datagram_destroy(&outbound);
     }
-    (void)ftun_datagram_release(&flow->inbound);
+    ftun_datagram_release(&flow->inbound);
     (void)ftun_runtime_release(&runtime);
     free(flow);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   flow->outbound = outbound;
@@ -566,7 +566,7 @@ ftun_status_t ftun_udp_flow_table_create(
   if (status != FTUN_OK) return status;
   table = (ftun_udp_flow_table_t *)calloc(1u, sizeof(*table));
   if (table == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   table->core = spec->core;
@@ -848,5 +848,6 @@ ftun_status_t ftun_udp_flow_table_destroy(ftun_udp_flow_table_t **table)
   *table = NULL;
   memset(owned, 0, sizeof(*owned));
   free(owned);
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

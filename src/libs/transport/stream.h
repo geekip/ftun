@@ -99,7 +99,8 @@ ftun_status_t ftun_stream_shutdown_write(ftun_stream_t *stream);
 ftun_status_t ftun_stream_budget(ftun_stream_t *stream, ftun_budget_t **out);
 /* 组合器可保留 Stream；创建者的初始引用始终由 destroy 消费。 */
 ftun_status_t ftun_stream_retain(ftun_stream_t *stream);
-ftun_status_t ftun_stream_release(ftun_stream_t **stream);
+/* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
+void ftun_stream_release(ftun_stream_t **stream);
 /* backend 可在 start 返回后重复查询保留的前缀；输出只借用到 complete/cancel。 */
 ftun_status_t ftun_stream_write_data(ftun_stream_write_token_t write,
                                      ftun_bytes_t *out);

@@ -62,7 +62,7 @@ ftun_status_t __wrap_ftun_budget_destroy(ftun_budget_t **budget)
   tracked = resource_tracking && budget != NULL && *budget != NULL && *budget == tracked_budget;
   (void)pthread_mutex_unlock(&write_fault_mutex);
   if (tracked && (ftun_budget_get_usage(*budget, &usage) != FTUN_OK ||
-      usage.used != 0u || usage.used_resources.descriptors != 0u ||
+      usage.used_resources.memory_bytes != 0u || usage.used_resources.descriptors != 0u ||
       usage.used_resources.queue_slots != 0u)) invalid = 1;
   status = __real_ftun_budget_destroy(budget);
   if (tracked) {

@@ -1,6 +1,6 @@
 #define _GNU_SOURCE 1
 
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 
 #include <errno.h>
 #include <stddef.h>
@@ -19,29 +19,29 @@ static ftun_status_t ftun_socket_option(int descriptor, int level, int name,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_socket_apply_liveness(int descriptor,
+ftun_status_t ftun_socket_apply_liveness(ftun_handle_t descriptor,
   const ftun_socket_liveness_t *liveness)
 {
   ftun_status_t status = FTUN_OK;
   if (descriptor < 0 || liveness == NULL) return FTUN_E_INVALID;
   if (liveness->keepalive_enabled) {
-    status = ftun_socket_option(descriptor, SOL_SOCKET, SO_KEEPALIVE, 1);
+    status = ftun_socket_option((int)descriptor, SOL_SOCKET, SO_KEEPALIVE, 1);
 #if defined(TCP_KEEPIDLE)
-    if (status == FTUN_OK) status = ftun_socket_option(descriptor, IPPROTO_TCP,
+    if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
       TCP_KEEPIDLE, (int)liveness->idle_s);
 #endif
 #if defined(TCP_KEEPINTVL)
-    if (status == FTUN_OK) status = ftun_socket_option(descriptor, IPPROTO_TCP,
+    if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
       TCP_KEEPINTVL, (int)liveness->interval_s);
 #endif
 #if defined(TCP_KEEPCNT)
-    if (status == FTUN_OK) status = ftun_socket_option(descriptor, IPPROTO_TCP,
+    if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
       TCP_KEEPCNT, (int)liveness->count);
 #endif
   }
 #if defined(TCP_USER_TIMEOUT)
   if (status == FTUN_OK && liveness->user_timeout_ms != 0u) {
-    status = ftun_socket_option(descriptor, IPPROTO_TCP, TCP_USER_TIMEOUT,
+    status = ftun_socket_option((int)descriptor, IPPROTO_TCP, TCP_USER_TIMEOUT,
                                 (int)liveness->user_timeout_ms);
   }
 #endif
@@ -54,7 +54,7 @@ ftun_status_t ftun_socket_apply_liveness(int descriptor,
 #define FTUN_TCPI_BYTES_ACKED_OFFSET 120u
 #define FTUN_TCP_INFO_BUFFER_BYTES 256u
 
-ftun_status_t ftun_socket_send_progress(int descriptor, uint64_t *acked,
+ftun_status_t ftun_socket_send_progress(ftun_handle_t descriptor, uint64_t *acked,
   uint32_t *queued)
 {
 #if defined(TCP_INFO) && defined(TIOCOUTQ)
@@ -63,8 +63,8 @@ ftun_status_t ftun_socket_send_progress(int descriptor, uint64_t *acked,
   int outstanding = 0;
   if (descriptor < 0 || acked == NULL || queued == NULL) return FTUN_E_INVALID;
   memset(info, 0, sizeof(info));
-  if (getsockopt(descriptor, IPPROTO_TCP, TCP_INFO, info, &length) != 0 ||
-      ioctl(descriptor, TIOCOUTQ, &outstanding) != 0) {
+  if (getsockopt((int)descriptor, IPPROTO_TCP, TCP_INFO, info, &length) != 0 ||
+      ioctl((int)descriptor, TIOCOUTQ, &outstanding) != 0) {
     return errno == EBADF || errno == ENOTSOCK ? FTUN_E_INVALID : FTUN_E_IO;
   }
   if (length < FTUN_TCPI_BYTES_ACKED_OFFSET + sizeof(*acked)) return FTUN_E_UNSUPPORTED;

@@ -150,7 +150,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_runtime_manager_destroy(&fixture->core) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   if (ftun_budget_destroy(&fixture->budget) != FTUN_OK) return 1;
   return 0;
 }
@@ -404,14 +404,14 @@ static int test_failure_and_boundaries(void)
         &rejected) == FTUN_E_INVALID && rejected == NULL);
   metadata.network = 1u;
   CHECK(ftun_budget_get_usage(fixture.budget, &budget_usage) == FTUN_OK &&
-        budget_usage.normal_available != 0u);
-  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available,
+        budget_usage.normal_available_resources.memory_bytes != 0u);
+  CHECK(ftun_budget_reserve(fixture.budget, budget_usage.normal_available_resources.memory_bytes,
         &exhaustion) == FTUN_OK);
   CHECK(ftun_session_submit(fixture.core, &metadata, fixture.stream,
         &rejected) == FTUN_E_LIMIT && rejected == NULL);
   CHECK(ftun_stream_get_usage(fixture.stream, &stream_usage) == FTUN_OK &&
         stream_usage.reference_count == 1u);
-  CHECK(ftun_reservation_release(&exhaustion) == FTUN_OK);
+  ftun_reservation_release(&exhaustion);
 
   CHECK(ftun_session_submit(fixture.core, &metadata, fixture.stream,
         &session) == FTUN_OK);
@@ -504,19 +504,19 @@ static int test_stream_budget_ownership(void)
   CHECK(ftun_stream_create(&options, &backend, &stream) == FTUN_OK);
   fill_metadata(&metadata, "budget.example", &resolved, 1u);
   CHECK(ftun_budget_get_usage(data, &before) == FTUN_OK);
-  CHECK(ftun_budget_reserve(data, before.normal_available, &hold) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(fixture.budget, &host) == FTUN_OK && host.normal_available > 65536u);
+  CHECK(ftun_budget_reserve(data, before.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(fixture.budget, &host) == FTUN_OK && host.normal_available_resources.memory_bytes > 65536u);
   /* 宿主仍有空间也不能绕过入站子预算，更不能先保留输入Stream。 */
   CHECK(ftun_session_submit(fixture.core, &metadata, stream, &session) == FTUN_E_LIMIT && session == NULL);
   CHECK(ftun_stream_get_usage(stream, &stream_usage) == FTUN_OK && stream_usage.reference_count == 1u);
-  CHECK(ftun_reservation_release(&hold) == FTUN_OK);
+  ftun_reservation_release(&hold);
   CHECK(ftun_session_submit(fixture.core, &metadata, stream, &session) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used > before.used);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used_resources.memory_bytes > before.used_resources.memory_bytes);
   CHECK(ftun_session_cancel(session) == FTUN_OK);
   CHECK(ftun_session_destroy(&session) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used == before.used);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used_resources.memory_bytes == before.used_resources.memory_bytes);
   CHECK(ftun_stream_destroy(&stream) == FTUN_OK && state.destroy_calls == 1);
-  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used == 0u);
+  CHECK(ftun_budget_get_usage(data, &during) == FTUN_OK && during.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&data) == FTUN_OK);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;

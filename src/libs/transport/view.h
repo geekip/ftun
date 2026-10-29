@@ -75,7 +75,8 @@ typedef struct {
 ftun_status_t ftun_network_view_create(const ftun_network_view_spec_t *spec,
                                        ftun_network_view_t **out);
 ftun_status_t ftun_network_view_retain(ftun_network_view_t *view);
-ftun_status_t ftun_network_view_release(ftun_network_view_t **view);
+/* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
+void ftun_network_view_release(ftun_network_view_t **view);
 /* 阻止后续路径授权，不改写策略/代次。控制方还须通知各 owner 的 Provider
  * 取消既有通道；原子标志不使 View 引用计数或 Provider 变为跨线程接口。 */
 ftun_status_t ftun_network_view_revoke(ftun_network_view_t *view);

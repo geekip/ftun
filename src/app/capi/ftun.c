@@ -107,7 +107,7 @@ ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   copy = (char *)malloc(length + 1u);
   if (copy == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   memcpy(copy, value, length + 1u);
@@ -118,10 +118,8 @@ ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
 
 ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path)
 {
-  ftun_status_t status;
   if (path == NULL) return FTUN_E_INVALID;
-  status = ftun_reservation_release(&path->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&path->reservation);
   free(path->value);
   path->value = NULL;
   return FTUN_OK;
@@ -374,7 +372,7 @@ ftun_status_t ftun_core_create_with_service(
   }
   control->root_budget = root_budget;
   control->reservation = control_reservation;
-  control->bootstrap_bytes = context_usage.used + control_bytes;
+  control->bootstrap_bytes = context_usage.used_resources.memory_bytes + control_bytes;
   control->budget = budget;
   control->data_budget = data_budget;
   control->service_descriptor = descriptor;
@@ -429,7 +427,7 @@ fail:
     free(control->tasks);
     free(control);
   }
-  (void)ftun_reservation_release(&control_reservation);
+  ftun_reservation_release(&control_reservation);
   if (core != NULL && ftun_app_runtime_support() != NULL) {
     (void)ftun_app_runtime_support()->clear(core);
   }
@@ -466,7 +464,7 @@ void ftun_control_task_destroy(ftun_control_task_t *task)
   free(task->first);
   free(task->second);
   free(task);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 void ftun_control_task_consumed(ftun_control_task_t *task)
@@ -569,7 +567,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
   if (status != FTUN_OK) return status;
   task = (ftun_control_task_t *)calloc(1u, sizeof(*task));
   if (task == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   task->reservation = reservation;
@@ -577,7 +575,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
   if (ftun_mutex_init(&task->mutex) != FTUN_OK) {
     task->reservation = (ftun_reservation_t){0};
     free(task);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_IO;
   }
   if (first != NULL) task->first = ftun_core_copy_string(first);
@@ -1423,8 +1421,8 @@ ftun_status_t ftun_core_destroy(ftun_core_t **core)
   ftun_condition_destroy(&control->condition);
   ftun_mutex_destroy(&control->mutex);
   free(control);
-  status = ftun_reservation_release(&reservation);
-  if (status == FTUN_OK) status = ftun_budget_destroy(&control_budget);
+  ftun_reservation_release(&reservation);
+  status = ftun_budget_destroy(&control_budget);
   if (status == FTUN_OK) status = ftun_budget_destroy(&root_budget);
   return status;
 }

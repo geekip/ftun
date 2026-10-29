@@ -1,3 +1,4 @@
+#include "proxy/protocol/socks5.h"
 #include "app/config/model.h"
 #include "app/composition/bridges.h"
 #include "core/core.h"
@@ -19,7 +20,7 @@
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
 #include "libs/tun/owner.h"
-#include "libs/tun/linux/interface.h"
+#include "libs/tun/interface_backend.h"
 #endif
 
 #include "libs/transport/netmon.h"
@@ -234,6 +235,7 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
   runtime->dns_binding.loop = runtime->loop;
   runtime->dns_binding.slot = &runtime->dns;
   runtime->dns_binding.path.open = ftun_socket_path_open;
+  runtime->dns_binding.protocol = &ftun_socks5_protocol;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy_dns.core = runtime->core;
   ftun_app_dns_bridge_init(&runtime->proxy_dns);
@@ -252,7 +254,7 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
 #if defined(FTUN_HAVE_MODULE_TUN)
   runtime->tun.provider = &runtime->l3;
   runtime->tun.loop = runtime->loop;
-  runtime->tun.network = &ftun_linux_interface_ops;
+  runtime->tun.network = &ftun_interface_default_ops;
   runtime->tun.protection_mark = config->base.proxy.routing_mark;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy.l3 =
@@ -322,7 +324,7 @@ static ftun_status_t ftun_default_prepare(
   if (status != FTUN_OK) return status;
   runtime = (ftun_default_runtime_t *)calloc(1u, sizeof(*runtime));
   if (runtime == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   runtime->reservation = reservation;
@@ -353,7 +355,7 @@ static ftun_status_t ftun_default_prepare(
       runtime->cleanup_error = ftun_default_loop_destroy(runtime);
       if (runtime->cleanup_error == FTUN_OK) {
         free(runtime);
-        (void)ftun_reservation_release(&reservation);
+        ftun_reservation_release(&reservation);
         runtime = NULL;
       }
     }
@@ -542,7 +544,8 @@ static ftun_status_t ftun_default_destroy_until(void **implementation,
   reservation = runtime->reservation;
   free(runtime);
   *implementation = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 static const ftun_core_service_descriptor_t ftun_default_service = {

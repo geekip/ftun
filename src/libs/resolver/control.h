@@ -1,7 +1,7 @@
 #ifndef FTUN_LIBS_RESOLVER_CONTROL_H
 #define FTUN_LIBS_RESOLVER_CONTROL_H
 #include "libs/resolver/basic.h"
-#include "libs/resolver/control_channel.h"
+#include "libs/resolver/control_transport.h"
 
 #define FTUN_CONTROL_ENDPOINT_TEXT_BYTES 260u
 #define FTUN_CONTROL_CREDENTIAL_BYTES 256u
@@ -18,6 +18,7 @@ typedef struct {
   bool named;
   bool tcp;
   bool use_proxy;
+  ftun_resolver_query_fn query;
 } ftun_control_resolver_plan_t;
 
 /* Synchronous worker/control-endpoint resolver.  Result is one IPv4 endpoint

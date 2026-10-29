@@ -89,7 +89,8 @@ ftun_status_t ftun_resolver_provider_start(
 ftun_status_t ftun_resolver_provider_scope(ftun_resolver_provider_t *provider,
   uint64_t generation, ftun_resolver_scope_t **out);
 ftun_status_t ftun_resolver_scope_retain(ftun_resolver_scope_t *scope);
-ftun_status_t ftun_resolver_scope_release(ftun_resolver_scope_t **scope);
+/* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
+void ftun_resolver_scope_release(ftun_resolver_scope_t **scope);
 ftun_status_t ftun_resolver_scope_generation(const ftun_resolver_scope_t *scope,
   uint64_t *out);
 ftun_status_t ftun_resolver_scope_start(ftun_resolver_scope_t *scope,

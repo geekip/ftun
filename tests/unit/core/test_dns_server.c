@@ -380,7 +380,7 @@ static int test_cache_binding(void)
     CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
     CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_E_LIMIT && operation == NULL);
     CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK &&
-          before.used == after.used && before.metadata_bytes == after.metadata_bytes);
+          before.used_resources.memory_bytes == after.used_resources.memory_bytes && before.metadata_bytes == after.metadata_bytes);
     CHECK(completion.calls == 0u && transport.selects == 1u && transport.submits == 1u);
     CHECK(ftun_operation_dispatch(operations, 4u, &count) == FTUN_OK && count == 4u);
     CHECK(completion.calls == 4u && completion.status == FTUN_OK);
@@ -388,7 +388,7 @@ static int test_cache_binding(void)
     CHECK(ftun_budget_get_usage(budget, &before) == FTUN_OK);
     CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_E_CANCELLED && operation == NULL);
     CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK &&
-          before.used == after.used && before.metadata_bytes == after.metadata_bytes);
+          before.used_resources.memory_bytes == after.used_resources.memory_bytes && before.metadata_bytes == after.metadata_bytes);
     CHECK(completion.calls == 4u && transport.selects == 1u && transport.submits == 1u);
   }
   CHECK(ftun_dns_server_destroy(&server) == FTUN_OK);

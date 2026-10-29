@@ -12,6 +12,6 @@ typedef struct {
 
 ftun_status_t ftun_netlink_build(
   ftun_netlink_message_t *message,
-  const ftun_linux_route_resource_t *resource, bool add);
-ftun_status_t ftun_linux_route_errno(int error_code, bool removing);
+  const ftun_route_resource_t *resource, bool add);
+ftun_status_t ftun_route_errno(int error_code, bool removing);
 #endif

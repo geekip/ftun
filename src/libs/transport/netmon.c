@@ -10,7 +10,7 @@
 
 struct ftun_netmon {
   ftun_event_loop_t *loop;
-  int descriptor;
+  ftun_handle_t descriptor;
   ftun_event_source_t *io;
   ftun_event_source_t *timer;
   uint64_t debounce_ms;
@@ -93,7 +93,7 @@ ftun_status_t ftun_netmon_create(ftun_event_loop_t *loop, uint64_t debounce_ms,
   netmon->debounce_ms = debounce_ms == 0u ? FTUN_NETMON_DEBOUNCE_MS : debounce_ms;
   status = ftun_iface_subscribe(&netmon->descriptor);
   if (status != FTUN_OK) { free(netmon); return status; }
-  status = ftun_event_io_start(loop, (ftun_native_socket_t)(unsigned int)netmon->descriptor,
+  status = ftun_event_io_start(loop, (ftun_native_socket_t)netmon->descriptor,
     FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_netmon_io_ready, netmon, &netmon->io);
   if (status != FTUN_OK) {
     (void)ftun_socket_close((ftun_native_socket_t)netmon->descriptor);

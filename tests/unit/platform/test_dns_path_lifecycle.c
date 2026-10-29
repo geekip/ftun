@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 /* 真实 DNS server 与非 socket 通道，验证异步接纳后的取消和停止拥有权。 */
+#include "proxy/protocol/socks5.h"
 #include <sys/socket.h>
 #include <fcntl.h>
 #include "app/config/parser.h"
@@ -65,6 +66,7 @@ static int fixture_open_capacity(fixture_t *f, bool tcp, size_t capacity,
   CHECK(length > 0 && (size_t)length < sizeof(json));
   CHECK(ftun_config_parse((ftun_bytes_t){(const uint8_t *)json, (size_t)length}, &f->config) == FTUN_OK);
   network.generation = 1u;
+  network.protocol = &ftun_socks5_protocol;
   network.path.open = fixture_path_open;
   network.context = f;
   CHECK(ftun_dns_runtime_prepare(f->core, f->budget, f->operations, f->loop,
@@ -132,7 +134,7 @@ static int fixture_close(fixture_t *f, size_t calls, ftun_status_t expected)
   CHECK(f->calls == calls && f->status == expected);
   CHECK(ftun_config_destroy(&f->config) == FTUN_OK);
   CHECK(ftun_budget_get_usage(f->budget, &usage) == FTUN_OK);
-  CHECK(usage.used == f->baseline.used &&
+  CHECK(usage.used_resources.memory_bytes == f->baseline.used_resources.memory_bytes &&
         usage.metadata_bytes == f->baseline.metadata_bytes &&
         usage.used_resources.descriptors == f->baseline.used_resources.descriptors &&
         usage.used_resources.queue_slots == f->baseline.used_resources.queue_slots);

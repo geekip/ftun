@@ -28,7 +28,7 @@ ftun_status_t ftun_blocking_socket_status(int error_code)
   return FTUN_E_IO;
 }
 
-bool ftun_blocking_socket_wait(int descriptor, uint32_t events,
+bool ftun_blocking_socket_wait(ftun_handle_t descriptor, uint32_t events,
                                uint64_t deadline_ms)
 {
   struct pollfd item;
@@ -39,7 +39,7 @@ bool ftun_blocking_socket_wait(int descriptor, uint32_t events,
   timeout = deadline_ms - now > (uint64_t)INT32_MAX
     ? INT32_MAX : (int)(deadline_ms - now);
   memset(&item, 0, sizeof(item));
-  item.fd = descriptor;
+  item.fd = (int)descriptor;
   item.events = (short)(((events & FTUN_POLLER_READ) != 0u ? POLLIN : 0) |
                         ((events & FTUN_POLLER_WRITE) != 0u ? POLLOUT : 0));
   do {
@@ -49,12 +49,12 @@ bool ftun_blocking_socket_wait(int descriptor, uint32_t events,
     (item.revents & (item.events | POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
 
-bool ftun_blocking_socket_send_all(int descriptor, const uint8_t *data,
+bool ftun_blocking_socket_send_all(ftun_handle_t descriptor, const uint8_t *data,
                                    size_t length, uint64_t deadline_ms)
 {
   size_t offset = 0u;
   while (offset < length) {
-    ssize_t sent = send(descriptor, data + offset, length - offset,
+    ssize_t sent = send((int)descriptor, data + offset, length - offset,
                         MSG_NOSIGNAL);
     if (sent > 0) offset += (size_t)sent;
     else if (sent < 0 && errno == EINTR) continue;

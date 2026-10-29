@@ -20,7 +20,7 @@ uint64_t ftun_process_boot_token(void)
 
 ftun_status_t ftun_platform_boot_identity(void *buffer, size_t capacity, size_t *length)
 {
-  int descriptor;
+  ftun_handle_t descriptor;
   size_t offset = 0u;
   ftun_status_t status = ftun_file_open("/proc/sys/kernel/random/boot_id",
     FTUN_FILE_READ_NOFOLLOW, &descriptor);

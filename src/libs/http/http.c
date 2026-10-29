@@ -3,7 +3,6 @@
 #include "libs/http/http.h"
 #include "libs/resolver/control_channel.h"
 
-#include "libs/transport/socks5_client.h"
 #include "libs/tls/tls.h"
 #include "platform/clock.h"
 
@@ -39,7 +38,7 @@ static ftun_status_t ftun_http_string_allocate(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   value = (char *)malloc(length + 1u);
   if (value == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   value[length] = '\0';
@@ -240,43 +239,38 @@ static ftun_status_t ftun_http_redirect_url(ftun_budget_t *budget, ftun_string_t
 typedef struct {
   ftun_control_channel_t *channel;
   uint64_t deadline_ms;
-} ftun_http_socks_io_t;
+} ftun_http_protocol_io_t;
 
-static ftun_status_t ftun_http_socks_write(void *context, const uint8_t *data,
+static ftun_status_t ftun_http_protocol_write(void *context, const uint8_t *data,
                                            size_t length)
 {
-  ftun_http_socks_io_t *io = (ftun_http_socks_io_t *)context;
+  ftun_http_protocol_io_t *io = (ftun_http_protocol_io_t *)context;
   return ftun_http_send_all(io->channel, data, length, io->deadline_ms)
     ? FTUN_OK : FTUN_E_TIMEOUT;
 }
 
-static ftun_status_t ftun_http_socks_read(void *context, uint8_t *data,
+static ftun_status_t ftun_http_protocol_read(void *context, uint8_t *data,
                                           size_t length)
 {
-  ftun_http_socks_io_t *io = (ftun_http_socks_io_t *)context;
+  ftun_http_protocol_io_t *io = (ftun_http_protocol_io_t *)context;
   return ftun_http_recv_all(io->channel, data, length, io->deadline_ms)
     ? FTUN_OK : FTUN_E_TIMEOUT;
 }
 
-static ftun_status_t ftun_http_socks_connect(
+static ftun_status_t ftun_http_protocol_connect(
   ftun_control_channel_t *channel, const ftun_http_fetch_spec_t *spec,
   const ftun_endpoint_t *target)
 {
-  ftun_http_socks_io_t transport = {channel, spec->deadline_ms};
-  ftun_socks5_client_io_t io = {ftun_http_socks_write, ftun_http_socks_read, &transport};
-  ftun_socks5_client_options_t options = {0};
-  ftun_socks5_client_result_t result;
-  ftun_socks5_client_t client;
-  ftun_status_t status;
+  ftun_http_protocol_io_t transport = {channel, spec->deadline_ms};
+  ftun_transport_protocol_io_t io = {ftun_http_protocol_write, ftun_http_protocol_read, &transport};
+  ftun_transport_protocol_options_t options = {0};
   options.username = (ftun_bytes_t){(const uint8_t *)spec->proxy_username.data,
                                     spec->proxy_username.length};
   options.password = (ftun_bytes_t){(const uint8_t *)spec->proxy_password.data,
                                     spec->proxy_password.length};
-  options.command = FTUN_SOCKS5_COMMAND_CONNECT;
   options.target = *target;
-  status = ftun_socks5_client_init(&client, &options);
-  if (status == FTUN_OK) status = ftun_socks5_client_run(&client, &io, &result);
-  return status;
+  return spec->protocol == NULL ? FTUN_E_UNSUPPORTED :
+    spec->protocol->run(&options, &io);
 }
 
 static const char *ftun_http_ca_file(void)
@@ -517,7 +511,7 @@ ftun_status_t ftun_http_fetch_parse_response(
         memcpy(etag, wire + value, value_length);
         etag[value_length] = '\0';
         free(out->etag);
-        (void)ftun_reservation_release(&out->etag_reservation);
+        ftun_reservation_release(&out->etag_reservation);
         out->etag = etag;
         out->etag_reservation = reservation;
       } else if (location != NULL && ftun_http_ascii_equal(
@@ -531,7 +525,7 @@ ftun_status_t ftun_http_fetch_parse_response(
         memcpy(copy, wire + value, value_length);
         copy[value_length] = '\0';
         free(*location);
-        (void)ftun_reservation_release(location_reservation);
+        ftun_reservation_release(location_reservation);
         *location = copy;
         *location_reservation = reservation;
       }
@@ -594,7 +588,7 @@ static ftun_status_t ftun_http_fetch_once(
     spec->use_proxy ? &proxy_endpoint : &endpoint, spec->socket_mark,
     spec->purpose == 0 ? FTUN_DIAL_PURPOSE_FRS_UPDATE : spec->purpose);
   if (status == FTUN_OK && spec->use_proxy) {
-    status = ftun_http_socks_connect(channel, spec, &endpoint);
+    status = ftun_http_protocol_connect(channel, spec, &endpoint);
   }
   if (status == FTUN_OK && url.https) {
     const char *ca_file = ftun_http_ca_file();
@@ -682,8 +676,8 @@ static ftun_status_t ftun_http_fetch_once(
   }
   free(wire);
   free(request);
-  (void)ftun_reservation_release(&wire_reservation);
-  (void)ftun_reservation_release(&request_reservation);
+  ftun_reservation_release(&wire_reservation);
+  ftun_reservation_release(&request_reservation);
   (void)ftun_tls_client_destroy(&tls);
   ftun_control_channel_drain(&channel);
   return status;
@@ -693,7 +687,8 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
                               ftun_http_fetch_result_t *out)
 {
   ftun_string_t current;
-  ftun_tls_context_t *tls_context = NULL;
+  ftun_tls_context_t *local_context = NULL;
+  ftun_tls_context_t **tls_context;
   char *owned_url = NULL;
   ftun_reservation_t url_reservation = (ftun_reservation_t){0};
   size_t redirects;
@@ -707,26 +702,27 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
         spec->proxy_domain[0] == '\0'))) {
     return FTUN_E_INVALID;
   }
+  tls_context = spec->tls_context != NULL ? spec->tls_context : &local_context;
   current = spec->url;
   for (redirects = 0u; redirects <= FTUN_HTTP_FETCH_REDIRECTS; redirects++) {
     char *location = NULL;
     ftun_reservation_t location_reservation = (ftun_reservation_t){0};
     ftun_http_fetch_release(out);
-    status = ftun_http_fetch_once(spec, current, &tls_context, out, &location,
+    status = ftun_http_fetch_once(spec, current, tls_context, out, &location,
       &location_reservation);
     if (status != FTUN_OK) {
       free(location);
-      (void)ftun_reservation_release(&location_reservation);
+      ftun_reservation_release(&location_reservation);
       break;
     }
     if (!ftun_http_redirect_status(out->status)) {
       free(location);
-      (void)ftun_reservation_release(&location_reservation);
+      ftun_reservation_release(&location_reservation);
       break;
     }
     if (location == NULL || redirects == FTUN_HTTP_FETCH_REDIRECTS) {
       free(location);
-      (void)ftun_reservation_release(&location_reservation);
+      ftun_reservation_release(&location_reservation);
       status = FTUN_E_PROTOCOL;
       break;
     }
@@ -736,10 +732,10 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
       status = ftun_http_redirect_url(spec->budget, current, location, &redirect,
         &redirect_reservation);
       free(location);
-      (void)ftun_reservation_release(&location_reservation);
+      ftun_reservation_release(&location_reservation);
       if (status != FTUN_OK) break;
       free(owned_url);
-      (void)ftun_reservation_release(&url_reservation);
+      ftun_reservation_release(&url_reservation);
       owned_url = redirect;
       url_reservation = redirect_reservation;
     }
@@ -747,8 +743,8 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
     current.length = strlen(owned_url);
   }
   free(owned_url);
-  (void)ftun_reservation_release(&url_reservation);
-  (void)ftun_tls_context_destroy(&tls_context);
+  ftun_reservation_release(&url_reservation);
+  (void)ftun_tls_context_destroy(&local_context);
   if (status != FTUN_OK) ftun_http_fetch_release(out);
   return status;
 }
@@ -758,7 +754,7 @@ void ftun_http_fetch_release(ftun_http_fetch_result_t *result)
   if (result == NULL) return;
   free(result->data);
   free(result->etag);
-  (void)ftun_reservation_release(&result->reservation);
-  (void)ftun_reservation_release(&result->etag_reservation);
+  ftun_reservation_release(&result->reservation);
+  ftun_reservation_release(&result->etag_reservation);
   memset(result, 0, sizeof(*result));
 }

@@ -1,4 +1,5 @@
 #include "proxy/control_resolver.h"
+#include "proxy/protocol/socks5_transport.h"
 #include "proxy/outbound_id.h"
 #include <string.h>
 
@@ -97,6 +98,7 @@ ftun_status_t ftun_control_resolver_plan(
   if (config == NULL || out == NULL ||
       (server.length != 0u && server.data == NULL)) return FTUN_E_INVALID;
   out->socket_mark = socket_mark;
+  out->query = ftun_resolver_socks5_query_blocking;
   if (!ftun_config_resolver(config).enable) return FTUN_OK;
   if (ftun_config_resolver(config).bootstrap.count > FTUN_BOOTSTRAP_MAX_SERVERS) {
     return FTUN_E_LIMIT;

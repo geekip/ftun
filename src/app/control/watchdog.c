@@ -123,7 +123,7 @@ static void *ftun_watchdog_thread(void *user)
   uint64_t previous_request = 0u;
   bool judged = false;
   for (;;) {
-    int phase;
+    uint64_t phase;
     if (ftun_watchdog_wait(watchdog, watchdog->interval_ms)) break;
     phase = ftun_atomic_load(&watchdog->phase);
     if (phase == 0) {

@@ -365,7 +365,7 @@ ftun_status_t ftun_core_module_reload_plan_prepare(
   if (status != FTUN_OK) return status;
   plan = (ftun_core_module_reload_plan_t *)calloc(1u, sizeof(*plan));
   if (plan == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   plan->reservation = reservation;
@@ -414,13 +414,7 @@ ftun_status_t ftun_core_module_reload_plan_destroy(
       return status;
     }
   }
-  {
-    ftun_status_t status = ftun_reservation_release(&owned->reservation);
-    if (status != FTUN_OK) {
-      ftun_core_module_record(&owned->cleanup_error, status);
-      return status;
-    }
-  }
+  ftun_reservation_release(&owned->reservation);
   free(owned);
   *plan = NULL;
   return FTUN_OK;
@@ -459,7 +453,7 @@ ftun_status_t ftun_core_module_runtime_prepare(
   if (status != FTUN_OK) return status;
   runtime = (ftun_core_module_runtime_t *)calloc(1u, sizeof(*runtime));
   if (runtime == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   runtime->reservation = reservation;
@@ -1039,7 +1033,8 @@ ftun_status_t ftun_core_module_runtime_destroy_until(
   reservation = owned->reservation;
   free(owned);
   *runtime = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_core_module_runtime_get_info(

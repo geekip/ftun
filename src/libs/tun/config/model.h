@@ -5,11 +5,7 @@ enum {
   FTUN_CONFIG_SECTION_TUN = 12u
 };
 
-#define FTUN_CONFIG_ROUTE_TABLE_DEFAULT UINT32_C(18004)
-#define FTUN_CONFIG_RULE_PRIORITY_DEFAULT UINT32_C(11000)
 /* 系统保留表号：unspec/default/main/local 和内核规则优先级上限之外的值。 */
-#define FTUN_CONFIG_ROUTE_TABLE_MAXIMUM UINT32_C(0xfffffff0)
-#define FTUN_CONFIG_RULE_PRIORITY_MAXIMUM UINT32_C(32000)
 
 typedef struct {
   bool present;

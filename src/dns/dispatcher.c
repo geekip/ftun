@@ -76,7 +76,7 @@ static void ftun_dns_local_completed(ftun_operation_t *operation,
   context->completion(operation, error, response, context->completion_user);
   if (dispatcher->inflight_local != 0u) dispatcher->inflight_local--;
   free(context);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 ftun_status_t ftun_dns_local_answer(ftun_dns_dispatcher_t *dispatcher,
@@ -101,7 +101,7 @@ ftun_status_t ftun_dns_local_answer(ftun_dns_dispatcher_t *dispatcher,
   if (status != FTUN_OK) return status;
   context = (ftun_dns_local_context_t *)calloc(1u, bytes);
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   context->dispatcher = dispatcher;
@@ -141,7 +141,7 @@ ftun_status_t ftun_dns_local_answer(ftun_dns_dispatcher_t *dispatcher,
     &context->completion_token);
   if (status != FTUN_OK) {
     free(context);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   dispatcher->inflight_local++;
@@ -199,14 +199,14 @@ ftun_status_t ftun_dns_dispatcher_create(
   if (status != FTUN_OK) return status;
   dispatcher = (ftun_dns_dispatcher_t *)calloc(1u, bytes);
   if (dispatcher == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   dispatcher->servers = (ftun_dns_server_t **)(dispatcher + 1);
   for (index = 0u; index < options->server_count; index++) {
     if (options->servers[index] == NULL) {
       free(dispatcher);
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return FTUN_E_INVALID;
     }
     dispatcher->servers[index] = options->servers[index];
@@ -291,5 +291,6 @@ ftun_status_t ftun_dns_dispatcher_destroy(ftun_dns_dispatcher_t **dispatcher)
   reservation = owned->reservation;
   free(owned);
   *dispatcher = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

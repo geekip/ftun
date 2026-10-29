@@ -1,4 +1,5 @@
 #include "libs/tun/config/validate.h"
+#include "platform/route.h"
 #include "core/config/syntax.h"
 #include <string.h>
 
@@ -8,19 +9,16 @@ ftun_status_t ftun_config_validate_tun_device(
 {
   ftun_config_cidr_t tun_range;
   const char *base = "/tun";
+  const char *route_error;
   if (tun == NULL || !tun->present) return FTUN_OK;
   if (!ftun_path_valid(tun->interface_name) ||
       strlen(tun->interface_name) > 15u) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
                                   "TUN interface name is invalid");
   }
-  if (tun->route_table < 256u ||
-      tun->route_table > FTUN_CONFIG_ROUTE_TABLE_MAXIMUM ||
-      tun->rule_priority == 0u ||
-      tun->rule_priority > FTUN_CONFIG_RULE_PRIORITY_MAXIMUM) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
-      "TUN route-table must be 256..4294967280 and rule-priority 1..32000");
-  }
+  route_error = ftun_platform_route_config_error(
+    (ftun_route_settings_t){tun->route_table, tun->rule_priority});
+  if (route_error != NULL) return ftun_config_diagnostic(out, FTUN_E_INVALID, base, route_error);
   if (tun->mtu == 0u ||
       (tun->strict_route && !tun->auto_route)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,

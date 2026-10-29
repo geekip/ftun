@@ -110,7 +110,7 @@ static int run(bool cancel)
     CHECK(ftun_worker_join_until(worker, now_ms() + 10u) == FTUN_E_TIMEOUT);
     CHECK(ftun_worker_destroy(&worker) == FTUN_E_AGAIN && worker != NULL);
     CHECK(ftun_worker_get_usage(worker, &usage) == FTUN_OK && usage.running == 1u);
-    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used != 0u);
+    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes != 0u);
   } else {
     while (now_ms() <= input.execution.deadline_ms) pause_once();
   }
@@ -129,7 +129,7 @@ static int run(bool cancel)
   CHECK(ftun_worker_stop(worker) == FTUN_OK);
   CHECK(ftun_worker_join_until(worker, deadline) == FTUN_OK);
   CHECK(ftun_worker_destroy(&worker) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used == before.used && after.metadata_bytes == before.metadata_bytes);
+  CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes == before.used_resources.memory_bytes && after.metadata_bytes == before.metadata_bytes);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

@@ -21,7 +21,7 @@ typedef struct {
   size_t collected;
   ftun_budget_t *budget;
   ftun_reservation_t reservation;
-  ftun_event_backend_group_t *groups;
+  ftun_event_backend_group_t *groups[FTUN_POLLER_CAPACITY];
   ftun_event_backend_group_t *dirty;
   ftun_event_backend_group_t *ready_head;
   ftun_event_backend_group_t *ready_tail;
@@ -39,15 +39,13 @@ struct ftun_event_backend_watcher {
   uint32_t interests;
 };
 
-/* 每 FD 一个 native watcher；source 仍分别拥有兴趣、取消和前端句柄。
- * AVL 索引使新增/查找/移除不随其他 FD 线性扫描。ready 链与成员游标
- * 都嵌入已准入对象，不为重复通知分配节点，也不重启尚未完成的批次。 */
+/* readiness 直接携带组指针；桶仅用于注册时合并同句柄订阅。
+ * 索引和 ready 链都内嵌，不为通知分配节点或重启未完成批次。 */
 struct ftun_event_backend_group {
   ftun_event_backend_adapter_t *adapter;
   ftun_reservation_t reservation;
-  ftun_event_backend_group_t *left;
-  ftun_event_backend_group_t *right;
-  ftun_event_backend_group_t *parent;
+  ftun_event_backend_group_t *hash_next;
+  ftun_event_backend_group_t **hash_previous;
   ftun_event_backend_group_t *ready_previous;
   ftun_event_backend_group_t *ready_next;
   ftun_event_backend_watcher_t *watchers;
@@ -56,12 +54,11 @@ struct ftun_event_backend_group {
   size_t writers;
   uint32_t events;
   uint32_t repeat_events;
-  int height;
   bool queued;
   bool dirty;
   uint32_t desired_events;
   ftun_event_backend_group_t *dirty_previous, *dirty_next;
-  struct { int fd; uint32_t events; } io;
+  struct { ftun_native_socket_t socket; uint32_t events; } io;
   /* 大多数 FD 只有一个 source，共享组直接拥有首个成员及其额度。 */
   ftun_event_backend_watcher_t first;
 };
@@ -73,107 +70,33 @@ static void ftun_event_backend_record(ftun_event_backend_adapter_t *adapter, ftu
   }
 }
 
-static int ftun_event_backend_height(const ftun_event_backend_group_t *group)
+static ftun_event_backend_group_t **ftun_event_backend_bucket(
+  ftun_event_backend_adapter_t *adapter, ftun_native_socket_t socket)
 {
-  return group == NULL ? 0 : group->height;
+  return &adapter->groups[socket % FTUN_POLLER_CAPACITY];
 }
 
-static void ftun_event_backend_refresh(ftun_event_backend_group_t *group)
+static ftun_event_backend_group_t *ftun_event_backend_group_find(
+  ftun_event_backend_adapter_t *adapter, ftun_native_socket_t socket)
 {
-  int left = ftun_event_backend_height(group->left), right = ftun_event_backend_height(group->right);
-  group->height = 1 + (left > right ? left : right);
-}
-
-static void ftun_event_backend_replace(ftun_event_backend_adapter_t *adapter,
-  ftun_event_backend_group_t *old, ftun_event_backend_group_t *replacement)
-{
-  if (old->parent == NULL) adapter->groups = replacement;
-  else if (old->parent->left == old) old->parent->left = replacement;
-  else old->parent->right = replacement;
-  if (replacement != NULL) replacement->parent = old->parent;
-}
-
-static ftun_event_backend_group_t *ftun_event_backend_rotate(ftun_event_backend_group_t *group, bool left)
-{
-  ftun_event_backend_group_t *pivot = left ? group->right : group->left;
-  ftun_event_backend_replace(group->adapter, group, pivot);
-  if (left) {
-    group->right = pivot->left;
-    if (group->right != NULL) group->right->parent = group;
-    pivot->left = group;
-  } else {
-    group->left = pivot->right;
-    if (group->left != NULL) group->left->parent = group;
-    pivot->right = group;
-  }
-  group->parent = pivot;
-  ftun_event_backend_refresh(group);
-  ftun_event_backend_refresh(pivot);
-  return pivot;
-}
-
-static void ftun_event_backend_rebalance(ftun_event_backend_group_t *group)
-{
-  while (group != NULL) {
-    int balance;
-    ftun_event_backend_refresh(group);
-    balance = ftun_event_backend_height(group->left) - ftun_event_backend_height(group->right);
-    if (balance > 1) {
-      if (ftun_event_backend_height(group->left->left) < ftun_event_backend_height(group->left->right)) {
-        (void)ftun_event_backend_rotate(group->left, true);
-      }
-      group = ftun_event_backend_rotate(group, false);
-    } else if (balance < -1) {
-      if (ftun_event_backend_height(group->right->right) < ftun_event_backend_height(group->right->left)) {
-        (void)ftun_event_backend_rotate(group->right, false);
-      }
-      group = ftun_event_backend_rotate(group, true);
-    }
-    group = group->parent;
-  }
-}
-
-static ftun_event_backend_group_t *ftun_event_backend_group_find(ftun_event_backend_adapter_t *adapter, int fd)
-{
-  ftun_event_backend_group_t *group = adapter->groups;
-  while (group != NULL && group->io.fd != fd) group = fd < group->io.fd ? group->left : group->right;
+  ftun_event_backend_group_t *group = *ftun_event_backend_bucket(adapter, socket);
+  while (group != NULL && group->io.socket != socket) group = group->hash_next;
   return group;
 }
 
 static void ftun_event_backend_group_insert(ftun_event_backend_group_t *group)
 {
-  ftun_event_backend_group_t **place = &group->adapter->groups, *parent = NULL;
-  while (*place != NULL) {
-    parent = *place;
-    place = group->io.fd < parent->io.fd ? &parent->left : &parent->right;
-  }
-  *place = group;
-  group->parent = parent;
-  group->height = 1;
-  ftun_event_backend_rebalance(parent);
+  ftun_event_backend_group_t **bucket = ftun_event_backend_bucket(group->adapter, group->io.socket);
+  group->hash_previous = bucket;
+  group->hash_next = *bucket;
+  if (*bucket != NULL) (*bucket)->hash_previous = &group->hash_next;
+  *bucket = group;
 }
 
 static void ftun_event_backend_group_unlink(ftun_event_backend_group_t *group)
 {
-  ftun_event_backend_group_t *repair;
-  if (group->left != NULL && group->right != NULL) {
-    ftun_event_backend_group_t *successor = group->right;
-    while (successor->left != NULL) successor = successor->left;
-    if (successor->parent == group) repair = successor;
-    else {
-      repair = successor->parent;
-      ftun_event_backend_replace(group->adapter, successor, successor->right);
-      successor->right = group->right;
-      successor->right->parent = successor;
-    }
-    ftun_event_backend_replace(group->adapter, group, successor);
-    successor->left = group->left;
-    successor->left->parent = successor;
-  } else {
-    repair = group->parent;
-    ftun_event_backend_replace(group->adapter, group, group->left != NULL ? group->left : group->right);
-  }
-  ftun_event_backend_rebalance(repair);
+  *group->hash_previous = group->hash_next;
+  if (group->hash_next != NULL) group->hash_next->hash_previous = group->hash_previous;
 }
 
 static void ftun_event_backend_ready_unlink(ftun_event_backend_group_t *group)
@@ -260,7 +183,7 @@ static ftun_status_t ftun_event_backend_watcher_create(ftun_event_backend_adapte
   }
   watcher = calloc(1u, sizeof(*watcher));
   if (watcher == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   watcher->reservation = reservation;
@@ -277,7 +200,7 @@ static void ftun_event_backend_watcher_free(ftun_event_backend_watcher_t *watche
     return;
   }
   free(watcher);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static void dirty_remove(ftun_event_backend_group_t *group)
@@ -318,10 +241,10 @@ static void ftun_event_backend_group_free(ftun_event_backend_group_t *group)
   ftun_event_backend_ready_unlink(group);
   dirty_remove(group);
   ftun_event_backend_record(group->adapter, ftun_poller_update(&group->adapter->poller,
-    (ftun_native_socket_t)group->io.fd, group->io.events, 0u, group));
+    (ftun_native_socket_t)group->io.socket, group->io.events, 0u, group));
   ftun_event_backend_group_unlink(group);
   free(group);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_source_t *source,
@@ -331,8 +254,8 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
   ftun_event_backend_watcher_t *watcher;
   ftun_event_backend_group_t *group;
   ftun_status_t status;
-  if (socket > (ftun_native_socket_t)INT_MAX) return FTUN_E_INVALID;
-  group = ftun_event_backend_group_find(adapter, (int)socket);
+  if (socket == (ftun_native_socket_t)UINTPTR_MAX) return FTUN_E_INVALID;
+  group = ftun_event_backend_group_find(adapter, socket);
   if (group == NULL) {
     ftun_reservation_t reservation = (ftun_reservation_t){0};
     if (adapter->budget != NULL) {
@@ -341,12 +264,12 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
     }
     group = calloc(1u, sizeof(*group));
     if (group == NULL) {
-      (void)ftun_reservation_release(&reservation);
+      ftun_reservation_release(&reservation);
       return FTUN_E_LIMIT;
     }
     group->reservation = reservation;
     group->adapter = adapter;
-    group->io.fd = (int)socket;
+    group->io.socket = socket;
     ftun_event_backend_group_insert(group);
   }
   status = ftun_event_backend_watcher_create(adapter, group, &watcher);
@@ -452,7 +375,7 @@ static ftun_status_t ftun_event_backend_run_once(void *context, bool block)
   while (adapter->dirty != NULL) {
     ftun_event_backend_group_t *group = adapter->dirty;
     dirty_remove(group);
-    status = ftun_poller_update(&adapter->poller, (ftun_native_socket_t)group->io.fd,
+    status = ftun_poller_update(&adapter->poller, (ftun_native_socket_t)group->io.socket,
       group->io.events, group->desired_events, group);
     if (status != FTUN_OK) return status;
     group->io.events = group->desired_events;
@@ -479,18 +402,21 @@ static void ftun_event_backend_destroy(void *context)
 {
   ftun_event_backend_adapter_t *adapter = (ftun_event_backend_adapter_t *)context;
   ftun_reservation_t reservation = adapter->reservation;
-  while (adapter->groups != NULL) {
-    ftun_event_backend_group_t *group = adapter->groups;
-    while (group->watchers != NULL) {
-      ftun_event_backend_watcher_t *watcher = group->watchers;
-      group->watchers = watcher->next;
-      ftun_event_backend_watcher_free(watcher);
+  size_t bucket;
+  for (bucket = 0u; bucket < FTUN_POLLER_CAPACITY; bucket++) {
+    while (adapter->groups[bucket] != NULL) {
+      ftun_event_backend_group_t *group = adapter->groups[bucket];
+      while (group->watchers != NULL) {
+        ftun_event_backend_watcher_t *watcher = group->watchers;
+        group->watchers = watcher->next;
+        ftun_event_backend_watcher_free(watcher);
+      }
+      ftun_event_backend_group_free(group);
     }
-    ftun_event_backend_group_free(group);
   }
   ftun_poller_destroy(&adapter->poller);
   free(adapter);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static const ftun_event_backend_ops_t ftun_event_backend_ops = {
@@ -523,14 +449,14 @@ ftun_status_t ftun_event_backend_attach(ftun_event_loop_t *loop)
   status = ftun_event_loop_budget(loop, &budget);
   if (status != FTUN_OK) return status;
   if (budget != NULL) {
-    /* 一个 epoll FD 与一个 eventfd，等待数组位于固定栈帧。 */
+    /* 平台轮询/唤醒至多两个句柄，就绪数组位于固定栈帧。 */
     const ftun_budget_resources_t charge = {sizeof(*adapter), 2u, 0u};
     status = ftun_budget_reserve_resources(budget, charge, &reservation);
     if (status != FTUN_OK) return status;
   }
   adapter = calloc(1u, sizeof(*adapter));
   if (adapter == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   adapter->reservation = reservation;
@@ -543,7 +469,7 @@ ftun_status_t ftun_event_backend_attach(ftun_event_loop_t *loop)
   ftun_poller_destroy(&adapter->poller);
 failed:
   free(adapter);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   return status;
 }
 

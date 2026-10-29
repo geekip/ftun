@@ -326,7 +326,7 @@ static int test_service_lifecycle(void)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &budget_usage) == FTUN_OK &&
-        budget_usage.used == 0u);
+        budget_usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

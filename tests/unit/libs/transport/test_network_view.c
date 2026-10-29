@@ -104,8 +104,8 @@ static int test_selection_and_revocation(void)
   CHECK(ftun_network_view_select_dial(revoked, &proxy,
           FTUN_DIAL_PURPOSE_PROXY, FTUN_DIAL_DOMAIN_AUTO, &decision) ==
         FTUN_E_REJECTED);
-  CHECK(ftun_network_view_release(&revoked) == FTUN_OK && revoked == NULL);
-  CHECK(ftun_network_view_release(&view) == FTUN_OK && view == NULL);
+  ftun_network_view_release(&revoked); CHECK(revoked == NULL);
+  ftun_network_view_release(&view); CHECK(view == NULL);
   return 0;
 }
 
@@ -135,9 +135,9 @@ static int test_invalid_specs(void)
   CHECK(ftun_network_view_retain(view) == FTUN_OK);
   {
     ftun_network_view_t *second = view;
-    CHECK(ftun_network_view_release(&second) == FTUN_OK && second == NULL);
+    ftun_network_view_release(&second); CHECK(second == NULL);
   }
-  CHECK(ftun_network_view_release(&view) == FTUN_OK && view == NULL);
+  ftun_network_view_release(&view); CHECK(view == NULL);
   return 0;
 }
 
@@ -169,7 +169,7 @@ static int test_default_prefix(void)
   CHECK(ftun_network_view_select_dial(view, &target,
           FTUN_DIAL_PURPOSE_BOOTSTRAP, FTUN_DIAL_DOMAIN_AUTO, &decision) ==
         FTUN_E_REJECTED);
-  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  ftun_network_view_release(&view);
 
   protected_prefix.network[0] = 1u;
   CHECK(ftun_network_view_create(&spec, &view) == FTUN_E_INVALID &&

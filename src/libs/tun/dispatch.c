@@ -21,14 +21,14 @@ static ftun_status_t ftun_tun_service_packet_queue(
     status = ftun_buffer_data(buffer, &data, &buffer_capacity);
   }
   if (status != FTUN_OK || buffer_capacity < packet.length) {
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_release(&buffer);
     return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;
   }
   memcpy(data, packet.data, packet.length);
   index = (head + count) % capacity;
   entry = &entries[index];
   if (entry->buffer != NULL) {
-    (void)ftun_buffer_release(&buffer);
+    ftun_buffer_release(&buffer);
     return FTUN_E_STATE_CORRUPT;
   }
   entry->buffer = buffer;
@@ -78,7 +78,7 @@ static ftun_status_t ftun_tun_service_output_queue(
       entry->length = 0u;
       entry->lease_generation = 0u;
       entry->path_generation = 0u;
-      (void)ftun_buffer_release(&entry->buffer);
+      ftun_buffer_release(&entry->buffer);
     }
   }
   return status;
@@ -180,8 +180,7 @@ static ftun_status_t ftun_tun_service_flush(
       }
       consumer->output_bytes -= entry->length;
       service->queued_output_bytes -= entry->length;
-      status = ftun_buffer_release(&entry->buffer);
-      if (status != FTUN_OK) return status;
+      ftun_buffer_release(&entry->buffer);
       entry->length = 0u;
       entry->lease_generation = 0u;
       entry->path_generation = 0u;
@@ -290,10 +289,7 @@ static ftun_status_t ftun_tun_service_dispatch_queued(
         consumer->consumer.user, lease,
         (ftun_bytes_t){data, entry->length});
       service->callback_depth--;
-      {
-        ftun_status_t released = ftun_buffer_release(&borrowed);
-        if (released != FTUN_OK) return released;
-      }
+      ftun_buffer_release(&borrowed);
       (*work)++;
       if (ftun_tun_service_lease_consumer(service, lease) == NULL) break;
       if (status == FTUN_E_AGAIN) {
@@ -304,8 +300,7 @@ static ftun_status_t ftun_tun_service_dispatch_queued(
       if (status != FTUN_OK) return status;
       consumer->input_bytes -= entry->length;
       service->queued_input_bytes -= entry->length;
-      status = ftun_buffer_release(&entry->buffer);
-      if (status != FTUN_OK) return status;
+      ftun_buffer_release(&entry->buffer);
       entry->length = 0u;
       entry->lease_generation = 0u;
       entry->path_generation = 0u;

@@ -30,7 +30,7 @@ ftun_status_t ftun_config_document_create(size_t size, ftun_budget_t *budget,
   }
   document = calloc(1u, size);
   if (document == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   document->reference_count = 1u;
@@ -111,8 +111,7 @@ ftun_status_t ftun_config_destroy(ftun_config_t **config)
   }
   status = document->ops->prepare_destroy(owned);
   if (status != FTUN_OK) return status;
-  status = ftun_reservation_release(&document->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&document->reservation);
   document->reference_count = 0u;
   *config = NULL;
   document->ops->destroy(owned);
@@ -306,7 +305,7 @@ ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
   }
   input = (char *)malloc(json.length + 1u);
   if (input == NULL) {
-    (void)ftun_reservation_release(&scratch);
+    ftun_reservation_release(&scratch);
     return FTUN_E_LIMIT;
   }
   memcpy(input, json.data, json.length);
@@ -317,13 +316,13 @@ ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
   free(input);
   if (root == NULL || !cJSON_IsObject(root)) {
     cJSON_Delete(root);
-    (void)ftun_reservation_release(&scratch);
+    ftun_reservation_release(&scratch);
     return FTUN_E_INVALID;
   }
   status = ftun_json_tree_check(root, 1u, &nodes);
   if (status != FTUN_OK) {
     cJSON_Delete(root);
-    (void)ftun_reservation_release(&scratch);
+    ftun_reservation_release(&scratch);
     return status;
   }
   out->root = root;
@@ -335,6 +334,6 @@ void ftun_config_json_close(ftun_config_json_t *document)
 {
   if (document == NULL) return;
   cJSON_Delete(document->root);
-  (void)ftun_reservation_release(&document->reservation);
+  ftun_reservation_release(&document->reservation);
   document->root = NULL;
 }

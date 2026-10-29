@@ -15,7 +15,7 @@
 #include "core/worker.h"
 #include "core/recovery.h"
 #include "proxy/config/transport.h"
-#include "platform/posix/sockopt.h"
+#include "platform/socket.h"
 #include "proxy/config/plan.h"
 #include "proxy/dns/resolver_adapter.h"
 #include "core/event/loop.h"
@@ -32,7 +32,7 @@
 #include "proxy/route/target.h"
 #include "proxy/outbound/group/health.h"
 #include "proxy/sniff/sniff.h"
-#include "platform/posix/error.h"
+#include "platform/socket.h"
 #if defined(FTUN_HAVE_MODULE_FRS)
 #include "proxy/frs/frs.h"
 #include "core/io/file.h"
@@ -99,6 +99,8 @@ typedef struct {
   uint32_t magic;
   uint32_t mark;
   uintptr_t budget;
+  ftun_tls_context_t **tls_context;
+  const ftun_transport_protocol_t *protocol;
   uint64_t generation;
   ftun_dial_purpose_t purpose;
   ftun_control_resolver_plan_t resolver;
@@ -265,7 +267,7 @@ struct ftun_proxy_runtime_udp_pending {
 
 typedef struct {
   ftun_proxy_runtime_flow_t *flow;
-  int descriptor;
+  ftun_handle_t descriptor;
   ftun_stream_write_token_t pending;
   bool write_shutdown;
 } ftun_proxy_runtime_socket_stream_t;
@@ -294,8 +296,8 @@ typedef enum {
 
 struct ftun_proxy_runtime_listener {
   struct ftun_proxy_runtime *engine;
-  int descriptor;
-  int udp_descriptor;
+  ftun_handle_t descriptor;
+  ftun_handle_t udp_descriptor;
   ftun_event_source_t *source;
   ftun_event_source_t *udp_source;
   uint32_t events;
@@ -423,6 +425,7 @@ struct ftun_proxy_runtime {
    * 避免维护任务占用唯一的系统解析执行槽。 */
   ftun_worker_t *worker;
   ftun_worker_t *maintenance_worker;
+  ftun_tls_context_t *http_tls_context;
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
   ftun_worker_t *fakeip_worker;
 #endif
@@ -638,7 +641,7 @@ void ftun_proxy_runtime_flow_close(ftun_proxy_runtime_flow_t *flow,
                                    ftun_status_t reason);
 ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
                                               ftun_proxy_runtime_listener_t *listener,
-                                              int descriptor,
+                                              ftun_handle_t descriptor,
                                               const ftun_endpoint_t *peer);
 ftun_status_t ftun_proxy_runtime_flow_deadline_arm(
   ftun_proxy_runtime_flow_t *flow, uint64_t deadline_ms);
@@ -793,7 +796,7 @@ ftun_status_t ftun_proxy_runtime_quarantine_run(
 ftun_status_t ftun_proxy_runtime_relay_path_ready(ftun_proxy_runtime_flow_t *flow);
 void ftun_proxy_runtime_relay_progress(void *user);
 ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
-                                              int descriptor);
+                                              ftun_handle_t descriptor);
 ftun_status_t ftun_proxy_runtime_reload_abort_owned(
   ftun_proxy_runtime_t *engine, ftun_proxy_reload_owner_t owner);
 ftun_status_t ftun_proxy_runtime_reload_commit_owned(
@@ -840,7 +843,7 @@ void ftun_proxy_runtime_stream_completed(ftun_operation_t *operation,
                                          ftun_error_t error, void *user);
 ftun_status_t ftun_proxy_runtime_stream_create(
   ftun_proxy_runtime_flow_t *flow, ftun_proxy_runtime_socket_stream_t *socket_stream,
-  int descriptor, ftun_stream_t **out);
+  ftun_handle_t descriptor, ftun_stream_t **out);
 void ftun_proxy_runtime_stream_destroy(void *user);
 void ftun_proxy_runtime_stream_progress(void *user);
 ftun_status_t ftun_proxy_runtime_stream_read(void *user, void *buffer,

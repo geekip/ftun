@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "platform/socket.h"
+#include "platform/posix/error.h"
 #include "platform/linux/socket_protect.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -231,56 +232,56 @@ static ftun_status_t ftun_socket_status(int error)
   return FTUN_E_IO;
 }
 
-ptrdiff_t ftun_socket_send_nowait(int descriptor, const void *data, size_t length,
+ptrdiff_t ftun_socket_send_nowait(ftun_handle_t descriptor, const void *data, size_t length,
   ftun_status_t *status)
 {
   ssize_t count;
   do {
-    count = send(descriptor, data, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+    count = send((int)descriptor, data, length, MSG_DONTWAIT | MSG_NOSIGNAL);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
 }
-ptrdiff_t ftun_socket_receive_nowait(int descriptor, void *data, size_t capacity,
+ptrdiff_t ftun_socket_receive_nowait(ftun_handle_t descriptor, void *data, size_t capacity,
   ftun_status_t *status)
 {
   ssize_t count;
   do {
-    count = recv(descriptor, data, capacity, MSG_DONTWAIT);
+    count = recv((int)descriptor, data, capacity, MSG_DONTWAIT);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
 }
-ptrdiff_t ftun_socket_stream_send(int descriptor, const void *data, size_t length,
+ptrdiff_t ftun_socket_stream_send(ftun_handle_t descriptor, const void *data, size_t length,
   ftun_status_t *status)
 {
   ssize_t count;
   do {
-    count = send(descriptor, data, length, MSG_DONTWAIT | MSG_NOSIGNAL);
+    count = send((int)descriptor, data, length, MSG_DONTWAIT | MSG_NOSIGNAL);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
 }
-ptrdiff_t ftun_socket_stream_receive(int descriptor, void *data, size_t capacity,
+ptrdiff_t ftun_socket_stream_receive(ftun_handle_t descriptor, void *data, size_t capacity,
   ftun_status_t *status)
 {
   ssize_t count;
   do {
-    count = recv(descriptor, data, capacity, MSG_DONTWAIT);
+    count = recv((int)descriptor, data, capacity, MSG_DONTWAIT);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
 }
-ftun_status_t ftun_socket_shutdown_write(int descriptor)
+ftun_status_t ftun_socket_shutdown_write(ftun_handle_t descriptor)
 {
-  if (shutdown(descriptor, SHUT_WR) == 0 || errno == ENOTCONN) return FTUN_OK;
+  if (shutdown((int)descriptor, SHUT_WR) == 0 || errno == ENOTCONN) return FTUN_OK;
   return ftun_socket_status(errno);
 }
-ftun_status_t ftun_socket_name(int descriptor, ftun_endpoint_t *out)
+ftun_status_t ftun_socket_name(ftun_handle_t descriptor, ftun_endpoint_t *out)
 {
   struct sockaddr_in address;
   socklen_t length = sizeof(address);
-  if (getsockname(descriptor, (struct sockaddr *)&address, &length) != 0) return ftun_socket_status(errno);
+  if (getsockname((int)descriptor, (struct sockaddr *)&address, &length) != 0) return ftun_socket_status(errno);
   if (length < sizeof(address) || address.sin_family != AF_INET) return FTUN_E_UNSUPPORTED;
   out->kind = FTUN_ADDRESS_IPV4;
   memcpy(out->address, &address.sin_addr.s_addr, 4u);
@@ -309,7 +310,7 @@ static ftun_status_t ftun_socket_endpoint(const struct sockaddr_in *address,
 }
 
 ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
-  ftun_dial_transport_t transport, int backlog, int *out,
+  ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
   ftun_socket_bind_issue_t *issue)
 {
   struct sockaddr_in address;
@@ -337,12 +338,12 @@ ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_socket_accept(int listener, int *out, ftun_endpoint_t *peer,
+ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out, ftun_endpoint_t *peer,
   ftun_socket_accept_disposition_t *disposition)
 {
   struct sockaddr_in address;
   socklen_t length = sizeof(address);
-  int descriptor = accept4(listener, (struct sockaddr *)&address, &length,
+  int descriptor = accept4((int)listener, (struct sockaddr *)&address, &length,
     SOCK_CLOEXEC | SOCK_NONBLOCK);
   int error = errno;
   *out = -1;
@@ -359,27 +360,32 @@ ftun_status_t ftun_socket_accept(int listener, int *out, ftun_endpoint_t *peer,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_socket_duplicate(int descriptor, int *out)
+ftun_status_t ftun_socket_duplicate(ftun_handle_t descriptor, ftun_handle_t *out)
 {
-  *out = fcntl(descriptor, F_DUPFD_CLOEXEC, 0);
+  *out = fcntl((int)descriptor, F_DUPFD_CLOEXEC, 0);
   return *out < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
 }
 
-ftun_status_t ftun_socket_pair(int out[2])
+ftun_status_t ftun_socket_pair(ftun_handle_t out[2])
 {
+  int pair[2];
   out[0] = out[1] = -1;
-  return socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0, out) == 0
-    ? FTUN_OK : ftun_socket_stream_status(errno);
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) != 0) {
+    return ftun_socket_stream_status(errno);
+  }
+  out[0] = pair[0];
+  out[1] = pair[1];
+  return FTUN_OK;
 }
 
-ptrdiff_t ftun_socket_receive_from(int descriptor, void *buffer, size_t capacity,
+ptrdiff_t ftun_socket_receive_from(ftun_handle_t descriptor, void *buffer, size_t capacity,
   ftun_endpoint_t *peer, ftun_status_t *status)
 {
   struct sockaddr_in address;
   socklen_t length = sizeof(address);
   ssize_t count;
   do {
-    count = recvfrom(descriptor, buffer, capacity, MSG_DONTWAIT,
+    count = recvfrom((int)descriptor, buffer, capacity, MSG_DONTWAIT,
       (struct sockaddr *)&address, &length);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno)
@@ -387,14 +393,14 @@ ptrdiff_t ftun_socket_receive_from(int descriptor, void *buffer, size_t capacity
   return *status == FTUN_OK ? (ptrdiff_t)count : -1;
 }
 
-ptrdiff_t ftun_socket_send_to(int descriptor, const void *buffer, size_t length,
+ptrdiff_t ftun_socket_send_to(ftun_handle_t descriptor, const void *buffer, size_t length,
   const ftun_endpoint_t *peer, ftun_status_t *status)
 {
   struct sockaddr_in address;
   ssize_t count;
   ftun_socket_address(peer, &address);
   do {
-    count = sendto(descriptor, buffer, length, MSG_DONTWAIT | MSG_NOSIGNAL,
+    count = sendto((int)descriptor, buffer, length, MSG_DONTWAIT | MSG_NOSIGNAL,
       (const struct sockaddr *)&address, sizeof(address));
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
@@ -402,7 +408,7 @@ ptrdiff_t ftun_socket_send_to(int descriptor, const void *buffer, size_t length,
 }
 
 ftun_status_t ftun_socket_connect_udp(const ftun_endpoint_t *peer, uint32_t mark,
-  int *out)
+  ftun_handle_t *out)
 {
   struct sockaddr_in address;
   int descriptor;

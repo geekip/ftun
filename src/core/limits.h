@@ -22,12 +22,6 @@ typedef struct {
 } ftun_budget_options_t;
 
 typedef struct {
-  /* Legacy memory fields remain available to existing callers. */
-  size_t limit;
-  size_t cleanup_reserve;
-  size_t used;
-  size_t normal_available;
-  size_t total_available;
   size_t child_count;
   ftun_budget_resources_t limits;
   ftun_budget_resources_t cleanup_reserves;
@@ -91,8 +85,8 @@ ftun_status_t ftun_budget_get_usage(const ftun_budget_t *budget,
 ftun_status_t ftun_budget_same_root(const ftun_budget_t *left,
                                     const ftun_budget_t *right,
                                     bool *out_same);
-/* 消费并清零凭据；空凭据幂等，NULL 输出存储无效。 */
-ftun_status_t ftun_reservation_release(ftun_reservation_t *reservation);
+/* 消费并清零凭据；空凭据幂等，调用方必须传入有效 owner 存储。 */
+void ftun_reservation_release(ftun_reservation_t *reservation);
 /* 在本域同步范围内改变拥有额度，不分配凭据；失败保持原额度。
  * 每一维独立准入，保留原 normal/cleanup 类型和祖先保障规则。
  * 全零目标无效，最终归还使用 release。调用者仍独占 reservation 句柄。 */

@@ -157,7 +157,7 @@ static void ftun_dns_listener_completed(ftun_operation_t *operation,
   listener->reply(transport, request->peer_id, error, reply,
                   listener->reply_user);
   free(request);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
 }
 
 static ftun_status_t ftun_dns_listener_accept(
@@ -201,7 +201,7 @@ static ftun_status_t ftun_dns_listener_accept(
   }
   request = (ftun_dns_listener_request_t *)calloc(1u, bytes);
   if (request == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     (void)ftun_dns_message_release(&message);
     return FTUN_E_LIMIT;
   }
@@ -272,7 +272,7 @@ static ftun_status_t ftun_dns_listener_accept(
 
 fail:
   free(request);
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   (void)ftun_dns_message_release(&message);
   return status;
 }
@@ -302,7 +302,7 @@ ftun_status_t ftun_dns_listen(ftun_core_t *core,
   if (status != FTUN_OK) return status;
   listener = (ftun_dns_listener_t *)calloc(1u, sizeof(*listener));
   if (listener == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   listener->core = core;
@@ -373,7 +373,7 @@ ftun_status_t ftun_dns_listener_tcp_open(ftun_dns_listener_t *listener,
   if (status != FTUN_OK) return status;
   connection = (ftun_dns_connection_t *)calloc(1u, bytes);
   if (connection == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   connection->listener = listener;
@@ -459,7 +459,8 @@ ftun_status_t ftun_dns_connection_close(ftun_dns_connection_t **connection)
   reservation = owned->reservation;
   free(owned);
   *connection = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_dns_listener_stop(ftun_dns_listener_t *listener)
@@ -493,5 +494,6 @@ ftun_status_t ftun_dns_listener_destroy(ftun_dns_listener_t **listener)
   reservation = owned->reservation;
   free(owned);
   *listener = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }

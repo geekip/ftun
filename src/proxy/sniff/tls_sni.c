@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* 
+/*
  * ftun_sniff_tls_sni 有界解析分片 ClientHello，不启动 TLS 库。 */
 
 #define FTUN_SNIFF_TLS_MAX_BYTES 65536u
@@ -139,7 +139,7 @@ ftun_status_t ftun_sniff_tls_sni_with_budget(ftun_budget_t *budget, ftun_bytes_t
   }
   handshake = (uint8_t *)malloc(FTUN_SNIFF_TLS_MAX_BYTES);
   if (handshake == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   while (cursor < preread.length && handshake_length < wanted) {
@@ -188,7 +188,7 @@ ftun_status_t ftun_sniff_tls_sni_with_budget(ftun_budget_t *budget, ftun_bytes_t
 
 done:
   free(handshake);
-  if (ftun_reservation_release(&reservation) != FTUN_OK) status = FTUN_E_STATE_CORRUPT;
+  ftun_reservation_release(&reservation);
   if (status != FTUN_OK) memset(out, 0, sizeof(*out));
   return status;
 }

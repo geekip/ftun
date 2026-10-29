@@ -136,15 +136,15 @@ static int run(bool hold, unsigned int port)
   CHECK(ftun_control_channel_read(channel, data, sizeof(data), &length) == FTUN_E_INVALID);
   CHECK(ftun_control_channel_receive(channel, &source, data, sizeof(data), &length) == FTUN_E_AGAIN && length == 0u);
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(ftun_budget_reserve(budget, after.normal_available, &pressure) == FTUN_OK);
+  CHECK(ftun_budget_reserve(budget, after.normal_available_resources.memory_bytes, &pressure) == FTUN_OK);
   CHECK(ftun_control_channel_send(channel, &peer, (const uint8_t *)"pressure", 8u) == FTUN_E_LIMIT);
-  CHECK(ftun_reservation_release(&pressure) == FTUN_OK && fixture.sent == 0u);
+  ftun_reservation_release(&pressure); CHECK(fixture.sent == 0u);
   CHECK(ftun_control_channel_send(channel, &peer, data, 65537u) == FTUN_E_LIMIT);
   CHECK(ftun_control_channel_send(channel, &peer, (const uint8_t *)"abc", 3u) == (hold ? FTUN_E_TIMEOUT : FTUN_OK));
   if (hold) {
     CHECK(ftun_control_channel_close(&channel) == FTUN_E_AGAIN && channel != NULL);
     CHECK(fixture.cancelled != 0u && fixture.destroyed == 0u && fixture.sent == 1u);
-    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used != 0u);
+    CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK && after.used_resources.memory_bytes != 0u);
     CHECK(ftun_datagram_send_complete(fixture.pending, (ftun_error_t){FTUN_E_CANCELLED, 0u, 0}) == FTUN_OK);
   } else {
     CHECK(receive(channel, &source, data, sizeof(data), &length) == FTUN_OK);
@@ -176,7 +176,7 @@ static int run(bool hold, unsigned int port)
   CHECK(ftun_control_channel_close(&channel) == FTUN_OK && channel == NULL);
   CHECK(fixture.physical || fixture.destroyed == 1u);
   CHECK(ftun_budget_get_usage(budget, &after) == FTUN_OK);
-  CHECK(after.used == before.used && after.metadata_bytes == before.metadata_bytes && after.used_resources.descriptors == 0u);
+  CHECK(after.used_resources.memory_bytes == before.used_resources.memory_bytes && after.metadata_bytes == before.metadata_bytes && after.used_resources.descriptors == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

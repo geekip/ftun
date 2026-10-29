@@ -109,7 +109,7 @@ static int scenario(ftun_status_t first_failure, bool complete_failed,
   CHECK(ftun_buffer_data(buffer, &data, &capacity) == FTUN_OK && capacity >= 8u);
   memcpy(data, "abcdefgh", 8u);
   CHECK(ftun_buffer_slice(buffer, 0u, 8u, &slice) == FTUN_OK);
-  CHECK(ftun_buffer_release(&buffer) == FTUN_OK);
+  ftun_buffer_release(&buffer);
   options.budget = budget;
   options.operations = operations;
   options.max_pending_writes = 3u;
@@ -135,7 +135,7 @@ static int scenario(ftun_status_t first_failure, bool complete_failed,
   retained = state.stream;
   CHECK(ftun_stream_write_ref(other.stream, &slice, &accepted, &operation) ==
         FTUN_OK && accepted == 8u && operation != NULL);
-  CHECK(ftun_buffer_slice_release(&slice) == FTUN_OK);
+  ftun_buffer_slice_release(&slice);
   memcpy(late, state.tokens, sizeof(late));
   state.failure = first_failure;
   CHECK(ftun_stream_abort(state.stream) == first_failure);
@@ -176,7 +176,7 @@ static int scenario(ftun_status_t first_failure, bool complete_failed,
   CHECK(state.guarded == expected_cancels * 3u + 2u * (unsigned int)abort_in_start +
         (abort_in_completion ? pending : 0u));
   CHECK(ftun_stream_destroy(&state.stream) == FTUN_E_AGAIN && state.stream != NULL);
-  CHECK(ftun_stream_release(&retained) == FTUN_OK && retained == NULL);
+  ftun_stream_release(&retained); CHECK(retained == NULL);
   CHECK(ftun_stream_destroy(&state.stream) == FTUN_OK && state.destroyed == 1u);
   /* 共用队列的另一流保持运行，未被单流撤销取消或停止。 */
   CHECK(ftun_stream_get_usage(other.stream, &stream_usage) == FTUN_OK &&
@@ -192,7 +192,7 @@ static int scenario(ftun_status_t first_failure, bool complete_failed,
   CHECK(ftun_stream_destroy(&other.stream) == FTUN_OK && other.destroyed == 1u);
   CHECK(ftun_buffer_pool_destroy(&pool) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used == 0u);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

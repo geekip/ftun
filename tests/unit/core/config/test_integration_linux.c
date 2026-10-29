@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "platform/linux/route.h"
 #include "app/config/compile.h"
 #include "app/config/config.h"
 #include "app/config/model.h"
@@ -14,9 +15,9 @@
 #include "core/event/backend.h"
 #include "proxy/netstack/ingress.h"
 #include "proxy/outbound/outbound.h"
-#include "libs/tun/linux/routes.h"
-#include "libs/tun/linux/interface.h"
-#include "libs/tun/linux/device.h"
+#include "libs/tun/routes.h"
+#include "libs/tun/interface_backend.h"
+#include "libs/tun/port.h"
 #include "platform/linux/uapi.h"
 #include "libs/resolver/system.h"
 #include "proxy/route/target.h"
@@ -557,22 +558,22 @@ static void peer_signal(int signal_number)
 }
 
 static int peer_route_drive(ftun_event_loop_t *loop,
-                            ftun_linux_route_async_t *routes,
-                            ftun_linux_route_async_state_t terminal,
+                            ftun_route_async_t *routes,
+                            ftun_route_async_state_t terminal,
                             uint64_t deadline_ms)
 {
   for (;;) {
-    ftun_linux_route_async_info_t info;
+    ftun_route_async_info_t info;
     size_t work = 0u;
     size_t callbacks = 0u;
     uint64_t now_ms = 0u;
     if (ftun_monotonic_now(&now_ms) != FTUN_OK || now_ms >= deadline_ms ||
-        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) return 0;
+        ftun_route_async_get_info(routes, &info) != FTUN_OK) return 0;
     if (info.state == terminal) return 1;
-    if (info.state == FTUN_LINUX_ROUTE_ASYNC_FAILED ||
-        info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED ||
-        ftun_linux_route_async_run(routes, now_ms, 8u, &work) != FTUN_OK ||
-        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) return 0;
+    if (info.state == FTUN_ROUTE_ASYNC_FAILED ||
+        info.state == FTUN_ROUTE_ASYNC_CLEANUP_FAILED ||
+        ftun_route_async_run(routes, now_ms, 8u, &work) != FTUN_OK ||
+        ftun_route_async_get_info(routes, &info) != FTUN_OK) return 0;
     if (info.state == terminal) return 1;
     if (ftun_event_loop_run_once(loop, work == 0u && !info.runnable, 8u,
                                  &callbacks) != FTUN_OK) return 0;
@@ -587,8 +588,8 @@ static int peer_main(const char *ready_path, const char *frs_path)
   ftun_event_loop_t *route_loop = NULL;
   ftun_packet_port_t *mesh_port = NULL;
   ftun_packet_port_info_t mesh_info;
-  ftun_linux_route_plan_t mesh_plan;
-  ftun_linux_route_async_t *mesh_routes = NULL;
+  ftun_route_plan_t mesh_plan;
+  ftun_route_async_t *mesh_routes = NULL;
   ftun_tun_spec_t mesh_tun;
   uint8_t buffer[2048];
   int direct_tcp = socket_bound(SOCK_STREAM, PEER_ADDRESS, DIRECT_TCP_PORT);
@@ -628,13 +629,13 @@ static int peer_main(const char *ready_path, const char *frs_path)
   if (direct_tcp < 0 || direct_udp < 0 || socks < 0 || mesh_wire < 0 ||
       http < 0 || dns < 0 || ftun_event_loop_create(NULL, &route_loop) !=
         FTUN_OK || ftun_event_backend_attach(route_loop) != FTUN_OK ||
-      ftun_linux_tun_open(&mesh_tun, &mesh_port) != FTUN_OK ||
+      ftun_tun_port_open(&mesh_tun, &mesh_port) != FTUN_OK ||
       ftun_packet_port_get_info(mesh_port, &mesh_info) != FTUN_OK ||
       ftun_monotonic_now(&now_ms) != FTUN_OK ||
-      ftun_linux_route_async_start_plan(&mesh_plan, route_loop, now_ms, 250u,
+      ftun_route_async_start_plan(&mesh_plan, route_loop, now_ms, 250u,
         now_ms + 5000u, &mesh_routes) != FTUN_OK ||
       !peer_route_drive(route_loop, mesh_routes,
-                        FTUN_LINUX_ROUTE_ASYNC_READY, now_ms + 5000u)) return 1;
+                        FTUN_ROUTE_ASYNC_READY, now_ms + 5000u)) return 1;
   mesh_socks = socket_bound(SOCK_STREAM, MESH_ADDRESS, MESH_SOCKS_PORT);
   if (mesh_socks < 0 ||
       listen(direct_tcp, 128) != 0 || listen(socks, 128) != 0 ||
@@ -717,12 +718,12 @@ static int peer_main(const char *ready_path, const char *frs_path)
   (void)close(direct_udp);
   (void)close(direct_tcp);
   if (ftun_monotonic_now(&now_ms) == FTUN_OK && mesh_routes != NULL &&
-      ftun_linux_route_async_release(mesh_routes, now_ms,
+      ftun_route_async_release(mesh_routes, now_ms,
                                      now_ms + 5000u) == FTUN_OK) {
     (void)peer_route_drive(route_loop, mesh_routes,
-                           FTUN_LINUX_ROUTE_ASYNC_RELEASED, now_ms + 5000u);
+                           FTUN_ROUTE_ASYNC_RELEASED, now_ms + 5000u);
   }
-  (void)ftun_linux_route_async_destroy(&mesh_routes);
+  (void)ftun_route_async_destroy(&mesh_routes);
   (void)ftun_packet_port_close(&mesh_port);
   (void)ftun_event_loop_stop(route_loop);
   (void)ftun_event_backend_detach(route_loop);
@@ -2521,9 +2522,9 @@ struct integration {
   ftun_tun_lease_t mesh_tun_lease;
   ftun_tun_ingress_context_t *ingress;
   ftun_udp_flow_table_t *udp_flows;
-  ftun_linux_route_async_t *routes;
-  ftun_linux_route_async_t *network_guard;
-  ftun_linux_route_async_t *overlay_routes;
+  ftun_route_async_t *routes;
+  ftun_route_async_t *network_guard;
+  ftun_route_async_t *overlay_routes;
   ftun_network_view_t *network_view;
   int mesh_wire;
   size_t mesh_packets_sent;
@@ -3016,14 +3017,12 @@ static ftun_status_t packet_from_bytes(integration_t *integration,
   if (status == FTUN_OK) {
     status = ftun_packet_init(&packet, &slice, INBOUND_ID);
   }
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   if (status == FTUN_OK) {
     status = ftun_tun_ingress(integration->ingress, &packet);
   }
-  if (ftun_packet_release(&packet) != FTUN_OK && status == FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
+  ftun_packet_release(&packet);
   return status;
 }
 
@@ -3165,14 +3164,12 @@ static ftun_status_t receive_udp_slot(udp_slot_t *slot)
     status = ftun_buffer_slice(buffer, 0u, (size_t)length, &slice);
   }
   if (status == FTUN_OK) status = ftun_packet_init(&packet, &slice, 0u);
-  (void)ftun_buffer_slice_release(&slice);
-  (void)ftun_buffer_release(&buffer);
+  ftun_buffer_slice_release(&slice);
+  ftun_buffer_release(&buffer);
   if (status == FTUN_OK) {
     status = ftun_datagram_deliver(slot->channel, &slot->remote, &packet);
   }
-  if (ftun_packet_release(&packet) != FTUN_OK && status == FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
+  ftun_packet_release(&packet);
   return status;
 }
 
@@ -3813,26 +3810,26 @@ static ftun_config_t *integration_config(void)
 }
 
 static int integration_route_drive(integration_t *integration,
-                                   ftun_linux_route_async_t *routes,
-                                   ftun_linux_route_async_state_t terminal,
+                                   ftun_route_async_t *routes,
+                                   ftun_route_async_state_t terminal,
                                    uint64_t deadline_ms)
 {
   for (;;) {
-    ftun_linux_route_async_info_t info;
+    ftun_route_async_info_t info;
     size_t route_work = 0u;
     size_t callbacks = 0u;
     bool block;
     if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
         integration->now_ms >= deadline_ms ||
-        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) {
+        ftun_route_async_get_info(routes, &info) != FTUN_OK) {
       return 1;
     }
     if (info.state == terminal) return 0;
-    if (info.state == FTUN_LINUX_ROUTE_ASYNC_FAILED ||
-        info.state == FTUN_LINUX_ROUTE_ASYNC_CLEANUP_FAILED) return 1;
-    if (ftun_linux_route_async_run(routes, integration->now_ms,
+    if (info.state == FTUN_ROUTE_ASYNC_FAILED ||
+        info.state == FTUN_ROUTE_ASYNC_CLEANUP_FAILED) return 1;
+    if (ftun_route_async_run(routes, integration->now_ms,
                                    16u, &route_work) != FTUN_OK ||
-        ftun_linux_route_async_get_info(routes, &info) != FTUN_OK) {
+        ftun_route_async_get_info(routes, &info) != FTUN_OK) {
       return 1;
     }
     if (info.state == terminal) return 0;
@@ -3851,7 +3848,7 @@ static int integration_start(integration_t *integration)
   ftun_network_prefix_t protected_prefix;
   ftun_network_route_t overlay_route;
   ftun_network_view_spec_t network_spec;
-  ftun_linux_route_plan_t network_plan;
+  ftun_route_plan_t network_plan;
   ftun_tun_service_spec_t tun_service_spec;
   ftun_tun_consumer_t proxy_consumer;
   ftun_tun_consumer_spec_t mesh_consumer;
@@ -3950,37 +3947,37 @@ static int integration_start(integration_t *integration)
   route_policy.tun_interface = tun_spec.name;
   CHECK(inet_pton(AF_INET, "10.77.0.1", route_policy.tun_ipv4) == 1);
   route_policy.tun_prefix_length = 30u;
-  route_policy.route_table = 100u;
-  route_policy.rule_priority = 12340u;
-  route_policy.capture_priority_offset = 100u;
-  route_policy.protection_mark = PROTECTION_MARK;
-  route_policy.protection_mark_mask = UINT32_MAX;
+  route_policy.routing_domain = 100u;
+  route_policy.precedence = 12340u;
+  route_policy.capture_offset = 100u;
+  route_policy.bypass_tag = PROTECTION_MARK;
+  route_policy.bypass_mask = UINT32_MAX;
   route_policy.manage_local = true;
   route_policy.lan_interface.data = "lan0";
   route_policy.lan_interface.length = 4u;
   route_policy.strict_route = true;
   {
     ftun_route_transaction_t *startup = NULL;
-    ftun_linux_route_async_t *adopted = NULL;
-    ftun_linux_route_async_info_t adopted_info;
+    ftun_route_async_t *adopted = NULL;
+    ftun_route_async_info_t adopted_info;
     /* 静态启动资源交给非阻塞事务；接管不重新安装，逆序撤销后再验证原动态路径。 */
-    if (ftun_linux_route_prepare(&route_policy, &startup) != FTUN_OK ||
+    if (ftun_route_prepare(&route_policy, &startup) != FTUN_OK ||
         ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-        ftun_linux_route_async_adopt(&startup, integration->loop,
+        ftun_route_async_adopt(&startup, integration->loop,
           integration->now_ms, 250u, integration->now_ms + 5000u, &adopted) != FTUN_OK ||
-        startup != NULL || ftun_linux_route_async_get_info(adopted, &adopted_info) != FTUN_OK ||
-        adopted_info.state != FTUN_LINUX_ROUTE_ASYNC_READY || adopted_info.active_count != 7u ||
-        ftun_linux_route_async_release(adopted, integration->now_ms,
+        startup != NULL || ftun_route_async_get_info(adopted, &adopted_info) != FTUN_OK ||
+        adopted_info.state != FTUN_ROUTE_ASYNC_READY || adopted_info.active_count != 7u ||
+        ftun_route_async_release(adopted, integration->now_ms,
           integration->now_ms + 5000u) != FTUN_OK ||
-        integration_route_drive(integration, adopted, FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+        integration_route_drive(integration, adopted, FTUN_ROUTE_ASYNC_RELEASED,
           integration->now_ms + 5000u) != 0 ||
-        ftun_linux_route_async_destroy(&adopted) != FTUN_OK) return 1;
+        ftun_route_async_destroy(&adopted) != FTUN_OK) return 1;
   }
-  if (ftun_linux_route_async_start(&route_policy, integration->loop,
+  if (ftun_route_async_start(&route_policy, integration->loop,
       integration->now_ms, 250u, integration->now_ms + 5000u,
       &integration->routes) != FTUN_OK ||
       integration_route_drive(integration, integration->routes,
-                              FTUN_LINUX_ROUTE_ASYNC_READY,
+                              FTUN_ROUTE_ASYNC_READY,
                               integration->now_ms + 5000u) != 0) return 1;
 
   memset(&protected_prefix, 0, sizeof(protected_prefix));
@@ -3999,32 +3996,32 @@ static int integration_start(integration_t *integration)
   network_spec.overlay_route_count = 1u;
   if (ftun_network_view_create(&network_spec, &integration->network_view) !=
         FTUN_OK ||
-      ftun_linux_route_guard_plan(integration->network_view, 100u, 12341u,
+      ftun_route_guard_plan(integration->network_view, 100u, 12341u,
                                   &network_plan) != FTUN_OK ||
       ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-      ftun_linux_route_async_start_plan(&network_plan, integration->loop,
+      ftun_route_async_start_plan(&network_plan, integration->loop,
         integration->now_ms, 250u, integration->now_ms + 5000u,
         &integration->network_guard) != FTUN_OK ||
       integration_route_drive(integration, integration->network_guard,
-        FTUN_LINUX_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0 ||
-      ftun_linux_route_overlay_plan(integration->network_view, tun_spec.name,
+        FTUN_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0 ||
+      ftun_route_overlay_plan(integration->network_view, tun_spec.name,
                                     100u, 100u, &network_plan) != FTUN_OK ||
       ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-      ftun_linux_route_async_start_plan(&network_plan, integration->loop,
+      ftun_route_async_start_plan(&network_plan, integration->loop,
         integration->now_ms, 250u, integration->now_ms + 5000u,
         &integration->overlay_routes) != FTUN_OK ||
       integration_route_drive(integration, integration->overlay_routes,
-        FTUN_LINUX_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0) {
+        FTUN_ROUTE_ASYNC_READY, integration->now_ms + 5000u) != 0) {
     return 1;
   }
   for (index = 0u; index < 3u; index++) {
     ftun_route_policy_t probe_policy = route_policy;
-    ftun_linux_route_async_t *duplicate_routes = NULL;
+    ftun_route_async_t *duplicate_routes = NULL;
     if (index >= 1u) probe_policy.tun_ipv4[2] = 1u;
-    if (index >= 2u) probe_policy.protection_mark = UINT32_C(0x46000002);
+    if (index >= 2u) probe_policy.bypass_tag = UINT32_C(0x46000002);
     /* 同表号的第二个实例在改动网络之前就被实例锁拒绝，不留下任何对象。 */
     if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-        ftun_linux_route_async_start(&probe_policy, integration->loop,
+        ftun_route_async_start(&probe_policy, integration->loop,
           integration->now_ms, 250u, integration->now_ms + 5000u,
           &duplicate_routes) != FTUN_E_REJECTED ||
         duplicate_routes != NULL) return 1;
@@ -4201,7 +4198,7 @@ static int test_network_protection(integration_t *integration)
   ftun_network_prefix_t protected_prefix;
   ftun_network_view_spec_t spec;
   ftun_network_view_t *revoked = NULL;
-  ftun_linux_route_plan_t guard_plan;
+  ftun_route_plan_t guard_plan;
   struct sockaddr_in target;
   struct sockaddr_ll capture_address;
   uint8_t packet[2048];
@@ -4245,17 +4242,17 @@ static int test_network_protection(integration_t *integration)
   spec.protected_prefixes = &protected_prefix;
   spec.protected_prefix_count = 1u;
   CHECK(ftun_network_view_create(&spec, &revoked) == FTUN_OK);
-  CHECK(ftun_network_view_release(&integration->network_view) == FTUN_OK);
+  ftun_network_view_release(&integration->network_view);
   integration->network_view = revoked;
   revoked = NULL;
 
   CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
-  CHECK(ftun_linux_route_async_release(integration->overlay_routes,
+  CHECK(ftun_route_async_release(integration->overlay_routes,
           integration->now_ms, integration->now_ms + 5000u) == FTUN_OK);
   CHECK(integration_route_drive(integration, integration->overlay_routes,
-          FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+          FTUN_ROUTE_ASYNC_RELEASED,
           integration->now_ms + 5000u) == 0);
-  CHECK(ftun_linux_route_async_destroy(&integration->overlay_routes) ==
+  CHECK(ftun_route_async_destroy(&integration->overlay_routes) ==
         FTUN_OK);
 
   errno = 0;
@@ -4297,21 +4294,21 @@ static int test_network_protection(integration_t *integration)
   /* 清理退出后按同一撤销视图重建 guard，模拟干净重启。保护必须先恢复，
    * 才允许后续使用该代 NetworkView。 */
   CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
-  CHECK(ftun_linux_route_async_release(integration->network_guard,
+  CHECK(ftun_route_async_release(integration->network_guard,
           integration->now_ms, integration->now_ms + 5000u) == FTUN_OK);
   CHECK(integration_route_drive(integration, integration->network_guard,
-          FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+          FTUN_ROUTE_ASYNC_RELEASED,
           integration->now_ms + 5000u) == 0);
-  CHECK(ftun_linux_route_async_destroy(&integration->network_guard) ==
+  CHECK(ftun_route_async_destroy(&integration->network_guard) ==
         FTUN_OK);
-  CHECK(ftun_linux_route_guard_plan(integration->network_view, 100u, 12341u,
+  CHECK(ftun_route_guard_plan(integration->network_view, 100u, 12341u,
                                     &guard_plan) == FTUN_OK);
   CHECK(ftun_monotonic_now(&integration->now_ms) == FTUN_OK);
-  CHECK(ftun_linux_route_async_start_plan(&guard_plan, integration->loop,
+  CHECK(ftun_route_async_start_plan(&guard_plan, integration->loop,
           integration->now_ms, 250u, integration->now_ms + 5000u,
           &integration->network_guard) == FTUN_OK);
   CHECK(integration_route_drive(integration, integration->network_guard,
-          FTUN_LINUX_ROUTE_ASYNC_READY,
+          FTUN_ROUTE_ASYNC_READY,
           integration->now_ms + 5000u) == 0);
   new_socket = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, IPPROTO_UDP);
   CHECK(new_socket >= 0);
@@ -4333,20 +4330,20 @@ static int integration_stop(integration_t *integration)
   if (ftun_udp_flow_table_destroy(&integration->udp_flows) != FTUN_OK ||
       ftun_tun_ingress_close(&integration->ingress) != FTUN_OK ||
       ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-      ftun_linux_route_async_release(integration->network_guard,
+      ftun_route_async_release(integration->network_guard,
         integration->now_ms, integration->now_ms + 5000u) != FTUN_OK ||
       integration_route_drive(integration, integration->network_guard,
-                              FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+                              FTUN_ROUTE_ASYNC_RELEASED,
                               integration->now_ms + 5000u) != 0 ||
-      ftun_linux_route_async_destroy(&integration->network_guard) != FTUN_OK ||
-      ftun_network_view_release(&integration->network_view) != FTUN_OK ||
-      ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
-      ftun_linux_route_async_release(integration->routes,
+      ftun_route_async_destroy(&integration->network_guard) != FTUN_OK) return 1;
+  ftun_network_view_release(&integration->network_view);
+  if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
+      ftun_route_async_release(integration->routes,
         integration->now_ms, integration->now_ms + 5000u) != FTUN_OK ||
       integration_route_drive(integration, integration->routes,
-                              FTUN_LINUX_ROUTE_ASYNC_RELEASED,
+                              FTUN_ROUTE_ASYNC_RELEASED,
                               integration->now_ms + 5000u) != 0 ||
-      ftun_linux_route_async_destroy(&integration->routes) != FTUN_OK ||
+      ftun_route_async_destroy(&integration->routes) != FTUN_OK ||
       close(integration->mesh_wire) != 0 ||
       ftun_tun_service_quiesce(integration->tun_service) != FTUN_OK ||
       ftun_tun_service_release(&integration->mesh_tun_lease) != FTUN_OK ||
@@ -4367,7 +4364,7 @@ static int integration_stop(integration_t *integration)
       ftun_buffer_pool_destroy(&integration->tun_buffers) != FTUN_OK ||
       ftun_runtime_manager_destroy(&integration->core) != FTUN_OK ||
       ftun_budget_get_usage(integration->budget, &budget_usage) != FTUN_OK ||
-      budget_usage.used != 0u ||
+      budget_usage.used_resources.memory_bytes != 0u ||
       ftun_budget_destroy(&integration->budget) != FTUN_OK) return 1;
   return 0;
 }
@@ -4461,7 +4458,7 @@ static int owner_recovery_main(void)
   CHECK(ftun_event_backend_attach(loop) == FTUN_OK);
   binding.provider = &provider;
   binding.loop = loop;
-  binding.network = &ftun_linux_interface_ops;
+  binding.network = &ftun_interface_default_ops;
   binding.protection_mark = PROTECTION_MARK;
   config.tun.present = true;
   config.tun.interface_name = "ftun-own-it0";
@@ -4469,8 +4466,8 @@ static int owner_recovery_main(void)
   config.tun.mtu = TUN_MTU;
   config.tun.auto_route = true;
   config.tun.strict_route = true;
-  config.tun.route_table = FTUN_CONFIG_ROUTE_TABLE_DEFAULT;
-  config.tun.rule_priority = FTUN_CONFIG_RULE_PRIORITY_DEFAULT;
+  config.tun.route_table = 18004u;
+  config.tun.rule_priority = 11000u;
   CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
   CHECK(ftun_tun_owner_service.prepare(core, budget, operations, &service_binding,
     &config, 1u, &owner) == FTUN_OK);
@@ -4507,7 +4504,7 @@ static int owner_recovery_main(void)
     }
   }
   CHECK(provider.service == NULL && if_nametoindex("ftun-own-it0") == 0u);
-  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used == baseline.used &&
+  CHECK(ftun_budget_get_usage(budget, &final) == FTUN_OK && final.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
     final.used_resources.descriptors == baseline.used_resources.descriptors &&
     final.used_resources.queue_slots == baseline.used_resources.queue_slots);
   CHECK(ftun_event_loop_stop(loop) == FTUN_OK && ftun_event_backend_detach(loop) == FTUN_OK);

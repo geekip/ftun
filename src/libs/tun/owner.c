@@ -160,14 +160,14 @@ static ftun_status_t ftun_tun_owner_plan_prepare(ftun_budget_t *budget,
   if (status != FTUN_OK) return status;
   plan = (ftun_tun_owner_prepared_plan_t *)calloc(1u, sizeof(*plan));
   if (plan == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   plan->reservation = reservation;
   status = ftun_tun_owner_plan_build(config, socket_mark, &plan->value);
   if (status != FTUN_OK) {
     free(plan);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   *out = plan;
@@ -177,12 +177,10 @@ static ftun_status_t ftun_tun_owner_plan_prepare(ftun_budget_t *budget,
 static ftun_status_t ftun_tun_owner_plan_destroy(void **plan)
 {
   ftun_tun_owner_prepared_plan_t *owned;
-  ftun_status_t status;
   if (plan == NULL) return FTUN_E_INVALID;
   owned = *plan;
   if (owned == NULL) return FTUN_OK;
-  status = ftun_reservation_release(&owned->reservation);
-  if (status != FTUN_OK) return status;
+  ftun_reservation_release(&owned->reservation);
   free(owned);
   *plan = NULL;
   return FTUN_OK;
@@ -250,7 +248,7 @@ static ftun_status_t ftun_tun_owner_prepare(
   if (status != FTUN_OK) return status;
   owner = (ftun_tun_owner_t *)calloc(1u, sizeof(*owner));
   if (owner == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   owner->reservation = reservation;
@@ -287,7 +285,7 @@ fail:
     (void)ftun_tun_service_quiesce(owner->service);
     (void)ftun_tun_service_destroy(&owner->service);
     (void)ftun_buffer_pool_destroy(&owner->buffers);
-    (void)ftun_reservation_release(&owner->reservation);
+    ftun_reservation_release(&owner->reservation);
     free(owner);
   }
   return status;
@@ -1222,7 +1220,8 @@ static ftun_status_t ftun_tun_owner_destroy_until(
   owner->loop = NULL;
   free(owner);
   *implementation = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 const ftun_core_service_descriptor_t ftun_tun_owner_service = {

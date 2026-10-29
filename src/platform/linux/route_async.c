@@ -37,7 +37,7 @@ static int ftun_netlink_attribute_u32(const struct ftun_rtattr *attribute,
 
 static int ftun_netlink_address_matches(
   const struct ftun_nlmsghdr *header,
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   const struct ftun_ifaddrmsg *address;
   const struct ftun_rtattr *attribute;
@@ -74,7 +74,7 @@ static int ftun_netlink_address_matches(
 
 static int ftun_netlink_route_matches(
   const struct ftun_nlmsghdr *header,
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   const struct ftun_rtmsg *route;
   const struct ftun_rtattr *attribute;
@@ -123,7 +123,7 @@ static int ftun_netlink_route_matches(
 
 static int ftun_netlink_rule_matches(
   const struct ftun_nlmsghdr *header,
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   const struct ftun_fib_rule_hdr *rule;
   const struct ftun_rtattr *attribute;
@@ -192,7 +192,7 @@ static int ftun_netlink_rule_matches(
 
 static int ftun_netlink_resource_matches(
   const struct ftun_nlmsghdr *header,
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   if (resource->kind == FTUN_LINUX_ROUTE_ADDRESS) {
     return header->nlmsg_type == FTUN_RTM_NEWADDR &&
@@ -210,7 +210,7 @@ static int ftun_netlink_resource_matches(
 
 static ftun_status_t ftun_netlink_query_build(
   ftun_netlink_message_t *message,
-  const ftun_linux_route_resource_t *resource)
+  const ftun_route_resource_t *resource)
 {
   memset(message, 0, sizeof(*message));
   message->header.nlmsg_flags = FTUN_NLM_F_REQUEST | FTUN_NLM_F_DUMP;
@@ -242,7 +242,7 @@ static ftun_status_t ftun_netlink_query_build(
 }
 
 ftun_status_t ftun_platform_route_submit(
-  ftun_route_kernel_t *operation, const ftun_linux_route_request_t *request)
+  ftun_route_kernel_t *operation, const ftun_route_request_t *request)
 {
   ftun_netlink_message_t message;
   struct ftun_sockaddr_nl address;
@@ -271,7 +271,7 @@ ftun_status_t ftun_platform_route_submit(
   }
   if (result < 0 || (size_t)result != message.header.nlmsg_len) {
     error_code = result < 0 ? errno : EIO;
-    return ftun_linux_route_errno(error_code,
+    return ftun_route_errno(error_code,
       request->kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE);
   }
   operation->write_interest = false;
@@ -284,7 +284,7 @@ ftun_status_t ftun_platform_route_submit(
 }
 
 ftun_status_t ftun_platform_route_receive(
-  ftun_route_kernel_t *operation, ftun_linux_route_reply_t *reply)
+  ftun_route_kernel_t *operation, ftun_route_reply_t *reply)
 {
   struct ftun_sockaddr_nl source;
   socklen_t source_length = (socklen_t)sizeof(source);
@@ -308,7 +308,7 @@ ftun_status_t ftun_platform_route_receive(
     }
     return FTUN_E_AGAIN;
   }
-  if (result < 0) return ftun_linux_route_errno(errno, false);
+  if (result < 0) return ftun_route_errno(errno, false);
   if ((size_t)result > sizeof(storage.bytes)) return FTUN_E_LIMIT;
   if (source_length < sizeof(source) || source.nl_pid != 0u) return FTUN_E_IO;
   operation->io_error = false;
@@ -330,7 +330,7 @@ ftun_status_t ftun_platform_route_receive(
       }
       reply->sequence = header->nlmsg_seq;
       reply->status = error->error == 0 ? FTUN_OK :
-        ftun_linux_route_errno(-error->error,
+        ftun_route_errno(-error->error,
           operation->pending_kind == FTUN_LINUX_ROUTE_REQUEST_REMOVE);
       return FTUN_OK;
     }

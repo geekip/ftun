@@ -23,8 +23,8 @@ ftun_status_t ftun_proxy_runtime_listener_endpoint(
 ftun_status_t ftun_proxy_runtime_listener_bind(
   ftun_proxy_runtime_listener_t *listener)
 {
-  int descriptor;
-  int udp_descriptor = -1;
+  ftun_handle_t descriptor;
+  ftun_handle_t udp_descriptor = -1;
   ftun_status_t status = ftun_socket_listen(&listener->address, FTUN_DIAL_TCP,
     128, &descriptor, &listener->bind_issue);
   if (status != FTUN_OK) return status;
@@ -32,7 +32,7 @@ ftun_status_t ftun_proxy_runtime_listener_bind(
     status = ftun_socket_listen(&listener->address, FTUN_DIAL_UDP,
       0, &udp_descriptor, &listener->bind_issue);
     if (status != FTUN_OK) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)descriptor);
       return status;
     }
   }
@@ -45,12 +45,12 @@ ftun_status_t ftun_proxy_runtime_listener_start(
   ftun_proxy_runtime_t *engine, ftun_proxy_runtime_listener_t *listener)
 {
   ftun_status_t status = ftun_event_io_start(engine->loop,
-    (ftun_native_socket_t)(unsigned int)listener->descriptor,
+    (ftun_native_socket_t)listener->descriptor,
     FTUN_EVENT_READ | FTUN_EVENT_ERROR, ftun_proxy_runtime_listener_ready,
     listener, &listener->source);
   if (status == FTUN_OK && listener->udp_descriptor >= 0) {
     status = ftun_event_io_start(engine->loop,
-      (ftun_native_socket_t)(unsigned int)listener->udp_descriptor,
+      (ftun_native_socket_t)listener->udp_descriptor,
       FTUN_EVENT_READ | FTUN_EVENT_ERROR,
       ftun_proxy_runtime_listener_udp_ready, listener, &listener->udp_source);
   }
@@ -66,8 +66,8 @@ ftun_status_t ftun_proxy_runtime_listener_close(
   if (status != FTUN_OK) return status;
   listener->events = 0u;
   listener->udp_events = 0u;
-  if (listener->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)listener->descriptor);
-  if (listener->udp_descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)listener->udp_descriptor);
+  if (listener->descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)listener->descriptor);
+  if (listener->udp_descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)listener->udp_descriptor);
   listener->descriptor = -1;
   listener->udp_descriptor = -1;
   return FTUN_OK;
@@ -141,7 +141,7 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
   size_t accepted;
   for (accepted = 0u; accepted < FTUN_PROXY_RUNTIME_ACCEPT_QUOTA; accepted++) {
     ftun_endpoint_t peer;
-    int descriptor;
+    ftun_handle_t descriptor;
     ftun_socket_accept_disposition_t disposition;
     ftun_status_t status = ftun_socket_accept(listener->descriptor, &descriptor,
       &peer, &disposition);
@@ -161,7 +161,7 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
     }
     /* 接入的 TCP 连接设置存活探测与确认期限；设置失败只丢弃这一条连接。 */
     if (ftun_socket_apply_liveness(descriptor, &engine->liveness) != FTUN_OK) {
-      (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+      (void)ftun_socket_close((ftun_native_socket_t)descriptor);
       continue;
     }
     {
@@ -176,7 +176,7 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
       }
       (void)ftun_runtime_release(&runtime);
       if (status != FTUN_OK || !permitted) {
-        (void)ftun_socket_close((ftun_native_socket_t)(unsigned int)descriptor);
+        (void)ftun_socket_close((ftun_native_socket_t)descriptor);
         if (status != FTUN_OK) return status;
         continue;
       }

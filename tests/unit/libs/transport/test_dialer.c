@@ -275,7 +275,7 @@ static int fixture_stop(fixture_t *fixture)
   if (ftun_event_loop_destroy(&fixture->loop) != FTUN_OK) return 1;
   if (ftun_operation_queue_destroy(&fixture->operations) != FTUN_OK) return 1;
   if (ftun_budget_get_usage(fixture->budget, &usage) != FTUN_OK ||
-      usage.used != 0u) return 1;
+      usage.used_resources.memory_bytes != 0u) return 1;
   if (ftun_budget_destroy(&fixture->budget) != FTUN_OK) return 1;
   return 0;
 }
@@ -415,7 +415,7 @@ static int test_synchronous_rejection(void)
   CHECK(fixture.socket.open_calls == 1 && fixture.socket.protect_calls == 1 &&
         fixture.socket.connect_calls == 0 && fixture.socket.close_calls == 1);
   CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK);
-  CHECK(after.used == before.used);
+  CHECK(after.used_resources.memory_bytes == before.used_resources.memory_bytes);
   CHECK(fixture_stop(&fixture) == 0);
 
   CHECK(fixture_start(&fixture, 16384u, 4u) == 0);
@@ -548,8 +548,8 @@ static int test_network_view_domains(void)
                                 &operation) == FTUN_E_REJECTED &&
         operation == NULL && fixture.socket.open_calls == 0);
   CHECK(fixture_stop(&fixture) == 0);
-  CHECK(ftun_network_view_release(&revoked) == FTUN_OK);
-  CHECK(ftun_network_view_release(&view) == FTUN_OK);
+  ftun_network_view_release(&revoked);
+  ftun_network_view_release(&view);
   return 0;
 }
 
@@ -586,14 +586,14 @@ static int test_admission_and_boundaries(void)
 
   CHECK(fixture_start(&fixture, 16384u, 2u) == 0);
   CHECK(ftun_budget_get_usage(fixture.budget, &usage) == FTUN_OK);
-  CHECK(usage.normal_available > 0u);
-  CHECK(ftun_budget_reserve(fixture.budget, usage.normal_available,
+  CHECK(usage.normal_available_resources.memory_bytes > 0u);
+  CHECK(ftun_budget_reserve(fixture.budget, usage.normal_available_resources.memory_bytes,
                             &reservation) == FTUN_OK);
   operation = (ftun_operation_t *)(uintptr_t)1;
   CHECK(ftun_dial_start_with_io(NULL, &fixture.request, &fixture.io,
                                 &operation) == FTUN_E_LIMIT);
   CHECK(operation == NULL && fixture.socket.open_calls == 0);
-  CHECK(ftun_reservation_release(&reservation) == FTUN_OK);
+  ftun_reservation_release(&reservation);
 
   fixture.request.endpoint.kind = FTUN_ADDRESS_DOMAIN;
   operation = (ftun_operation_t *)(uintptr_t)1;

@@ -31,7 +31,7 @@ typedef struct {
   void (*terminate)(void *context);
   void *terminate_context;
   /* 诊断输出描述符；<0 不输出。 */
-  int diagnostic_fd;
+  ftun_handle_t diagnostic_fd;
 } ftun_watchdog_spec_t;
 
 /* timeout_ms==0 且服务管理器没有要求看门狗时，不创建线程，*out 为 NULL。 */

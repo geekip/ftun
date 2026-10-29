@@ -24,13 +24,13 @@ ftun_status_t ftun_dns_message_parse_with_budget(ftun_budget_t *budget, ftun_byt
   }
   owned = calloc(1u, allocation);
   if (owned == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   status = ftun_dnswire_decode(wire, &owned->message, size);
   if (status != FTUN_OK) {
     free(owned);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   owned->reservation = reservation;
@@ -53,6 +53,7 @@ ftun_status_t ftun_dns_message_release(ftun_dns_message_t **message)
   reservation = owned->reservation;
   free(owned);
   *message = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 

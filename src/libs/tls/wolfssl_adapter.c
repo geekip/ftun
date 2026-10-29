@@ -188,13 +188,13 @@ ftun_status_t ftun_wolfssl_prepare(const ftun_tls_options_t *options, ftun_tls_c
   if (status != FTUN_OK) return status;
   context = (ftun_tls_context_t *)calloc(1u, sizeof(*context));
   if (context == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   status = ftun_mutex_init(&context->create_mutex);
   if (status != FTUN_OK) {
     free(context);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return status;
   }
   ftun_atomic_init(&context->clients, 0u);
@@ -262,13 +262,13 @@ ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
   if (status != FTUN_OK) return status;
   client = (ftun_tls_client_t *)calloc(1u, sizeof(*client));
   if (client == NULL) {
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   client->server_name = (char *)malloc(options->server_name.length + 1u);
   if (client->server_name == NULL) {
     free(client);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   memcpy(client->server_name, options->server_name.data,
@@ -281,7 +281,7 @@ ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
   if (client->native == NULL) {
     free(client->server_name);
     free(client);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
   client->context = context;
@@ -298,7 +298,7 @@ ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
     wolfSSL_free(client->native);
     free(client->server_name);
     free(client);
-    (void)ftun_reservation_release(&reservation);
+    ftun_reservation_release(&reservation);
     return FTUN_E_REJECTED;
   }
   (void)ftun_atomic_fetch_add(&context->clients, 1u);
@@ -403,7 +403,7 @@ ftun_status_t ftun_wolfssl_client_destroy(ftun_tls_client_t **client)
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *client = NULL;
-  (void)ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
   (void)ftun_atomic_fetch_sub_explicit(&context->clients, 1u, FTUN_MEMORY_ACQ_REL);
   return owns_context ? ftun_wolfssl_context_destroy(&context) : FTUN_OK;
 }
@@ -422,7 +422,8 @@ ftun_status_t ftun_wolfssl_context_destroy(ftun_tls_context_t **context)
   memset(owned, 0, sizeof(*owned));
   free(owned);
   *context = NULL;
-  return ftun_reservation_release(&reservation);
+  ftun_reservation_release(&reservation);
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_wolfssl_client_open(const ftun_tls_options_t *options,
