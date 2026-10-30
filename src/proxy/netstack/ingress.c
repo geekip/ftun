@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/netstack/ingress.h"
 
 #include <stdlib.h>
@@ -55,13 +56,9 @@ struct ftun_tun_udp_bridge {
   bool linked;
 };
 
-static int ftun_tun_endpoint_equal(const ftun_endpoint_t *left,
-                                   const ftun_endpoint_t *right)
+static int ftun_tun_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  return left != NULL && right != NULL &&
-         left->kind == FTUN_ADDRESS_IPV4 &&
-         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
 }
 
 static void ftun_tun_metadata(ftun_tun_ingress_context_t *context,
@@ -554,16 +551,29 @@ ftun_status_t ftun_tun_ingress(ftun_tun_ingress_context_t *context,
   if (packet->source_id != context->inbound_id) return FTUN_E_REJECTED;
   status = ftun_packet_view(packet, &bytes);
   if (status != FTUN_OK) return status;
-  if (bytes.length < 20u || bytes.length > context->mtu ||
-      (bytes.data[0] >> 4) != 4u) return FTUN_E_PROTOCOL;
-  header_length = (size_t)(bytes.data[0] & 0x0fu) * 4u;
-  total_length = ((size_t)bytes.data[2] << 8) | bytes.data[3];
-  if (header_length < 20u || header_length > bytes.length ||
-      total_length != bytes.length) return FTUN_E_PROTOCOL;
-  protocol = bytes.data[9];
+  if (bytes.length < 20u || bytes.length > context->mtu) return FTUN_E_PROTOCOL;
+  if ((bytes.data[0] >> 4) == 6u) {
+    if (bytes.length < 40u) return FTUN_E_PROTOCOL;
+    total_length = 40u + (((size_t)bytes.data[4] << 8) | bytes.data[5]);
+    protocol = bytes.data[6];
+    if (total_length != bytes.length) return FTUN_E_PROTOCOL;
+    /* ICMPv6、扩展头及分片由 lwIP 处理，包括路径 MTU 控制。 */
+    if (protocol == 0u || protocol == 43u || protocol == 44u ||
+        protocol == 58u || protocol == 60u) {
+      protocol = 0u;
+    }
+  } else if ((bytes.data[0] >> 4) == 4u) {
+    header_length = (size_t)(bytes.data[0] & 0x0fu) * 4u;
+    total_length = ((size_t)bytes.data[2] << 8) | bytes.data[3];
+    if (header_length < 20u || header_length > bytes.length ||
+        total_length != bytes.length) return FTUN_E_PROTOCOL;
+    protocol = bytes.data[9];
+  } else return FTUN_E_PROTOCOL;
   if (protocol == 6u && !context->tcp) return FTUN_E_UNSUPPORTED;
   if (protocol == 17u && !context->udp) return FTUN_E_UNSUPPORTED;
-  if (protocol != 6u && protocol != 17u) return FTUN_E_UNSUPPORTED;
+  if (protocol != 0u && protocol != 6u && protocol != 17u) {
+    return FTUN_E_UNSUPPORTED;
+  }
   status = ftun_lwip_input(context->stack, packet);
   if (context->corrupt) return FTUN_E_STATE_CORRUPT;
   return status;

@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #define _GNU_SOURCE 1
 #include "libs/transport/dialer.h"
 #include "platform/socket.h"
@@ -51,9 +52,7 @@ static int ftun_dial_domain_valid(ftun_dial_domain_t domain)
 static int ftun_dial_endpoint_equal(const ftun_endpoint_t *left,
                                     const ftun_endpoint_t *right)
 {
-  return left->kind == FTUN_ADDRESS_IPV4 &&
-         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return ftun_endpoint_equal(left, right);
 }
 
 static int ftun_dial_allowed_valid(const ftun_dial_request_t *request)
@@ -63,7 +62,7 @@ static int ftun_dial_allowed_valid(const ftun_dial_request_t *request)
   if (request->allowed == NULL) return 0;
   for (index = 0u; index < request->allowed_count; index++) {
     const ftun_endpoint_t *item = &request->allowed[index];
-    if (item->kind != FTUN_ADDRESS_IPV4 || item->port == 0u ||
+    if (!ftun_endpoint_is_ip(item) || item->port == 0u ||
         item->domain.length != 0u) return 0;
   }
   return 1;
@@ -91,7 +90,7 @@ static int ftun_dial_request_valid(const ftun_dial_request_t *request)
 {
   if (request == NULL || request->loop == NULL || request->operations == NULL ||
       request->budget == NULL ||
-      request->endpoint.kind != FTUN_ADDRESS_IPV4 ||
+      !ftun_endpoint_is_ip(&request->endpoint) ||
       request->endpoint.port == 0u ||
       !ftun_dial_transport_valid(request->transport) ||
       !ftun_dial_purpose_valid(request->purpose) ||
@@ -329,7 +328,7 @@ ftun_status_t ftun_dial_start_with_io(ftun_core_t *core,
                                           ftun_dial_cancel, context);
   if (status != FTUN_OK) return ftun_dial_reject(context, status);
 
-  status = context->io.open_socket(context->io.context, request->transport,
+  status = context->io.open_socket(context->io.context, request->endpoint.kind, request->transport,
                                    &context->result.socket);
   if (status != FTUN_OK) return ftun_dial_reject(context, status);
   if (context->result.socket == FTUN_INVALID_SOCKET) {

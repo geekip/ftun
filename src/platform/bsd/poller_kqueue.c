@@ -4,7 +4,6 @@
  * 不能向 Core 交付一个看似可用的后端；Linux 产品继续使用 epoll。 */
 ftun_status_t ftun_poller_create(ftun_poller_t *poller)
 {
-  poller->descriptor = poller->wakeup = -1;
   poller->collected = 0u;
   return FTUN_E_UNSUPPORTED;
 }

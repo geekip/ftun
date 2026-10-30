@@ -1,4 +1,6 @@
+#define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 200809L
+#include "platform/posix/socket_native.h"
 #include "platform/process.h"
 #include <errno.h>
 #include <limits.h>
@@ -83,28 +85,6 @@ void ftun_process_exit(int code)
 {
   _exit(code);
 }
-ftun_status_t ftun_process_alarm_start(ftun_process_alarm_t *alarm, uint64_t milliseconds)
-{
-  timer_t native;
-  struct sigevent event = {0};
-  struct itimerspec value = {0};
-  event.sigev_notify = SIGEV_SIGNAL;
-  event.sigev_signo = SIGALRM;
-  if (timer_create(CLOCK_MONOTONIC, &event, &native) != 0) return FTUN_E_IO;
-  value.it_value.tv_sec = (time_t)(milliseconds / 1000u);
-  value.it_value.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
-  if (timer_settime(native, 0, &value, NULL) == 0) {
-    alarm->native = (uintptr_t)native;
-    return FTUN_OK;
-  }
-  (void)timer_delete(native);
-  return FTUN_E_IO;
-}
-void ftun_process_alarm_destroy(ftun_process_alarm_t *alarm)
-{
-  if (timer_delete((timer_t)alarm->native) != 0) abort();
-}
-
 ftun_status_t ftun_process_notify(const char *state)
 {
   const char *path = getenv("NOTIFY_SOCKET");
@@ -126,7 +106,7 @@ ftun_status_t ftun_process_notify(const char *state)
   if (path[0] == '@') address.sun_path[0] = '\0';
   length = (socklen_t)(offsetof(struct sockaddr_un, sun_path) + path_length +
                        (path[0] == '@' ? 0u : 1u));
-  descriptor = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  descriptor = ftun_posix_socket(AF_UNIX, SOCK_DGRAM, 0);
   if (descriptor < 0) return FTUN_E_IO;
   sent = sendto(descriptor, state, strlen(state), MSG_NOSIGNAL,
                 (const struct sockaddr *)&address, length);

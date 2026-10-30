@@ -10,7 +10,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
   FUZZ_NOT_CORRUPT(status);
   if (status == FTUN_OK) {
     FUZZ_REQUIRE(message != NULL);
-    FUZZ_REQUIRE(ftun_dns_message_release(&message) == FTUN_OK && message == NULL);
+    ftun_dns_message_release(&message);
+    FUZZ_REQUIRE(message == NULL);
   } else {
     FUZZ_REQUIRE(message == NULL);
   }

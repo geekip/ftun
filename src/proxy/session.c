@@ -1,3 +1,5 @@
+#include "util/endpoint.h"
+#include "util/endpoint.h"
 #include "proxy/session.h"
 
 #include "core/limits.h"
@@ -56,8 +58,7 @@ static ftun_status_t ftun_session_endpoint_validate(
     return allow_none && endpoint->port == 0u && endpoint->domain.length == 0u
       ? FTUN_OK : FTUN_E_INVALID;
   }
-  if (endpoint->kind == FTUN_ADDRESS_IPV6_RESERVED) return FTUN_E_UNSUPPORTED;
-  if (endpoint->kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(endpoint)) {
     return endpoint->domain.length == 0u ? FTUN_OK : FTUN_E_INVALID;
   }
   if (endpoint->kind != FTUN_ADDRESS_DOMAIN) return FTUN_E_INVALID;
@@ -109,20 +110,20 @@ static ftun_status_t ftun_session_layout(const ftun_metadata_t *metadata,
   if (metadata->resolved_count != 0u && metadata->resolved == NULL) {
     return FTUN_E_INVALID;
   }
-  if (metadata->resolved_count > FTUN_SESSION_MAX_RESOLVED_IPV4) {
+  if (metadata->resolved_count > FTUN_SESSION_MAX_RESOLVED) {
     return FTUN_E_LIMIT;
   }
   for (index = 0u; index < metadata->resolved_count; index++) {
     status = ftun_session_endpoint_validate(&metadata->resolved[index], 0);
     if (status != FTUN_OK) return status;
-    if (metadata->resolved[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&metadata->resolved[index]) ||
         metadata->resolved[index].port == 0u) return FTUN_E_INVALID;
   }
   slots = metadata->resolved_count;
   if (slots == 0u) {
     slots = metadata->original_target.kind == FTUN_ADDRESS_DOMAIN ||
             metadata->original_is_fake
-      ? FTUN_SESSION_MAX_RESOLVED_IPV4 : 1u;
+      ? FTUN_SESSION_MAX_RESOLVED : 1u;
   }
   if (!ftun_session_size_array(&total, slots, sizeof(ftun_endpoint_t)) ||
       !ftun_session_size_array(&total, slots, sizeof(ftun_endpoint_t)) ||
@@ -171,8 +172,8 @@ static int ftun_session_endpoint_equal(const ftun_endpoint_t *left,
                                        const ftun_endpoint_t *right)
 {
   if (left->kind != right->kind || left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
+  if (ftun_endpoint_is_ip(left)) {
+    return memcmp(left->address, right->address, ftun_endpoint_address_bytes(left)) == 0;
   }
   if (left->kind == FTUN_ADDRESS_DOMAIN) {
     return left->domain.length == right->domain.length &&
@@ -429,17 +430,15 @@ ftun_status_t ftun_session_store_resolved(
       session->pending_operation != operation ||
       session->metadata.resolved_count != 0u) return FTUN_E_STALE;
   if (address_count > session->endpoint_capacity ||
-      address_count > FTUN_SESSION_MAX_RESOLVED_IPV4) return FTUN_E_LIMIT;
+      address_count > FTUN_SESSION_MAX_RESOLVED) return FTUN_E_LIMIT;
   for (index = 0u; index < address_count; index++) {
-    if (addresses[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&addresses[index]) ||
         addresses[index].port != 0u ||
         addresses[index].domain.length != 0u) {
-      return addresses[index].kind == FTUN_ADDRESS_IPV6_RESERVED
-        ? FTUN_E_UNSUPPORTED : FTUN_E_STATE_CORRUPT;
+      return FTUN_E_STATE_CORRUPT;
     }
     for (previous = 0u; previous < index; previous++) {
-      if (memcmp(addresses[index].address,
-                 addresses[previous].address, 4u) == 0) {
+      if (ftun_endpoint_equal(&addresses[index], &addresses[previous])) {
         return FTUN_E_STATE_CORRUPT;
       }
     }

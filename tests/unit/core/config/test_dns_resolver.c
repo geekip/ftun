@@ -31,7 +31,7 @@ typedef struct {
   ftun_operation_token_t completion_token;
   ftun_system_resolve_completion_fn completion;
   void *completion_user;
-  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
+  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
   ftun_error_t result_error;
   ftun_status_t start_status;
@@ -536,7 +536,7 @@ static int test_boundaries(void)
   ftun_operation_t *operation = (ftun_operation_t *)(uintptr_t)1;
   completion_state_t completion;
   ftun_endpoint_t existing = ipv4(9u, 443u);
-  ftun_endpoint_t too_many[FTUN_SESSION_MAX_RESOLVED_IPV4 + 1u];
+  ftun_endpoint_t too_many[FTUN_SESSION_MAX_RESOLVED + 1u];
   ftun_resolver_backend_t invalid_backend;
   size_t index;
   size_t dispatched = 0u;
@@ -596,12 +596,12 @@ static int test_boundaries(void)
         &fixture.backend, &operation) == FTUN_OK);
   CHECK(ftun_session_transition(session, FTUN_SESSION_RESOLVING,
                                 operation) == FTUN_OK);
-  for (index = 0u; index < FTUN_SESSION_MAX_RESOLVED_IPV4 + 1u; index++) {
+  for (index = 0u; index < FTUN_SESSION_MAX_RESOLVED + 1u; index++) {
     too_many[index] = ipv4((uint8_t)(index + 1u), 0u);
   }
   CHECK(ftun_session_store_resolved(
         session, operation, too_many,
-        FTUN_SESSION_MAX_RESOLVED_IPV4 + 1u) == FTUN_E_LIMIT);
+        FTUN_SESSION_MAX_RESOLVED + 1u) == FTUN_E_LIMIT);
   CHECK(ftun_session_cancel(session) == FTUN_OK);
   CHECK(ftun_operation_dispatch(fixture.operations, 1u,
         &dispatched) == FTUN_OK && dispatched == 1u);

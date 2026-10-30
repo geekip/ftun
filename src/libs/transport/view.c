@@ -1,4 +1,5 @@
 #include "libs/transport/view.h"
+#include "util/endpoint.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -34,63 +35,39 @@ static int ftun_network_domain_valid(ftun_dial_domain_t domain)
          domain <= FTUN_DIAL_DOMAIN_OVERLAY;
 }
 
-static uint32_t ftun_network_ipv4(const uint8_t address[4])
-{
-  return ((uint32_t)address[0] << 24u) |
-         ((uint32_t)address[1] << 16u) |
-         ((uint32_t)address[2] << 8u) | (uint32_t)address[3];
-}
-
-static uint32_t ftun_network_mask(uint8_t prefix_length)
-{
-  return prefix_length == 0u ? 0u :
-    UINT32_MAX << (32u - (uint32_t)prefix_length);
-}
-
 static int ftun_network_prefix_valid(const ftun_network_prefix_t *prefix)
 {
-  uint32_t value;
-  uint32_t mask;
-  if (prefix == NULL || prefix->prefix_length > 32u) return 0;
-  value = ftun_network_ipv4(prefix->network);
-  mask = ftun_network_mask(prefix->prefix_length);
-  return (value & ~mask) == 0u;
+  size_t bits, i;
+  if (prefix == NULL || (prefix->address.family != FTUN_IP_V4 &&
+      prefix->address.family != FTUN_IP_V6)) return 0;
+  bits = prefix->address.family == FTUN_IP_V6 ? 128u : 32u;
+  if (prefix->prefix > bits) return 0;
+  for (i = prefix->prefix; i < bits; i++) {
+    if ((prefix->address.bytes[i / 8u] & (1u << (7u - i % 8u))) != 0u) return 0;
+  }
+  return 1;
 }
-
 static int ftun_network_prefix_equal(const ftun_network_prefix_t *left,
-                                     const ftun_network_prefix_t *right)
+  const ftun_network_prefix_t *right)
 {
-  return left->prefix_length == right->prefix_length &&
-         memcmp(left->network, right->network, 4u) == 0;
+  return left->prefix == right->prefix && ftun_ip_equal(&left->address, &right->address);
 }
-
-static int ftun_network_prefix_contains(const ftun_network_prefix_t *prefix,
-                                        const uint8_t address[4])
+static int ftun_network_prefix_contains_prefix(const ftun_network_prefix_t *outer,
+  const ftun_network_prefix_t *inner)
 {
-  uint32_t mask = ftun_network_mask(prefix->prefix_length);
-  return (ftun_network_ipv4(prefix->network) & mask) ==
-         (ftun_network_ipv4(address) & mask);
-}
-
-static int ftun_network_prefix_contains_prefix(
-  const ftun_network_prefix_t *outer, const ftun_network_prefix_t *inner)
-{
-  return outer->prefix_length <= inner->prefix_length &&
-         ftun_network_prefix_contains(outer, inner->network);
+  return outer->prefix <= inner->prefix && ftun_cidr_contains(outer, &inner->address);
 }
 
 static int ftun_network_endpoint_valid(const ftun_endpoint_t *endpoint)
 {
-  return endpoint != NULL && endpoint->kind == FTUN_ADDRESS_IPV4 &&
+  return endpoint != NULL && ftun_endpoint_is_ip(endpoint) &&
          endpoint->port != 0u && endpoint->domain.length == 0u;
 }
 
 static int ftun_network_endpoint_equal(const ftun_endpoint_t *left,
                                        const ftun_endpoint_t *right)
 {
-  return left->kind == FTUN_ADDRESS_IPV4 &&
-         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return ftun_endpoint_equal(left, right);
 }
 
 static int ftun_network_mask_valid(uint32_t mask)
@@ -274,6 +251,7 @@ ftun_status_t ftun_network_view_select_dial(
       !ftun_network_domain_valid(requested) || out == NULL) {
     return FTUN_E_INVALID;
   }
+  ftun_ip_t target = ftun_endpoint_ip(endpoint);
   purpose_bit = FTUN_DIAL_PURPOSE_BIT(purpose);
   if (__atomic_load_n(&view->revoked, __ATOMIC_ACQUIRE)) return FTUN_E_CANCELLED;
   out->generation = view->generation;
@@ -290,10 +268,10 @@ ftun_status_t ftun_network_view_select_dial(
   }
   for (index = 0u; index < view->protected_prefix_count; index++) {
     const ftun_network_prefix_t *prefix = &view->protected_prefixes[index];
-    if ((!protected_target || prefix->prefix_length > protected_length) &&
-        ftun_network_prefix_contains(prefix, endpoint->address)) {
+    if ((!protected_target || prefix->prefix > protected_length) &&
+        ftun_cidr_contains(prefix, &target)) {
       protected_target = true;
-      protected_length = prefix->prefix_length;
+      protected_length = prefix->prefix;
     }
   }
   out->protected_target = protected_target;
@@ -313,12 +291,12 @@ ftun_status_t ftun_network_view_select_dial(
   for (index = 0u; index < view->overlay_route_count; index++) {
     const ftun_network_route_t *candidate = &view->overlay_routes[index];
     if ((candidate->purpose_mask & purpose_bit) != 0u &&
-        ftun_network_prefix_contains(&candidate->prefix, endpoint->address) &&
-        (route == NULL || candidate->prefix.prefix_length >
-                          route->prefix.prefix_length)) route = candidate;
+        ftun_cidr_contains(&candidate->prefix, &target) &&
+        (route == NULL || candidate->prefix.prefix >
+                          route->prefix.prefix)) route = candidate;
   }
   if (route == NULL) return FTUN_E_REJECTED;
   out->domain = FTUN_DIAL_DOMAIN_OVERLAY;
-  out->matched_prefix_length = route->prefix.prefix_length;
+  out->matched_prefix_length = route->prefix.prefix;
   return FTUN_OK;
 }

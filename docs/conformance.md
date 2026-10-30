@@ -14,7 +14,7 @@
 | DIRECT / REJECT 出站 | 已实现 | | `outbound-direct-contract`、`outbound-reject-contract` |
 | SOCKS5 出站（TCP、UDP） | 已实现 | 域名或 IPv4 服务器地址；失败不回退为直连 | `outbound-socks5-contract`、`protocol-socks5-client-contract`、`outbound-contract` |
 | Select / URL-Test 代理组 | 已实现 | URL-Test 失败退避，网络变化时提前重新探测 | `route-router-contract`、`group-cache-contract` |
-| IPv6 | 未实现 | 地址模块可以表示 IPv6，但数据路径未打开；配置里 IPv6 CIDR 会被拒绝 | `network-address-contract` |
+| IPv6 | 已实现 | Socket、DNS A/AAAA、SOCKS5、TUN 与 CIDR 规则双栈；FakeIP 池和现有 FRS IP 数据格式保留 IPv4 | `ipv6-product`、`ipv6-tun-production`、`resolver-dual-contract` |
 | AnyTLS、VLESS、VMess、QUIC、混淆 | 未实现 | | |
 | Full Cone NAT、Mesh、NAT 穿透、P2P/Relay | 未实现 | | |
 | 管理 HTTP API、Web 控制台 | 未实现 | 进程控制只有信号与 `ftun stop/reload` | |

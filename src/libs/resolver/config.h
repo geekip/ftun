@@ -20,6 +20,7 @@ typedef struct {
   ftun_config_string_list_t bootstrap;
   const char *default_server;
   ftun_config_fakeip_t fake_ip;
+  bool ipv6;
   const ftun_config_dns_server_t *servers;
   size_t server_count;
 } ftun_config_resolver_t;

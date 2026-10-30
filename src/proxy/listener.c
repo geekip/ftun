@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
 ftun_status_t ftun_proxy_runtime_listener_endpoint(
@@ -7,7 +8,7 @@ ftun_status_t ftun_proxy_runtime_listener_endpoint(
   uint32_t inbound_id)
 {
   ftun_endpoint_t endpoint;
-  ftun_status_t status = ftun_proxy_runtime_parse_ipv4_endpoint(config->listen,
+  ftun_status_t status = ftun_proxy_runtime_parse_ip_endpoint(config->listen,
                                                           &endpoint);
   if (status != FTUN_OK) return status;
   listener->name = strdup(config->name);
@@ -170,9 +171,11 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
       bool permitted = false;
       status = ftun_runtime_active_acquire(engine->core, &runtime);
       if (status == FTUN_OK) status = ftun_runtime_config(runtime, &config);
-      if (status == FTUN_OK && peer.kind == FTUN_ADDRESS_IPV4) {
-        const uint8_t *address = peer.address;
-        permitted = ftun_config_base(config)->allow_lan || address[0] == 127u;
+      if (status == FTUN_OK && ftun_endpoint_is_ip(&peer)) {
+        static const uint8_t loopback6[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+        bool loopback = peer.kind == FTUN_ADDRESS_IPV4 ? peer.address[0] == 127u :
+          memcmp(peer.address, loopback6, sizeof(loopback6)) == 0;
+        permitted = ftun_config_base(config)->allow_lan || loopback;
       }
       (void)ftun_runtime_release(&runtime);
       if (status != FTUN_OK || !permitted) {

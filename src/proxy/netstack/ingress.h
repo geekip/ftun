@@ -58,7 +58,7 @@ typedef struct {
 } ftun_tun_ingress_usage_t;
 
 /* TUN 到协议栈入口。
- * 实现路径：保留来源、设备身份及完整 IP 包；仅支持 IPv4 TCP/UDP；将包交 lwIP，生成统一 Stream/Datagram。
+ * 实现路径：保留来源、设备身份及完整 IP 包；支持 IPv4/IPv6 TCP/UDP；将包交 lwIP，生成统一 Stream/Datagram。
  * 调用边界：不访问配置 AST，不跨线程修改 Session。
  * bind 创建 owner-loop 消费者上下文；输入同步借用，lwIP 在返回前取得独立
  * slice 引用。TCP accept 成功后 Stream 初始引用交给回调；UDP Datagram 仍由

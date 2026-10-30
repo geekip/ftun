@@ -26,7 +26,7 @@ ftun_status_t ftun_dns_query_request_validate(ftun_budget_t *budget, const ftun_
   valid = (message->flags & 0x8000u) == 0u && message->id == query->id &&
           message->question.type == query->question.type &&
           message->question.class_code == query->question.class_code;
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return valid ? FTUN_OK : FTUN_E_INVALID;
 }
 

@@ -1,4 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
+#include "util/endpoint.h"
 #include "libs/resolver/control_channel.h"
 
 #include "core/context.h"
@@ -47,6 +48,7 @@ struct ftun_control_channel {
   ftun_packet_t received;
   ftun_endpoint_t received_source;
   ftun_dial_transport_t transport;
+  ftun_egress_id_t egress_id;
   ftun_operation_t *opening;
   ftun_operation_t *writing;
   uint64_t generation;
@@ -115,9 +117,9 @@ static ftun_status_t ftun_control_channel_received(ftun_datagram_t *datagram,
   if (channel->has_received) return FTUN_E_AGAIN;
   status = ftun_packet_view(packet, &bytes);
   if (status != FTUN_OK) return status;
-  if (source->kind != FTUN_ADDRESS_IPV4 ||
+  if (!ftun_endpoint_is_ip(source) ||
       bytes.length > FTUN_CONTROL_CHANNEL_BYTES) {
-    channel->status = source->kind != FTUN_ADDRESS_IPV4
+    channel->status = !ftun_endpoint_is_ip(source)
       ? FTUN_E_UNSUPPORTED : FTUN_E_LIMIT;
     return FTUN_OK;
   }
@@ -218,6 +220,11 @@ ftun_status_t ftun_control_channel_create_execution(
   spec.generation = generation;
   spec.ops.open = execution->path.open == NULL ? ftun_socket_path_open : execution->path.open;
   spec.context = execution->path.context;
+  if (execution->egress != NULL) {
+    spec.ops.open = ftun_egress_path_open;
+    spec.context = (void *)execution->egress;
+  }
+  channel->egress_id = execution->egress_id;
   spec.max_pending = 1u;
   spec.max_paths = 1u;
   if (status == FTUN_OK) status = ftun_path_provider_create(&spec, &channel->provider);
@@ -245,8 +252,7 @@ static void ftun_control_channel_resolved(ftun_operation_t *operation,
     channel->status = FTUN_E_PROTOCOL;
     return;
   }
-  channel->resolved.kind = FTUN_ADDRESS_IPV4;
-  memcpy(channel->resolved.address, result->addresses[0].address, 4u);
+  channel->resolved = result->addresses[0];
 }
 
 ftun_status_t ftun_control_channel_resolve(ftun_control_channel_t *channel,
@@ -302,6 +308,7 @@ static ftun_status_t ftun_control_channel_open(ftun_control_channel_t *channel,
       channel->opening != NULL || channel->path != NULL) return FTUN_E_INVALID;
   status = ftun_control_channel_deadline(channel);
   if (status != FTUN_OK) return status;
+  request.egress = channel->egress_id;
   request.dial.loop = channel->loop;
   request.dial.operations = channel->operations;
   request.dial.budget = channel->budget;

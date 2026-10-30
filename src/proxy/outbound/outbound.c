@@ -1,4 +1,5 @@
 #include "proxy/outbound/outbound.h"
+#include "util/endpoint.h"
 
 #include <string.h>
 
@@ -6,8 +7,8 @@ static int ftun_outbound_endpoint_equal(const ftun_endpoint_t *left,
                                         const ftun_endpoint_t *right)
 {
   if (left->kind != right->kind || left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
+  if (ftun_endpoint_is_ip(left)) {
+    return memcmp(left->address, right->address, ftun_endpoint_address_bytes(left)) == 0;
   }
   if (left->kind == FTUN_ADDRESS_DOMAIN) {
     return left->domain.data != NULL && right->domain.data != NULL &&

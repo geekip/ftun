@@ -116,7 +116,7 @@ ftun_status_t ftun_lwip_tcp_shutdown_write(ftun_lwip_tcp_t *flow);
 ftun_status_t ftun_lwip_tcp_close(ftun_lwip_tcp_t **flow);
 
 /* UDP flow 由 transparent listener 按四元组创建。receive 中的 Packet
- * 同步借用；send 同步复制 payload 并输出完整 IPv4 包。 */
+ * 同步借用；send 同步复制 payload 并输出完整 IP 包。 */
 ftun_status_t ftun_lwip_udp_send(ftun_lwip_udp_t *flow,
                                  const ftun_packet_t *packet);
 ftun_status_t ftun_lwip_udp_close(ftun_lwip_udp_t **flow);

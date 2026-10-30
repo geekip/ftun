@@ -2,6 +2,7 @@ set(ftun_sources_lib_transport
   channel.c
   datagram.c
   dialer.c
+  egress.c
   netmon.c
   path.c
   relay.c

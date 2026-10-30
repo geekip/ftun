@@ -81,16 +81,17 @@ static ftun_status_t ftun_netlink_address(ftun_netlink_message_t *message,
   message->header.nlmsg_len = FTUN_NLMSG_LENGTH(sizeof(*address));
   address = (struct ftun_ifaddrmsg *)message->body;
   memset(address, 0, sizeof(*address));
-  address->ifa_family = AF_INET;
+  address->ifa_family = (uint8_t)resource->family;
+  if (resource->family == FTUN_ROUTE_FAMILY_IPV6) address->ifa_flags = 0x02u; /* IFA_F_NODAD */
   address->ifa_prefixlen = resource->prefix_length;
   address->ifa_scope = FTUN_RT_SCOPE_UNIVERSE;
   address->ifa_index = interface_index;
   if (!ftun_netlink_add_attribute(message,
                                   FTUN_IFA_LOCAL,
-                                  resource->address, 4u) ||
+                                  resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) ||
       !ftun_netlink_add_attribute(message,
                                   FTUN_IFA_ADDRESS,
-                                  resource->address, 4u)) return FTUN_E_LIMIT;
+                                  resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u)) return FTUN_E_LIMIT;
   return FTUN_OK;
 }
 
@@ -112,11 +113,11 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
   if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE && !stray) {
     rule->dst_len = resource->prefix_length;
   }
-  rule->action = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
+  rule->action = resource->kind == FTUN_LINUX_ROUTE_BLOCK ?
                  FTUN_FR_ACT_UNREACHABLE : FTUN_FR_ACT_TO_TBL;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
                (uint8_t)FTUN_RT_TABLE_UNSPEC;
-  rule->table = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
+  rule->table = resource->kind == FTUN_LINUX_ROUTE_BLOCK ?
                 (uint8_t)FTUN_RT_TABLE_UNSPEC : table_byte;
   if (stray) {
     rule->action = 0u;
@@ -129,7 +130,7 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                                   FTUN_FRA_PROTOCOL, &resource->protocol,
                                   sizeof(resource->protocol))) return FTUN_E_LIMIT;
   if (stray) return FTUN_OK;
-  if (resource->kind != FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
+  if (resource->kind != FTUN_LINUX_ROUTE_BLOCK &&
       !ftun_netlink_add_attribute(message,
                                   FTUN_FRA_TABLE,
                                   &resource->table,
@@ -144,11 +145,11 @@ static ftun_status_t ftun_netlink_rule(ftun_netlink_message_t *message,
                                    sizeof(resource->mark_mask)))) return FTUN_E_LIMIT;
   if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE &&
       !ftun_netlink_add_attribute(message,
-                                  FTUN_FRA_DST, resource->address, 4u)) {
+                                  FTUN_FRA_DST, resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u)) {
     return FTUN_E_LIMIT;
   }
   if ((resource->kind == FTUN_LINUX_ROUTE_CAPTURE_RULE ||
-       resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6) &&
+       resource->kind == FTUN_LINUX_ROUTE_BLOCK) &&
       !ftun_netlink_add_attribute(message,
                                   FTUN_FRA_IIFNAME,
                                   resource->interface_name,
@@ -177,7 +178,7 @@ static ftun_status_t ftun_netlink_route(
   message->header.nlmsg_len = FTUN_NLMSG_LENGTH(sizeof(*route));
   route = (struct ftun_rtmsg *)message->body;
   memset(route, 0, sizeof(*route));
-  route->rtm_family = AF_INET;
+  route->rtm_family = (uint8_t)resource->family;
   route->rtm_dst_len = resource->prefix_length;
   table_byte = resource->table <= UINT8_MAX ? (uint8_t)resource->table :
                (uint8_t)FTUN_RT_TABLE_UNSPEC;
@@ -197,7 +198,7 @@ static ftun_status_t ftun_netlink_route(
   }
   if (resource->prefix_length != 0u &&
       !ftun_netlink_add_attribute(message,
-                                  FTUN_RTA_DST, resource->address, 4u)) {
+                                  FTUN_RTA_DST, resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u)) {
     return FTUN_E_LIMIT;
   }
   if (stray) return FTUN_OK;

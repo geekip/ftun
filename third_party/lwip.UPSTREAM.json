@@ -1,0 +1,12 @@
+{
+  "name": "heiher/lwip",
+  "revision": "150d2b1a2658612741b4ac002578d440e7874540",
+  "archive": "https://github.com/heiher/lwip/archive/150d2b1a2658612741b4ac002578d440e7874540.tar.gz",
+  "sha256": "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416",
+  "upstream_tree_sha256": "c6f799f51564f89f962df9b3b1dc82ea5ab68af54f1585872d0421d00b682c59",
+  "license": "BSD-3-Clause",
+  "license_sha256": "ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b",
+  "local_patches": [],
+  "source_form": "git-submodule",
+  "source": "https://github.com/heiher/lwip.git"
+}

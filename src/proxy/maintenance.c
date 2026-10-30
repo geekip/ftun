@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 #include "platform/thread.h"
 #include "util/ip.h"
@@ -43,8 +44,6 @@ ftun_status_t ftun_proxy_runtime_http_execute(
 {
   const ftun_proxy_runtime_http_work_t *header;
   const char *url;
-  const char *username;
-  const char *password;
   const char *etag;
   ftun_http_fetch_spec_t spec;
   ftun_http_fetch_result_t fetched;
@@ -70,28 +69,22 @@ ftun_status_t ftun_proxy_runtime_http_execute(
   expected = sizeof(*header);
   if (header->url_length > SIZE_MAX - expected) return FTUN_E_LIMIT;
   expected += header->url_length;
-  if (header->username_length > SIZE_MAX - expected) return FTUN_E_LIMIT;
-  expected += header->username_length;
-  if (header->password_length > SIZE_MAX - expected) return FTUN_E_LIMIT;
-  expected += header->password_length;
   if (header->etag_length > SIZE_MAX - expected) return FTUN_E_LIMIT;
   expected += header->etag_length;
   if (expected != input.length || header->etag_length >
       FTUN_PROXY_RUNTIME_HTTP_ETAG_BYTES ||
-      (header->use_proxy != 0u && header->proxy_port == 0u) ||
       (header->validate_frs != 0u && header->runtime_snapshot == 0u)) {
     return FTUN_E_INVALID;
   }
   /* 宿主在所有Worker及结果清理结束后才销毁预算，任务只借用。 */
   budget = (ftun_budget_t *)header->budget;
   url = (const char *)input.data + sizeof(*header);
-  username = url + header->url_length;
-  password = username + header->username_length;
-  etag = password + header->password_length;
+  etag = url + header->url_length;
   memset(&spec, 0, sizeof(spec));
   spec.budget = budget;
   spec.tls_context = header->tls_context;
-  spec.protocol = header->protocol;
+  spec.egress = header->egress;
+  spec.egress_id = header->egress_id;
   spec.url.data = url;
   spec.url.length = header->url_length;
   spec.maximum_bytes = maximum;
@@ -102,23 +95,6 @@ ftun_status_t ftun_proxy_runtime_http_execute(
   spec.resolver = header->resolver;
   spec.path = header->path;
   spec.allow_system_resolver = header->allow_system_resolver;
-  spec.use_proxy = header->use_proxy != 0u;
-  if (spec.use_proxy) {
-    spec.proxy.kind = header->proxy_domain[0] == '\0'
-      ? FTUN_ADDRESS_IPV4 : FTUN_ADDRESS_DOMAIN;
-    spec.proxy.port = header->proxy_port;
-    memcpy(spec.proxy.address, header->proxy_address, 4u);
-    memcpy(spec.proxy_domain, header->proxy_domain,
-           sizeof(spec.proxy_domain));
-    if (spec.proxy.kind == FTUN_ADDRESS_DOMAIN) {
-      spec.proxy.domain.data = spec.proxy_domain;
-      spec.proxy.domain.length = strlen(spec.proxy_domain);
-    }
-  }
-  spec.proxy_username.data = username;
-  spec.proxy_username.length = header->username_length;
-  spec.proxy_password.data = password;
-  spec.proxy_password.length = header->password_length;
   spec.if_none_match.data = etag;
   spec.if_none_match.length = header->etag_length;
   memset(&fetched, 0, sizeof(fetched));
@@ -208,6 +184,8 @@ ftun_status_t ftun_proxy_runtime_http_input_cleanup(ftun_bytes_t input)
   if (input.data == NULL || input.length < sizeof(header)) return FTUN_E_INVALID;
   memcpy(&header, input.data, sizeof(header));
   if (header.magic != FTUN_PROXY_RUNTIME_HTTP_WORK_MAGIC) return FTUN_E_INVALID;
+  ftun_egress_release(&header.egress);
+  memcpy((void *)(uintptr_t)input.data, &header, sizeof(header));
   if (header.runtime_snapshot == 0u) return FTUN_OK;
   runtime = (ftun_runtime_t *)header.runtime_snapshot;
   status = ftun_runtime_release(&runtime);
@@ -253,8 +231,6 @@ ftun_status_t ftun_proxy_runtime_http_submit(
   uint8_t *input;
   size_t input_length;
   size_t result_capacity;
-  size_t username_length;
-  size_t password_length;
   size_t etag_length;
   ftun_reservation_t input_reservation = (ftun_reservation_t){0};
   ftun_status_t status;
@@ -265,20 +241,13 @@ ftun_status_t ftun_proxy_runtime_http_submit(
     return FTUN_E_INVALID;
   }
   if (validate_frs != (runtime_snapshot != NULL)) return FTUN_E_INVALID;
-  username_length = spec->proxy_username.length;
-  password_length = spec->proxy_password.length;
   etag_length = spec->if_none_match.length;
-  if (username_length > UINT32_MAX || password_length > UINT32_MAX ||
-      etag_length > FTUN_PROXY_RUNTIME_HTTP_ETAG_BYTES ||
+  if (etag_length > FTUN_PROXY_RUNTIME_HTTP_ETAG_BYTES ||
       spec->maximum_bytes > SIZE_MAX - sizeof(ftun_proxy_runtime_http_result_t) -
                             FTUN_PROXY_RUNTIME_HTTP_ETAG_BYTES) return FTUN_E_LIMIT;
   input_length = sizeof(*header);
   if (spec->url.length > SIZE_MAX - input_length) return FTUN_E_LIMIT;
   input_length += spec->url.length;
-  if (username_length > SIZE_MAX - input_length) return FTUN_E_LIMIT;
-  input_length += username_length;
-  if (password_length > SIZE_MAX - input_length) return FTUN_E_LIMIT;
-  input_length += password_length;
   if (etag_length > SIZE_MAX - input_length) return FTUN_E_LIMIT;
   input_length += etag_length;
   result_capacity = sizeof(ftun_proxy_runtime_http_result_t) +
@@ -296,7 +265,8 @@ ftun_status_t ftun_proxy_runtime_http_submit(
   header->magic = FTUN_PROXY_RUNTIME_HTTP_WORK_MAGIC;
   header->budget = (uintptr_t)engine->budget;
   header->tls_context = &engine->http_tls_context;
-  header->protocol = spec->protocol;
+  header->egress = spec->egress == NULL ? engine->egress : spec->egress;
+  header->egress_id = spec->egress_id;
   header->mark = spec->socket_mark;
   header->generation = spec->generation;
   header->purpose = spec->purpose;
@@ -308,29 +278,13 @@ ftun_status_t ftun_proxy_runtime_http_submit(
 #endif
   header->maximum_bytes = spec->maximum_bytes;
   header->deadline_ms = spec->deadline_ms;
-  header->use_proxy = spec->use_proxy ? 1u : 0u;
   header->validate_frs = validate_frs ? 1u : 0u;
   header->runtime_snapshot = (uintptr_t)runtime_snapshot;
-  header->proxy_port = spec->proxy.port;
-  memcpy(header->proxy_address, spec->proxy.address, 4u);
-  memcpy(header->proxy_domain, spec->proxy_domain,
-         sizeof(header->proxy_domain));
   header->url_length = (uint32_t)spec->url.length;
-  header->username_length = (uint32_t)username_length;
-  header->password_length = (uint32_t)password_length;
   header->etag_length = (uint32_t)etag_length;
   memcpy(input + sizeof(*header), spec->url.data, spec->url.length);
-  if (username_length != 0u) {
-    memcpy(input + sizeof(*header) + spec->url.length,
-           spec->proxy_username.data, username_length);
-  }
-  if (password_length != 0u) {
-    memcpy(input + sizeof(*header) + spec->url.length + username_length,
-           spec->proxy_password.data, password_length);
-  }
   if (etag_length != 0u) {
-    memcpy(input + sizeof(*header) + spec->url.length + username_length +
-           password_length, spec->if_none_match.data, etag_length);
+    memcpy(input + sizeof(*header) + spec->url.length, spec->if_none_match.data, etag_length);
   }
   memset(&job, 0, sizeof(job));
   job.execute = ftun_proxy_runtime_http_execute;
@@ -348,8 +302,10 @@ ftun_status_t ftun_proxy_runtime_http_submit(
       return status;
     }
   }
+  ftun_egress_retain(header->egress);
   status = ftun_worker_submit(engine->maintenance_worker, &job, completion,
                               user, out);
+  if (status != FTUN_OK) ftun_egress_release(&header->egress);
   if (status != FTUN_OK && runtime_snapshot != NULL) {
     (void)ftun_runtime_release(&runtime_snapshot);
   }
@@ -360,19 +316,13 @@ ftun_status_t ftun_proxy_runtime_http_submit(
 
 
 
-ftun_status_t ftun_proxy_runtime_parse_ipv4_endpoint(
-  const char *text, ftun_endpoint_t *out)
+ftun_status_t ftun_proxy_runtime_parse_ip_endpoint(const char *text, ftun_endpoint_t *out)
 {
   ftun_host_port_t value;
-  if (out != NULL) memset(out, 0, sizeof(*out));
-  if (text == NULL || out == NULL ||
-      !ftun_host_port_split(text, strlen(text), &value) ||
-      !value.has_port || value.bracketed ||
-      !ftun_ipv4_parse(value.host, value.host_length, out->address)) {
-    return FTUN_E_INVALID;
-  }
-  out->kind = FTUN_ADDRESS_IPV4;
-  out->port = value.port;
+  ftun_ip_t ip;
+  if (text == NULL || out == NULL || !ftun_host_port_split(text, strlen(text), &value) ||
+      !value.has_port || !ftun_ip_parse(value.host, value.host_length, &ip)) return FTUN_E_INVALID;
+  ftun_endpoint_set_ip(out, &ip, value.port);
   return FTUN_OK;
 }
 
@@ -380,7 +330,7 @@ ftun_status_t ftun_proxy_runtime_parse_server_endpoint(
   const char *text, ftun_endpoint_t *out)
 {
   ftun_host_port_t value;
-  ftun_status_t status = ftun_proxy_runtime_parse_ipv4_endpoint(text, out);
+  ftun_status_t status = ftun_proxy_runtime_parse_ip_endpoint(text, out);
   if (status == FTUN_OK) return FTUN_OK;
   if (!ftun_host_port_split(text, strlen(text), &value) || !value.has_port ||
       value.bracketed || value.host_length > 253u) return FTUN_E_INVALID;
@@ -392,18 +342,13 @@ ftun_status_t ftun_proxy_runtime_parse_server_endpoint(
   return FTUN_OK;
 }
 
-ftun_status_t ftun_proxy_runtime_parse_bootstrap_endpoint(
-  const char *text, ftun_endpoint_t *out)
+ftun_status_t ftun_proxy_runtime_parse_bootstrap_endpoint(const char *text, ftun_endpoint_t *out)
 {
   ftun_host_port_t value;
-  if (out != NULL) memset(out, 0, sizeof(*out));
-  if (text == NULL || out == NULL ||
-      !ftun_host_port_split(text, strlen(text), &value) || value.bracketed ||
-      !ftun_ipv4_parse(value.host, value.host_length, out->address)) {
-    return FTUN_E_INVALID;
-  }
-  out->kind = FTUN_ADDRESS_IPV4;
-  out->port = value.has_port ? value.port : 53u;
+  ftun_ip_t ip;
+  if (text == NULL || out == NULL || !ftun_host_port_split(text, strlen(text), &value) ||
+      !ftun_ip_parse(value.host, value.host_length, &ip)) return FTUN_E_INVALID;
+  ftun_endpoint_set_ip(out, &ip, value.has_port ? value.port : 53u);
   return FTUN_OK;
 }
 

@@ -43,17 +43,15 @@ ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire, ftun_dns_message_t **out
   return ftun_dns_message_parse_with_budget(NULL, wire, out);
 }
 
-ftun_status_t ftun_dns_message_release(ftun_dns_message_t **message)
+void ftun_dns_message_release(ftun_dns_message_t **message)
 {
   ftun_reservation_t reservation;
   ftun_owned_dns_message_t *owned;
-  if (message == NULL) return FTUN_E_INVALID;
-  if (*message == NULL) return FTUN_OK;
+  if (*message == NULL) return;
   owned = (ftun_owned_dns_message_t *)((uint8_t *)*message - offsetof(ftun_owned_dns_message_t, message));
   reservation = owned->reservation;
   free(owned);
   *message = NULL;
   ftun_reservation_release(&reservation);
-  return FTUN_OK;
 }
 

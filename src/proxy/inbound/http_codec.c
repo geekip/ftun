@@ -1,4 +1,5 @@
 /* ftun_http_decode。 */
+#include "util/endpoint.h"
 #include "proxy/inbound/http_codec.h"
 
 #include <string.h>
@@ -37,68 +38,18 @@ static size_t ftun_http_find_crlf(const uint8_t *data, size_t begin,
 }
 
 static ftun_status_t ftun_http_parse_port(const uint8_t *data, size_t length,
-                                          uint16_t default_port,
-                                          ftun_string_t *host,
-                                          uint16_t *port)
+  uint16_t default_port, ftun_string_t *host, uint16_t *port)
 {
-  size_t colon = SIZE_MAX;
-  size_t index;
-  uint32_t value = 0u;
-  if (host == NULL || port == NULL || data == NULL || length == 0u) {
-    return FTUN_E_INVALID;
-  }
-  for (index = 0u; index < length; index++) {
-    uint8_t byte = data[index];
-    if (byte == (uint8_t)'@' || byte == (uint8_t)'[' ||
-        byte == (uint8_t)']' || byte <= 0x20u || byte >= 0x7fu) {
-      return FTUN_E_PROTOCOL;
-    }
-    if (byte == (uint8_t)':') {
-      if (colon != SIZE_MAX) return FTUN_E_UNSUPPORTED;
-      colon = index;
-    }
-  }
-  host->data = (const char *)data;
-  host->length = colon == SIZE_MAX ? length : colon;
-  if (host->length == 0u || host->length > 253u) return FTUN_E_PROTOCOL;
-  if (colon == SIZE_MAX) {
-    if (default_port == 0u) return FTUN_E_PROTOCOL;
-    *port = default_port;
-    return FTUN_OK;
-  }
-  if (colon + 1u == length) return FTUN_E_PROTOCOL;
-  for (index = colon + 1u; index < length; index++) {
-    if (data[index] < (uint8_t)'0' || data[index] > (uint8_t)'9') {
-      return FTUN_E_PROTOCOL;
-    }
-    value = value * 10u + (uint32_t)(data[index] - (uint8_t)'0');
-    if (value > UINT16_MAX) return FTUN_E_PROTOCOL;
-  }
-  if (value == 0u) return FTUN_E_PROTOCOL;
-  *port = (uint16_t)value;
+  ftun_host_port_t parsed;
+  if (data == NULL || host == NULL || port == NULL ||
+      !ftun_host_port_split((const char *)data, length, &parsed) ||
+      (!parsed.has_port && default_port == 0u)) return FTUN_E_PROTOCOL;
+  *host = (ftun_string_t){parsed.host, parsed.host_length};
+  *port = parsed.has_port ? parsed.port : default_port;
   return FTUN_OK;
 }
 
-static int ftun_http_ipv4(ftun_string_t host, uint8_t address[4])
-{
-  size_t part = 0u;
-  size_t index = 0u;
-  while (part < 4u) {
-    unsigned int value = 0u;
-    size_t digits = 0u;
-    while (index < host.length && host.data[index] >= '0' &&
-           host.data[index] <= '9') {
-      value = value * 10u + (unsigned int)(host.data[index] - '0');
-      if (value > 255u || ++digits > 3u) return 0;
-      index++;
-    }
-    if (digits == 0u) return 0;
-    address[part++] = (uint8_t)value;
-    if (part == 4u) return index == host.length;
-    if (index >= host.length || host.data[index++] != '.') return 0;
-  }
-  return 0;
-}
+
 
 static int ftun_http_domain_valid(ftun_string_t host)
 {
@@ -140,8 +91,9 @@ static ftun_status_t ftun_http_endpoint(const uint8_t *authority,
                                 &host, &port);
   if (status != FTUN_OK) return status;
   out->port = port;
-  if (ftun_http_ipv4(host, out->address)) {
-    out->kind = FTUN_ADDRESS_IPV4;
+  ftun_ip_t ip;
+  if (ftun_ip_parse(host.data, host.length, &ip)) {
+    ftun_endpoint_set_ip(out, &ip, port);
   } else {
     if (!ftun_http_domain_valid(host)) return FTUN_E_PROTOCOL;
     out->kind = FTUN_ADDRESS_DOMAIN;
@@ -155,8 +107,8 @@ static int ftun_http_authority_equal(const ftun_endpoint_t *left,
 {
   size_t index;
   if (left->kind != right->kind || left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
+  if (ftun_endpoint_is_ip(left)) {
+    return memcmp(left->address, right->address, ftun_endpoint_address_bytes(left)) == 0;
   }
   if (left->domain.length != right->domain.length) return 0;
   for (index = 0u; index < left->domain.length; index++) {

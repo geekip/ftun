@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path
 import sys
+import subprocess
 
 
 def fail(message):
@@ -28,7 +29,7 @@ def main():
     return fail("source root and compile_commands.json are required")
   root = Path(sys.argv[1])
   vendor = root / "third_party/lwip"
-  metadata = json.loads((vendor / "FTUN-UPSTREAM.json").read_text(encoding="utf-8"))
+  metadata = json.loads((root / "third_party/lwip.UPSTREAM.json").read_text(encoding="utf-8"))
   revision = "150d2b1a2658612741b4ac002578d440e7874540"
   archive_digest = "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416"
   if metadata.get("revision") != revision or metadata.get("sha256") != archive_digest:
@@ -36,22 +37,16 @@ def main():
   if metadata.get("license") != "BSD-3-Clause" or hashlib.sha256(
       (vendor / "LICENSE").read_bytes()).hexdigest() != metadata.get("license_sha256"):
     return fail("license declaration or retained license differs")
-  if tree_digest(vendor) != metadata.get("vendored_tree_sha256"):
-    return fail("vendored source tree differs from the locked tree")
-  patches = metadata.get("local_patches")
-  if not isinstance(patches, list) or len(patches) != 1:
-    return fail("the reviewed IPv4-only patch declaration is missing")
-  patch = patches[0]
-  patch_path = vendor / patch.get("path", "")
-  patched_file = vendor / patch.get("patched_file", "")
-  if not patch_path.is_file() or not patched_file.is_file() or hashlib.sha256(
-      patched_file.read_bytes()).hexdigest() != patch.get("patched_sha256"):
-    return fail("the reviewed IPv4-only patch is missing or stale")
+  if metadata.get("source_form") != "git-submodule" or metadata.get("local_patches") != []:
+    return fail("lwIP must use the unmodified dual-stack submodule")
+  actual = subprocess.check_output(["git", "-C", str(vendor), "rev-parse", "HEAD"], text=True).strip()
+  if actual != revision or subprocess.run(["git", "-C", str(vendor), "diff", "--quiet", "HEAD"]).returncode:
+    return fail("submodule differs from the pinned upstream revision")
 
   commands = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
   lwip_commands = [entry["command"] for entry in commands
                    if "/third_party/lwip/src/core/" in entry["file"]]
-  if len(lwip_commands) != 18:
+  if len(lwip_commands) != 23:
     return fail("the reviewed raw-core source set must compile exactly once")
   required = ("/src/proxy/netstack", "/third_party/lwip/src/include")
   if any(any(item not in command for item in required) for command in lwip_commands):

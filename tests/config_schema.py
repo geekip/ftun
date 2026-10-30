@@ -111,7 +111,6 @@ class ConfigSchemaTest(unittest.TestCase):
 
     def test_future_features_are_rejected(self):
         for value in [{'api': {'enable': False}}, {'mesh': {}},
-                      {'base': {'ipv6': True}},
                       {'inbounds': [{'name': 'a', 'type': 'anytls', 'listen': '127.0.0.1:443'}]},
                       {'outbounds': [{'name': 'a', 'type': 'anytls', 'server': 'example.com:443'}]},
                       {'outbounds': [{'name': 'custom', 'type': 'direct'}]},
@@ -122,7 +121,7 @@ class ConfigSchemaTest(unittest.TestCase):
         for address in ['0.0.0.0:1', '127.0.0.1:1080', '255.255.255.255:65535']:
             self.valid({'inbounds': [{'type': 'socks5', 'name': 's', 'listen': address}]})
         for address in ['256.0.0.1:80', '127.1:80', '01.0.0.1:80', '127.0.0.1:0',
-                        '127.0.0.1:65536', '127.0.0.1:080', '[::1]:80', 'localhost:80',
+                        '127.0.0.1:65536', '127.0.0.1:080', 'localhost:80',
                         '127.0.0.1', '127.0.0.1:80\n']:
             with self.subTest(address=address):
                 self.invalid({'inbounds': [{'type': 'mixed', 'name': 's', 'listen': address}]})
@@ -133,7 +132,7 @@ class ConfigSchemaTest(unittest.TestCase):
             self.valid({'outbounds': [dict(node(), server=address)]})
         for address in ['proxy.example.com', 'http://example.com:80', '999.1.1.1:80',
                         '192.0.2.1:65536', 'proxy..example.com:80', '-proxy.example:80',
-                        '代理.example:80', 'proxy.example:80\n', '[::1]:1080', 'a'*64+'.com:80']:
+                        '代理.example:80', 'proxy.example:80\n', 'a'*64+'.com:80']:
             with self.subTest(address=address):
                 self.invalid({'outbounds': [dict(node(), server=address)]})
         self.valid({'dns': {'bootstrap': ['192.0.2.1', '192.0.2.2:65535']}})
@@ -141,6 +140,16 @@ class ConfigSchemaTest(unittest.TestCase):
             self.invalid({'dns': {'bootstrap': [address]}})
         for address in ['dns.example.com', 'dns.example.com:53', '192.0.2.53']:
             self.valid({'dns': {'servers': [{'name': 'd', 'type': 'tcp', 'address': [address]}]}})
+
+    def test_ipv6(self):
+        self.valid({'base': {'ipv6': True}, 'rules': ['IP-CIDR,::1/128,DIRECT', 'SRC-IP-CIDR,2001:db8::/64,REJECT']})
+        self.valid({'inbounds': [{'type': 'mixed', 'name': 'in', 'listen': '[::1]:1080'}]})
+        self.valid({'outbounds': [dict(node(), server='[2001:db8::1]:1080')]})
+        self.valid({'dns': {'bootstrap': ['[::1]', '[2001:db8::53]:5353']}})
+        self.valid(tun_config(ipv6={'address': 'fd00:77::1/126'}, mtu=1280))
+        self.invalid(tun_config(ipv6={'address': 'fd00:77::1/129'}))
+        self.invalid(tun_config(ipv6={'address': 'fd00:77::1/126'}, mtu=1279))
+        self.invalid({'inbounds': [{'type': 'mixed', 'name': 'in', 'listen': '[::1]:0'}]})
 
     def test_domain_total_length(self):
         limit = '.'.join(['a' * 63, 'b' * 63, 'c' * 63, 'd' * 61])
@@ -236,10 +245,10 @@ class ConfigSchemaTest(unittest.TestCase):
             self.valid({'outbounds': [group('url-test', interval=duration)]})
         for duration in ['0s', '-1s', '5', '1.5s', '1d', '5m\n']:
             self.invalid({'outbounds': [group('url-test', timeout=duration)]})
-        for url in ['https://example.com', 'http://192.0.2.1:65535/a?b=c', 'https://example.com./204']:
+        for url in ['https://example.com', 'http://192.0.2.1:65535/a?b=c', 'https://example.com./204', 'https://[::1]/', 'http://[2001:db8::1]:8080/a']:
             self.valid({'outbounds': [group('url-test', url=url)]})
         for url in ['ftp://example.com', 'https://', 'https://example.com:65536',
-                    'https://999.1.1.1/', 'https://[::1]/', 'https://exa mple.com/',
+                    'https://999.1.1.1/', 'https://exa mple.com/',
                     'https://example.com/\n']:
             self.invalid({'outbounds': [group('url-test', url=url)]})
 
@@ -266,13 +275,13 @@ class ConfigSchemaTest(unittest.TestCase):
                  'DOMAIN,A.COM.,proxy', 'DOMAIN-SUFFIX,xn--fiqs8s.com,proxy',
                  'DOMAIN-KEYWORD,google,proxy', 'DST-PORT,1,DIRECT', 'DST-PORT,65535,DIRECT',
                  'FRS-IP,cn,DIRECT', 'frs-domain,CN,proxy',
-                 'NETWORK,tcp,proxy', 'NETWORK,udp,DIRECT', 'MATCH,香港 01']
+                 'NETWORK,tcp,proxy', 'NETWORK,udp,DIRECT', 'SRC-IP-CIDR,::/0,DIRECT', 'MATCH,香港 01']
         self.valid({'rules': rules})
         for rule in ['IP-CIDR,10.0.0.0/33,DIRECT', 'IP-CIDR,10.0.0.0/8,DIRECT,no-resolve',
                      'DOMAIN-REGEX,.*example.*,proxy', 'DOMAIN,*.example.com,proxy',
                      'DOMAIN,中文.com,proxy', 'DOMAIN,,DIRECT', 'DOMAIN-KEYWORD,,DIRECT',
                      'DOMAIN-KEYWORD,中文,DIRECT', 'FRS-DOMAIN-REGEX,private,proxy',
-                     'SRC-IP-CIDR,::/0,DIRECT', 'DST-PORT,0,DIRECT', 'DST-PORT,80-90,DIRECT',
+                     'SRC-IP-CIDR,::/129,DIRECT', 'DST-PORT,0,DIRECT', 'DST-PORT,80-90,DIRECT',
                      'DST-PORT,65536,DIRECT', 'NETWORK,icmp,DIRECT', 'MATCH,',
                      'INBOUND,tun-in,proxy', 'MATCH,DIRECT\n']:
             with self.subTest(rule=rule): self.invalid({'rules': [rule]})

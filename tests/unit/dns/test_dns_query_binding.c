@@ -1,5 +1,7 @@
 #define _GNU_SOURCE 1
-#include "proxy/protocol/socks5.h"
+#define FTUN_TEST_PROXY 1
+#include "../../support/egress_fixture.h"
+#include "proxy/egress_internal.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <poll.h>
@@ -237,7 +239,7 @@ static int proxy_step(proxy_t *proxy)
 }
 
 static ftun_status_t select_member(void *user,
-  const ftun_config_t *expected, uint32_t group, uint32_t *member)
+  uint64_t generation, uint32_t group, uint32_t *member)
 {
   selector_t *selector = (selector_t *)user;
   selector->calls++;
@@ -245,7 +247,17 @@ static ftun_status_t select_member(void *user,
     *member = selector->forced_member;
     return FTUN_OK;
   }
-  return ftun_proxy_dns_select_member(&selector->proxy, expected, group, member);
+  ftun_runtime_t *runtime = NULL;
+  ftun_runtime_info_t info;
+  bool is_group, degraded;
+  ftun_string_t resolver;
+  ftun_status_t status = ftun_runtime_active_acquire(selector->proxy.core, &runtime);
+  if (status == FTUN_OK) status = ftun_runtime_get_info(runtime, &info);
+  if (status == FTUN_OK && info.generation != generation) status = FTUN_E_STALE;
+  if (status == FTUN_OK) status = ftun_runtime_group_selected(runtime, group,
+    member, &is_group, &degraded, &resolver);
+  (void)ftun_runtime_release(&runtime);
+  return status;
 }
 
 static ftun_config_t *configuration(fixture_t *fixture, int variant)
@@ -317,11 +329,13 @@ static int fixture_init(fixture_t *fixture, int variant)
   ftun_app_dns_bridge_init(&fixture->selector.proxy);
   fixture->selector.proxy.slot = &fixture->slot;
   fixture->adapter.user = &fixture->selector;
-  fixture->adapter.select_member = select_member;
+  const ftun_egress_provider_t *egress = NULL;
+  CHECK(ftun_test_egress(fixture->budget, fixture->config, 1u, select_member, &fixture->selector, &egress) == FTUN_OK);
   CHECK(ftun_dns_runtime_prepare(fixture->core, fixture->budget, fixture->operations,
     fixture->loop, fixture->config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u, .egress = egress,
       .path = {.open = ftun_socket_path_open}}, &fixture->dns) == FTUN_OK);
+  ftun_egress_release(&egress);
   CHECK(ftun_dns_runtime_activate(fixture->dns) == FTUN_OK);
   for (index = 0u; index < 3u; index++) CHECK(fixture->proxies[index].udp_queries == 0u);
   return 0;
@@ -407,10 +421,13 @@ static int reload(fixture_t *fixture, int variant)
   CHECK(config != NULL);
   CHECK(ftun_runtime_prepare(fixture->core, config, &candidate) == FTUN_OK);
   CHECK(ftun_dns_runtime_plan_prepare(fixture->budget, config, 0u, &plan) == FTUN_OK);
+  const ftun_egress_provider_t *egress = NULL;
+  CHECK(ftun_test_egress(fixture->budget, config, 2u, select_member, &fixture->selector, &egress) == FTUN_OK);
   CHECK(ftun_dns_runtime_prepare_reload_planned(fixture->dns, fixture->core,
     fixture->budget, fixture->operations, fixture->loop, config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u, .egress = egress,
       .path = {.open = ftun_socket_path_open}}, plan, &prepared) == FTUN_OK);
+  ftun_egress_release(&egress);
   CHECK(ftun_dns_runtime_commit_reload(&fixture->dns, &prepared, &fixture->retired) == FTUN_OK);
   CHECK(ftun_runtime_commit(fixture->core, &candidate) == FTUN_OK);
   CHECK(ftun_config_destroy(&fixture->config) == FTUN_OK);
@@ -462,7 +479,7 @@ static int generation_case(int variant)
   CHECK(query_start(&fixture, 11u, &first, &operation) == 0);
   CHECK(wait_udp(&fixture, 0u, 1u) == 0);
   CHECK(fixture.selector.calls == first_selects);
-  CHECK(old->request_count == 1u && old->request_head->proxy.port == fixture.proxies[0].port);
+  CHECK(old->request_count == 1u && ((ftun_proxy_egress_t *)old->egress->context)->nodes[old->request_head->egress_id - 2u].endpoint.port == fixture.proxies[0].port);
   original_deadline = old->request_head->waiter_head->deadline_ms;
   if (variant < 5) {
     CHECK(reload(&fixture, variant) == 0);
@@ -496,9 +513,9 @@ static int generation_case(int variant)
       if (tcp == NULL) CHECK(pump(&fixture) == 0);
     }
     CHECK(tcp != NULL);
-    CHECK(tcp->proxy.port == fixture.proxies[0].port);
+    CHECK(((ftun_proxy_egress_t *)old->egress->context)->nodes[tcp->egress_id - 2u].endpoint.port == fixture.proxies[0].port);
     CHECK(tcp->waiter_head->deadline_ms == original_deadline);
-    CHECK(tcp->username_length == 3u && memcmp(tcp->username, "old", 3u) == 0);
+    CHECK(memcmp(((ftun_proxy_egress_t *)old->egress->context)->nodes[tcp->egress_id - 2u].username, "old", 3u) == 0);
     CHECK(fixture.selector.calls == first_selects);
   }
   CHECK(wait_completion(&fixture, &first) == 0);
@@ -547,8 +564,7 @@ static int invalid_binding_case(void)
       ftun_dns_runtime_now(NULL) + 1000u, unexpected_completion, NULL, &request) ==
       (index == 4u ? FTUN_E_STALE : FTUN_E_REJECTED));
     CHECK(request == NULL && fixture.dns->request_count == 0u);
-    CHECK(fixture.dns->proxy_endpoint_valid[0] == 0u &&
-          fixture.dns->proxy_endpoint_valid[1] == 1u && fixture.dns->proxy_endpoint_valid[2] == 0u);
+    CHECK(((ftun_proxy_egress_t *)fixture.dns->egress->context)->nodes[1].resolved);
   }
   fixture.selector.force = true;
   for (index = 0u; index < 4u; index++) {

@@ -30,7 +30,7 @@ typedef enum {
 } ftun_dial_transport_t;
 
 typedef struct {
-  ftun_status_t (*open_socket)(void *context, ftun_dial_transport_t transport,
+  ftun_status_t (*open_socket)(void *context, ftun_address_kind_t family, ftun_dial_transport_t transport,
                                ftun_native_socket_t *out);
   ftun_status_t (*protect_socket)(void *context, ftun_native_socket_t socket,
                                   const ftun_socket_policy_t *policy);

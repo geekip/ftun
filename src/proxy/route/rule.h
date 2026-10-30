@@ -1,6 +1,7 @@
 #ifndef FTUN_PROXY_ROUTE_RULE_H
 #define FTUN_PROXY_ROUTE_RULE_H
 
+#include "util/ip.h"
 #include "util/types.h"
 #include "proxy/outbound_id.h"
 
@@ -20,8 +21,7 @@ typedef enum {
 struct ftun_rule {
   ftun_rule_kind_t kind;
   uint32_t outbound_id;
-  uint32_t network_address;
-  uint32_t network_mask;
+  ftun_cidr_t cidr;
   uint16_t port;
   uint8_t network;
   ftun_string_t operand;

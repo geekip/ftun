@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/route/target.h"
 
 #include <string.h>
@@ -13,8 +14,7 @@ static ftun_status_t ftun_target_endpoint_validate(
   const ftun_endpoint_t *endpoint)
 {
   if (endpoint == NULL || endpoint->port == 0u) return FTUN_E_INVALID;
-  if (endpoint->kind == FTUN_ADDRESS_IPV6_RESERVED) return FTUN_E_UNSUPPORTED;
-  if (endpoint->kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(endpoint)) {
     return endpoint->domain.length == 0u ? FTUN_OK : FTUN_E_INVALID;
   }
   if (endpoint->kind != FTUN_ADDRESS_DOMAIN) return FTUN_E_INVALID;
@@ -27,17 +27,9 @@ static int ftun_target_string_equal(ftun_string_t left, ftun_string_t right)
          memcmp(left.data, right.data, left.length) == 0;
 }
 
-static int ftun_target_endpoint_equal(const ftun_endpoint_t *left,
-                                      const ftun_endpoint_t *right)
+static int ftun_target_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  if (left->kind != right->kind || left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
-  }
-  if (left->kind == FTUN_ADDRESS_DOMAIN) {
-    return ftun_target_string_equal(left->domain, right->domain);
-  }
-  return 0;
+  return ftun_endpoint_equal(left, right);
 }
 
 static int ftun_target_contains(const ftun_endpoint_t *items, size_t count,
@@ -79,7 +71,7 @@ ftun_status_t ftun_target_from_metadata(const ftun_metadata_t *metadata,
   for (index = 0u; index < metadata->resolved_count; index++) {
     status = ftun_target_endpoint_validate(&metadata->resolved[index]);
     if (status != FTUN_OK) return status;
-    if (metadata->resolved[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&metadata->resolved[index]) ||
         metadata->resolved[index].port != metadata->original_target.port) {
       return FTUN_E_INVALID;
     }
@@ -114,7 +106,7 @@ ftun_status_t ftun_target_from_metadata(const ftun_metadata_t *metadata,
     out->identity = metadata->original_target.domain;
     out->identity_source = FTUN_DOMAIN_EXPLICIT;
   }
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+  if (ftun_endpoint_is_ip(&metadata->original_target) &&
       !metadata->original_is_fake) {
     /* 原始真实 IP 不因嗅探或额外解析结果被替换。 */
     out->candidates = &metadata->original_target;

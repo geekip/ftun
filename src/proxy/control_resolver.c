@@ -1,5 +1,6 @@
+#include "util/endpoint.h"
 #include "proxy/control_resolver.h"
-#include "proxy/protocol/socks5_transport.h"
+
 #include "proxy/outbound_id.h"
 #include <string.h>
 
@@ -57,16 +58,8 @@ static ftun_status_t ftun_control_proxy_plan(
     if (index >= ftun_config_outbound_count(config)) return FTUN_E_STATE_CORRUPT;
     item = &ftun_config_outbounds(config)[index];
     if (item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
-      status = ftun_control_copy(plan->proxy, sizeof(plan->proxy),
-                                 item->server);
-      if (status == FTUN_OK && item->username != NULL) {
-        status = ftun_control_copy(plan->proxy_username,
-          sizeof(plan->proxy_username), item->username);
-        if (status == FTUN_OK) status = ftun_control_copy(
-          plan->proxy_password, sizeof(plan->proxy_password), item->password);
-      }
-      if (status == FTUN_OK) plan->use_proxy = true;
-      return status;
+      plan->egress_id = current;
+      return FTUN_OK;
     }
     if (runtime != NULL) {
       uint32_t selected = 0u;
@@ -98,7 +91,7 @@ ftun_status_t ftun_control_resolver_plan(
   if (config == NULL || out == NULL ||
       (server.length != 0u && server.data == NULL)) return FTUN_E_INVALID;
   out->socket_mark = socket_mark;
-  out->query = ftun_resolver_socks5_query_blocking;
+  out->ipv6 = ftun_config_resolver(config).ipv6;
   if (!ftun_config_resolver(config).enable) return FTUN_OK;
   if (ftun_config_resolver(config).bootstrap.count > FTUN_BOOTSTRAP_MAX_SERVERS) {
     return FTUN_E_LIMIT;
@@ -107,7 +100,7 @@ ftun_status_t ftun_control_resolver_plan(
     char domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
     status = ftun_control_parse_endpoint(ftun_config_resolver(config).bootstrap.items[index],
       53u, &out->bootstrap[index], domain);
-    if (status != FTUN_OK || out->bootstrap[index].kind != FTUN_ADDRESS_IPV4) {
+    if (status != FTUN_OK || !ftun_endpoint_is_ip(&out->bootstrap[index])) {
       return status == FTUN_OK ? FTUN_E_INVALID : status;
     }
     out->bootstrap_count++;

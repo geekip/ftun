@@ -1,4 +1,3 @@
-#include "libs/transport/config.h"
 #include "libs/tun/config/model.h"
 #include "libs/tun/owner.h"
 
@@ -22,8 +21,8 @@
 
 typedef struct {
   char name[FTUN_PACKET_PORT_NAME_BYTES];
-  uint8_t address[4];
-  uint8_t prefix_length;
+  ftun_cidr_t addresses[2];
+  size_t address_count;
   uint32_t mtu;
   uint32_t protection_mark;
   uint32_t route_table;
@@ -96,23 +95,21 @@ static bool ftun_tun_owner_async_supported(const ftun_tun_owner_t *owner);
 static ftun_status_t ftun_tun_owner_change(void *context, bool rebuild,
   uint64_t device_generation, uint64_t network_generation);
 
-static ftun_status_t ftun_tun_owner_parse_cidr(
-  const char *text, uint8_t address[4], uint8_t *prefix)
+static bool ftun_tun_owner_addresses_valid(const ftun_interface_spec_t *network)
 {
-  ftun_cidr_t cidr;
-  if (text == NULL || address == NULL || prefix == NULL ||
-      !ftun_cidr_parse(text, strlen(text), false, &cidr) ||
-      cidr.address.family != FTUN_IP_V4) return FTUN_E_INVALID;
-  memcpy(address, cidr.address.bytes, 4u);
-  *prefix = cidr.prefix;
-  return FTUN_OK;
+  size_t i;
+  if (network->address_count == 0u || network->address_count > 2u) return false;
+  for (i = 0u; i < network->address_count; i++) {
+    if (!ftun_cidr_valid(&network->addresses[i], false) || network->addresses[i].prefix == 0u) return false;
+    if (i != 0u && network->addresses[i].address.family == network->addresses[0].address.family) return false;
+  }
+  return true;
 }
 
 static ftun_status_t ftun_tun_owner_plan_build(
   const ftun_config_t *config, uint32_t protection_mark,
   ftun_tun_owner_plan_t *out)
 {
-  ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   if (!ftun_config_tun(config)->present || ftun_config_tun(config)->interface_name == NULL ||
@@ -129,18 +126,27 @@ static ftun_status_t ftun_tun_owner_plan_build(
   out->protection_mark = ftun_config_tun(config)->auto_route ? protection_mark : 0u;
   out->route_table = ftun_config_tun(config)->route_table;
   out->rule_priority = ftun_config_tun(config)->rule_priority;
-  status = ftun_tun_owner_parse_cidr(
-    ftun_config_tun(config)->ipv4_address, out->address, &out->prefix_length);
-  return status;
+  const ftun_config_tun_t *tun = ftun_config_tun(config);
+  out->address_count = 1u;
+  if (!ftun_cidr_parse(tun->ipv4_address, strlen(tun->ipv4_address), false, &out->addresses[0])) return FTUN_E_INVALID;
+  if (tun->ipv6_address != NULL && tun->ipv6_address[0] != '\0') {
+    if (!ftun_cidr_parse(tun->ipv6_address, strlen(tun->ipv6_address), false, &out->addresses[1])) return FTUN_E_INVALID;
+    out->address_count = 2u;
+  }
+  return FTUN_OK;
 }
 
 static int ftun_tun_owner_plan_equal(
   const ftun_tun_owner_plan_t *left, const ftun_tun_owner_plan_t *right)
 {
-  return left != NULL && right != NULL &&
+  if (left->address_count != right->address_count) return 0;
+  for (size_t index = 0u; index < left->address_count; index++) {
+    if (left->addresses[index].prefix != right->addresses[index].prefix ||
+        !ftun_ip_equal(&left->addresses[index].address, &right->addresses[index].address)) return 0;
+  }
+  return
     strcmp(left->name, right->name) == 0 &&
-    memcmp(left->address, right->address, sizeof(left->address)) == 0 &&
-    left->prefix_length == right->prefix_length && left->mtu == right->mtu &&
+    left->mtu == right->mtu &&
     left->protection_mark == right->protection_mark &&
     left->route_table == right->route_table &&
     left->rule_priority == right->rule_priority &&
@@ -206,8 +212,8 @@ static ftun_status_t ftun_tun_owner_network_restore(void *context)
   }
   spec.budget = owner->budget;
   spec.name = (ftun_string_t){owner->network_plan.name, strlen(owner->network_plan.name)};
-  memcpy(spec.ipv4_address, owner->network_plan.address, sizeof(spec.ipv4_address));
-  spec.prefix_length = owner->network_plan.prefix_length;
+  memcpy(spec.addresses, owner->network_plan.addresses, sizeof(spec.addresses));
+  spec.address_count = owner->network_plan.address_count;
   spec.protection_mark = owner->network_plan.protection_mark;
   spec.route_table = owner->network_plan.route_table;
   spec.rule_priority = owner->network_plan.rule_priority;
@@ -510,7 +516,7 @@ ftun_status_t ftun_tun_owner_start_network_update(
   if (network->name.data == NULL || network->name.length != strlen(owner->plan.name) ||
       memcmp(network->name.data, owner->plan.name, network->name.length) != 0 ||
       network->protection_mark != owner->plan.protection_mark ||
-      network->prefix_length == 0u || network->prefix_length > 32u) return FTUN_E_INVALID;
+      !ftun_tun_owner_addresses_valid(network)) return FTUN_E_INVALID;
   status = ftun_monotonic_now(&now_ms);
   if (status != FTUN_OK) return status;
   if (deadline_ms <= now_ms) return FTUN_E_TIMEOUT;
@@ -519,8 +525,9 @@ ftun_status_t ftun_tun_owner_start_network_update(
   if (usage.network_generation != expected_network_generation) return FTUN_E_STALE;
   /* 失败后显式重试可重新撤销残留并安装；不允许把未恢复的同计划当成功。 */
   candidate = owner->network_plan;
-  memcpy(candidate.address, network->ipv4_address, sizeof(candidate.address));
-  candidate.prefix_length = network->prefix_length;
+  memset(candidate.addresses, 0, sizeof(candidate.addresses));
+  for (size_t i = 0u; i < network->address_count; i++) candidate.addresses[i] = network->addresses[i];
+  candidate.address_count = network->address_count;
   candidate.strict_route = network->strict_route;
   if (usage.accepting && ftun_tun_owner_plan_equal(&candidate, &owner->network_plan)) {
     owner->network_result = (ftun_tun_network_update_result_t){0};
@@ -668,8 +675,8 @@ static ftun_status_t ftun_tun_owner_update_run(
       ? &owner->network_plan : &owner->candidate_network;
     ftun_interface_spec_t spec = {0};
     spec.name = (ftun_string_t){plan->name, strlen(plan->name)};
-    memcpy(spec.ipv4_address, plan->address, sizeof(spec.ipv4_address));
-    spec.prefix_length = plan->prefix_length;
+    memcpy(spec.addresses, plan->addresses, sizeof(spec.addresses));
+    spec.address_count = plan->address_count;
     spec.protection_mark = plan->protection_mark;
     spec.route_table = plan->route_table;
     spec.rule_priority = plan->rule_priority;
@@ -889,7 +896,7 @@ ftun_status_t ftun_tun_owner_update_network(
   if (network->name.data == NULL || network->name.length != strlen(owner->plan.name) ||
       memcmp(network->name.data, owner->plan.name, network->name.length) != 0 ||
       network->protection_mark != owner->plan.protection_mark ||
-      network->prefix_length == 0u || network->prefix_length > 32u) {
+      !ftun_tun_owner_addresses_valid(network)) {
     return ftun_tun_owner_update_rejected(out, FTUN_E_INVALID);
   }
   status = ftun_tun_service_get_usage(owner->service, &usage);
@@ -901,8 +908,9 @@ ftun_status_t ftun_tun_owner_update_network(
   }
   if (!usage.accepting) return ftun_tun_owner_update_rejected(out, FTUN_E_CANCELLED);
   previous = candidate = owner->network_plan;
-  memcpy(candidate.address, network->ipv4_address, sizeof(candidate.address));
-  candidate.prefix_length = network->prefix_length;
+  memset(candidate.addresses, 0, sizeof(candidate.addresses));
+  for (size_t i = 0u; i < network->address_count; i++) candidate.addresses[i] = network->addresses[i];
+  candidate.address_count = network->address_count;
   candidate.strict_route = network->strict_route;
   if (ftun_tun_owner_plan_equal(&candidate, &previous)) {
     out->committed = true;

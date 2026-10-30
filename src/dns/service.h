@@ -1,7 +1,7 @@
 #ifndef FTUN_DNS_SERVICE_H
 #define FTUN_DNS_SERVICE_H
 
-#include "libs/transport/config.h"
+#include "libs/transport/egress.h"
 #include "dns/config/model.h"
 #include "core/limits.h"
 #include "core/operation.h"
@@ -9,7 +9,7 @@
 #include "core/event/loop.h"
 #include "util/types.h"
 #include "libs/transport/path.h"
-#include "libs/transport/protocol.h"
+
 
 #include <stdbool.h>
 
@@ -19,12 +19,8 @@ typedef struct ftun_dns_runtime ftun_dns_runtime_t;
 typedef struct ftun_dns_runtime_plan ftun_dns_runtime_plan_t;
 #endif
 
-typedef ftun_status_t (*ftun_dns_group_select_fn)(
-  void *user, const ftun_config_t *expected_config,
-  uint32_t group_id, uint32_t *out_member);
 
 typedef struct {
-  ftun_dns_group_select_fn select_member;
   ftun_dns_dispatch_fn dispatch;
   void *user;
 } ftun_dns_runtime_adapter_t;
@@ -35,7 +31,7 @@ typedef struct {
   uint64_t generation;
   uint32_t socket_mark;
   ftun_path_provider_ops_t path;
-  const ftun_transport_protocol_t *protocol;
+  const ftun_egress_provider_t *egress;
   void *context;
 } ftun_dns_runtime_network_t;
 

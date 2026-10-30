@@ -15,13 +15,13 @@
 #include "dns/server.h"
 #include "libs/resolver/dnswire.h"
 #include "core/config/document.h"
-#include "libs/transport/protocol.h"
+#include "libs/transport/egress.h"
 #include "libs/transport/datagram.h"
 #include "platform/socket.h"
 #include "platform/socket.h"
 #include "libs/buffer/buffer.h"
 #include "platform/clock.h"
-#include "libs/transport/config.h"
+
 #include "platform/socket.h"
 
 #include <stdio.h>
@@ -51,16 +51,10 @@ typedef char ftun_dns_tcp_mask_fits[
 #define FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES \
   (FTUN_DNS_MAX_MESSAGE_BYTES + 263u)
 
-enum {
-  FTUN_DNS_RUNTIME_DIRECT = 1,
-  FTUN_DNS_RUNTIME_PROXY = 2
-};
 
 /* DNS 内部出口编号只在本 service 的配置快照中使用；不依赖 Proxy 私有 ID。 */
 enum {
-  FTUN_DNS_OUTBOUND_DIRECT = 0,
-  FTUN_DNS_OUTBOUND_REJECT = 1,
-  FTUN_DNS_OUTBOUND_NAMED_BASE = 2
+  FTUN_DNS_OUTBOUND_DIRECT = FTUN_EGRESS_DIRECT
 };
 
 struct ftun_dns_runtime_plan {
@@ -70,16 +64,11 @@ struct ftun_dns_runtime_plan {
   /* 每个服务器的全部上游地址（配置顺序即优先级）；servers[i] 是其中第一个。 */
   ftun_endpoint_t addresses[FTUN_DNS_RUNTIME_MAX_SERVERS][FTUN_UPSTREAM_SET_MAX];
   uint8_t address_count[FTUN_DNS_RUNTIME_MAX_SERVERS];
-  ftun_endpoint_t *proxies;
-  uint8_t *proxy_valid;
   size_t server_count;
-  size_t outbound_count;
 };
 
 typedef enum {
   FTUN_DNS_RUNTIME_REQUEST_CONNECT = 1,
-  FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND,
-  FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV,
   FTUN_DNS_RUNTIME_REQUEST_DNS_SEND,
   FTUN_DNS_RUNTIME_REQUEST_DNS_RECV_UDP,
   FTUN_DNS_RUNTIME_REQUEST_DNS_RECV_PREFIX,
@@ -100,7 +89,6 @@ typedef struct ftun_dns_runtime_transport_request {
   struct ftun_dns_runtime_transport_request *fallback_parent;
   size_t fallback_children;
   ftun_path_t *path;
-  ftun_path_t *control_path;
   ftun_channel_t *stream;
   ftun_channel_t *datagram;
   ftun_operation_t *opening;
@@ -116,7 +104,6 @@ typedef struct ftun_dns_runtime_transport_request {
   ftun_dns_runtime_transport_waiter_t *waiter_head;
   ftun_dns_runtime_transport_waiter_t *waiter_tail;
   ftun_endpoint_t upstream;
-  ftun_endpoint_t proxy;
   uint64_t deadline_ms;
   uint8_t *query;
   uint8_t *buffer;
@@ -124,20 +111,14 @@ typedef struct ftun_dns_runtime_transport_request {
   size_t buffer_length;
   size_t buffer_offset;
   size_t receive_needed;
-  void *protocol_state;
   size_t response_length;
-  size_t username_length;
-  size_t password_length;
   uint64_t identity_hash;
   uint64_t policy_fingerprint;
   uint64_t server_fingerprint;
   uint32_t outbound_id;
-  uint8_t username[UINT8_MAX];
-  uint8_t password[UINT8_MAX];
+  ftun_egress_id_t egress_id;
   ftun_dns_transport_t transport;
   ftun_dns_runtime_request_state_t state;
-  uint8_t mode;
-  bool opening_control;
   bool write_pending;
   bool received_present;
   bool closing;
@@ -225,7 +206,7 @@ typedef struct {
 } ftun_dns_runtime_pending_t;
 
 struct ftun_dns_runtime {
-  const ftun_transport_protocol_t *protocol;
+  const ftun_egress_provider_t *egress;
   ftun_core_t *core;
   ftun_budget_t *budget;
   ftun_reservation_t listener_reservation;
@@ -235,8 +216,6 @@ struct ftun_dns_runtime {
   ftun_path_provider_t *paths;
   uint64_t generation;
   ftun_dns_runtime_adapter_t adapter;
-  ftun_endpoint_t *proxy_endpoints;
-  uint8_t *proxy_endpoint_valid;
   ftun_dns_server_t *servers[FTUN_DNS_RUNTIME_MAX_SERVERS];
   ftun_upstream_set_t *upstream_sets[FTUN_DNS_RUNTIME_MAX_SERVERS];
   ftun_dns_runtime_listener_slot_t listeners[FTUN_DNS_RUNTIME_MAX_LISTENERS];
@@ -284,18 +263,11 @@ struct ftun_dns_runtime {
 };
 
 
-ftun_status_t ftun_dns_runtime_binding_reachable(
-  ftun_dns_runtime_t *dns, uint32_t current, uint32_t leaf, size_t depth,
-  size_t *first, size_t *last);
 ftun_status_t ftun_dns_runtime_binding_validate(
   ftun_dns_runtime_t *dns, const ftun_dns_transport_binding_t *binding);
 ftun_status_t ftun_dns_runtime_bootstrap_endpoint(
   ftun_budget_t *budget, const ftun_config_t *config, ftun_endpoint_t *out);
-ftun_status_t ftun_dns_runtime_encode_bootstrap_query(
-  const char *domain, uint16_t query_id, uint8_t *wire, size_t capacity,
-  size_t *out_length);
-bool ftun_dns_runtime_group_member(const ftun_config_t *config,
-  const ftun_channel_config_t *group, uint32_t member);
+
 uint64_t ftun_dns_runtime_hash_bytes(uint64_t hash, const void *data,
                                            size_t length);
 ftun_status_t ftun_dns_runtime_idle(const ftun_dns_runtime_t *dns);
@@ -315,11 +287,8 @@ ftun_status_t ftun_dns_runtime_listener_udp_one(
 ftun_status_t ftun_dns_runtime_named_index(ftun_string_t name,
                                                   size_t *out, void *user);
 uint64_t ftun_dns_runtime_now(void *user);
-ftun_status_t ftun_dns_runtime_outbound(
-  ftun_dns_runtime_t *dns, uint32_t leaf, uint8_t *mode,
-  ftun_endpoint_t *proxy, const char **username, const char **password);
 ftun_status_t ftun_dns_runtime_outbound_id(
-  const ftun_config_t *config, const char *name, uint32_t *out);
+  ftun_dns_runtime_t *dns, const char *name, uint32_t required, uint32_t *out);
 void ftun_dns_runtime_packet_done(ftun_datagram_t *channel,
   ftun_error_t error, const ftun_endpoint_t *target,
   const ftun_packet_t *packet, void *user);
@@ -346,10 +315,6 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
 ftun_status_t ftun_dns_runtime_protocol_create(
   ftun_dns_runtime_t *dns, bool policy, size_t fixed_server,
   uint32_t inbound_id, ftun_dns_listener_t **out);
-ftun_status_t ftun_dns_runtime_proxy_dependencies(
-  const ftun_config_t *config, uint8_t *needed);
-ftun_status_t ftun_dns_runtime_proxy_visit(
-  const ftun_config_t *config, uint32_t id, uint8_t *states, size_t depth);
 void ftun_dns_runtime_record(ftun_dns_runtime_t *dns,
                                    ftun_status_t status);
 ftun_status_t ftun_dns_runtime_recovery_create(ftun_dns_runtime_t *dns,
@@ -373,8 +338,7 @@ void ftun_dns_runtime_request_finish(
 uint64_t ftun_dns_runtime_request_hash(
   uint32_t outbound_id, uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
-  ftun_dns_transport_t transport, uint8_t mode,
-  const ftun_endpoint_t *proxy, const char *username, const char *password,
+  ftun_dns_transport_t transport, ftun_egress_id_t egress_id,
   ftun_bytes_t query);
 void ftun_dns_runtime_request_index_insert(
   ftun_dns_runtime_transport_request_t *request);
@@ -384,12 +348,8 @@ int ftun_dns_runtime_request_matches(
   const ftun_dns_runtime_transport_request_t *request,
   uint32_t outbound_id, uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
-  ftun_dns_transport_t transport,
-  uint8_t mode, const ftun_endpoint_t *proxy, const char *username,
-  const char *password, ftun_bytes_t query);
-ftun_status_t ftun_dns_runtime_request_open(
-  ftun_dns_runtime_transport_request_t *request, int type,
-  const ftun_endpoint_t *target, bool control);
+  ftun_dns_transport_t transport, ftun_egress_id_t egress_id, ftun_bytes_t query);
+ftun_status_t ftun_dns_runtime_request_open(ftun_dns_runtime_transport_request_t *request);
 ftun_status_t ftun_dns_runtime_request_path_close(ftun_path_t **path);
 void ftun_dns_runtime_request_ready_enqueue(
   ftun_dns_runtime_transport_request_t *request);
@@ -400,8 +360,6 @@ ftun_status_t ftun_dns_runtime_request_receive(
 void ftun_dns_runtime_request_release(
   ftun_dns_runtime_transport_request_t *request);
 ftun_status_t ftun_dns_runtime_request_send(
-  ftun_dns_runtime_transport_request_t *request);
-ftun_status_t ftun_dns_runtime_request_handshake_next(
   ftun_dns_runtime_transport_request_t *request);
 void ftun_dns_runtime_request_unlink(
   ftun_dns_runtime_transport_request_t *request);

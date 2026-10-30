@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "util/dnswire.h"
 
 #include <string.h>
@@ -402,15 +403,13 @@ static int ftun_dns_name_equal(ftun_dns_name_t left, ftun_dns_name_t right)
 
 static int ftun_dns_endpoint_valid(const ftun_endpoint_t *endpoint)
 {
-  return endpoint != NULL && endpoint->kind == FTUN_ADDRESS_IPV4 &&
+  return endpoint != NULL && ftun_endpoint_is_ip(endpoint) &&
          endpoint->port != 0u && endpoint->domain.length == 0u;
 }
 
-static int ftun_dns_endpoint_equal(const ftun_endpoint_t *left,
-                                    const ftun_endpoint_t *right)
+static int ftun_dns_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  return left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return ftun_endpoint_equal(left, right);
 }
 
 ftun_status_t ftun_dns_message_matches(

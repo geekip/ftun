@@ -2,6 +2,7 @@
 
 #include "libs/resolver/system.h"
 #include "platform/sysresolve.h"
+#include "util/endpoint.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -91,9 +92,9 @@ static int ftun_system_resolver_request_valid(
          request->check_path != NULL && request->completion != NULL;
 }
 
-static ftun_status_t ftun_system_resolver_execute(
+static ftun_status_t ftun_system_resolver_execute_family(
   ftun_bytes_t input, uint8_t *result, size_t result_capacity,
-  size_t *out_result_size)
+  size_t *out_result_size, uint8_t family)
 {
   size_t count = 0u;
   ftun_status_t status;
@@ -102,29 +103,40 @@ static ftun_status_t ftun_system_resolver_execute(
       input.data[input.length - 1u] != '\0' ||
       memchr(input.data, '\0', input.length - 1u) != NULL ||
       result == NULL ||
-      result_capacity < FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS * 4u) {
+      result_capacity < FTUN_SYSTEM_RESOLVER_MAX_RESULTS * sizeof(ftun_ip_t)) {
     return FTUN_E_INVALID;
   }
-  status = ftun_sysresolve_ipv4((const char *)input.data, result,
-    FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS, &count);
-  if (status == FTUN_OK) *out_result_size = count * 4u;
+  status = ftun_sysresolve((const char *)input.data, family, (ftun_ip_t *)result,
+    FTUN_SYSTEM_RESOLVER_MAX_RESULTS, &count);
+  if (status == FTUN_OK) *out_result_size = count * sizeof(ftun_ip_t);
   return status;
 }
+
+static ftun_status_t ftun_system_resolver_execute(ftun_bytes_t input, uint8_t *result,
+  size_t capacity, size_t *size)
+{ return ftun_system_resolver_execute_family(input, result, capacity, size, FTUN_IP_V4); }
+static ftun_status_t ftun_system_resolver_execute6(ftun_bytes_t input, uint8_t *result,
+  size_t capacity, size_t *size)
+{ return ftun_system_resolver_execute_family(input, result, capacity, size, FTUN_IP_V6); }
+static ftun_status_t ftun_system_resolver_execute_all(ftun_bytes_t input, uint8_t *result,
+  size_t capacity, size_t *size)
+{ return ftun_system_resolver_execute_family(input, result, capacity, size, FTUN_IP_NONE); }
 
 static int ftun_system_resolver_result_valid(ftun_bytes_t bytes)
 {
   size_t count;
   size_t index;
   size_t previous;
-  if (bytes.data == NULL || bytes.length == 0u || bytes.length % 4u != 0u) {
+  if (bytes.data == NULL || bytes.length == 0u || bytes.length % sizeof(ftun_ip_t) != 0u) {
     return 0;
   }
-  count = bytes.length / 4u;
-  if (count > FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) return 0;
+  count = bytes.length / sizeof(ftun_ip_t);
+  if (count > FTUN_SYSTEM_RESOLVER_MAX_RESULTS) return 0;
+  const ftun_ip_t *addresses = (const ftun_ip_t *)bytes.data;
   for (index = 0u; index < count; index++) {
+    if (addresses[index].family != FTUN_IP_V4 && addresses[index].family != FTUN_IP_V6) return 0;
     for (previous = 0u; previous < index; previous++) {
-      if (memcmp(bytes.data + previous * 4u,
-                 bytes.data + index * 4u, 4u) == 0) return 0;
+      if (ftun_ip_equal(&addresses[previous], &addresses[index])) return 0;
     }
   }
   return 1;
@@ -137,7 +149,7 @@ static void ftun_system_resolver_completed(ftun_operation_t *operation,
   ftun_system_resolve_context_t *context =
     (ftun_system_resolve_context_t *)user;
   ftun_system_resolve_result_t result;
-  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
+  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   ftun_reservation_t reservation;
   size_t index;
   memset(&result, 0, sizeof(result));
@@ -147,12 +159,11 @@ static void ftun_system_resolver_completed(ftun_operation_t *operation,
                                        FTUN_SYSTEM_RESOLVER_STAGE_RESULT);
   }
   if (error.status == FTUN_OK) {
-    result.address_count = bytes.length / 4u;
+    result.address_count = bytes.length / sizeof(ftun_ip_t);
     result.addresses = addresses;
     memset(addresses, 0, sizeof(addresses));
     for (index = 0u; index < result.address_count; index++) {
-      addresses[index].kind = FTUN_ADDRESS_IPV4;
-      memcpy(addresses[index].address, bytes.data + index * 4u, 4u);
+      ftun_endpoint_set_ip(&addresses[index], &((const ftun_ip_t *)bytes.data)[index], 0u);
     }
   } else if (error.stage == 0u) {
     error.stage = error.status == FTUN_E_TIMEOUT ?
@@ -218,7 +229,7 @@ ftun_status_t ftun_system_resolve_with_execute(
   job.execute = execute;
   job.input.data = (const uint8_t *)context->domain_storage;
   job.input.length = request->domain.length + 1u;
-  job.result_capacity = FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS * 4u;
+  job.result_capacity = FTUN_SYSTEM_RESOLVER_MAX_RESULTS * sizeof(ftun_ip_t);
   job.deadline_ms = request->deadline_ms;
   status = ftun_worker_submit(request->worker, &job,
                               ftun_system_resolver_completed, context, out);
@@ -231,5 +242,6 @@ ftun_status_t ftun_system_resolve(
   ftun_operation_t **out)
 {
   return ftun_system_resolve_with_execute(
-    core, request, ftun_system_resolver_execute, out);
+    core, request, request->query_type == 28u ? ftun_system_resolver_execute6 :
+      request->ipv6 ? ftun_system_resolver_execute_all : ftun_system_resolver_execute, out);
 }

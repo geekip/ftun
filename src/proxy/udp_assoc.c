@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
 void ftun_proxy_runtime_udp_sent(ftun_datagram_t *channel, ftun_error_t error,
@@ -328,12 +329,12 @@ void ftun_proxy_runtime_udp_proxy_resolved(
     return;
   }
   if (status == FTUN_OK && (result == NULL || result->address_count == 0u ||
-      result->address_count > FTUN_SESSION_MAX_RESOLVED_IPV4)) {
+      result->address_count > FTUN_SESSION_MAX_RESOLVED)) {
     status = FTUN_E_STATE_CORRUPT;
   }
   for (index = 0u; status == FTUN_OK && index < result->address_count;
        index++) {
-    if (result->addresses[index].kind != FTUN_ADDRESS_IPV4) {
+    if (!ftun_endpoint_is_ip(&result->addresses[index])) {
       status = FTUN_E_UNSUPPORTED;
       break;
     }
@@ -375,8 +376,8 @@ ftun_status_t ftun_proxy_runtime_udp_socks_prepare(
 {
   size_t length;
   if (slot == NULL || target == NULL || config == NULL || server == NULL ||
-      target->candidate_count > FTUN_SESSION_MAX_RESOLVED_IPV4 ||
-      target->allowed_count > FTUN_SESSION_MAX_RESOLVED_IPV4 ||
+      target->candidate_count > FTUN_SESSION_MAX_RESOLVED ||
+      target->allowed_count > FTUN_SESSION_MAX_RESOLVED ||
       (target->candidate_count != 0u && target->candidates == NULL) ||
       (target->allowed_count != 0u && target->allowed == NULL)) {
     return FTUN_E_INVALID;
@@ -488,7 +489,7 @@ ftun_status_t ftun_proxy_runtime_udp_open(
       ? FTUN_ROUTE_DENY : FTUN_ROUTE_READY;
     route.generation = metadata->generation;
     route.outbound_id = forced;
-    if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+    if (ftun_endpoint_is_ip(&metadata->original_target) &&
         !metadata->original_is_fake) {
       route.allowed = &metadata->original_target;
       route.allowed_count = 1u;
@@ -740,6 +741,7 @@ ftun_status_t ftun_proxy_runtime_resolve_async(
   query.operations = engine->operations;
   query.worker = engine->worker;
   query.budget = budget;
+  query.ipv6 = ftun_config_base(config)->ipv6;
   query.domain = domain;
   query.protection.mark = engine->socket_mark;
   query.protection.liveness = engine->liveness;
@@ -809,7 +811,7 @@ ftun_status_t ftun_proxy_runtime_udp_finish_route(
       ? FTUN_ROUTE_DENY : FTUN_ROUTE_READY;
     pending->route.generation = pending->metadata.generation;
     pending->route.outbound_id = forced;
-    if (pending->metadata.original_target.kind == FTUN_ADDRESS_IPV4 &&
+    if (ftun_endpoint_is_ip(&pending->metadata.original_target) &&
         !pending->metadata.original_is_fake) {
       pending->route.allowed = &pending->metadata.original_target;
       pending->route.allowed_count = 1u;
@@ -881,12 +883,12 @@ void ftun_proxy_runtime_udp_resolved(
     if (status == FTUN_OK && !usage.accepting) status = FTUN_E_CANCELLED;
   }
   if (status == FTUN_OK && (result == NULL || result->address_count == 0u ||
-      result->address_count > FTUN_UDP_FLOW_MAX_RESOLVED_IPV4)) {
+      result->address_count > FTUN_UDP_FLOW_MAX_RESOLVED)) {
     status = FTUN_E_STATE_CORRUPT;
   }
   for (index = 0u; status == FTUN_OK && index < result->address_count;
        index++) {
-    if (result->addresses[index].kind != FTUN_ADDRESS_IPV4) {
+    if (!ftun_endpoint_is_ip(&result->addresses[index])) {
       status = FTUN_E_UNSUPPORTED;
       break;
     }
@@ -967,7 +969,7 @@ ftun_status_t ftun_proxy_runtime_udp_route_datagram(
   }
   if (metadata->resolved_count != 0u) {
     if (metadata->resolved == NULL ||
-        metadata->resolved_count > FTUN_UDP_FLOW_MAX_RESOLVED_IPV4) {
+        metadata->resolved_count > FTUN_UDP_FLOW_MAX_RESOLVED) {
       status = FTUN_E_INVALID;
       goto pending_fail;
     }
@@ -1217,7 +1219,7 @@ ftun_status_t ftun_proxy_runtime_association_start(
   ftun_status_t status;
   if (flow == NULL || requested == NULL || flow->listener == NULL ||
       flow->listener->udp_descriptor < 0 ||
-      requested->kind != FTUN_ADDRESS_IPV4) return FTUN_E_UNSUPPORTED;
+      !ftun_endpoint_is_ip(requested)) return FTUN_E_UNSUPPORTED;
   status = ftun_proxy_runtime_flow_classify(
     flow, FTUN_PROXY_RUNTIME_FLOW_ASSOCIATION);
   if (status != FTUN_OK) return status;
@@ -1247,9 +1249,10 @@ ftun_status_t ftun_proxy_runtime_association_start(
   if (status != FTUN_OK) goto fail;
   memset(&bound, 0, sizeof(bound));
   status = ftun_socket_name(flow->listener->udp_descriptor, &bound);
-  if (status == FTUN_OK && bound.address[0] == 0u && bound.address[1] == 0u &&
-      bound.address[2] == 0u && bound.address[3] == 0u) {
+  if (status == FTUN_OK && ftun_proxy_runtime_zero_ip(&bound)) {
+    uint16_t port = bound.port;
     status = ftun_socket_name(flow->client_socket.descriptor, &bound);
+    bound.port = port;
   }
   if (status == FTUN_OK) {
     flow->udp_request = *requested;
@@ -1273,11 +1276,11 @@ fail:
   return status;
 }
 
-bool ftun_proxy_runtime_zero_ipv4(const ftun_endpoint_t *endpoint)
+bool ftun_proxy_runtime_zero_ip(const ftun_endpoint_t *endpoint)
 {
-  static const uint8_t zero[4] = {0u, 0u, 0u, 0u};
-  return endpoint != NULL && endpoint->kind == FTUN_ADDRESS_IPV4 &&
-         memcmp(endpoint->address, zero, sizeof(zero)) == 0;
+  static const uint8_t zero[16] = {0};
+  return endpoint != NULL && ftun_endpoint_is_ip(endpoint) &&
+    memcmp(endpoint->address, zero, ftun_endpoint_address_bytes(endpoint)) == 0;
 }
 
 ftun_proxy_runtime_flow_t *ftun_proxy_runtime_association_find(
@@ -1300,12 +1303,13 @@ ftun_proxy_runtime_flow_t *ftun_proxy_runtime_association_find(
     if (!flow->active || flow->listener != listener ||
         flow->state != FTUN_PROXY_RUNTIME_FLOW_UDP_ASSOCIATE ||
         flow->udp_client_pinned ||
-        flow->tcp_peer.kind != FTUN_ADDRESS_IPV4 ||
-        memcmp(flow->tcp_peer.address, client->address, 4u) != 0) {
+        flow->tcp_peer.kind != client->kind ||
+        memcmp(flow->tcp_peer.address, client->address, ftun_endpoint_address_bytes(client)) != 0) {
       continue;
     }
-    if (!ftun_proxy_runtime_zero_ipv4(&flow->udp_request) &&
-        memcmp(flow->udp_request.address, client->address, 4u) != 0) continue;
+    if (!ftun_proxy_runtime_zero_ip(&flow->udp_request) &&
+        (flow->udp_request.kind != client->kind ||
+         memcmp(flow->udp_request.address, client->address, ftun_endpoint_address_bytes(client)) != 0)) continue;
     if (flow->udp_request.port != 0u &&
         flow->udp_request.port != client->port) continue;
     flow->udp_client = *client;

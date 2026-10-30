@@ -32,6 +32,7 @@ foreach(section core dns proxy)
 endforeach()
 # CMake 统一对象顺序和缩进，使构建产物与仓库中的发行文件可逐字比较。
 string(JSON merged GET "${merged}")
+string(REGEX REPLACE "[ \t]+\n" "\n" merged "${merged}")
 if(FTUN_SCHEMA_CHECK)
   file(READ "${FTUN_SCHEMA_OUTPUT}" published)
   if(NOT published STREQUAL "${merged}\n")

@@ -33,7 +33,9 @@ static int endpoint_contract(void)
   CHECK(ftun_control_parse_endpoint("example.com:0", 53u, &endpoint,
                                     domain) == FTUN_E_INVALID);
   CHECK(ftun_control_parse_endpoint("[::1]:53", 53u, &endpoint,
-                                    domain) == FTUN_E_INVALID);
+                                    domain) == FTUN_OK);
+  CHECK(endpoint.kind == FTUN_ADDRESS_IPV6 && endpoint.address[15] == 1u &&
+        endpoint.port == 53u);
   return 0;
 }
 
@@ -97,12 +99,9 @@ static int named_plan_contract(void)
   config.outbound_count = 1u;
   CHECK(ftun_control_resolver_plan(&config, NULL,
     (ftun_string_t){"real", 4u}, UINT32_C(0x4654), &plan) == FTUN_OK);
-  CHECK(plan.named && plan.tcp && plan.use_proxy);
+  CHECK(plan.named && plan.tcp && plan.egress_id == 2u);
   CHECK(plan.bootstrap_count == 1u);
   CHECK(strcmp(plan.upstream, "dns.internal:5353") == 0);
-  CHECK(strcmp(plan.proxy, "proxy.internal:1080") == 0);
-  CHECK(strcmp(plan.proxy_username, "user") == 0);
-  CHECK(strcmp(plan.proxy_password, "pass") == 0);
   CHECK(ftun_control_resolver_plan(&config, NULL,
     (ftun_string_t){"missing", 7u}, UINT32_C(0x4654),
     &plan) == FTUN_E_REJECTED);

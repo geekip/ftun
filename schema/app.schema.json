@@ -29,9 +29,8 @@
       "properties": {
         "ipv6": {
           "type": "boolean",
-          "const": false,
           "default": false,
-          "description": "FTUN v1.0 仅支持 IPv4；真实 DNS 回答不因此删除 AAAA 记录。"
+          "description": "为域名解析同时查询 A/AAAA，默认仅查询 A；数值 IPv6 目标与双栈监听独立可用。"
         },
         "allow-lan": {
           "type": "boolean",

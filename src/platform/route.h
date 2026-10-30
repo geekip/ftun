@@ -37,8 +37,8 @@ const char *ftun_platform_route_config_error(ftun_route_settings_t settings);
 
 struct ftun_route_policy {
   ftun_string_t tun_interface;
-  uint8_t tun_ipv4[4];
-  uint8_t tun_prefix_length;
+  ftun_cidr_t tun_addresses[2];
+  size_t tun_address_count;
   uint32_t routing_domain;
   uint32_t precedence;
   /* 0 保持旧布局：capture 从 precedence+1 开始。NetworkView 可预留

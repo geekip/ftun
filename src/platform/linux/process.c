@@ -3,6 +3,8 @@
 #include <sys/resource.h>
 #include "platform/process.h"
 #include <sys/random.h>
+#include <signal.h>
+#include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -48,4 +50,26 @@ size_t ftun_platform_descriptor_limit(size_t requested)
 ptrdiff_t ftun_process_executable(char *buffer, size_t capacity)
 {
   return (ptrdiff_t)readlink("/proc/self/exe", buffer, capacity);
+}
+
+ftun_status_t ftun_process_alarm_start(ftun_process_alarm_t *alarm, uint64_t milliseconds)
+{
+  timer_t native;
+  struct sigevent event = {0};
+  struct itimerspec value = {0};
+  event.sigev_notify = SIGEV_SIGNAL;
+  event.sigev_signo = SIGALRM;
+  if (timer_create(CLOCK_MONOTONIC, &event, &native) != 0) return FTUN_E_IO;
+  value.it_value.tv_sec = (time_t)(milliseconds / 1000u);
+  value.it_value.tv_nsec = (long)(milliseconds % 1000u) * 1000000L;
+  if (timer_settime(native, 0, &value, NULL) == 0) {
+    alarm->native = (uintptr_t)native;
+    return FTUN_OK;
+  }
+  (void)timer_delete(native);
+  return FTUN_E_IO;
+}
+void ftun_process_alarm_destroy(ftun_process_alarm_t *alarm)
+{
+  if (timer_delete((timer_t)alarm->native) != 0) abort();
 }

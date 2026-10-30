@@ -1,4 +1,5 @@
 #define _GNU_SOURCE 1
+#include "util/endpoint.h"
 #include "proxy/outbound/socks5.h"
 #include "libs/transport/channel_internal.h"
 #include "proxy/protocol/socks5_client.h"
@@ -83,6 +84,7 @@ struct ftun_socks5_connection {
   ftun_datagram_options_t datagram_options;
   ftun_datagram_send_token_t datagram_send;
   ftun_status_t channel_failure;
+  bool report_datagram_errors;
   bool cancelling_send;
   ftun_stream_options_t stream_options;
   ftun_path_notify_fn notify;
@@ -133,13 +135,9 @@ static int ftun_socks5_domain_valid(ftun_string_t domain, size_t maximum)
          memchr(domain.data, '\0', domain.length) == NULL;
 }
 
-static int ftun_socks5_endpoint_equal(const ftun_endpoint_t *left,
-                                      const ftun_endpoint_t *right)
+static int ftun_socks5_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  return left != NULL && right != NULL &&
-         left->kind == FTUN_ADDRESS_IPV4 &&
-         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
 }
 
 static int ftun_socks5_contains(const ftun_endpoint_t *items, size_t count,
@@ -166,15 +164,12 @@ static ftun_status_t ftun_socks5_proxy_validate(
       (proxy->resolved_count != 0u && proxy->resolved == NULL)) {
     return FTUN_E_INVALID;
   }
-  if (proxy->server.kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(&proxy->server)) {
     if (proxy->server.domain.length != 0u || proxy->resolved_count != 0u) {
       return FTUN_E_INVALID;
     }
     *candidate_count = 1u;
     return FTUN_OK;
-  }
-  if (proxy->server.kind == FTUN_ADDRESS_IPV6_RESERVED) {
-    return FTUN_E_UNSUPPORTED;
   }
   if (proxy->server.kind != FTUN_ADDRESS_DOMAIN ||
       !ftun_socks5_domain_valid(proxy->server.domain, 253u)) {
@@ -183,7 +178,7 @@ static ftun_status_t ftun_socks5_proxy_validate(
   if (proxy->resolved_count == 0u) return FTUN_E_RESOLVE;
   for (index = 0u; index < proxy->resolved_count; index++) {
     const ftun_endpoint_t *endpoint = &proxy->resolved[index];
-    if (endpoint->kind != FTUN_ADDRESS_IPV4 || endpoint->port == 0u ||
+    if (!ftun_endpoint_is_ip(endpoint) || endpoint->port == 0u ||
         endpoint->port != proxy->server.port ||
         endpoint->domain.length != 0u) return FTUN_E_INVALID;
   }
@@ -202,19 +197,19 @@ static ftun_status_t ftun_socks5_target_select(const ftun_target_t *target,
       (target->candidate_count != 0u && target->candidates == NULL) ||
       (target->allowed_count != 0u && target->allowed == NULL) ||
       target->allowed_count > target->candidate_count) return FTUN_E_INVALID;
-  if (target->original.kind != FTUN_ADDRESS_IPV4 &&
+  if (!ftun_endpoint_is_ip(&target->original) &&
       target->original.kind != FTUN_ADDRESS_DOMAIN) return FTUN_E_INVALID;
   if (target->original.kind == FTUN_ADDRESS_DOMAIN &&
       !ftun_socks5_domain_valid(target->original.domain, 253u)) {
     return FTUN_E_INVALID;
   }
   for (index = 0u; index < target->candidate_count; index++) {
-    if (target->candidates[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&target->candidates[index]) ||
         target->candidates[index].port != target->original.port ||
         target->candidates[index].domain.length != 0u) return FTUN_E_INVALID;
   }
   for (index = 0u; index < target->allowed_count; index++) {
-    if (target->allowed[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&target->allowed[index]) ||
         target->allowed[index].port == 0u ||
         target->allowed[index].domain.length != 0u) return FTUN_E_INVALID;
     if (!ftun_socks5_contains(target->candidates, target->candidate_count,
@@ -609,11 +604,11 @@ static ftun_status_t ftun_socks5_begin_handshake(
   return ftun_socks5_watch(connection, FTUN_EVENT_WRITE);
 }
 
-static int ftun_socks5_ipv4_unspecified(const ftun_endpoint_t *endpoint)
+static int ftun_socks5_ip_unspecified(const ftun_endpoint_t *endpoint)
 {
-  static const uint8_t zero[4] = {0u, 0u, 0u, 0u};
-  return endpoint->kind == FTUN_ADDRESS_IPV4 &&
-         memcmp(endpoint->address, zero, sizeof(zero)) == 0;
+  static const uint8_t zero[16] = {0};
+  return ftun_endpoint_is_ip(endpoint) &&
+    memcmp(endpoint->address, zero, ftun_endpoint_address_bytes(endpoint)) == 0;
 }
 
 static ftun_status_t ftun_socks5_start_udp(
@@ -621,14 +616,14 @@ static ftun_status_t ftun_socks5_start_udp(
 {
   ftun_dial_request_t request;
   ftun_status_t status;
-  if (relay->kind == FTUN_ADDRESS_IPV6_RESERVED ||
-      relay->kind == FTUN_ADDRESS_DOMAIN) return FTUN_E_UNSUPPORTED;
-  if (relay->kind != FTUN_ADDRESS_IPV4 || relay->port == 0u) {
+  if (relay->kind == FTUN_ADDRESS_DOMAIN) return FTUN_E_UNSUPPORTED;
+  if (!ftun_endpoint_is_ip(relay) || relay->port == 0u) {
     return FTUN_E_PROTOCOL;
   }
   connection->relay = *relay;
-  if (ftun_socks5_ipv4_unspecified(&connection->relay)) {
-    memcpy(connection->relay.address, connection->proxy_endpoint.address, 4u);
+  if (ftun_socks5_ip_unspecified(&connection->relay)) {
+    connection->relay.kind = connection->proxy_endpoint.kind;
+    memcpy(connection->relay.address, connection->proxy_endpoint.address, 16u);
   }
   status = connection->scope == NULL ? ftun_socks5_cancel_sources(connection) : FTUN_OK;
   if (status != FTUN_OK) return status;
@@ -1060,13 +1055,9 @@ static void ftun_socks5_path_completed(ftun_operation_t *operation,
     ftun_socks5_error(status, FTUN_SOCKS5_STAGE_METHOD));
 }
 
-static bool ftun_socks5_logical_endpoint_equal(const ftun_endpoint_t *left,
-  const ftun_endpoint_t *right)
+static bool ftun_socks5_logical_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  if (left == NULL || right == NULL || left->kind != right->kind || left->port != right->port) return false;
-  if (left->kind == FTUN_ADDRESS_IPV4) return memcmp(left->address, right->address, 4u) == 0;
-  return left->kind == FTUN_ADDRESS_DOMAIN && left->domain.length == right->domain.length &&
-    memcmp(left->domain.data, right->domain.data, left->domain.length) == 0;
+  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
 }
 
 static ftun_status_t ftun_socks5_datagram_send_start(void *user,
@@ -1178,10 +1169,15 @@ static ftun_status_t ftun_socks5_wire_receive(ftun_datagram_t *channel,
   if (ftun_channel_transport(&connection->datagram) == 0) return FTUN_E_CANCELLED;
   status = ftun_packet_view(packet, &wire);
   if (status == FTUN_OK) status = ftun_socks5_connection_decode_udp(connection, source, wire, &decoded, &consumed);
-  if (status != FTUN_OK || consumed != wire.length) return FTUN_OK;
-  if (!ftun_socks5_logical_endpoint_equal(&decoded.endpoint, &connection->target) &&
-      !(connection->target.kind == FTUN_ADDRESS_DOMAIN && decoded.endpoint.kind == FTUN_ADDRESS_IPV4 &&
-        decoded.endpoint.port == connection->target.port)) return FTUN_OK;
+  if (status == FTUN_OK && consumed != wire.length) status = FTUN_E_PROTOCOL;
+  if (status == FTUN_OK && !ftun_socks5_logical_endpoint_equal(&decoded.endpoint, &connection->target) &&
+      !(connection->target.kind == FTUN_ADDRESS_DOMAIN && ftun_endpoint_is_ip(&decoded.endpoint) &&
+        decoded.endpoint.port == connection->target.port)) status = FTUN_E_REJECTED;
+  if (status != FTUN_OK) {
+    if (connection->report_datagram_errors) ftun_socks5_path_notify(connection->data_path,
+      FTUN_PATH_ERROR, ftun_socks5_error(status, FTUN_SOCKS5_STAGE_UDP_DIAL), connection);
+    return FTUN_OK;
+  }
   slice = packet->payload;
   slice.offset += wire.length - decoded.payload.length;
   slice.length = decoded.payload.length;
@@ -1293,6 +1289,7 @@ static ftun_status_t ftun_socks5_connect_internal(
     connection->scope = request->scope;
     connection->stream_options = request->stream;
     connection->datagram_options = request->datagram;
+    connection->report_datagram_errors = request->report_datagram_errors;
     connection->notify = request->notify;
     connection->notify_user = request->notify_user;
   }
@@ -1301,7 +1298,7 @@ static ftun_status_t ftun_socks5_connect_internal(
   connection->budget = request->budget;
   connection->proxy_candidates = (ftun_endpoint_t *)(connection + 1);
   connection->proxy_candidate_count = proxy_candidate_count;
-  if (request->proxy->server.kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(&request->proxy->server)) {
     connection->proxy_candidates[0] = request->proxy->server;
   } else {
     memcpy(connection->proxy_candidates, request->proxy->resolved,
@@ -1492,4 +1489,16 @@ ftun_status_t ftun_socks5_connection_resume(ftun_socks5_connection_t *connection
   if (connection == NULL) return FTUN_E_INVALID;
   if (!connection->ready || connection->data_path == NULL) return FTUN_E_AGAIN;
   return ftun_path_resume(connection->data_path);
+}
+
+ftun_status_t ftun_socks5_connection_quiesce(ftun_socks5_connection_t *connection)
+{
+  ftun_status_t status;
+  if (connection == NULL) return FTUN_OK;
+  if (connection->busy) return FTUN_E_AGAIN;
+  status = ftun_event_source_cancel(&connection->pump_source);
+  if (status == FTUN_OK) connection->scheduled = false;
+  if (status == FTUN_OK && connection->control_path != NULL) status = ftun_path_revoke(connection->control_path);
+  if (status == FTUN_OK && connection->data_path != NULL) status = ftun_path_revoke(connection->data_path);
+  return status;
 }

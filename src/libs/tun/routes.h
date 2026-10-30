@@ -4,7 +4,7 @@
 #include "libs/transport/view.h"
 #include "platform/route.h"
 
-/* 动态路由事务使用非阻塞 rtnetlink，并把 fd/timer 挂到 owner loop。
+/* 动态路由事务使用非阻塞 平台路由接口，并把 fd/timer 挂到 owner loop。
  * total_deadline_ms 是绝对单调毫秒；step_timeout_ms 限制单个 ACK/dump。
  * 每个资源先核验不存在再 CREATE|EXCL。ACK 超时必须 dump reconcile，
  * 无法确认的资源按可能已创建保留所有权并进入可重试清理状态。 */

@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "libs/transport/socket_path.h"
 #include "platform/socket.h"
 
@@ -217,8 +218,7 @@ static ftun_status_t ftun_socket_send(void *user, ftun_datagram_send_token_t tok
   ftun_status_t status;
   if (driver->stopped) return FTUN_E_CANCELLED;
   if (driver->failure != FTUN_OK) return driver->failure;
-  if (target->kind != FTUN_ADDRESS_IPV4 || target->port != driver->peer.port ||
-      memcmp(target->address, driver->peer.address, 4u) != 0) return FTUN_E_REJECTED;
+  if (!ftun_endpoint_equal(target, &driver->peer)) return FTUN_E_REJECTED;
   status = ftun_packet_view(packet, &bytes);
   if (status != FTUN_OK) return status;
   if (bytes.length > FTUN_SOCKET_UDP_BYTES) return FTUN_E_LIMIT;
@@ -430,6 +430,8 @@ ftun_status_t ftun_socket_path_open(void *context, ftun_core_t *core,
   if (core == NULL || request == NULL || spec == NULL || out == NULL ||
       request->completion == NULL || request->dial.budget == NULL ||
       request->dial.loop == NULL) return FTUN_E_INVALID;
+  /* 物理工厂只能直连；非零出口必须经出口提供者解释，不能被静默当作直连。 */
+  if (request->egress != 0u) return FTUN_E_REJECTED;
   if (spec->receive_pool != NULL) {
     ftun_budget_t *pool_budget = NULL;
     bool same_root = false;

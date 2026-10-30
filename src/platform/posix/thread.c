@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__APPLE__)
+#define _DARWIN_C_SOURCE 1
+#endif
 #include "platform/thread.h"
 #include <sched.h>
 #include <errno.h>
@@ -37,6 +40,9 @@ bool ftun_mutex_trylock(ftun_mutex_t *mutex)
 
 ftun_status_t ftun_condition_init(ftun_condition_t *condition)
 {
+#if defined(__APPLE__)
+  return pthread_cond_init(&condition->native, NULL) == 0 ? FTUN_OK : FTUN_E_IO;
+#else
   pthread_condattr_t attributes;
   int result = pthread_condattr_init(&attributes);
   if (result != 0) return FTUN_E_IO;
@@ -44,6 +50,7 @@ ftun_status_t ftun_condition_init(ftun_condition_t *condition)
   if (result == 0) result = pthread_cond_init(&condition->native, &attributes);
   require_success(pthread_condattr_destroy(&attributes));
   return result == 0 ? FTUN_OK : FTUN_E_IO;
+#endif
 }
 void ftun_condition_destroy(ftun_condition_t *condition)
 {
@@ -71,11 +78,22 @@ ftun_status_t ftun_condition_wait_until(ftun_condition_t *condition,
     ftun_condition_wait(condition, mutex);
     return FTUN_OK;
   }
+#if defined(__APPLE__)
+  struct timespec now;
+  if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return FTUN_E_IO;
+  uint64_t now_ms = (uint64_t)now.tv_sec * 1000u + (uint64_t)now.tv_nsec / 1000000u;
+  if (now_ms >= deadline_ms) return FTUN_E_TIMEOUT;
+  deadline_ms -= now_ms;
+#endif
   seconds = deadline_ms / UINT64_C(1000);
   deadline.tv_sec = (time_t)seconds;
   if ((uint64_t)deadline.tv_sec != seconds) return FTUN_E_LIMIT;
   deadline.tv_nsec = (long)((deadline_ms % UINT64_C(1000)) * UINT64_C(1000000));
+#if defined(__APPLE__)
+  result = pthread_cond_timedwait_relative_np(&condition->native, &mutex->native, &deadline);
+#else
   result = pthread_cond_timedwait(&condition->native, &mutex->native, &deadline);
+#endif
   if (result == ETIMEDOUT) return FTUN_E_TIMEOUT;
   return result == 0 ? FTUN_OK : FTUN_E_IO;
 }

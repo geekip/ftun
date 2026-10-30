@@ -131,7 +131,7 @@ static int test_udp_associate_and_ipv6_bnd(void)
   CHECK(send_frame(&client, request, sizeof(request)) == 0);
   reply[20] = 0x04u; reply[21] = 0xd2u;
   CHECK(feed(&client, reply, sizeof(reply), 7u, &result, &used) == FTUN_OK);
-  CHECK(used == 22u && result.bound.kind == FTUN_ADDRESS_IPV6_RESERVED &&
+  CHECK(used == 22u && result.bound.kind == FTUN_ADDRESS_IPV6 &&
         result.bound.port == 1234u);
   return 0;
 }

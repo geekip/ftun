@@ -1,12 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include "platform/sysresolve.h"
-#include "util/ip.h"
+#include "util/endpoint.h"
 #include <stdio.h>
 #include <errno.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <string.h>
-#include <stdio.h>
 
 static ftun_status_t ftun_system_resolver_errno(int error_code)
 {
@@ -33,81 +32,47 @@ static ftun_status_t ftun_system_resolver_gai_status(int code)
   return FTUN_E_RESOLVE;
 }
 
-static int ftun_system_resolver_contains(const uint8_t *addresses,
-                                          size_t count,
-                                          const uint8_t address[4])
-{
-  size_t index;
-  for (index = 0u; index < count; index++) {
-    if (memcmp(addresses + index * 4u, address, 4u) == 0) return 1;
-  }
-  return 0;
-}
-
-ftun_status_t ftun_sysresolve_ipv4(const char *domain, uint8_t *result,
+ftun_status_t ftun_sysresolve(const char *domain, uint8_t family, ftun_ip_t *result,
   size_t maximum, size_t *out_count)
 {
-  struct addrinfo hints;
-  struct addrinfo *addresses = NULL, *item;
+  struct addrinfo hints = {0}, *addresses = NULL, *item;
   size_t count = 0u;
   int code;
   *out_count = 0u;
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
+  hints.ai_family = family == FTUN_IP_V4 ? AF_INET : family == FTUN_IP_V6 ? AF_INET6 : AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
   code = getaddrinfo(domain, NULL, &hints, &addresses);
   if (code != 0) return ftun_system_resolver_gai_status(code);
   for (item = addresses; item != NULL; item = item->ai_next) {
-    const struct sockaddr_in *address;
-    const uint8_t *bytes;
-    if (item->ai_family != AF_INET || item->ai_addr == NULL ||
-        item->ai_addrlen < (socklen_t)sizeof(*address)) continue;
-    address = (const struct sockaddr_in *)item->ai_addr;
-    bytes = (const uint8_t *)&address->sin_addr.s_addr;
-    if (ftun_system_resolver_contains(result, count, bytes)) continue;
-    if (count >= maximum) {
-      freeaddrinfo(addresses);
-      return FTUN_E_LIMIT;
-    }
-    memcpy(result + count * 4u, bytes, 4u);
-    count++;
+    ftun_ip_t ip = {0};
+    size_t previous;
+    if (item->ai_family == AF_INET && item->ai_addrlen >= sizeof(struct sockaddr_in)) {
+      ip.family = FTUN_IP_V4;
+      memcpy(ip.bytes, &((struct sockaddr_in *)item->ai_addr)->sin_addr, 4u);
+    } else if (item->ai_family == AF_INET6 && item->ai_addrlen >= sizeof(struct sockaddr_in6)) {
+      ip.family = FTUN_IP_V6;
+      memcpy(ip.bytes, &((struct sockaddr_in6 *)item->ai_addr)->sin6_addr, 16u);
+    } else continue;
+    for (previous = 0u; previous < count && !ftun_ip_equal(&result[previous], &ip); previous++) {}
+    if (previous < count) continue;
+    if (count == maximum) { freeaddrinfo(addresses); return FTUN_E_LIMIT; }
+    result[count++] = ip;
   }
   freeaddrinfo(addresses);
   if (count == 0u) return FTUN_E_RESOLVE;
   *out_count = count;
   return FTUN_OK;
 }
-
-ftun_status_t ftun_sysresolve_first_ipv4(const char *host, uint16_t port, ftun_endpoint_t *out)
+ftun_status_t ftun_sysresolve_first(const char *host, uint8_t family, uint16_t port, ftun_endpoint_t *out)
 {
-  char service[6];
-  struct addrinfo hints;
-  struct addrinfo *results = NULL;
-  struct addrinfo *cursor;
-  (void)snprintf(service, sizeof(service), "%u", (unsigned int)port);
-  memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
-  hints.ai_socktype = SOCK_STREAM;
-  if (getaddrinfo(host, service, &hints, &results) != 0) {
-    return FTUN_E_RESOLVE;
-  }
-  for (cursor = results; cursor != NULL; cursor = cursor->ai_next) {
-    if (cursor->ai_family == AF_INET && cursor->ai_addr != NULL &&
-        cursor->ai_addrlen >= (socklen_t)sizeof(struct sockaddr_in)) {
-      const struct sockaddr_in *address =
-        (const struct sockaddr_in *)cursor->ai_addr;
-      memset(out, 0, sizeof(*out));
-      out->kind = FTUN_ADDRESS_IPV4;
-      out->port = port;
-      memcpy(out->address, &address->sin_addr.s_addr, 4u);
-      freeaddrinfo(results);
-      return FTUN_OK;
-    }
-  }
-  freeaddrinfo(results);
-  return FTUN_E_RESOLVE;
+  ftun_ip_t addresses[16];
+  size_t count;
+  ftun_status_t status = ftun_sysresolve(host, family, addresses, 16u, &count);
+  if (status == FTUN_OK) ftun_endpoint_set_ip(out, &addresses[0], port);
+  return status;
 }
 
-/* 读取本机解析器的首个 IPv4 nameserver；不回退到其他服务。 */
+/* 读取本机解析器的首个nameserver；不回退到其他服务。 */
 ftun_status_t ftun_system_nameserver(ftun_endpoint_t *out)
 {
   FILE *file = fopen("/etc/resolv.conf", "r");
@@ -115,12 +80,12 @@ ftun_status_t ftun_system_nameserver(ftun_endpoint_t *out)
   ftun_status_t status = FTUN_E_RESOLVE;
   if (file == NULL) return FTUN_E_IO;
   while (fgets(line, sizeof(line), file) != NULL) {
-    char address[16];
+    char address[FTUN_IP_TEXT_BYTES];
+    ftun_ip_t ip;
     char extra;
-    if (sscanf(line, " nameserver %15s %c", address, &extra) >= 1 &&
-        ftun_ipv4_parse(address, strlen(address), out->address)) {
-      out->kind = FTUN_ADDRESS_IPV4;
-      out->port = 53u;
+    if (sscanf(line, " nameserver %45s %c", address, &extra) >= 1 &&
+        ftun_ip_parse(address, strlen(address), &ip)) {
+      ftun_endpoint_set_ip(out, &ip, 53u);
       status = FTUN_OK;
       break;
     }

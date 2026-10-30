@@ -48,7 +48,7 @@ static int ftun_netlink_address_matches(
   if (interface_index == 0u ||
       header->nlmsg_len < FTUN_NLMSG_LENGTH(sizeof(*address))) return 0;
   address = (const struct ftun_ifaddrmsg *)FTUN_NLMSG_DATA(header);
-  if (address->ifa_family != AF_INET ||
+  if (address->ifa_family != resource->family ||
       address->ifa_prefixlen != resource->prefix_length ||
       address->ifa_index != interface_index) return 0;
   remaining = header->nlmsg_len - FTUN_NLMSG_LENGTH(sizeof(*address));
@@ -59,12 +59,12 @@ static int ftun_netlink_address_matches(
     if (attribute->rta_len < sizeof(*attribute) ||
         attribute->rta_len > remaining) return 0;
     value_length = attribute->rta_len - FTUN_RTA_LENGTH(0u);
-    if (value_length >= 4u && attribute->rta_type == FTUN_IFA_LOCAL &&
-        memcmp(FTUN_RTA_DATA(attribute), resource->address, 4u) == 0) {
+    if (value_length >= (resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) && attribute->rta_type == FTUN_IFA_LOCAL &&
+        memcmp(FTUN_RTA_DATA(attribute), resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) == 0) {
       local = true;
     }
-    if (value_length >= 4u && attribute->rta_type == FTUN_IFA_ADDRESS &&
-        memcmp(FTUN_RTA_DATA(attribute), resource->address, 4u) == 0) {
+    if (value_length >= (resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) && attribute->rta_type == FTUN_IFA_ADDRESS &&
+        memcmp(FTUN_RTA_DATA(attribute), resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) == 0) {
       peer = true;
     }
     if (!ftun_netlink_attribute_next(&attribute, &remaining)) break;
@@ -91,7 +91,7 @@ static int ftun_netlink_route_matches(
   }
   if (header->nlmsg_len < FTUN_NLMSG_LENGTH(sizeof(*route))) return 0;
   route = (const struct ftun_rtmsg *)FTUN_NLMSG_DATA(header);
-  if (route->rtm_family != AF_INET ||
+  if (route->rtm_family != resource->family ||
       route->rtm_dst_len != resource->prefix_length ||
       route->rtm_protocol != resource->protocol ||
       route->rtm_scope != (unreachable ? FTUN_RT_SCOPE_UNIVERSE :
@@ -111,8 +111,8 @@ static int ftun_netlink_route_matches(
     if (attribute->rta_type == FTUN_RTA_PRIORITY &&
         ftun_netlink_attribute_u32(attribute, &value)) metric = value;
     if (attribute->rta_type == FTUN_RTA_DST &&
-        attribute->rta_len >= FTUN_RTA_LENGTH(4u) &&
-        memcmp(FTUN_RTA_DATA(attribute), resource->address, 4u) == 0) {
+        attribute->rta_len >= FTUN_RTA_LENGTH(resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) &&
+        memcmp(FTUN_RTA_DATA(attribute), resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) == 0) {
       destination = true;
     }
     if (!ftun_netlink_attribute_next(&attribute, &remaining)) break;
@@ -136,7 +136,7 @@ static int ftun_netlink_rule_matches(
   const char *interface_name = NULL;
   size_t interface_length = 0u;
   bool destination = resource->prefix_length == 0u;
-  uint8_t expected_action = resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 ?
+  uint8_t expected_action = resource->kind == FTUN_LINUX_ROUTE_BLOCK ?
     FTUN_FR_ACT_UNREACHABLE : FTUN_FR_ACT_TO_TBL;
   if (header->nlmsg_len < FTUN_NLMSG_LENGTH(sizeof(*rule))) return 0;
   rule = (const struct ftun_fib_rule_hdr *)FTUN_NLMSG_DATA(header);
@@ -162,8 +162,8 @@ static int ftun_netlink_rule_matches(
         ftun_netlink_attribute_u32(attribute, &value)) mark = value;
     if (attribute->rta_type == FTUN_FRA_FWMASK &&
         ftun_netlink_attribute_u32(attribute, &value)) mask = value;
-    if (attribute->rta_type == FTUN_FRA_DST && value_length >= 4u &&
-        memcmp(FTUN_RTA_DATA(attribute), resource->address, 4u) == 0) {
+    if (attribute->rta_type == FTUN_FRA_DST && value_length >= (resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) &&
+        memcmp(FTUN_RTA_DATA(attribute), resource->address, resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u) == 0) {
       destination = true;
     }
     if (attribute->rta_type == FTUN_FRA_PROTOCOL && value_length >= 1u) {
@@ -183,7 +183,7 @@ static int ftun_netlink_rule_matches(
   if (resource->kind == FTUN_LINUX_ROUTE_PROTECT_RULE) {
     return table == resource->table && destination;
   }
-  if (resource->kind != FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
+  if (resource->kind != FTUN_LINUX_ROUTE_BLOCK &&
       table != resource->table) return 0;
   return interface_name != NULL && interface_length != 0u &&
     strnlen(interface_name, interface_length) + 1u == interface_length &&

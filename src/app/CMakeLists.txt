@@ -9,6 +9,7 @@ set(ftun_sources_app
   cli/cmd_version.c
   cli/dispatch.c
   cli/result.c
+  composition/egress.c
   composition/default.c
   composition/reload.c
   control/cleanup.c

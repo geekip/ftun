@@ -63,9 +63,7 @@ ftun_status_t ftun_budget_create_resources(
   ftun_budget_t *parent, const ftun_budget_options_t *options,
   ftun_budget_t **out);
 
-/* Compatibility constructor for memory-only callers.  Descriptor and queue
- * resources are unbounded for this budget; new production roots use the
- * resource-vector constructor. */
+/* 仅计内存的预算构造入口，不限制句柄和队列；生产根使用资源向量构造。 */
 ftun_status_t ftun_budget_create(ftun_budget_t *parent, size_t limit,
                                  size_t cleanup_reserve, ftun_budget_t **out);
 

@@ -185,8 +185,8 @@ int main(int argc, char **argv)
                           "\"FRS-DOMAIN,CN,proxy\"]}", FTUN_E_INVALID,
                           "/rules"));
   CHECK(expect_validation(disabled_dns_refs, FTUN_OK, ""));
-  CHECK(expect_validation("{\"base\":{\"ipv6\":true}}", FTUN_E_UNSUPPORTED,
-                          "/base/ipv6"));
+  CHECK(expect_validation("{\"base\":{\"ipv6\":true}}", FTUN_OK,
+                          ""));
   CHECK(expect_validation("{\"log\":{\"level\":\"verbose\"}}", FTUN_E_INVALID,
                           "/log/level"));
   CHECK(expect_validation("{\"dns\":{\"fake-ip\":{\"range\":\"198.18.0.0/33\"}}}",

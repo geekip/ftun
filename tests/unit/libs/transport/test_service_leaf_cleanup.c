@@ -1,7 +1,6 @@
 #if !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
 #endif
-#include "proxy/protocol/socks5.h"
 #include <netinet/in.h>
 #include "app/config/model.h"
 #include "app/composition/bridges.h"
@@ -420,7 +419,7 @@ static int dns_early_retain_failure(void)
   config->document.reference_count = SIZE_MAX;
   CHECK(ftun_dns_runtime_prepare(fixture.core, fixture.budget,
     fixture.operations, fixture.loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &runtime) == FTUN_E_LIMIT);
   CHECK(runtime == NULL && config->document.reference_count == SIZE_MAX);
   CHECK(fcntl(STDIN_FILENO, F_GETFD) == stdin_flags);

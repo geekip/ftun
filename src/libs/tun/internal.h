@@ -49,11 +49,10 @@ typedef struct {
   size_t header_length;
   uint16_t fragment;
   uint8_t protocol;
-  uint8_t source[4];
-  uint8_t destination[4];
+  ftun_ip_t source, destination;
   bool dont_fragment;
   bool fragmented;
-} ftun_tun_ipv4_t;
+} ftun_tun_ip_t;
 
 struct ftun_tun_service {
   ftun_core_t *core;

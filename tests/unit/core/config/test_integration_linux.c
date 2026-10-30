@@ -2505,7 +2505,7 @@ typedef struct {
 typedef struct {
   int calls;
   ftun_error_t error;
-  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
+  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
 } resolver_completion_t;
 
@@ -3700,7 +3700,7 @@ static void resolver_completed(
   completion->calls++;
   completion->error = error;
   if (result == NULL ||
-      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) return;
+      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_RESULTS) return;
   completion->address_count = result->address_count;
   for (index = 0u; index < result->address_count; index++) {
     completion->addresses[index] = result->addresses[index];
@@ -3910,9 +3910,10 @@ static int integration_start(integration_t *integration)
   mesh_consumer.consumer.event = integration_tun_event;
   mesh_consumer.consumer.packet_error = integration_mesh_packet_error;
   mesh_consumer.consumer.user = integration;
-  mesh_consumer.route.kind = FTUN_TUN_ROUTE_IPV4_PREFIX;
-  memcpy(mesh_consumer.route.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
-  mesh_consumer.route.prefix_length = 16u;
+  mesh_consumer.route.kind = FTUN_TUN_ROUTE_PREFIX;
+  mesh_consumer.route.prefix.address.family = FTUN_IP_V4;
+  memcpy(mesh_consumer.route.prefix.address.bytes, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  mesh_consumer.route.prefix.prefix = 16u;
   mesh_consumer.route.priority = 1u;
   mesh_consumer.path.carrier_mtu = 1500u;
   mesh_consumer.path.headroom = 100u;
@@ -3945,8 +3946,10 @@ static int integration_start(integration_t *integration)
   }
   memset(&route_policy, 0, sizeof(route_policy));
   route_policy.tun_interface = tun_spec.name;
-  CHECK(inet_pton(AF_INET, "10.77.0.1", route_policy.tun_ipv4) == 1);
-  route_policy.tun_prefix_length = 30u;
+  CHECK(inet_pton(AF_INET, "10.77.0.1", route_policy.tun_addresses[0].address.bytes) == 1);
+  route_policy.tun_addresses[0].prefix = 30u;
+  route_policy.tun_addresses[0].address.family = FTUN_IP_V4;
+  route_policy.tun_address_count = 1u;
   route_policy.routing_domain = 100u;
   route_policy.precedence = 12340u;
   route_policy.capture_offset = 100u;
@@ -3981,8 +3984,9 @@ static int integration_start(integration_t *integration)
                               integration->now_ms + 5000u) != 0) return 1;
 
   memset(&protected_prefix, 0, sizeof(protected_prefix));
-  memcpy(protected_prefix.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
-  protected_prefix.prefix_length = 16u;
+  protected_prefix.address.family = FTUN_IP_V4;
+  memcpy(protected_prefix.address.bytes, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  protected_prefix.prefix = 16u;
   memset(&overlay_route, 0, sizeof(overlay_route));
   overlay_route.prefix = protected_prefix;
   overlay_route.purpose_mask =
@@ -4017,7 +4021,7 @@ static int integration_start(integration_t *integration)
   for (index = 0u; index < 3u; index++) {
     ftun_route_policy_t probe_policy = route_policy;
     ftun_route_async_t *duplicate_routes = NULL;
-    if (index >= 1u) probe_policy.tun_ipv4[2] = 1u;
+    if (index >= 1u) probe_policy.tun_addresses[0].address.bytes[2] = 1u;
     if (index >= 2u) probe_policy.bypass_tag = UINT32_C(0x46000002);
     /* 同表号的第二个实例在改动网络之前就被实例锁拒绝，不留下任何对象。 */
     if (ftun_monotonic_now(&integration->now_ms) != FTUN_OK ||
@@ -4235,8 +4239,9 @@ static int test_network_protection(integration_t *integration)
   CHECK(old_tcp >= 0);
 
   memset(&protected_prefix, 0, sizeof(protected_prefix));
-  memcpy(protected_prefix.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
-  protected_prefix.prefix_length = 16u;
+  protected_prefix.address.family = FTUN_IP_V4;
+  memcpy(protected_prefix.address.bytes, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  protected_prefix.prefix = 16u;
   memset(&spec, 0, sizeof(spec));
   spec.generation = 2u;
   spec.protected_prefixes = &protected_prefix;
@@ -4446,7 +4451,9 @@ static int owner_recovery_main(void)
   ftun_config_bind_sections(&config);
   ftun_budget_usage_t baseline, final;
   ftun_tun_network_update_result_t result;
-  ftun_interface_spec_t candidate = {{"ftun-own-it0", 12u}, {10u, 79u, 1u, 1u}, 24u, PROTECTION_MARK, 18004u, 11000u, false, NULL};
+  ftun_interface_spec_t candidate = {.name = {"ftun-own-it0", 12u},
+    .addresses = {{{FTUN_IP_V4, {10u, 79u, 1u, 1u}}, 24u}}, .address_count = 1u,
+    .protection_mark = PROTECTION_MARK, .route_table = 18004u, .rule_priority = 11000u, .strict_route = false};
   void *owner = NULL;
   uint64_t now_ms, deadline;
   unsigned int old_index;
@@ -4478,16 +4485,16 @@ static int owner_recovery_main(void)
   CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, now_ms + 5000u) == FTUN_OK);
   CHECK(owner_update_drive(owner, &result) == 0 && result.committed && result.ready &&
     result.device_generation == 1u && result.network_generation == 2u);
-  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(owner_address_matches(candidate.addresses[0].address.bytes) == 0);
   CHECK(ftun_tun_service_rebuild(provider.service) == FTUN_E_AGAIN);
   CHECK(owner_update_drive(owner, &result) == 0 && result.rebuild && result.committed && result.ready &&
     result.device_generation == 2u && result.network_generation == 3u);
   CHECK(if_nametoindex("ftun-own-it0") != 0u && if_nametoindex("ftun-own-it0") != old_index);
-  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(owner_address_matches(candidate.addresses[0].address.bytes) == 0);
   CHECK(ftun_tun_service_refresh_network(provider.service, 3u) == FTUN_E_AGAIN);
   CHECK(owner_update_drive(owner, &result) == 0 && !result.rebuild && result.ready &&
     result.device_generation == 2u && result.network_generation == 4u);
-  CHECK(owner_address_matches(candidate.ipv4_address) == 0);
+  CHECK(owner_address_matches(candidate.addresses[0].address.bytes) == 0);
   CHECK(ftun_monotonic_now(&now_ms) == FTUN_OK);
   CHECK(ftun_tun_owner_start_rebuild(owner, 1u, 4u, now_ms + 5000u) == FTUN_E_STALE);
   CHECK(ftun_tun_owner_start_rebuild(owner, 2u, 4u, now_ms + 5000u) == FTUN_OK);

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "platform/posix/socket_native.h"
 #include "platform/socket.h"
 
 #include "platform/clock.h"

@@ -5,6 +5,9 @@
 #include <lwip/ip.h>
 #include <lwip/ip4_addr.h>
 #include <lwip/ip4_frag.h>
+#include <lwip/ip6_frag.h>
+#include <lwip/ip6_addr.h>
+#include <lwip/nd6.h>
 #include <lwip/netif.h>
 #include <lwip/pbuf.h>
 #include <lwip/priv/tcp_priv.h>
@@ -23,7 +26,7 @@
 #define FTUN_LWIP_PACKET_POOL_BYTES (2u * 1024u * 1024u)
 #define FTUN_LWIP_PACKET_POOL_BUFFERS 64u
 
-/* NO_SYS raw IPv4、显式计时、
+/* NO_SYS raw IPv4/IPv6、显式计时、
  * Budget allocator，以及 ftun_lwip_input 的 pbuf/ACK 所有权边界。 */
 
 typedef union {
@@ -433,8 +436,9 @@ static void ftun_lwip_endpoint(ftun_endpoint_t *endpoint, const ip_addr_t *addre
                                uint16_t port)
 {
   memset(endpoint, 0, sizeof(*endpoint));
-  endpoint->kind = FTUN_ADDRESS_IPV4;
-  memcpy(endpoint->address, &ip_2_ip4(address)->addr, 4u);
+  endpoint->kind = IP_IS_V6(address) ? FTUN_ADDRESS_IPV6 : FTUN_ADDRESS_IPV4;
+  if (IP_IS_V6(address)) memcpy(endpoint->address, ip_2_ip6(address)->addr, 16u);
+  else memcpy(endpoint->address, &ip_2_ip4(address)->addr, 4u);
   endpoint->port = port;
 }
 
@@ -613,14 +617,12 @@ static err_t ftun_lwip_tcp_accept(void *argument, struct tcp_pcb *pcb, err_t err
   return ERR_OK;
 }
 
-static err_t ftun_lwip_netif_output(struct netif *netif, struct pbuf *buffer,
-                                    const ip4_addr_t *destination)
+static err_t ftun_lwip_output(struct netif *netif, struct pbuf *buffer)
 {
   ftun_lwip_t *stack = (ftun_lwip_t *)netif->state;
   ftun_bytes_t packet;
   ftun_status_t status;
   u16_t copied;
-  (void)destination;
   if (stack == NULL || stack->destroying || buffer == NULL ||
       buffer->tot_len == 0u || buffer->tot_len > stack->mtu) return ERR_IF;
   copied = pbuf_copy_partial(buffer, stack->output_buffer, buffer->tot_len, 0u);
@@ -634,9 +636,23 @@ static err_t ftun_lwip_netif_output(struct netif *netif, struct pbuf *buffer,
   return ERR_IF;
 }
 
+static err_t ftun_lwip_netif_output(struct netif *netif, struct pbuf *buffer,
+  const ip4_addr_t *destination)
+{
+  (void)destination;
+  return ftun_lwip_output(netif, buffer);
+}
+static err_t ftun_lwip_netif_output6(struct netif *netif, struct pbuf *buffer,
+  const ip6_addr_t *destination)
+{
+  (void)destination;
+  return ftun_lwip_output(netif, buffer);
+}
+
 static err_t ftun_lwip_netif_init(struct netif *netif)
 {
   netif->output = ftun_lwip_netif_output;
+  netif->output_ip6 = ftun_lwip_netif_output6;
   netif->mtu = (u16_t)((ftun_lwip_t *)netif->state)->mtu;
   netif->name[0] = 'f';
   netif->name[1] = 't';
@@ -748,6 +764,10 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
   ip4_addr_set_loopback(&loopback);
   ip4_addr_set_any(&any);
   netif_set_addr(&stack->netif, &loopback, &any, &any);
+  ip6_addr_t loopback6;
+  ip6_addr_set_loopback(&loopback6);
+  netif_ip6_addr_set(&stack->netif, 0u, &loopback6);
+  netif_ip6_addr_set_state(&stack->netif, 0u, IP6_ADDR_PREFERRED);
   netif_set_up(&stack->netif);
   netif_set_link_up(&stack->netif);
   netif_set_default(&stack->netif);
@@ -755,12 +775,13 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
                   (spec->accept != NULL ? NETIF_FLAG_PRETEND_TCP : 0u) |
                   (spec->udp_accept != NULL ? NETIF_FLAG_PRETEND_UDP : 0u));
   if (spec->accept != NULL) {
-    listener = tcp_new_ip_type(IPADDR_TYPE_V4);
+    listener = tcp_new_ip_type(IPADDR_TYPE_ANY);
     if (listener == NULL) {
       (void)ftun_lwip_cleanup_create(stack);
       return FTUN_E_LIMIT;
     }
     tcp_bind_netif(listener, &stack->netif);
+    /* 上游透明扩展以NULL地址和零端口激活pretend，保留ANY家族。 */
     error = tcp_bind(listener, NULL, 0u);
     if (error != ERR_OK) {
       tcp_abort(listener);
@@ -782,7 +803,7 @@ ftun_status_t ftun_lwip_create(const ftun_lwip_spec_t *spec, ftun_lwip_t **out)
     tcp_accept(listener, ftun_lwip_tcp_accept);
   }
   if (spec->udp_accept != NULL) {
-    udp_listener = udp_new_ip_type(IPADDR_TYPE_V4);
+    udp_listener = udp_new_ip_type(IPADDR_TYPE_ANY);
     if (udp_listener == NULL) {
       (void)ftun_lwip_cleanup_create(stack);
       return FTUN_E_LIMIT;
@@ -813,7 +834,7 @@ ftun_status_t ftun_lwip_input(ftun_lwip_t *stack, ftun_packet_t *packet)
   status = ftun_packet_view(packet, &bytes);
   if (status != FTUN_OK) return status;
   if (bytes.length < 20u || bytes.length > stack->mtu || bytes.length > UINT16_MAX ||
-      (bytes.data[0] >> 4) != 4u) return FTUN_E_PROTOCOL;
+      ((bytes.data[0] >> 4u) != 4u && ((bytes.data[0] >> 4u) != 6u || bytes.length < 40u))) return FTUN_E_PROTOCOL;
   input = ftun_lwip_input_acquire(stack);
   if (input == NULL) return FTUN_E_LIMIT;
   status = ftun_buffer_slice_clone(&packet->payload, &input->slice);
@@ -859,6 +880,8 @@ ftun_status_t ftun_lwip_tick(ftun_lwip_t *stack, uint64_t now_ms)
   while (now_ms >= stack->next_reassembly_ms) {
     if (catchup++ == FTUN_LWIP_MAX_TIMER_CATCHUP) return FTUN_E_LIMIT;
     ip_reass_tmr();
+    ip6_reass_tmr();
+    nd6_tmr();
     stack->reassembly_timer_ticks++;
     if (stack->next_reassembly_ms > UINT64_MAX - IP_TMR_INTERVAL) {
       stack->next_reassembly_ms = UINT64_MAX;
@@ -1046,7 +1069,7 @@ ftun_status_t ftun_lwip_udp_send(ftun_lwip_udp_t *flow,
       flow->stack->destroying) return FTUN_E_INVALID;
   status = ftun_packet_view(packet, &bytes);
   if (status != FTUN_OK) return status;
-  if (bytes.length > UINT16_MAX || bytes.length + 28u > flow->stack->mtu) {
+  if (bytes.length > UINT16_MAX || bytes.length + (IP_IS_V6(&flow->pcb->local_ip) ? 48u : 28u) > flow->stack->mtu) {
     return FTUN_E_LIMIT;
   }
   buffer = pbuf_alloc(PBUF_TRANSPORT, (u16_t)bytes.length, PBUF_RAM);
@@ -1109,6 +1132,7 @@ ftun_status_t ftun_lwip_destroy(ftun_lwip_t **stack)
   }
   udp_fini();
   ip_reass_fini();
+  ip6_reass_fini();
   if (owned->netif_added) {
     netif_remove(&owned->netif);
     owned->netif_added = false;

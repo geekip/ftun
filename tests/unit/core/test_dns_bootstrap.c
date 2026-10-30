@@ -61,7 +61,7 @@ typedef struct {
   int calls;
   ftun_error_t error;
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
-  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
+  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
 } completion_state_t;
 
@@ -195,9 +195,10 @@ static const ftun_event_backend_ops_t backend_ops = {
   false
 };
 
-static ftun_status_t socket_open(void *user, ftun_dial_transport_t transport,
+static ftun_status_t socket_open(void *user, ftun_address_kind_t family, ftun_dial_transport_t transport,
                                  ftun_native_socket_t *out)
 {
+  if (family != FTUN_ADDRESS_IPV4) return FTUN_E_UNSUPPORTED;
   socket_state_t *state = (socket_state_t *)user;
   if (out != NULL) *out = FTUN_INVALID_SOCKET;
   if (out == NULL || transport != FTUN_DIAL_UDP) return FTUN_E_INVALID;
@@ -310,7 +311,7 @@ static void completed(ftun_operation_t *operation, ftun_error_t error,
   state->error = error;
   if (result == NULL || result->domain.length >
       FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
-      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) {
+      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_RESULTS) {
     state->calls = -100;
     return;
   }
@@ -443,7 +444,7 @@ static int test_explicit_success_and_copy(void)
           &query) == FTUN_OK);
   CHECK(query->id == 0x1234u && query->question.type == 1u &&
         query->question.class_code == 1u);
-  CHECK(ftun_dns_message_release(&query) == FTUN_OK);
+  ftun_dns_message_release(&query);
   CHECK(deliver(&fixture, response_ok, sizeof(response_ok),
                 &fixture.sockets.endpoints[0]));
   CHECK(dispatch_operations(&fixture, 1u));

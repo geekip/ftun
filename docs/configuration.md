@@ -17,7 +17,7 @@
 | `base.capacity.tcp-flows` | 整数 | `256` | 最小 1；最大 10000 | 同时存活的普通 TCP 流上限；仅启动时生效。 |
 | `base.capacity.udp-associations` | 整数 | `256` | 最小 1；最大 10000 | 同时存活的 SOCKS5 UDP 关联上限；仅启动时生效。 |
 | `base.capacity.udp-flows` | 整数 | `256` | 最小 1；最大 10000 | 同时存活的 UDP 五元组流上限；仅启动时生效。 |
-| `base.ipv6` | 布尔 | `false` | 固定为 `false` | FTUN v1.0 仅支持 IPv4；真实 DNS 回答不因此删除 AAAA 记录。 |
+| `base.ipv6` | 布尔 | `false` |  | 为域名解析同时查询 A/AAAA，默认仅查询 A；数值 IPv6 目标与双栈监听独立可用。 |
 | `base.reload-retain` | 对象 | `{}` |  |  |
 | `base.reload-retain.count` | 整数 | `4` | 最小 1；最大 64 | 同时保留的旧代次数量；满了以后拒绝 reload。只在启动时读取，修改需要重启。 |
 | `base.routing-mark` | 整数 | `18004` | 最小 1；最大 4294967295 | 出站 socket 的 fwmark，同时是 TUN 路由保护规则匹配值；同机多实例必须不同。 |
@@ -42,7 +42,7 @@
 |---|---|---|---|---|
 | `dns` | 对象 |  |  | 关闭后仍检查字段形状和语法，但不建立失效 DNS 引用或资源依赖。 |
 | `dns.bootstrap` | 数组 | `[]` |  | 空数组/省略使用系统解析配置，不硬编码公共 DNS。显式来源失败不静默切换来源。 |
-| `dns.bootstrap[]` | 字符串 |  | 格式见 Schema | Bootstrap 仅接受 IPv4 或 IPv4:port，默认端口 53；始终真实直连解析。 |
+| `dns.bootstrap[]` | 字符串 |  | 格式见 Schema | IPv4 或 [IPv6]，可带端口，默认 53；始终真实直连解析。 |
 | `dns.cache` | 布尔 | `true` |  | 缓存真实答案；不控制 FakeIP 身份寿命。 |
 | `dns.default-server` | 多选一 | `` |  | 默认服务及路由前 REAL 解析器；空值/省略为 Bootstrap。 |
 | `dns.enable` | 布尔 | `true` |  | false 时停用 FTUN DNS 入口、缓存、Hijack 与 FakeIP；必要本地解析使用系统解析器。 |
@@ -52,12 +52,12 @@
 | `dns.fake-ip.range` | 字符串 | `198.18.0.0/15` | 格式见 Schema | IPv4 地址/前缀，前缀 0–32；网络地址规范化、地址冲突及用途检查由运行时执行。 |
 | `dns.listeners` | 数组 | `[]` |  |  |
 | `dns.listeners[]` | 对象 |  |  |  |
-| `dns.listeners[].listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port，端口 1–65535；不接受域名或 IPv6 监听地址。 |
+| `dns.listeners[].listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port 或 [IPv6]:port，端口 1–65535；IPv6 地址合法性由运行时校验。 |
 | `dns.listeners[].server` | 多选一 | `` |  | 非空为固定 DNS Server；空值或省略为策略入口。 |
 | `dns.servers` | 数组 | `[]` |  |  |
 | `dns.servers[]` | 对象 |  |  |  |
 | `dns.servers[].address（必填）` | 数组 |  | 至少项数 1；至多项数 4 | 上游地址，配置顺序就是优先级；最多 4 个。网络类失败的地址进入退避，查询自动换到下一个。 |
-| `dns.servers[].address[]` | 字符串 |  | 格式见 Schema | IPv4/ASCII 域名及可选端口，默认 53。上游域名由 Bootstrap 解析。 |
+| `dns.servers[].address[]` | 字符串 |  | 格式见 Schema | IPv4、[IPv6] 或 ASCII 域名，可带端口，默认 53；上游域名由 Bootstrap 解析。 |
 | `dns.servers[].fake-ip` | 布尔 | `false` |  | 客户端回答策略；内部 REAL 查询仍通过 address/outbound 获取真实地址。 |
 | `dns.servers[].name（必填）` | 字符串 |  | 最短 1；格式见 Schema | 区分大小写的名称。可以使用中文和空格；不得含逗号或控制字符。名称唯一性及引用由运行时检查。 |
 | `dns.servers[].outbound` | 字符串 | `DIRECT` | 最短 1；格式见 Schema | 只决定 DNS 查询的传输路径，不决定查询域名的业务出口。 |
@@ -76,7 +76,7 @@
 | `inbounds` | 数组 | `[]` |  | v1 同时最多一个 TUN。空数组可表示配置片段，但 CLI run 还要求至少一个入口。 |
 | `inbounds[]` | 多选一 |  |  |  |
 | `inbounds[]（变体 1）` | 对象 |  |  |  |
-| `inbounds[]（变体 1）.listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port，端口 1–65535；不接受域名或 IPv6 监听地址。 |
+| `inbounds[]（变体 1）.listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port 或 [IPv6]:port，端口 1–65535；IPv6 地址合法性由运行时校验。 |
 | `inbounds[]（变体 1）.name（必填）` | 字符串 |  | 最短 1；格式见 Schema | 区分大小写的名称。可以使用中文和空格；不得含逗号或控制字符。名称唯一性及引用由运行时检查。 |
 | `inbounds[]（变体 1）.outbound` | 字符串 |  | 最短 1；格式见 Schema | 强制绑定出口；指定后跳过 rules，但仍执行身份、能力和防回环检查。 |
 | `inbounds[]（变体 1）.tcp-idle` | 字符串 |  | 格式见 Schema | 覆盖 base.timeouts.tcp-idle；省略则继承。 |
@@ -84,7 +84,7 @@
 | `inbounds[]（变体 1）.udp` | 布尔 | `true` |  | 允许 SOCKS5 UDP ASSOCIATE；Mixed 的 HTTP 分支不提供 UDP。 |
 | `inbounds[]（变体 1）.users` | 对象 | `{}` |  | 用户名到密码的映射。空对象表示无需认证；非空时必须认证。密码不得输出到日志。 |
 | `inbounds[]（变体 2）` | 对象 |  |  |  |
-| `inbounds[]（变体 2）.listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port，端口 1–65535；不接受域名或 IPv6 监听地址。 |
+| `inbounds[]（变体 2）.listen（必填）` | 字符串 |  | 格式见 Schema | IPv4:port 或 [IPv6]:port，端口 1–65535；IPv6 地址合法性由运行时校验。 |
 | `inbounds[]（变体 2）.name（必填）` | 字符串 |  | 最短 1；格式见 Schema | 区分大小写的名称。可以使用中文和空格；不得含逗号或控制字符。名称唯一性及引用由运行时检查。 |
 | `inbounds[]（变体 2）.outbound` | 字符串 |  | 最短 1；格式见 Schema | 强制绑定出口；指定后跳过 rules，但仍执行身份、能力和防回环检查。 |
 | `inbounds[]（变体 2）.tcp-idle` | 字符串 |  | 格式见 Schema | 覆盖 base.timeouts.tcp-idle；省略则继承。 |
@@ -121,7 +121,7 @@
 | `outbounds[]（变体 1）.dns-server` | 多选一 | `` |  | 需要本地解析且尚无真实候选时使用；已有真实候选不得重新解析。 |
 | `outbounds[]（变体 1）.name（必填）` | 字符串 |  | 最短 1；格式见 Schema | 自定义出站/组名称，不可重定义内置 DIRECT 或 REJECT。 |
 | `outbounds[]（变体 1）.password` | 字符串 |  | 最短 1；最长 255 | SOCKS5 认证值；Schema 限制字符数，运行时还须验证 UTF-8 编码后为 1–255 字节。 |
-| `outbounds[]（变体 1）.server（必填）` | 字符串 |  | 格式见 Schema | IPv4/ASCII 域名:port。域名使用 ASCII A-label；端口 1–65535。 |
+| `outbounds[]（变体 1）.server（必填）` | 字符串 |  | 格式见 Schema | IPv4/ASCII 域名:port 或 [IPv6]:port；端口 1–65535。 |
 | `outbounds[]（变体 1）.type（必填）` | 多选一 |  | 固定为 `"socks5"` |  |
 | `outbounds[]（变体 1）.udp` | 布尔 | `true` |  | 允许 UDP ASSOCIATE，不支持 SOCKS5 分片。 |
 | `outbounds[]（变体 1）.username` | 字符串 |  | 最短 1；最长 255 | SOCKS5 认证值；Schema 限制字符数，运行时还须验证 UTF-8 编码后为 1–255 字节。 |
@@ -144,7 +144,7 @@
 | `outbounds[]（变体 3）.timeout` | 字符串 | `5s` | 格式见 Schema | 单次探测超时，不大于 interval；跨字段比较由运行时执行。 |
 | `outbounds[]（变体 3）.tolerance` | 整数 | `50` | 最小 0 | 切换延迟优势阈值，毫秒。 |
 | `outbounds[]（变体 3）.type（必填）` | 多选一 |  | 固定为 `"url-test"` |  |
-| `outbounds[]（变体 3）.url（必填）` | 字符串 |  | 格式见 Schema | HTTP/HTTPS URL，IPv4 或 ASCII 域名主机；HTTPS 必须验证证书和主机名。 |
+| `outbounds[]（变体 3）.url（必填）` | 字符串 |  | 格式见 Schema | HTTP/HTTPS URL，主机支持 IPv4、[IPv6] 或 ASCII 域名；HTTPS 必须验证证书和主机名。 |
 
 ## `rules`
 
@@ -171,6 +171,8 @@
 | `tun.interface（必填）` | 字符串 |  | 最短 1；最长 15 | 平台 TUN 设备名。 |
 | `tun.ipv4（必填）` | 对象 |  |  |  |
 | `tun.ipv4.address（必填）` | 字符串 |  | 格式见 Schema | 设备 IPv4 地址及前缀；保留主机地址语义，不能将此字段当路由网络地址清除主机位。 |
+| `tun.ipv6` | 对象 |  |  |  |
+| `tun.ipv6.address（必填）` | 字符串 |  | 格式见 Schema | 可选设备 IPv6 地址及前缀；配置后安装 IPv6 路由，MTU 至少 1280。 |
 | `tun.mtu` | 整数 | `1500` | 最小 1 |  |
 | `tun.route-table` | 整数 | `18004` | 最小 256；最大 4294967280 |  |
 | `tun.rule-priority` | 整数 | `11000` | 最小 1；最大 32000 |  |

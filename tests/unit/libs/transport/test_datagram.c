@@ -556,9 +556,11 @@ static int test_receive_and_boundaries(void)
   ftun_packet_release(&clone);
 
   memset(&invalid, 0, sizeof(invalid));
-  invalid.kind = FTUN_ADDRESS_IPV6_RESERVED;
+  invalid.kind = FTUN_ADDRESS_IPV6;
   invalid.port = 1u;
-  CHECK(ftun_datagram_send(fixture.channel, &invalid, &packet) == FTUN_E_UNSUPPORTED);
+  invalid.address[15] = 1u;
+  CHECK(ftun_datagram_send(fixture.channel, &invalid, &packet) == FTUN_OK);
+  CHECK(complete_first(&fixture, (ftun_error_t){FTUN_OK, 0u, 0}) == 0);
   invalid.kind = FTUN_ADDRESS_DOMAIN;
   invalid.domain.data = "";
   invalid.domain.length = 0u;

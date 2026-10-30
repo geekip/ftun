@@ -24,10 +24,14 @@ ftun_status_t ftun_config_validate_tun_device(
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
                                   "TUN options are invalid");
   }
-  if (!ftun_cidr(tun->ipv4_address, 0, &tun_range)) {
+  if ((!ftun_cidr(tun->ipv4_address, 0, &tun_range) || tun_range.address.family != FTUN_IP_V4)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
                                   "TUN IPv4 address is invalid");
   }
 
+  if (tun->ipv6_address != NULL &&
+      (!ftun_cidr(tun->ipv6_address, 0, &tun_range) || tun_range.address.family != FTUN_IP_V6 || tun->mtu < 1280u)) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/tun/ipv6/address", "TUN IPv6 requires a valid address and MTU >= 1280");
+  }
   return FTUN_OK;
 }

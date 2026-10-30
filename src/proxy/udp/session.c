@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/udp/session.h"
 
 #include "proxy/runtime_state.h"
@@ -20,7 +21,7 @@ struct ftun_udp_flow {
   ftun_datagram_t *inbound;
   ftun_datagram_t *outbound;
   ftun_metadata_t metadata;
-  ftun_endpoint_t resolved[FTUN_UDP_FLOW_MAX_RESOLVED_IPV4];
+  ftun_endpoint_t resolved[FTUN_UDP_FLOW_MAX_RESOLVED];
   ftun_endpoint_t remote;
   char domain[FTUN_UDP_FLOW_DOMAIN_BYTES];
   uint64_t expires_at;
@@ -70,19 +71,9 @@ static void ftun_udp_flow_increment(size_t *value)
   if (*value != SIZE_MAX) (*value)++;
 }
 
-static int ftun_udp_endpoint_equal(const ftun_endpoint_t *left,
-                                   const ftun_endpoint_t *right)
+static int ftun_udp_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  if (left == NULL || right == NULL || left->kind != right->kind ||
-      left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
-  }
-  return left->kind == FTUN_ADDRESS_DOMAIN &&
-         left->domain.data != NULL && right->domain.data != NULL &&
-         left->domain.length == right->domain.length &&
-         memcmp(left->domain.data, right->domain.data,
-                left->domain.length) == 0;
+  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
 }
 
 static ftun_status_t ftun_udp_metadata_validate(
@@ -96,16 +87,16 @@ static ftun_status_t ftun_udp_metadata_validate(
       metadata->inbound_id == 0u ||
       (metadata->known_fields & required) != required ||
       (metadata->known_fields & ~known) != 0u || metadata->network != 2u ||
-      metadata->source.kind != FTUN_ADDRESS_IPV4 ||
+      !ftun_endpoint_is_ip(&metadata->source) ||
       metadata->source.port == 0u || metadata->source.domain.length != 0u ||
       metadata->original_target.port == 0u ||
-      (metadata->original_target.kind != FTUN_ADDRESS_IPV4 &&
+      (!ftun_endpoint_is_ip(&metadata->original_target) &&
        metadata->original_target.kind != FTUN_ADDRESS_DOMAIN) ||
-      metadata->resolved_count > FTUN_UDP_FLOW_MAX_RESOLVED_IPV4 ||
+      metadata->resolved_count > FTUN_UDP_FLOW_MAX_RESOLVED ||
       (metadata->resolved_count != 0u && metadata->resolved == NULL)) {
     return FTUN_E_INVALID;
   }
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+  if (ftun_endpoint_is_ip(&metadata->original_target) &&
       metadata->original_target.domain.length != 0u) return FTUN_E_INVALID;
   if (metadata->original_target.kind == FTUN_ADDRESS_DOMAIN &&
       (metadata->original_target.domain.data == NULL ||
@@ -132,7 +123,7 @@ static ftun_status_t ftun_udp_metadata_validate(
   for (index = 0u; index < metadata->resolved_count; index++) {
     size_t previous;
     const ftun_endpoint_t *endpoint = &metadata->resolved[index];
-    if (endpoint->kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(endpoint) ||
         endpoint->port != metadata->original_target.port ||
         endpoint->domain.length != 0u) return FTUN_E_INVALID;
     for (previous = 0u; previous < index; previous++) {
@@ -158,11 +149,11 @@ static bool ftun_udp_remote_allowed(const ftun_metadata_t *metadata,
       remote->domain.length == expected.length &&
       memcmp(remote->domain.data, expected.data, expected.length) == 0;
   }
-  if (remote->kind != FTUN_ADDRESS_IPV4 || remote->domain.length != 0u) {
+  if (!ftun_endpoint_is_ip(remote) || remote->domain.length != 0u) {
     return false;
   }
   if (!metadata->original_is_fake &&
-      metadata->original_target.kind == FTUN_ADDRESS_IPV4) {
+      ftun_endpoint_is_ip(&metadata->original_target)) {
     return ftun_udp_endpoint_equal(remote, &metadata->original_target);
   }
   for (index = 0u; index < metadata->resolved_count; index++) {
@@ -256,7 +247,7 @@ static size_t ftun_udp_flow_hash(const ftun_metadata_t *metadata)
                              sizeof(metadata->original_target.kind));
   hash = ftun_udp_hash_bytes(hash, &metadata->original_target.port,
                              sizeof(metadata->original_target.port));
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(&metadata->original_target)) {
     hash = ftun_udp_hash_bytes(hash, metadata->original_target.address, 4u);
   } else {
     hash = ftun_udp_hash_bytes(hash, metadata->original_target.domain.data,
@@ -375,7 +366,7 @@ static ftun_status_t ftun_udp_flow_receive(
   }
   if (!ftun_udp_endpoint_equal(source, &flow->remote) &&
       !(flow->remote.kind == FTUN_ADDRESS_DOMAIN &&
-        source != NULL && source->kind == FTUN_ADDRESS_IPV4 &&
+        source != NULL && ftun_endpoint_is_ip(source) &&
         source->port == flow->remote.port)) {
     ftun_udp_flow_increment(&flow->table->rejected_sources);
     return FTUN_E_REJECTED;

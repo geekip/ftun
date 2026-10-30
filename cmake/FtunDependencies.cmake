@@ -32,6 +32,8 @@ set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static dependencies" FORCE)
 set(WOLFSSL_EXAMPLES no CACHE STRING "Disable wolfSSL examples" FORCE)
 set(WOLFSSL_CRYPT_TESTS no CACHE STRING "Disable wolfSSL crypt tests" FORCE)
 set(WOLFSSL_INSTALL no CACHE STRING "Disable wolfSSL install rules" FORCE)
+set(WOLFSSL_IP_ALT_NAME yes CACHE STRING "Verify numeric IPv4/IPv6 certificate identities" FORCE)
+set(WOLFSSL_OPENSSLEXTRA yes CACHE STRING "Use native certificate IP verification parameters" FORCE)
 set(WOLFSSL_TLS13 yes CACHE STRING "Enable wolfSSL TLS 1.3" FORCE)
 set(WOLFSSL_DTLS no CACHE STRING "Disable unused wolfSSL DTLS" FORCE)
 set(WOLFSSL_OLD_TLS no CACHE STRING "Disable obsolete TLS versions" FORCE)
@@ -89,13 +91,25 @@ if(FTUN_MODULE_PROXY STREQUAL "BUILTIN" AND FTUN_MODULE_TUN STREQUAL "BUILTIN")
     ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/udp.c
     ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv4/ip4.c
     ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv4/ip4_addr.c
-    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv4/ip4_frag.c)
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv4/ip4_frag.c
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/ip6.c
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/ip6_addr.c
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/ip6_frag.c
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/icmp6.c
+    ${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/nd6.c)
     target_include_directories(ftun_lwip PUBLIC
       "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/third_party/lwip/src/include>"
       "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/src/proxy/netstack>")
     if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
       target_compile_options(ftun_lwip PRIVATE -Wall -Wextra -fno-strict-aliasing
         "$<$<CONFIG:Debug>:-O0;-g>" "$<$<NOT:$<CONFIG:Debug>>:${ftun_opt}>")
+      # 禁用自动配置和路由发现后，上游两份 IPv6 源保留未使用的形参/变量。
+      set_property(SOURCE
+        "${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/ip6.c"
+        "${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/nd6.c"
+        APPEND PROPERTY COMPILE_OPTIONS -Wno-unused-parameter)
+      set_property(SOURCE "${PROJECT_SOURCE_DIR}/third_party/lwip/src/core/ipv6/nd6.c"
+        APPEND PROPERTY COMPILE_OPTIONS -Wno-unused-variable)
       if(FTUN_SECTION_GC)
         target_compile_options(ftun_lwip PRIVATE -ffunction-sections -fdata-sections)
       endif()

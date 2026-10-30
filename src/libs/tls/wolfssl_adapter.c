@@ -1,5 +1,6 @@
 /* ftun_wolfssl_prepare。 */
 #include "libs/tls/wolfssl_adapter.h"
+#include "util/ip.h"
 #include "core/limits.h"
 #include "platform/atomic.h"
 
@@ -75,7 +76,9 @@ static ftun_status_t ftun_wolfssl_initialize(void)
 static int ftun_wolfssl_name_valid(ftun_string_t name)
 {
   size_t index;
+  ftun_ip_t ip;
   if (name.data == NULL || name.length == 0u || name.length > 253u) return 0;
+  if (ftun_ip_parse(name.data, name.length, &ip)) return 1;
   for (index = 0u; index < name.length; index++) {
     uint8_t byte = (uint8_t)name.data[index];
     if (byte <= 0x20u || byte >= 0x7fu || byte == (uint8_t)'/' ||
@@ -289,12 +292,17 @@ ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
   client->maximum_plaintext = options->maximum_plaintext;
   wolfSSL_SetIOReadCtx(client->native, client);
   wolfSSL_SetIOWriteCtx(client->native, client);
-  if (wolfSSL_check_domain_name(client->native, client->server_name) !=
-        WOLFSSL_SUCCESS ||
-      wolfSSL_UseSNI(client->native, WOLFSSL_SNI_HOST_NAME,
+  ftun_ip_t ip;
+  bool literal = ftun_ip_parse(client->server_name, options->server_name.length, &ip);
+  /* 数值地址由 wolfSSL 的 IP SAN 校验处理；SNI 只携带域名。 */
+  int identity = literal
+    ? wolfSSL_X509_VERIFY_PARAM_set1_ip_asc(wolfSSL_get0_param(client->native), client->server_name)
+    : wolfSSL_check_domain_name(client->native, client->server_name);
+  if (identity != WOLFSSL_SUCCESS ||
+      (!literal && wolfSSL_UseSNI(client->native, WOLFSSL_SNI_HOST_NAME,
                      client->server_name,
                      (unsigned short)options->server_name.length) !=
-        WOLFSSL_SUCCESS) {
+        WOLFSSL_SUCCESS)) {
     wolfSSL_free(client->native);
     free(client->server_name);
     free(client);

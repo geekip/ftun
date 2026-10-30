@@ -51,10 +51,6 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
   };
   size_t index;
   int level_valid = 0;
-  if (config->base.proxy.ipv6) {
-    return ftun_config_diagnostic(out, FTUN_E_UNSUPPORTED, "/base/ipv6",
-                                  "IPv6 mode is not supported");
-  }
   if (config->base.watchdog_ms != 0u &&
       (config->base.watchdog_ms < FTUN_CONFIG_WATCHDOG_MINIMUM_MS ||
        config->base.watchdog_ms > FTUN_CONFIG_WATCHDOG_MAXIMUM_MS)) {
@@ -134,7 +130,7 @@ static ftun_status_t ftun_validate_outbound_links(const ftun_config_t *config,
   size_t index;
   for (index = 0u; index < config->outbound_count; index++) {
     const ftun_config_outbound_t *item = &config->outbounds[index];
-    uint32_t address = 0u;
+    ftun_ip_t address = {0};
     int is_ipv4 = 0;
     if (config->dns.enable && item->dns_server[0] != '\0' &&
         !ftun_dns_server_exists(&config->dns, item->dns_server)) {
@@ -144,13 +140,13 @@ static ftun_status_t ftun_validate_outbound_links(const ftun_config_t *config,
     if (!config->dns.enable || !config->dns.fake_ip.enable) continue;
     if (item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
       (void)ftun_server_address(item->server, 1, &address, &is_ipv4);
-      if (is_ipv4 && ftun_config_cidr_has(fake_range, address)) {
+      if (is_ipv4 && ftun_config_cidr_has(fake_range, &address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
           "SOCKS5 server overlaps FakeIP range");
       }
     } else if (item->kind == FTUN_CONFIG_OUTBOUND_URL_TEST) {
       (void)ftun_http_url(item->url, &address, &is_ipv4);
-      if (is_ipv4 && ftun_config_cidr_has(fake_range, address)) {
+      if (is_ipv4 && ftun_config_cidr_has(fake_range, &address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
           "health check URL overlaps FakeIP range");
       }
@@ -186,7 +182,7 @@ static ftun_status_t ftun_validate_tun_overlap(const ftun_config_t *config,
 static ftun_status_t ftun_validate_frs_links(const ftun_config_t *config,
   const ftun_config_cidr_t *fake_range, ftun_diagnostic_t *out)
 {
-  uint32_t address = 0u;
+  ftun_ip_t address = {0};
   int is_ipv4 = 0;
   if (!config->frs.active || !config->frs.auto_update || config->frs.url == NULL ||
       config->frs.url[0] == '\0') return FTUN_OK;
@@ -197,7 +193,7 @@ static ftun_status_t ftun_validate_frs_links(const ftun_config_t *config,
   }
   (void)ftun_http_url(config->frs.url, &address, &is_ipv4);
   if (config->dns.enable && config->dns.fake_ip.enable && is_ipv4 &&
-      ftun_config_cidr_has(fake_range, address)) {
+      ftun_config_cidr_has(fake_range, &address)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/frs/url",
       "FRS update URL overlaps FakeIP range");
   }

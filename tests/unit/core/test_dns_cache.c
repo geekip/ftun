@@ -130,7 +130,7 @@ int main(void)
         answer->kind == FTUN_DNS_CACHE_POSITIVE &&
         answer->wire[0] == 0x45u && answer->wire[1] == 0x67u &&
         answer->wire[38] == 8u);
-  CHECK(ftun_dns_answer_release(&answer) == FTUN_OK);
+  ftun_dns_answer_release(&answer);
   isolated = query;
   isolated.policy_fingerprint++;
   CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_E_EOF);
@@ -149,7 +149,7 @@ int main(void)
         answer->kind == FTUN_DNS_CACHE_NEGATIVE &&
         answer->wire[0] == 0x88u && answer->wire[1] == 0x88u &&
         answer->wire[38] == 30u);
-  CHECK(ftun_dns_answer_release(&answer) == FTUN_OK);
+  ftun_dns_answer_release(&answer);
   isolated = query;
   isolated.server_fingerprint++;
   CHECK(ftun_dns_cache_store_failure(cache, &isolated, FTUN_E_TIMEOUT,
@@ -181,7 +181,7 @@ int main(void)
   CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_E_EOF);
   query_init(&isolated, 0x3000u, 100u, 2u);
   CHECK(ftun_dns_cache_lookup(cache, &isolated, &answer) == FTUN_OK);
-  CHECK(ftun_dns_answer_release(&answer) == FTUN_OK);
+  ftun_dns_answer_release(&answer);
   CHECK(ftun_dns_cache_get_usage(cache, &usage) == FTUN_OK &&
         usage.entries == 4u && usage.evictions == 1u &&
         usage.expirations == 0u && usage.hits == 1u && usage.misses == 1u);

@@ -521,6 +521,69 @@ static int no_view_case(bool datagram)
   return 0;
 }
 
+typedef struct {
+  ftun_path_t *physical;
+  ftun_status_t failure;
+} wrapper_t;
+
+static ftun_status_t wrapper_stop(void *context)
+{
+  return ftun_path_revoke(((wrapper_t *)context)->physical);
+}
+static ftun_status_t wrapper_destroy(void *context)
+{
+  wrapper_t *wrapper = context;
+  if (wrapper->failure != FTUN_OK) return wrapper->failure;
+  return ftun_path_destroy(&wrapper->physical);
+}
+
+/* 包装路径只借用数据通道；驱动清理失败或通道仍有引用时必须保留整个 owner。 */
+static int wrapped_case(bool datagram)
+{
+  fixture_t fixture;
+  channel_t state;
+  wrapper_t driver = {0};
+  ftun_path_t *wrapped = NULL;
+  ftun_path_spec_t spec;
+  ftun_channel_t *channel = NULL;
+  ftun_budget_usage_t before, after;
+  CHECK(setup(&fixture) == 0 && create(&fixture, &state, datagram) == 0);
+  if (datagram) {
+    ftun_datagram_t *owner = state.datagram;
+    CHECK(ftun_path_adopt_datagram(&state.spec, &owner, &state.path) == FTUN_OK);
+    CHECK(ftun_datagram_retain(state.datagram) == FTUN_OK);
+  } else {
+    ftun_stream_t *owner = state.stream;
+    CHECK(ftun_path_adopt_stream(&state.spec, &owner, &state.path) == FTUN_OK);
+    CHECK(ftun_stream_retain(state.stream) == FTUN_OK);
+  }
+  driver.physical = state.path;
+  spec = state.spec;
+  spec.driver = (ftun_path_driver_t){0};
+  spec.driver.context = &driver;
+  spec.driver.stop = wrapper_stop;
+  spec.driver.destroy = wrapper_destroy;
+  CHECK(ftun_path_channel(state.path, &channel) == FTUN_OK);
+  CHECK(ftun_path_wrap_channel(&spec, channel, &wrapped) == FTUN_OK);
+  CHECK(ftun_path_revoke(wrapped) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(fixture.budget, &before) == FTUN_OK);
+  driver.failure = FTUN_E_IO;
+  CHECK(ftun_path_destroy(&wrapped) == FTUN_E_IO && wrapped != NULL && driver.physical == state.path);
+  CHECK(ftun_budget_get_usage(fixture.budget, &after) == FTUN_OK &&
+    before.used_resources.memory_bytes == after.used_resources.memory_bytes);
+  driver.failure = FTUN_OK;
+  CHECK(ftun_path_destroy(&wrapped) == FTUN_E_AGAIN && wrapped != NULL && state.destroyed == 0u);
+  if (datagram) ftun_datagram_release(&state.datagram);
+  else ftun_stream_release(&state.stream);
+  /* 释放的是借用引用；后端回调还需要原始通道身份。 */
+  if (datagram) CHECK(ftun_path_datagram(driver.physical, &state.datagram) == FTUN_OK);
+  else CHECK(ftun_path_stream(driver.physical, &state.stream) == FTUN_OK);
+  CHECK(ftun_path_destroy(&wrapped) == FTUN_OK && wrapped == NULL && driver.physical == NULL);
+  CHECK(state.destroyed == 1u && state.failures == 0u);
+  CHECK(cleanup(&fixture) == 0);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(stream_case() == 0);
@@ -528,6 +591,8 @@ int main(void)
   CHECK(datagram_case(true) == 0);
   CHECK(no_view_case(false) == 0);
   CHECK(no_view_case(true) == 0);
-  puts("Owned path result contract passed: five lifecycle scenarios");
+  CHECK(wrapped_case(false) == 0);
+  CHECK(wrapped_case(true) == 0);
+  puts("Owned path result contract passed: seven lifecycle scenarios");
   return 0;
 }

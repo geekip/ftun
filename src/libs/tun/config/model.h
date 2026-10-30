@@ -12,6 +12,7 @@ typedef struct {
   char *interface_name;
   uint32_t mtu;
   char *ipv4_address;
+  char *ipv6_address;
   bool auto_route;
   bool strict_route;
   /* 策略路由表号与规则优先级：同机多实例时必须各不相同。 */

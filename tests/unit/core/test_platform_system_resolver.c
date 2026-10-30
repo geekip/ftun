@@ -7,6 +7,7 @@
 #include "core/worker.h"
 #include "libs/resolver/system.h"
 #include "platform/clock.h"
+#include "util/ip.h"
 
 #include <pthread.h>
 #include <stdint.h>
@@ -34,7 +35,8 @@ typedef struct {
   ftun_error_t error;
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
   size_t domain_length;
-  uint8_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS][4];
+  uint8_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS][16];
+  ftun_address_kind_t families[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
 } completion_state_t;
 
@@ -85,7 +87,7 @@ static void resolved(ftun_operation_t *operation, ftun_error_t error,
   state->error = error;
   if (result == NULL || result->domain.length >
       FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
-      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) {
+      result->address_count > FTUN_SYSTEM_RESOLVER_MAX_RESULTS) {
     state->calls = -100;
     return;
   }
@@ -96,13 +98,16 @@ static void resolved(ftun_operation_t *operation, ftun_error_t error,
   state->domain[result->domain.length] = '\0';
   state->address_count = result->address_count;
   for (index = 0u; index < result->address_count; index++) {
-    if (result->addresses[index].kind != FTUN_ADDRESS_IPV4 ||
+    if ((result->addresses[index].kind != FTUN_ADDRESS_IPV4 &&
+         result->addresses[index].kind != FTUN_ADDRESS_IPV6) ||
         result->addresses[index].port != 0u ||
         result->addresses[index].domain.length != 0u) {
       state->calls = -100;
       return;
     }
-    memcpy(state->addresses[index], result->addresses[index].address, 4u);
+    state->families[index] = result->addresses[index].kind;
+    memcpy(state->addresses[index], result->addresses[index].address,
+      result->addresses[index].kind == FTUN_ADDRESS_IPV6 ? 16u : 4u);
   }
 }
 
@@ -110,13 +115,26 @@ static ftun_status_t two_addresses(ftun_bytes_t input, uint8_t *result,
                                    size_t capacity, size_t *out_size)
 {
   static const uint8_t expected[] = "dual.test";
-  static const uint8_t addresses[8] = {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u};
+  static const ftun_ip_t addresses[2] = {{FTUN_IP_V4, {1u, 2u, 3u, 4u}},
+    {FTUN_IP_V4, {5u, 6u, 7u, 8u}}};
   if (input.length != sizeof(expected) ||
-      memcmp(input.data, expected, sizeof(expected)) != 0 || capacity < 8u) {
+      memcmp(input.data, expected, sizeof(expected)) != 0 || capacity < sizeof(addresses)) {
     return FTUN_E_STATE_CORRUPT;
   }
   memcpy(result, addresses, sizeof(addresses));
   *out_size = sizeof(addresses);
+  return FTUN_OK;
+}
+
+static ftun_status_t ipv6_address(ftun_bytes_t input, uint8_t *result,
+  size_t capacity, size_t *out_size)
+{
+  const ftun_ip_t address = {FTUN_IP_V6,
+    {0x20u, 1u, 0x0du, 0xb8u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 0u, 1u, 2u, 3u, 4u}};
+  (void)input;
+  if (capacity < sizeof(address)) return FTUN_E_LIMIT;
+  memcpy(result, &address, sizeof(address));
+  *out_size = sizeof(address);
   return FTUN_OK;
 }
 
@@ -145,7 +163,8 @@ static ftun_status_t malformed_result(ftun_bytes_t input, uint8_t *result,
 static ftun_status_t duplicate_result(ftun_bytes_t input, uint8_t *result,
                                       size_t capacity, size_t *out_size)
 {
-  static const uint8_t addresses[8] = {1u, 2u, 3u, 4u, 1u, 2u, 3u, 4u};
+  static const ftun_ip_t addresses[2] = {{FTUN_IP_V4, {1u, 2u, 3u, 4u}},
+    {FTUN_IP_V4, {1u, 2u, 3u, 4u}}};
   (void)input;
   if (capacity < sizeof(addresses)) return FTUN_E_LIMIT;
   memcpy(result, addresses, sizeof(addresses));
@@ -165,12 +184,10 @@ static ftun_status_t gate_execute(ftun_bytes_t input, uint8_t *result,
   while (!gate_open) (void)pthread_cond_wait(&gate_condition, &gate_mutex);
   execute_calls++;
   (void)pthread_mutex_unlock(&gate_mutex);
-  if (capacity < 4u) return FTUN_E_LIMIT;
-  result[0] = 9u;
-  result[1] = 8u;
-  result[2] = 7u;
-  result[3] = 6u;
-  *out_size = 4u;
+  const ftun_ip_t address = {FTUN_IP_V4, {9u, 8u, 7u, 6u}};
+  if (capacity < sizeof(address)) return FTUN_E_LIMIT;
+  memcpy(result, &address, sizeof(address));
+  *out_size = sizeof(address);
   return FTUN_OK;
 }
 
@@ -181,9 +198,10 @@ static ftun_status_t counted_execute(ftun_bytes_t input, uint8_t *result,
   (void)pthread_mutex_lock(&gate_mutex);
   execute_calls++;
   (void)pthread_mutex_unlock(&gate_mutex);
-  if (capacity < 4u) return FTUN_E_LIMIT;
-  memset(result, 10, 4u);
-  *out_size = 4u;
+  const ftun_ip_t address = {FTUN_IP_V4, {10u, 10u, 10u, 10u}};
+  if (capacity < sizeof(address)) return FTUN_E_LIMIT;
+  memcpy(result, &address, sizeof(address));
+  *out_size = sizeof(address);
   return FTUN_OK;
 }
 
@@ -482,6 +500,14 @@ static int test_libc_localhost(void)
     if (state.addresses[index][0] == 127u) found_loopback = 1;
   }
   CHECK(found_loopback);
+  memset(&state, 0, sizeof(state));
+  fixture.request.domain = (ftun_string_t){"v6.test", 7u};
+  fixture.request.query_type = 28u;
+  CHECK(ftun_system_resolve_with_execute(NULL, &fixture.request, ipv6_address, &operation) == FTUN_OK);
+  CHECK(wait_for_calls(fixture.worker, &state, 1));
+  CHECK(state.error.status == FTUN_OK && state.address_count == 1u &&
+    state.families[0] == FTUN_ADDRESS_IPV6 && state.addresses[0][0] == 0x20u &&
+    state.addresses[0][12] == 1u && state.addresses[0][15] == 4u);
   CHECK(fixture_stop(&fixture) == 0);
   return 0;
 }

@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "libs/transport/path.h"
 #include "libs/transport/channel_internal.h"
 #include "platform/clock.h"
@@ -69,6 +70,7 @@ struct ftun_path {
   ftun_path_t *next;
   bool retired;
   bool busy;
+  bool wrapped;
 };
 
 static void ftun_path_untrack(ftun_path_t *path)
@@ -96,10 +98,7 @@ static ftun_status_t ftun_path_spec_valid(const ftun_path_spec_t *spec)
   if (spec->domain == FTUN_DIAL_DOMAIN_OVERLAY && spec->network_view == NULL) {
     return FTUN_E_UNSUPPORTED;
   }
-  if (spec->endpoint.kind == FTUN_ADDRESS_IPV4) return FTUN_OK;
-  if (spec->endpoint.kind == FTUN_ADDRESS_IPV6_RESERVED) {
-    return FTUN_E_UNSUPPORTED;
-  }
+  if (ftun_endpoint_is_ip(&spec->endpoint)) return FTUN_OK;
   if (spec->endpoint.kind != FTUN_ADDRESS_DOMAIN ||
       spec->endpoint.domain.data == NULL || spec->endpoint.domain.length == 0u ||
       spec->endpoint.domain.length >= FTUN_DATAGRAM_DOMAIN_BYTES) {
@@ -215,6 +214,23 @@ ftun_status_t ftun_path_adopt_datagram(const ftun_path_spec_t *spec,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_path_wrap_channel(const ftun_path_spec_t *spec,
+  ftun_channel_t *channel, ftun_path_t **out)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_path_t *path = NULL;
+  ftun_status_t status;
+  assert(spec != NULL && spec->driver.destroy != NULL);
+  status = ftun_channel_budget(channel, &budget);
+  if (status == FTUN_OK) status = ftun_path_allocate(spec, budget, &path);
+  if (status != FTUN_OK) return status;
+  path->channel = *channel;
+  path->info.transport = ftun_channel_transport(channel);
+  path->wrapped = true;
+  *out = path;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_path_retain(ftun_path_t *path)
 {
   if (path == NULL) return FTUN_E_INVALID;
@@ -312,7 +328,8 @@ ftun_status_t ftun_path_destroy(ftun_path_t **path)
     owned->busy = false;
     return status;
   }
-  status = ftun_channel_destroy(&owned->channel);
+  status = owned->wrapped ? owned->driver.destroy(owned->driver.context) :
+    ftun_channel_destroy(&owned->channel);
   owned->busy = false;
   if (status != FTUN_OK) return status;
   ftun_network_view_release(&owned->network_view);
@@ -457,7 +474,7 @@ static ftun_status_t ftun_path_result_check(const ftun_path_open_t *open,
       info->purpose != spec->purpose || info->domain != spec->domain ||
       info->endpoint.kind != spec->endpoint.kind ||
       info->endpoint.port != spec->endpoint.port ||
-      memcmp(info->endpoint.address, spec->endpoint.address, 4u) != 0 ||
+      memcmp(info->endpoint.address, spec->endpoint.address, ftun_endpoint_address_bytes(&spec->endpoint)) != 0 ||
       info->references != 1u || info->revoked) return FTUN_E_STATE_CORRUPT;
   return FTUN_OK;
 }

@@ -6,8 +6,8 @@
 #include <stdint.h>
 
 /* 地址文本的解析与地址运算，纯函数：不分配、不做 I/O、不依赖配置或运行时。
- * 地址可以表示 IPv6（解析、比较、格式化、前缀包含），但 IPv6 数据路径尚未打开，
- * 需要 IPv4 的调用方必须自己检查 family。所有解析都要求完全匹配，不接受
+ * 地址统一表示IPv4/IPv6；专用IPv4数据格式的调用方检查family。
+ * 所有解析都要求完全匹配，不接受
  * 前导零、空白或多余字符。 */
 
 #define FTUN_IP_NONE 0u
@@ -50,6 +50,7 @@ bool ftun_host_port_split(const char *text, size_t length,
 bool ftun_cidr_parse(const char *text, size_t length, bool require_network,
                      ftun_cidr_t *out);
 
+bool ftun_cidr_valid(const ftun_cidr_t *cidr, bool require_network);
 bool ftun_ip_equal(const ftun_ip_t *left, const ftun_ip_t *right);
 /* address 是否落在 cidr 内；家族不同返回 false。 */
 bool ftun_cidr_contains(const ftun_cidr_t *cidr, const ftun_ip_t *address);

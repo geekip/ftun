@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "libs/resolver/control.h"
 #include "platform/sysresolve.h"
 
@@ -27,7 +28,7 @@ ftun_status_t ftun_control_parse_endpoint(
   if (text == NULL || text[0] == '\0' || default_port == 0u || out == NULL) {
     return FTUN_E_INVALID;
   }
-  if (!ftun_host_port_split(text, strlen(text), &value) || value.bracketed ||
+  if (!ftun_host_port_split(text, strlen(text), &value) ||
       value.host_length > 253u || value.host_length >= sizeof(host)) {
     return FTUN_E_INVALID;
   }
@@ -35,8 +36,9 @@ ftun_status_t ftun_control_parse_endpoint(
   memcpy(host, value.host, length);
   host[length] = '\0';
   out->port = value.has_port ? value.port : default_port;
-  if (ftun_ipv4_parse(host, length, out->address)) {
-    out->kind = FTUN_ADDRESS_IPV4;
+  ftun_ip_t ip;
+  if (ftun_ip_parse(host, length, &ip)) {
+    ftun_endpoint_set_ip(out, &ip, out->port);
     return FTUN_OK;
   }
   if (domain == NULL) return FTUN_E_RESOLVE;
@@ -73,7 +75,7 @@ ftun_status_t ftun_control_parse_endpoint(
 
 static ftun_status_t ftun_control_system(const ftun_control_execution_t *execution,
   ftun_string_t domain, uint16_t port,
-                                         ftun_endpoint_t *out)
+  ftun_endpoint_t *out, uint16_t query_type)
 {
   char host[254];
   if (domain.data == NULL || domain.length == 0u || domain.length > 253u) {
@@ -82,17 +84,14 @@ static ftun_status_t ftun_control_system(const ftun_control_execution_t *executi
   memcpy(host, domain.data, domain.length);
   host[domain.length] = '\0';
   {
-    uint8_t numeric[4];
-    if (ftun_ipv4_parse(host, domain.length, numeric)) {
-      memset(out, 0, sizeof(*out));
-      out->kind = FTUN_ADDRESS_IPV4;
-      out->port = port;
-      memcpy(out->address, numeric, 4u);
+    ftun_ip_t numeric;
+    if (ftun_ip_parse(host, domain.length, &numeric)) {
+      ftun_endpoint_set_ip(out, &numeric, port);
       return FTUN_OK;
     }
   }
   if (!execution->allow_system_resolver) return FTUN_E_REJECTED;
-  return ftun_sysresolve_first_ipv4(host, port, out);
+  return ftun_sysresolve_first(host, query_type == 28u ? FTUN_IP_V6 : FTUN_IP_V4, port, out);
 }
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -146,7 +145,7 @@ static ftun_status_t ftun_control_encode_query(
 static ftun_status_t ftun_control_dns_query(
   const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan,
-  const ftun_resolver_transport_query_t *transport,
+  const ftun_dns_blocking_query_t *transport,
   ftun_string_t domain, uint16_t port, ftun_endpoint_t *out)
 {
   uint8_t query_wire[FTUN_DNS_HEADER_BYTES + FTUN_DNS_MAX_NAME_BYTES + 4u];
@@ -159,18 +158,14 @@ static ftun_status_t ftun_control_dns_query(
   size_t response_length = 0u;
   size_t index;
   uint16_t id = UINT16_C(0x4654);
+  size_t bytes = plan->query_type == 28u ? 16u : 4u;
   ftun_status_t status;
   status = ftun_control_encode_query(domain, id, query_wire,
     sizeof(query_wire), &query_length, &name_length);
   if (status == FTUN_OK) {
-    if (transport->use_proxy) {
-      status = plan->query == NULL ? FTUN_E_UNSUPPORTED :
-        plan->query(execution, transport, (ftun_bytes_t){query_wire, query_length},
-          response, sizeof(response), &response_length);
-    } else {
-      status = ftun_dns_query_blocking(execution, &transport->direct,
-        (ftun_bytes_t){query_wire, query_length}, response, sizeof(response), &response_length);
-    }
+    query_wire[query_length - 3u] = plan->query_type == 28u ? 28u : 1u;
+    status = ftun_dns_query_blocking(execution, transport,
+      (ftun_bytes_t){query_wire, query_length}, response, sizeof(response), &response_length);
   }
   if (status == FTUN_OK) {
     status = ftun_dns_message_parse_with_budget(execution->budget,
@@ -179,12 +174,12 @@ static ftun_status_t ftun_control_dns_query(
   memset(&query, 0, sizeof(query));
   if (status == FTUN_OK) {
     query.id = id;
-    query.transport = transport->direct.tcp ? FTUN_DNS_TRANSPORT_TCP :
+    query.transport = transport->tcp ? FTUN_DNS_TRANSPORT_TCP :
                                               FTUN_DNS_TRANSPORT_UDP;
-    query.upstream = transport->direct.upstream;
+    query.upstream = transport->upstream;
     query.question.name.data = query_wire + FTUN_DNS_HEADER_BYTES;
     query.question.name.length = name_length;
-    query.question.type = 1u;
+    query.question.type = plan->query_type == 28u ? 28u : 1u;
     query.question.class_code = 1u;
     status = ftun_dns_message_matches(message, &query, query.transport,
                                       &query.upstream, &matches);
@@ -196,22 +191,22 @@ static ftun_status_t ftun_control_dns_query(
        message->rcode == 0u &&
        index < message->record_count; index++) {
     const ftun_dns_record_t *record = &message->records[index];
-    if (record->section != FTUN_DNS_SECTION_ANSWER || record->type != 1u ||
-        record->class_code != 1u || record->rdata.length != 4u) continue;
+    if (record->section != FTUN_DNS_SECTION_ANSWER || record->type != (plan->query_type == 28u ? 28u : 1u) ||
+        record->class_code != 1u || record->rdata.length != bytes) continue;
     memset(out, 0, sizeof(*out));
-    out->kind = FTUN_ADDRESS_IPV4;
+    out->kind = plan->query_type == 28u ? FTUN_ADDRESS_IPV6 : FTUN_ADDRESS_IPV4;
     out->port = port;
-    memcpy(out->address, record->rdata.data, 4u);
+    memcpy(out->address, record->rdata.data, bytes);
     status = FTUN_OK;
   }
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return status;
 }
 #else
 static ftun_status_t ftun_control_dns_query(
   const ftun_control_execution_t *execution,
   const ftun_control_resolver_plan_t *plan,
-  const ftun_resolver_transport_query_t *transport,
+  const ftun_dns_blocking_query_t *transport,
   ftun_string_t domain, uint16_t port, ftun_endpoint_t *out)
 {
   (void)plan;
@@ -236,7 +231,7 @@ static ftun_status_t ftun_control_bootstrap(
   if (status != FTUN_OK) return status;
   if (plan->bootstrap_count == 0u) {
     ftun_status_t deadline_status;
-    status = ftun_control_system(execution, domain, port, out);
+    status = ftun_control_system(execution, domain, port, out, plan->query_type);
     /* libc 解析仍在阻塞工作线程；返回时检查期限，不交付已过期的结果。 */
     deadline_status = ftun_control_execution_limit(execution, UINT64_MAX, &checked);
     if (deadline_status != FTUN_OK) status = deadline_status;
@@ -244,12 +239,12 @@ static ftun_status_t ftun_control_bootstrap(
     return status;
   }
   for (index = 0u; index < plan->bootstrap_count; index++) {
-    ftun_resolver_transport_query_t query;
+    ftun_dns_blocking_query_t query;
     memset(&query, 0, sizeof(query));
-    query.direct.upstream = plan->bootstrap[index];
-    query.direct.socket_mark = plan->socket_mark;
+    query.upstream = plan->bootstrap[index];
+    query.socket_mark = plan->socket_mark;
     status = ftun_control_dns_query(execution, plan, &query, domain, port, out);
-    if (status == FTUN_OK) return FTUN_OK;
+    if (status == FTUN_OK || status == FTUN_E_PROTOCOL) return status;
   }
   return status;
 }
@@ -264,11 +259,18 @@ static ftun_status_t ftun_control_resolve_text(
   ftun_status_t status = ftun_control_parse_endpoint(text, default_port,
                                                       &parsed, domain);
   if (status != FTUN_OK) return status;
-  if (parsed.kind == FTUN_ADDRESS_IPV4) {
+  if (ftun_endpoint_is_ip(&parsed)) {
     *out = parsed;
     return FTUN_OK;
   }
-  return ftun_control_bootstrap(execution, plan, parsed.domain, parsed.port, out);
+  ftun_control_resolver_plan_t dependency = *plan;
+  dependency.query_type = 1u;
+  status = ftun_control_bootstrap(execution, &dependency, parsed.domain, parsed.port, out);
+  if (status == FTUN_E_RESOLVE && plan->ipv6) {
+    dependency.query_type = 28u;
+    status = ftun_control_bootstrap(execution, &dependency, parsed.domain, parsed.port, out);
+  }
+  return status;
 }
 
 static ftun_status_t ftun_control_resolve_raw(
@@ -276,9 +278,8 @@ static ftun_status_t ftun_control_resolve_raw(
   const ftun_control_resolver_plan_t *plan, ftun_string_t domain,
   uint16_t port, ftun_endpoint_t *out)
 {
-  ftun_resolver_transport_query_t query;
+  ftun_dns_blocking_query_t query;
   ftun_endpoint_t upstream;
-  ftun_endpoint_t proxy;
   ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (execution == NULL || plan == NULL ||
@@ -288,21 +289,10 @@ static ftun_status_t ftun_control_resolve_raw(
   status = ftun_control_resolve_text(execution, plan, plan->upstream, 53u, &upstream);
   if (status != FTUN_OK) return status;
   memset(&query, 0, sizeof(query));
-  query.direct.upstream = upstream;
-  query.direct.socket_mark = plan->socket_mark;
-  query.direct.tcp = plan->tcp;
-  if (plan->use_proxy) {
-    status = ftun_control_resolve_text(execution, plan, plan->proxy, 1u, &proxy);
-    if (status != FTUN_OK) return status;
-    query.use_proxy = true;
-    query.proxy = proxy;
-    if (plan->proxy_username[0] != '\0') {
-      query.proxy_username.data = plan->proxy_username;
-      query.proxy_username.length = strlen(plan->proxy_username);
-      query.proxy_password.data = plan->proxy_password;
-      query.proxy_password.length = strlen(plan->proxy_password);
-    }
-  }
+  query.upstream = upstream;
+  query.socket_mark = plan->socket_mark;
+  query.tcp = plan->tcp;
+  query.egress_id = plan->egress_id;
   return ftun_control_dns_query(execution, plan, &query, domain, port, out);
 }
 
@@ -391,6 +381,7 @@ static ftun_status_t ftun_control_resolver_start(void *context, ftun_core_t *cor
   state->binding = *binding;
   state->binding.execution.budget = request->system.budget;
   state->binding.execution.deadline_ms = request->system.deadline_ms;
+  state->binding.plan.query_type = request->system.query_type;
   state->binding.plan.named = request->source == FTUN_RESOLVER_NAMED;
   if (request->source != FTUN_RESOLVER_NAMED) {
     state->binding.plan.bootstrap_count = request->server_count;
@@ -436,6 +427,8 @@ static ftun_status_t ftun_control_resolve_provider(
   request.purpose = execution->purpose;
   request.requested_domain = FTUN_DIAL_DOMAIN_UNDERLAY;
   request.system.domain = domain;
+  request.system.ipv6 = plan->ipv6;
+  request.system.query_type = plan->query_type;
   request.system.protection.mark = plan->socket_mark;
   if (plan->named && !bootstrap) {
     request.source = FTUN_RESOLVER_NAMED;

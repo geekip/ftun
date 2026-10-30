@@ -119,7 +119,8 @@ typedef struct {
   void *completion_user;
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
   size_t domain_length;
-  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS];
+  uint16_t query_type;
+  ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
 } ftun_dns_named_context_t;
 
 static ftun_status_t ftun_dns_named_status(uint16_t rcode)
@@ -140,6 +141,7 @@ static void ftun_dns_named_completed(ftun_operation_t *operation,
   ftun_dns_message_t *message = NULL;
   ftun_system_resolve_result_t result;
   ftun_reservation_t reservation = context->reservation;
+  size_t bytes = context->query_type == 28u ? 16u : 4u;
   size_t count = 0u;
   size_t index;
   memset(&result, 0, sizeof(result));
@@ -158,19 +160,19 @@ static void ftun_dns_named_completed(ftun_operation_t *operation,
       size_t previous;
       int duplicate = 0;
       if (record->section != FTUN_DNS_SECTION_ANSWER ||
-          record->kind != FTUN_DNS_RECORD_ORDINARY || record->type != 1u ||
-          record->class_code != 1u || record->rdata.length != 4u) continue;
+          record->kind != FTUN_DNS_RECORD_ORDINARY || record->type != context->query_type ||
+          record->class_code != 1u || record->rdata.length != bytes) continue;
       for (previous = 0u; previous < count; previous++) {
         if (memcmp(context->addresses[previous].address,
-                   record->rdata.data, 4u) == 0) duplicate = 1;
+                   record->rdata.data, bytes) == 0) duplicate = 1;
       }
       if (duplicate) continue;
-      if (count >= FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) {
+      if (count >= FTUN_SYSTEM_RESOLVER_MAX_RESULTS) {
         error.status = FTUN_E_LIMIT;
         break;
       }
-      context->addresses[count].kind = FTUN_ADDRESS_IPV4;
-      memcpy(context->addresses[count].address, record->rdata.data, 4u);
+      context->addresses[count].kind = context->query_type == 28u ? FTUN_ADDRESS_IPV6 : FTUN_ADDRESS_IPV4;
+      memcpy(context->addresses[count].address, record->rdata.data, bytes);
       count++;
     }
     if (error.status == FTUN_OK && count == 0u) error.status = FTUN_E_RESOLVE;
@@ -179,7 +181,7 @@ static void ftun_dns_named_completed(ftun_operation_t *operation,
     result.addresses = context->addresses;
     result.address_count = count;
   }
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   context->completion(operation, error, &result, context->completion_user);
   free(context);
   ftun_reservation_release(&reservation);
@@ -264,6 +266,7 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   context->completion = request->completion;
   context->completion_user = request->user;
   context->domain_length = request->domain.length;
+  context->query_type = request->query_type == 28u ? 28u : 1u;
   memcpy(context->domain, request->domain.data, request->domain.length);
   context->domain[request->domain.length] = '\0';
   memset(&query, 0, sizeof(query));
@@ -271,7 +274,8 @@ ftun_status_t ftun_proxy_dns_resolve_named_dispatcher(
   query.flags = 0x0100u;
   query.question.name.data = wire + FTUN_DNS_HEADER_BYTES;
   query.question.name.length = name_length;
-  query.question.type = 1u;
+  query.question.type = context->query_type;
+  wire[wire_length - 3u] = (uint8_t)context->query_type;
   query.question.class_code = 1u;
   query.wire = (ftun_bytes_t){wire, wire_length};
   query.deadline_ms = request->deadline_ms;

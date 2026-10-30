@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/dns/resolver_adapter.h"
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -94,7 +95,7 @@ static ftun_status_t ftun_resolver_validate(
   status = ftun_session_get_metadata(request->session, &metadata);
   if (status != FTUN_OK) return status;
   if (metadata->resolved_count != 0u ||
-      (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+      (ftun_endpoint_is_ip(&metadata->original_target) &&
        !metadata->original_is_fake)) return FTUN_E_STALE;
   memset(&identity, 0, sizeof(identity));
   if ((metadata->known_fields & FTUN_META_DOMAIN) != 0u) {
@@ -126,6 +127,8 @@ ftun_status_t ftun_resolve_real_with_backend(
     system.worker = request->query.worker;
     system.budget = request->query.budget;
     system.domain = request->query.domain;
+    system.ipv6 = request->query.ipv6;
+    system.query_type = request->query.query_type;
     system.protection = request->query.protection;
     system.deadline_ms = request->query.deadline_ms;
     system.check_path = request->query.check_system_path;
@@ -158,6 +161,8 @@ ftun_status_t ftun_proxy_dns_resolve_with_provider(
   request.system.worker = query->worker;
   request.system.budget = query->budget;
   request.system.domain = query->domain;
+  request.system.ipv6 = query->ipv6;
+  request.system.query_type = query->query_type;
   request.system.protection = query->protection;
   request.system.deadline_ms = query->deadline_ms;
   request.system.check_path = query->check_system_path;

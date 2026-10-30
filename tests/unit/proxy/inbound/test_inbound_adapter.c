@@ -177,7 +177,8 @@ static int until_event(fixture_t *f, ftun_inbound_event_t *event, ftun_status_t 
     }
     CHECK(complete(f) == 0);
   }
-  CHECK(false);
+  fprintf(stderr, "inbound adapter did not produce an event\n");
+  return 1;
 }
 
 static int drain(fixture_t *f)

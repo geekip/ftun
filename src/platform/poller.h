@@ -5,7 +5,11 @@
 #define FTUN_POLLER_READ 1u
 #define FTUN_POLLER_WRITE 2u
 #define FTUN_POLLER_ERROR 4u
-typedef struct { int descriptor; int wakeup; size_t collected; } ftun_poller_t;
+/* 原生句柄只由后端解释；存储随调用方预算一起准入。 */
+typedef struct {
+  size_t collected;
+  union { uintptr_t alignment; unsigned char bytes[32]; } native;
+} ftun_poller_t;
 typedef struct { void *user; uint32_t events; } ftun_poller_event_t;
 /* poller 拥有两个 FD。除 wakeup 外全部由 owner 串行调用；user 借用至 remove。
  * wait 只交付 readiness，不执行回调。remove 前必须保证没有在途 wait。 */

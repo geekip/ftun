@@ -29,8 +29,13 @@ def isolate(argv):
     """在私有命名空间里重新执行自己；无法隔离时跳过。"""
     if os.environ.get(MARK) == '1':
         return
-    if shutil.which('unshare') is None or os.geteuid() != 0:
-        print('resilience: needs root and unshare', file=sys.stderr)
+    if any(shutil.which(tool) is None for tool in ('unshare', 'ip', 'mount')) or os.geteuid() != 0:
+        print('resilience: needs root, unshare, ip and mount', file=sys.stderr)
+        sys.exit(SKIP)
+    probe = subprocess.run(['unshare', '--mount', '--net', '--propagation', 'private', 'true'],
+                           capture_output=True, text=True)
+    if probe.returncode:
+        print(f'resilience: private namespaces unavailable: {probe.stderr.strip()}', file=sys.stderr)
         sys.exit(SKIP)
     env = dict(os.environ, **{MARK: '1'})
     result = subprocess.run(['unshare', '--mount', '--net', '--propagation', 'private',

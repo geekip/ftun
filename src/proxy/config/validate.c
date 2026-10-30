@@ -285,7 +285,7 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
     if (outbound->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
       size_t user_length = outbound->username == NULL ? 0u : strlen(outbound->username);
       size_t password_length = outbound->password == NULL ? 0u : strlen(outbound->password);
-      uint32_t address = 0u;
+      ftun_ip_t address = {0};
       int is_ipv4 = 0;
       if (!ftun_server_address(outbound->server, 1, &address, &is_ipv4)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
@@ -327,7 +327,7 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
     if (outbound->kind == FTUN_CONFIG_OUTBOUND_URL_TEST) {
       uint64_t interval;
       uint64_t timeout;
-      uint32_t address = 0u;
+      ftun_ip_t address = {0};
       int is_ipv4 = 0;
       if (!ftun_http_url(outbound->url, &address, &is_ipv4)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
@@ -408,7 +408,7 @@ ftun_status_t ftun_config_validate_inbounds(const ftun_config_inbound_t *inbound
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
                                       "TUN options are invalid");
       }
-      if (!ftun_cidr(inbound->ipv4_address, 0, &tun_range)) {
+      if ((!ftun_cidr(inbound->ipv4_address, 0, &tun_range) || tun_range.address.family != FTUN_IP_V4)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
                                       "TUN IPv4 address is invalid");
       }
@@ -459,7 +459,7 @@ ftun_status_t ftun_config_validate_frs(const ftun_config_frs_t *frs,
                                        ftun_diagnostic_t *out)
 {
   uint64_t ignored;
-  uint32_t address = 0u;
+  ftun_ip_t address = {0};
   int is_ipv4 = 0;
   if (!frs->active) return FTUN_OK;
   if (frs->path != NULL && !ftun_path_valid(frs->path)) {

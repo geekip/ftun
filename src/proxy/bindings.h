@@ -5,6 +5,7 @@
 #include "core/event/loop.h"
 #include "proxy/dns/runtime_adapter.h"
 #include "libs/transport/path.h"
+#include "libs/transport/egress.h"
 #include "libs/resolver/control_channel.h"
 #if defined(FTUN_HAVE_MODULE_TUN)
 #include "libs/tun/service.h"
@@ -23,6 +24,7 @@ typedef struct {
   ftun_path_provider_ops_t path;
   void *path_context;
   ftun_control_path_binding_t control_path;
+  const ftun_egress_provider_t *const *egress_slot;
   /* DNS service 与 Proxy 平级装配；Proxy 只借用当前发布代。 */
   ftun_proxy_dns_runtime_adapter_t *dns;
   /* Proxy 拥有 FakeIP 身份服务；Composition 槽只传递显式借用。 */

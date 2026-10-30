@@ -23,24 +23,18 @@
     {
       "name": "heiher/lwIP",
       "revision": "150d2b1a2658612741b4ac002578d440e7874540",
-      "source": "https://github.com/heiher/lwip/archive/150d2b1a2658612741b4ac002578d440e7874540.tar.gz",
+      "source": "https://github.com/heiher/lwip.git",
       "archive_sha256": "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416",
-      "vendored_tree_sha256": "beaa0b74d1660d0997a2f79e0918ecddd2b1c9548ced43ece8da83869d988eba",
       "path": "third_party/lwip",
-      "metadata": "third_party/lwip/FTUN-UPSTREAM.json",
+      "metadata": "third_party/lwip.UPSTREAM.json",
       "license": "BSD-3-Clause",
       "license_file": "third_party/lwip/LICENSE",
       "license_sha256": "ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b",
-      "local_patches": [
-        {
-          "path": "third_party/lwip/patches/0001-ipv4-only-pretend-udp.patch",
-          "sha256": "5e3663e11424b874e284bb2a1c6d9b1bdd2a11985125eb49398536d874297f59",
-          "description": "Replaces direct access to the dual-stack-only ip_addr_t.type field with IP_GET_TYPE, preserving pretend-UDP behavior while allowing the IPv4-only configuration to compile."
-        }
-      ],
-      "build_boundary": "static raw IPv4 core; no socket, app, netif or OS-port sources",
+      "local_patches": [],
+      "build_boundary": "static raw IPv4/IPv6 core; no socket, app, netif or OS-port sources",
       "selected_license": "BSD-3-Clause",
-      "notice": "FTUN vendors the complete upstream source tree under the three-clause BSD license, with the portability patch listed below."
+      "notice": "FTUN uses the unmodified upstream commit as a Git submodule under the three-clause BSD license.",
+      "source_form": "git-submodule"
     },
     {
       "name": "wolfSSL",

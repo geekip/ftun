@@ -1,7 +1,11 @@
 #define _GNU_SOURCE 1
 #include "platform/socket.h"
 #include "platform/posix/error.h"
+#if defined(__linux__)
 #include "platform/linux/socket_protect.h"
+#endif
+#include "platform/posix/socket_native.h"
+#include "util/endpoint.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -9,6 +13,50 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
+
+static socklen_t ftun_socket_address(const ftun_endpoint_t *endpoint,
+  struct sockaddr_storage *storage)
+{
+  memset(storage, 0, sizeof(*storage));
+  if (endpoint->kind == FTUN_ADDRESS_IPV6) {
+    struct sockaddr_in6 *address = (struct sockaddr_in6 *)storage;
+    address->sin6_family = AF_INET6;
+    address->sin6_port = htons(endpoint->port);
+    memcpy(&address->sin6_addr, endpoint->address, 16u);
+    return sizeof(*address);
+  }
+  struct sockaddr_in *address = (struct sockaddr_in *)storage;
+  address->sin_family = AF_INET;
+  address->sin_port = htons(endpoint->port);
+  memcpy(&address->sin_addr, endpoint->address, 4u);
+  return sizeof(*address);
+}
+static ftun_status_t ftun_socket_endpoint(const struct sockaddr_storage *storage,
+  socklen_t length, ftun_endpoint_t *endpoint)
+{
+  memset(endpoint, 0, sizeof(*endpoint));
+  if (storage->ss_family == AF_INET6 && length >= sizeof(struct sockaddr_in6)) {
+    const struct sockaddr_in6 *address = (const struct sockaddr_in6 *)storage;
+    endpoint->kind = FTUN_ADDRESS_IPV6;
+    endpoint->port = ntohs(address->sin6_port);
+    memcpy(endpoint->address, &address->sin6_addr, 16u);
+    /* 双栈监听将映射的IPv4还原为IPv4身份。 */
+    if (IN6_IS_ADDR_V4MAPPED(&address->sin6_addr)) {
+      memmove(endpoint->address, endpoint->address + 12u, 4u);
+      memset(endpoint->address + 4u, 0, 12u);
+      endpoint->kind = FTUN_ADDRESS_IPV4;
+    }
+    return FTUN_OK;
+  }
+  if (storage->ss_family == AF_INET && length >= sizeof(struct sockaddr_in)) {
+    const struct sockaddr_in *address = (const struct sockaddr_in *)storage;
+    endpoint->kind = FTUN_ADDRESS_IPV4;
+    endpoint->port = ntohs(address->sin_port);
+    memcpy(endpoint->address, &address->sin_addr, 4u);
+    return FTUN_OK;
+  }
+  return FTUN_E_PROTOCOL;
+}
 
 static ftun_status_t ftun_dial_errno_status(int error_code)
 {
@@ -34,7 +82,7 @@ static ftun_status_t ftun_dial_errno_status(int error_code)
 }
 
 static ftun_status_t ftun_system_open_socket(void *context,
-                                               ftun_dial_transport_t transport,
+                                               ftun_address_kind_t family, ftun_dial_transport_t transport,
                                                ftun_native_socket_t *out)
 {
   int descriptor;
@@ -45,7 +93,7 @@ static ftun_status_t ftun_system_open_socket(void *context,
   if (out == NULL || (transport != FTUN_DIAL_TCP && transport != FTUN_DIAL_UDP)) return FTUN_E_INVALID;
   type = transport == FTUN_DIAL_TCP ? SOCK_STREAM : SOCK_DGRAM;
   protocol = transport == FTUN_DIAL_TCP ? IPPROTO_TCP : IPPROTO_UDP;
-  descriptor = socket(AF_INET, type | SOCK_NONBLOCK | SOCK_CLOEXEC, protocol);
+  descriptor = ftun_posix_socket(family == FTUN_ADDRESS_IPV6 ? AF_INET6 : AF_INET, type, protocol);
   if (descriptor < 0) return ftun_dial_errno_status(errno);
   *out = (ftun_native_socket_t)(unsigned int)descriptor;
   return FTUN_OK;
@@ -56,27 +104,24 @@ static ftun_status_t ftun_system_protect_socket(
   const ftun_socket_policy_t *policy)
 {
   (void)context;
+#if defined(__linux__)
   return ftun_linux_socket_protect(socket, policy);
+#else
+  (void)socket; (void)policy;
+  return FTUN_E_UNSUPPORTED;
+#endif
 }
 
 static ftun_status_t ftun_system_connect_socket(
   void *context, ftun_native_socket_t socket, const ftun_endpoint_t *endpoint)
 {
-  struct sockaddr_in address;
-  int descriptor;
+  struct sockaddr_storage address;
+  socklen_t length;
   (void)context;
   if (socket > (ftun_native_socket_t)INT_MAX || endpoint == NULL ||
-      endpoint->kind != FTUN_ADDRESS_IPV4 || endpoint->port == 0u) {
-    return FTUN_E_INVALID;
-  }
-  descriptor = (int)socket;
-  memset(&address, 0, sizeof(address));
-  address.sin_family = AF_INET;
-  address.sin_port = htons(endpoint->port);
-  memcpy(&address.sin_addr.s_addr, endpoint->address,
-         sizeof(address.sin_addr.s_addr));
-  if (connect(descriptor, (const struct sockaddr *)&address,
-              (socklen_t)sizeof(address)) == 0) return FTUN_OK;
+      !ftun_endpoint_is_ip(endpoint) || endpoint->port == 0u) return FTUN_E_INVALID;
+  length = ftun_socket_address(endpoint, &address);
+  if (connect((int)socket, (const struct sockaddr *)&address, length) == 0) return FTUN_OK;
   if (errno == EISCONN) return FTUN_OK;
   return ftun_dial_errno_status(errno);
 }
@@ -162,7 +207,7 @@ ftun_status_t ftun_socket_datagram_receive(
   void *user, ftun_native_socket_t socket, void *data, size_t capacity,
   size_t *out_received, ftun_endpoint_t *out_source)
 {
-  struct sockaddr_in source;
+  struct sockaddr_storage source;
   struct iovec vector;
   struct msghdr message;
   ssize_t result;
@@ -191,11 +236,8 @@ ftun_status_t ftun_socket_datagram_receive(
   if ((size_t)result > capacity || (message.msg_flags & MSG_TRUNC) != 0) {
     return FTUN_E_LIMIT;
   }
-  if (source.sin_family != AF_INET ||
-      message.msg_namelen < (socklen_t)sizeof(source)) return FTUN_E_PROTOCOL;
-  out_source->kind = FTUN_ADDRESS_IPV4;
-  memcpy(out_source->address, &source.sin_addr.s_addr, 4u);
-  out_source->port = ntohs(source.sin_port);
+  ftun_status_t status = ftun_socket_endpoint(&source, message.msg_namelen, out_source);
+  if (status != FTUN_OK) return status;
   *out_received = (size_t)result;
   return FTUN_OK;
 }
@@ -279,54 +321,30 @@ ftun_status_t ftun_socket_shutdown_write(ftun_handle_t descriptor)
 }
 ftun_status_t ftun_socket_name(ftun_handle_t descriptor, ftun_endpoint_t *out)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   socklen_t length = sizeof(address);
   if (getsockname((int)descriptor, (struct sockaddr *)&address, &length) != 0) return ftun_socket_status(errno);
-  if (length < sizeof(address) || address.sin_family != AF_INET) return FTUN_E_UNSUPPORTED;
-  out->kind = FTUN_ADDRESS_IPV4;
-  memcpy(out->address, &address.sin_addr.s_addr, 4u);
-  out->port = ntohs(address.sin_port);
-  return FTUN_OK;
-}
-
-static void ftun_socket_address(const ftun_endpoint_t *endpoint,
-  struct sockaddr_in *address)
-{
-  memset(address, 0, sizeof(*address));
-  address->sin_family = AF_INET;
-  address->sin_port = htons(endpoint->port);
-  memcpy(&address->sin_addr.s_addr, endpoint->address, 4u);
-}
-
-static ftun_status_t ftun_socket_endpoint(const struct sockaddr_in *address,
-  socklen_t length, ftun_endpoint_t *endpoint)
-{
-  memset(endpoint, 0, sizeof(*endpoint));
-  if (length < sizeof(*address) || address->sin_family != AF_INET) return FTUN_E_PROTOCOL;
-  endpoint->kind = FTUN_ADDRESS_IPV4;
-  endpoint->port = ntohs(address->sin_port);
-  memcpy(endpoint->address, &address->sin_addr.s_addr, 4u);
-  return FTUN_OK;
+  return ftun_socket_endpoint(&address, length, out);
 }
 
 ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
   ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
   ftun_socket_bind_issue_t *issue)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   int descriptor;
   int one = 1;
   int error;
   *out = -1;
   *issue = FTUN_SOCKET_BIND_OTHER;
-  if (endpoint->kind != FTUN_ADDRESS_IPV4 ||
+  if (!ftun_endpoint_is_ip(endpoint) ||
       (transport != FTUN_DIAL_TCP && transport != FTUN_DIAL_UDP)) return FTUN_E_INVALID;
-  descriptor = socket(AF_INET,
-    (transport == FTUN_DIAL_TCP ? SOCK_STREAM : SOCK_DGRAM) | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+  descriptor = ftun_posix_socket(endpoint->kind == FTUN_ADDRESS_IPV6 ? AF_INET6 : AF_INET,
+    transport == FTUN_DIAL_TCP ? SOCK_STREAM : SOCK_DGRAM, 0);
   if (descriptor < 0) return ftun_blocking_socket_status(errno);
   (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-  ftun_socket_address(endpoint, &address);
-  if (bind(descriptor, (const struct sockaddr *)&address, sizeof(address)) != 0 ||
+  socklen_t length = ftun_socket_address(endpoint, &address);
+  if (bind(descriptor, (const struct sockaddr *)&address, length) != 0 ||
       (transport == FTUN_DIAL_TCP && listen(descriptor, backlog) != 0)) {
     error = errno;
     if (error == EADDRNOTAVAIL) *issue = FTUN_SOCKET_BIND_ADDRESS_UNAVAILABLE;
@@ -341,10 +359,9 @@ ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
 ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out, ftun_endpoint_t *peer,
   ftun_socket_accept_disposition_t *disposition)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   socklen_t length = sizeof(address);
-  int descriptor = accept4((int)listener, (struct sockaddr *)&address, &length,
-    SOCK_CLOEXEC | SOCK_NONBLOCK);
+  int descriptor = ftun_posix_accept((int)listener, (struct sockaddr *)&address, &length);
   int error = errno;
   *out = -1;
   *disposition = FTUN_SOCKET_ACCEPT_FATAL;
@@ -370,7 +387,7 @@ ftun_status_t ftun_socket_pair(ftun_handle_t out[2])
 {
   int pair[2];
   out[0] = out[1] = -1;
-  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, pair) != 0) {
+  if (ftun_posix_socket_pair(pair) != 0) {
     return ftun_socket_stream_status(errno);
   }
   out[0] = pair[0];
@@ -381,7 +398,7 @@ ftun_status_t ftun_socket_pair(ftun_handle_t out[2])
 ptrdiff_t ftun_socket_receive_from(ftun_handle_t descriptor, void *buffer, size_t capacity,
   ftun_endpoint_t *peer, ftun_status_t *status)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   socklen_t length = sizeof(address);
   ssize_t count;
   do {
@@ -396,12 +413,12 @@ ptrdiff_t ftun_socket_receive_from(ftun_handle_t descriptor, void *buffer, size_
 ptrdiff_t ftun_socket_send_to(ftun_handle_t descriptor, const void *buffer, size_t length,
   const ftun_endpoint_t *peer, ftun_status_t *status)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   ssize_t count;
-  ftun_socket_address(peer, &address);
+  socklen_t address_length = ftun_socket_address(peer, &address);
   do {
     count = sendto((int)descriptor, buffer, length, MSG_DONTWAIT | MSG_NOSIGNAL,
-      (const struct sockaddr *)&address, sizeof(address));
+      (const struct sockaddr *)&address, address_length);
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
@@ -410,19 +427,20 @@ ptrdiff_t ftun_socket_send_to(ftun_handle_t descriptor, const void *buffer, size
 ftun_status_t ftun_socket_connect_udp(const ftun_endpoint_t *peer, uint32_t mark,
   ftun_handle_t *out)
 {
-  struct sockaddr_in address;
+  struct sockaddr_storage address;
   int descriptor;
   ftun_status_t status;
   *out = -1;
-  descriptor = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+  descriptor = ftun_posix_socket(peer->kind == FTUN_ADDRESS_IPV6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
   if (descriptor < 0) return ftun_blocking_socket_status(errno);
-  if (mark != 0u && setsockopt(descriptor, SOL_SOCKET, SO_MARK, &mark, sizeof(mark)) != 0) {
-    status = ftun_blocking_socket_status(errno);
-    (void)close(descriptor);
-    return status;
+  if (mark != 0u) {
+    ftun_socket_policy_t policy = {0};
+    policy.mark = mark;
+    status = ftun_system_protect_socket(NULL, (ftun_native_socket_t)descriptor, &policy);
+    if (status != FTUN_OK) { close(descriptor); return status; }
   }
-  ftun_socket_address(peer, &address);
-  if (connect(descriptor, (const struct sockaddr *)&address, sizeof(address)) != 0 &&
+  socklen_t address_length = ftun_socket_address(peer, &address);
+  if (connect(descriptor, (const struct sockaddr *)&address, address_length) != 0 &&
       errno != EINPROGRESS) {
     status = ftun_blocking_socket_status(errno);
     (void)close(descriptor);

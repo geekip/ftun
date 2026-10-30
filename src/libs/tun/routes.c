@@ -92,10 +92,7 @@ static ftun_status_t prefixes(const ftun_network_view_t *view, bool overlay,
       if (ftun_network_view_get_route(view, i, &route) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
       prefix = route.prefix;
     } else if (ftun_network_view_get_protected(view, i, &prefix) != FTUN_OK) return FTUN_E_STATE_CORRUPT;
-    out[i] = (ftun_cidr_t){0};
-    out[i].address.family = FTUN_IP_V4;
-    memcpy(out[i].address.bytes, prefix.network, 4u);
-    out[i].prefix = prefix.prefix_length;
+    out[i] = prefix;
   }
   return FTUN_OK;
 }

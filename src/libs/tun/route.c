@@ -11,29 +11,16 @@ uint32_t ftun_tun_service_ipv4_value(const uint8_t address[4])
 
 static int ftun_tun_service_route_valid(const ftun_tun_route_t *route)
 {
-  uint32_t address;
-  uint32_t mask;
   if (route == NULL) return 0;
-  if (route->kind == FTUN_TUN_ROUTE_DEFAULT) {
-    return route->prefix_length == 0u && route->network[0] == 0u &&
-           route->network[1] == 0u && route->network[2] == 0u &&
-           route->network[3] == 0u;
-  }
-  if (route->kind != FTUN_TUN_ROUTE_IPV4_PREFIX ||
-      route->prefix_length > 32u) return 0;
-  address = ftun_tun_service_ipv4_value(route->network);
-  mask = route->prefix_length == 0u
-    ? 0u : UINT32_MAX << (32u - route->prefix_length);
-  return (address & mask) == address;
+  if (route->kind == FTUN_TUN_ROUTE_DEFAULT) return route->prefix.address.family == FTUN_IP_NONE && route->prefix.prefix == 0u;
+  return route->kind == FTUN_TUN_ROUTE_PREFIX && ftun_cidr_valid(&route->prefix, true);
 }
 
-static int ftun_tun_service_route_equal(const ftun_tun_route_t *left,
-                                        const ftun_tun_route_t *right)
+static int ftun_tun_service_route_equal(const ftun_tun_route_t *left, const ftun_tun_route_t *right)
 {
   if (left->kind != right->kind || left->priority != right->priority) return 0;
-  if (left->kind == FTUN_TUN_ROUTE_DEFAULT) return 1;
-  return left->prefix_length == right->prefix_length &&
-         memcmp(left->network, right->network, 4u) == 0;
+  return left->kind == FTUN_TUN_ROUTE_DEFAULT ||
+    (left->prefix.prefix == right->prefix.prefix && ftun_ip_equal(&left->prefix.address, &right->prefix.address));
 }
 
 ftun_status_t ftun_tun_service_acquire(
@@ -205,17 +192,21 @@ ftun_tun_service_consumer_t *ftun_tun_service_route(
 {
   ftun_tun_service_consumer_t *prefix_match = NULL;
   ftun_tun_service_consumer_t *default_match = NULL;
-  uint32_t destination = 0u;
-  bool ipv4 = false;
+  ftun_ip_t destination = {0};
   size_t index;
   if (packet.length >= 20u && (packet.data[0] >> 4u) == 4u) {
     size_t header_length = (size_t)(packet.data[0] & 0x0fu) * 4u;
     size_t total_length = ((size_t)packet.data[2] << 8u) | packet.data[3];
     if (header_length >= 20u && header_length <= packet.length &&
         total_length >= header_length && total_length <= packet.length) {
-      destination = ftun_tun_service_ipv4_value(packet.data + 16u);
-      ipv4 = true;
+      destination.family = FTUN_IP_V4;
+      memcpy(destination.bytes, packet.data + 16u, 4u);
     }
+  }
+  if (packet.length >= 40u && (packet.data[0] >> 4u) == 6u &&
+      40u + ((size_t)packet.data[4] << 8u) + packet.data[5] == packet.length) {
+    destination.family = FTUN_IP_V6;
+    memcpy(destination.bytes, packet.data + 24u, 16u);
   }
   for (index = 0u; index < service->consumer_capacity; index++) {
     ftun_tun_service_consumer_t *consumer = &service->consumers[index];
@@ -225,14 +216,10 @@ ftun_tun_service_consumer_t *ftun_tun_service_route(
           consumer->route.priority < default_match->route.priority) {
         default_match = consumer;
       }
-    } else if (ipv4) {
-      uint32_t network = ftun_tun_service_ipv4_value(consumer->route.network);
-      uint32_t mask = consumer->route.prefix_length == 0u
-        ? 0u : UINT32_MAX << (32u - consumer->route.prefix_length);
-      if ((destination & mask) != network) continue;
+    } else if (ftun_cidr_contains(&consumer->route.prefix, &destination)) {
       if (prefix_match == NULL ||
-          consumer->route.prefix_length > prefix_match->route.prefix_length ||
-          (consumer->route.prefix_length == prefix_match->route.prefix_length &&
+          consumer->route.prefix.prefix > prefix_match->route.prefix.prefix ||
+          (consumer->route.prefix.prefix == prefix_match->route.prefix.prefix &&
            consumer->route.priority < prefix_match->route.priority)) {
         prefix_match = consumer;
       }

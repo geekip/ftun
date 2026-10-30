@@ -180,29 +180,29 @@ static ftun_status_t ftun_dns_listener_accept(
   status = ftun_dns_message_parse_with_budget(listener->budget, wire, &message);
   if (status != FTUN_OK) return status;
   if ((message->flags & 0x8000u) != 0u) {
-    (void)ftun_dns_message_release(&message);
+    ftun_dns_message_release(&message);
     return FTUN_E_PROTOCOL;
   }
   if (connection != NULL) {
     if (connection->inflight >= listener->max_tcp_inflight) {
-      (void)ftun_dns_message_release(&message);
+      ftun_dns_message_release(&message);
       return FTUN_E_LIMIT;
     }
     if (bytes > SIZE_MAX - listener->max_tcp_frame_bytes - 2u) {
-      (void)ftun_dns_message_release(&message);
+      ftun_dns_message_release(&message);
       return FTUN_E_LIMIT;
     }
     bytes += listener->max_tcp_frame_bytes + 2u;
   }
   status = ftun_budget_reserve(listener->budget, bytes, &reservation);
   if (status != FTUN_OK) {
-    (void)ftun_dns_message_release(&message);
+    ftun_dns_message_release(&message);
     return status;
   }
   request = (ftun_dns_listener_request_t *)calloc(1u, bytes);
   if (request == NULL) {
     ftun_reservation_release(&reservation);
-    (void)ftun_dns_message_release(&message);
+    ftun_dns_message_release(&message);
     return FTUN_E_LIMIT;
   }
   request->listener = listener;
@@ -267,13 +267,13 @@ static ftun_status_t ftun_dns_listener_accept(
   if (status != FTUN_OK) goto fail;
   listener->inflight++;
   if (connection != NULL) connection->inflight++;
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return FTUN_OK;
 
 fail:
   free(request);
   ftun_reservation_release(&reservation);
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return status;
 }
 
@@ -347,7 +347,7 @@ ftun_status_t ftun_dns_listener_receive_udp(ftun_dns_listener_t *listener,
     }
   }
   if (limit > listener->udp_payload_limit) limit = listener->udp_payload_limit;
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return ftun_dns_listener_accept(listener, NULL, peer_id, datagram, limit, out);
 }
 

@@ -40,6 +40,8 @@ typedef struct {
   ftun_path_scope_t *scope;
   ftun_stream_options_t stream;
   ftun_datagram_options_t datagram;
+  /* 控制请求需立即报告坏报文；业务关联继续丢弃无效包。 */
+  bool report_datagram_errors;
   ftun_path_notify_fn notify;
   void *notify_user;
 } ftun_socks5_connect_request_t;
@@ -66,8 +68,8 @@ typedef struct {
 } ftun_socks5_io_t;
 
 /* SOCKS5 出站。
- * 代理节点必须先成为本次真实 IPv4 候选，再由受保护 Dialer
- * 建立控制 TCP。目标已有真实 allowed 候选时发送 IPv4，只有完全
+ * 代理节点必须先成为本次真实 IP 候选，再由受保护 Dialer
+ * 建立控制 TCP。目标已有真实 allowed 候选时发送数值 IP，只有完全
  * 没有真实候选时才允许发送 DOMAIN。UDP 关联同时保留控制 TCP
  * 和已连接到回复 relay 的受保护 UDP socket。
  * request/proxy/target/认证和保护策略在返回前复制。同步拒绝清空
@@ -107,6 +109,8 @@ ftun_status_t ftun_socks5_connection_channel(ftun_socks5_connection_t *connectio
 ftun_status_t ftun_socks5_connection_resume(ftun_socks5_connection_t *connection);
 /* native close 消费 connection；拥有型 close 失败保留 Path、通道与回调状态
  * 供重试，成功才消费 connection。 */
+/* 只撤销事件与物理路径，不释放被外层Path借用的通道。 */
+ftun_status_t ftun_socks5_connection_quiesce(ftun_socks5_connection_t *connection);
 ftun_status_t ftun_socks5_connection_close(
   ftun_socks5_connection_t **connection);
 

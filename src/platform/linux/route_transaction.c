@@ -2,6 +2,7 @@
 #include "platform/route.h"
 #include "platform/linux/route_transaction.h"
 #include <stdio.h>
+#include <assert.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,18 +48,14 @@ static int ftun_route_c_name_valid(const char *name, bool optional)
   return ftun_route_name_valid(value, optional);
 }
 
-static int ftun_route_network_normalized(const uint8_t address[4],
-                                         uint8_t prefix_length)
+static int ftun_route_network_normalized(const uint8_t address[16],
+  uint8_t prefix_length, int family)
 {
-  uint32_t value;
-  uint32_t mask;
-  if (prefix_length > 32u) return 0;
-  value = ((uint32_t)address[0] << 24u) |
-          ((uint32_t)address[1] << 16u) |
-          ((uint32_t)address[2] << 8u) | (uint32_t)address[3];
-  mask = prefix_length == 0u ? 0u :
-    UINT32_MAX << (32u - (uint32_t)prefix_length);
-  return (value & ~mask) == 0u;
+  ftun_cidr_t cidr = {0};
+  cidr.address.family = family == FTUN_ROUTE_FAMILY_IPV6 ? FTUN_IP_V6 : FTUN_IP_V4;
+  memcpy(cidr.address.bytes, address, family == FTUN_ROUTE_FAMILY_IPV6 ? 16u : 4u);
+  cidr.prefix = prefix_length;
+  return ftun_cidr_valid(&cidr, true);
 }
 
 static int ftun_route_resource_valid(
@@ -67,43 +64,44 @@ static int ftun_route_resource_valid(
   if (resource == NULL || resource->protocol != FTUN_LINUX_ROUTE_PROTOCOL) {
     return 0;
   }
+  if (resource->family != FTUN_ROUTE_FAMILY_IPV4 && resource->family != FTUN_ROUTE_FAMILY_IPV6) return 0;
   switch (resource->kind) {
     case FTUN_LINUX_ROUTE_ADDRESS:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 &&
+      return
         ftun_route_c_name_valid(resource->interface_name, false) &&
-        resource->prefix_length != 0u && resource->prefix_length <= 32u;
+        resource->prefix_length != 0u && resource->prefix_length <= (resource->family == FTUN_ROUTE_FAMILY_IPV6 ? 128u : 32u);
     case FTUN_LINUX_ROUTE_MARK_RULE:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         resource->priority != 0u && resource->mark != 0u &&
         resource->mark_mask != 0u &&
         (resource->mark & ~resource->mark_mask) == 0u;
     case FTUN_LINUX_ROUTE_DEFAULT:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         ftun_route_c_name_valid(resource->interface_name, false) &&
         resource->prefix_length == 0u;
     case FTUN_LINUX_ROUTE_CAPTURE_RULE:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         resource->priority != 0u &&
         ftun_route_c_name_valid(resource->interface_name, false);
-    case FTUN_LINUX_ROUTE_BLOCK_IPV6:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV6 && resource->priority != 0u &&
+    case FTUN_LINUX_ROUTE_BLOCK:
+      return resource->priority != 0u &&
         ftun_route_c_name_valid(resource->interface_name, false);
     case FTUN_LINUX_ROUTE_PROTECT_RULE:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         resource->priority != 0u &&
         ftun_route_network_normalized(resource->address,
-                                      resource->prefix_length);
+                                      resource->prefix_length, resource->family);
     case FTUN_LINUX_ROUTE_OVERLAY:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         resource->metric != 0u &&
         ftun_route_c_name_valid(resource->interface_name, false) &&
         ftun_route_network_normalized(resource->address,
-                                      resource->prefix_length);
+                                      resource->prefix_length, resource->family);
     case FTUN_LINUX_ROUTE_UNREACHABLE:
-      return resource->family == FTUN_ROUTE_FAMILY_IPV4 && resource->table != 0u &&
+      return resource->table != 0u &&
         resource->metric != 0u && resource->interface_name[0] == '\0' &&
         ftun_route_network_normalized(resource->address,
-                                      resource->prefix_length);
+                                      resource->prefix_length, resource->family);
     default:
       return 0;
   }
@@ -155,23 +153,23 @@ ftun_status_t ftun_platform_route_guard_plan(
   }
   for (index = 0u; index < prefix_count; index++) {
     const ftun_cidr_t *prefix = &prefixes[index];
-    if (prefix->address.family != FTUN_IP_V4) {
+    if (!ftun_cidr_valid(prefix, true)) {
       memset(out, 0, sizeof(*out));
-      return FTUN_E_UNSUPPORTED;
+      return FTUN_E_INVALID;
     }
     ftun_route_resource_t *resource;
     resource = &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_UNREACHABLE;
-    resource->family = FTUN_ROUTE_FAMILY_IPV4;
-    memcpy(resource->address, prefix->address.bytes, 4u);
+    resource->family = prefix->address.family == FTUN_IP_V6 ? FTUN_ROUTE_FAMILY_IPV6 : FTUN_ROUTE_FAMILY_IPV4;
+    memcpy(resource->address, prefix->address.bytes, prefix->address.family == FTUN_IP_V6 ? 16u : 4u);
     resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->metric = UINT32_C(32767);
     resource->protocol = FTUN_LINUX_ROUTE_PROTOCOL;
     resource = &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_PROTECT_RULE;
-    resource->family = FTUN_ROUTE_FAMILY_IPV4;
-    memcpy(resource->address, prefix->address.bytes, 4u);
+    resource->family = prefix->address.family == FTUN_IP_V6 ? FTUN_ROUTE_FAMILY_IPV6 : FTUN_ROUTE_FAMILY_IPV4;
+    memcpy(resource->address, prefix->address.bytes, prefix->address.family == FTUN_IP_V6 ? 16u : 4u);
     resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->priority = first_priority + (uint32_t)index;
@@ -197,17 +195,17 @@ ftun_status_t ftun_platform_route_overlay_plan(
   }
   for (index = 0u; index < prefix_count; index++) {
     const ftun_cidr_t *prefix = &prefixes[index];
-    if (prefix->address.family != FTUN_IP_V4) {
+    if (!ftun_cidr_valid(prefix, true)) {
       memset(out, 0, sizeof(*out));
-      return FTUN_E_UNSUPPORTED;
+      return FTUN_E_INVALID;
     }
     ftun_route_resource_t *resource =
       &out->resources[out->resource_count++];
     resource->kind = FTUN_LINUX_ROUTE_OVERLAY;
-    resource->family = FTUN_ROUTE_FAMILY_IPV4;
+    resource->family = prefix->address.family == FTUN_IP_V6 ? FTUN_ROUTE_FAMILY_IPV6 : FTUN_ROUTE_FAMILY_IPV4;
     memcpy(resource->interface_name, tun_interface.data,
            tun_interface.length);
-    memcpy(resource->address, prefix->address.bytes, 4u);
+    memcpy(resource->address, prefix->address.bytes, prefix->address.family == FTUN_IP_V6 ? 16u : 4u);
     resource->prefix_length = prefix->prefix;
     resource->table = table;
     resource->metric = metric;
@@ -228,7 +226,7 @@ int ftun_route_policy_valid(const ftun_route_policy_t *policy)
       ftun_route_name_equals(policy->lan_interface, "lo") ||
       ftun_route_names_equal(policy->tun_interface, policy->lan_interface) ||
       (!policy->manage_local && policy->lan_interface.length == 0u) ||
-      policy->tun_prefix_length == 0u || policy->tun_prefix_length > 32u ||
+      policy->tun_address_count == 0u || policy->tun_address_count > 2u ||
       policy->routing_domain == FTUN_ROUTE_TABLE_UNSPEC ||
       policy->routing_domain == FTUN_ROUTE_TABLE_DEFAULT ||
       policy->routing_domain == FTUN_ROUTE_TABLE_MAIN ||
@@ -238,6 +236,10 @@ int ftun_route_policy_valid(const ftun_route_policy_t *policy)
       policy->precedence + offset > UINT32_MAX - 1u ||
       policy->bypass_tag == 0u || policy->bypass_mask == 0u ||
       (policy->bypass_tag & ~policy->bypass_mask) != 0u) return 0;
+  for (size_t i = 0u; i < policy->tun_address_count; i++) {
+    if (!ftun_cidr_valid(&policy->tun_addresses[i], false) || policy->tun_addresses[i].prefix == 0u) return 0;
+    if (i != 0u && policy->tun_addresses[i].address.family == policy->tun_addresses[0].address.family) return 0;
+  }
   return 1;
 }
 
@@ -253,7 +255,7 @@ static ftun_route_resource_t *ftun_route_append(
   int family)
 {
   ftun_route_resource_t *resource;
-  if (transaction->resource_count >= FTUN_LINUX_ROUTE_MAX_RESOURCES) return NULL;
+  assert(transaction->resource_count < FTUN_LINUX_ROUTE_MAX_RESOURCES);
   resource = &transaction->resources[transaction->resource_count++];
   memset(resource, 0, sizeof(*resource));
   resource->kind = kind;
@@ -262,64 +264,49 @@ static ftun_route_resource_t *ftun_route_append(
   return resource;
 }
 
-int ftun_route_build(const ftun_route_policy_t *policy,
-                     ftun_platform_route_transaction_t *transaction)
+void ftun_route_build(const ftun_route_policy_t *policy,
+  ftun_platform_route_transaction_t *transaction)
 {
-  ftun_route_resource_t *resource;
-  uint32_t offset = policy->capture_offset == 0u ? 1u :
-                    policy->capture_offset;
-  uint32_t local_priority = policy->precedence + offset;
-  uint32_t lan_priority = local_priority + 1u;
-  resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_ADDRESS, FTUN_ROUTE_FAMILY_IPV4);
-  if (resource == NULL) return 0;
-  ftun_route_copy_name(resource->interface_name, policy->tun_interface);
-  memcpy(resource->address, policy->tun_ipv4, 4u);
-  resource->prefix_length = policy->tun_prefix_length;
-
-  resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_MARK_RULE, FTUN_ROUTE_FAMILY_IPV4);
-  if (resource == NULL) return 0;
-  resource->table = FTUN_ROUTE_TABLE_MAIN;
-  resource->priority = policy->precedence;
-  resource->mark = policy->bypass_tag;
-  resource->mark_mask = policy->bypass_mask;
-
-  resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_DEFAULT, FTUN_ROUTE_FAMILY_IPV4);
-  if (resource == NULL) return 0;
-  ftun_route_copy_name(resource->interface_name, policy->tun_interface);
-  resource->table = policy->routing_domain;
-
-  if (policy->manage_local) {
-    resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_CAPTURE_RULE,
-                                 FTUN_ROUTE_FAMILY_IPV4);
-    if (resource == NULL) return 0;
-    memcpy(resource->interface_name, "lo", 3u);
-    resource->table = policy->routing_domain;
-    resource->priority = local_priority;
-  }
-  if (policy->lan_interface.length != 0u) {
-    resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_CAPTURE_RULE,
-                                 FTUN_ROUTE_FAMILY_IPV4);
-    if (resource == NULL) return 0;
-    ftun_route_copy_name(resource->interface_name, policy->lan_interface);
-    resource->table = policy->routing_domain;
-    resource->priority = lan_priority;
-  }
-  if (policy->strict_route && policy->manage_local) {
-    resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_BLOCK_IPV6,
-                                 FTUN_ROUTE_FAMILY_IPV6);
-    if (resource == NULL) return 0;
-    memcpy(resource->interface_name, "lo", 3u);
-    resource->priority = local_priority;
-  }
-  if (policy->strict_route && policy->lan_interface.length != 0u) {
-    resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_BLOCK_IPV6,
-                                 FTUN_ROUTE_FAMILY_IPV6);
-    if (resource == NULL) return 0;
-    ftun_route_copy_name(resource->interface_name, policy->lan_interface);
-    resource->priority = lan_priority;
+  uint32_t offset = policy->capture_offset == 0u ? 1u : policy->capture_offset;
+  for (size_t family_index = 0u; family_index < 2u; family_index++) {
+    uint8_t ip_family = family_index == 0u ? FTUN_IP_V4 : FTUN_IP_V6;
+    int family = family_index == 0u ? FTUN_ROUTE_FAMILY_IPV4 : FTUN_ROUTE_FAMILY_IPV6;
+    const ftun_cidr_t *address = NULL;
+    ftun_route_resource_t *resource;
+    for (size_t i = 0u; i < policy->tun_address_count; i++) {
+      if (policy->tun_addresses[i].address.family == ip_family) address = &policy->tun_addresses[i];
+    }
+    if (address != NULL) {
+      resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_ADDRESS, family);
+      ftun_route_copy_name(resource->interface_name, policy->tun_interface);
+      memcpy(resource->address, address->address.bytes, ip_family == FTUN_IP_V6 ? 16u : 4u);
+      resource->prefix_length = address->prefix;
+      resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_MARK_RULE, family);
+      resource->table = FTUN_ROUTE_TABLE_MAIN;
+      resource->priority = policy->precedence;
+      resource->mark = policy->bypass_tag;
+      resource->mark_mask = policy->bypass_mask;
+      resource = ftun_route_append(transaction, FTUN_LINUX_ROUTE_DEFAULT, family);
+      ftun_route_copy_name(resource->interface_name, policy->tun_interface);
+      resource->table = policy->routing_domain;
+    }
+    if (address == NULL && !policy->strict_route) continue;
+    if (policy->manage_local) {
+      resource = ftun_route_append(transaction,
+        address == NULL ? FTUN_LINUX_ROUTE_BLOCK : FTUN_LINUX_ROUTE_CAPTURE_RULE, family);
+      memcpy(resource->interface_name, "lo", 3u);
+      resource->table = address == NULL ? 0u : policy->routing_domain;
+      resource->priority = policy->precedence + offset;
+    }
+    if (policy->lan_interface.length != 0u) {
+      resource = ftun_route_append(transaction,
+        address == NULL ? FTUN_LINUX_ROUTE_BLOCK : FTUN_LINUX_ROUTE_CAPTURE_RULE, family);
+      ftun_route_copy_name(resource->interface_name, policy->lan_interface);
+      resource->table = address == NULL ? 0u : policy->routing_domain;
+      resource->priority = policy->precedence + offset + 1u;
+    }
   }
   transaction->strict_route = policy->strict_route;
-  return 1;
 }
 
 static ftun_status_t ftun_route_remove_active(
@@ -368,10 +355,7 @@ static ftun_status_t ftun_route_prepare(
   transaction->lock_descriptor = lock_descriptor;
   transaction->magic = FTUN_LINUX_ROUTE_MAGIC;
   transaction->io = *io;
-  if (!ftun_route_build(policy, transaction)) {
-    status = FTUN_E_LIMIT;
-    goto fail;
-  }
+  ftun_route_build(policy, transaction);
   for (index = 0u; sweep && index < transaction->resource_count; index++) {
     ftun_route_resource_t stray = transaction->resources[index];
     size_t removed;

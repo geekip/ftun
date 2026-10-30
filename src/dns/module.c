@@ -18,6 +18,7 @@ typedef struct {
   ftun_dns_service_slot_t *slot;
   ftun_dns_runtime_adapter_t adapter;
   ftun_dns_runtime_network_t network;
+  const ftun_dns_service_binding_t *bindings;
   ftun_dns_runtime_t *active;
   ftun_dns_runtime_t *pending;
   ftun_dns_runtime_t *retired;
@@ -116,13 +117,14 @@ static ftun_status_t ftun_dns_service_prepare(
   service->operations = operations;
   service->loop = bindings->loop;
   service->slot = bindings->slot;
+  service->bindings = bindings;
   service->adapter = bindings->adapter;
   service->socket_mark = bindings->socket_mark;
   service->generation = generation;
   service->network.generation = generation;
+  service->network.egress = service->bindings->egress;
   service->network.socket_mark = bindings->socket_mark;
   service->network.path = bindings->path;
-  service->network.protocol = bindings->protocol;
   service->network.context = bindings->path_context;
   status = ftun_dns_runtime_prepare(core, budget, operations, service->loop,
     config, &service->adapter, &service->network,
@@ -165,6 +167,7 @@ static ftun_status_t ftun_dns_service_reload_prepare_planned(
     return FTUN_E_INVALID;
   }
   service->network.generation = generation;
+  service->network.egress = service->bindings->egress;
   status = ftun_dns_runtime_prepare_reload_planned(
     service->active, service->core, service->budget, service->operations,
     service->loop, config, &service->adapter, &service->network,

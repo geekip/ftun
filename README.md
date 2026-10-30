@@ -2,7 +2,7 @@
 
 FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明代理和嵌入式宿主集成。它提供独立命令行程序和稳定的 C API，通过规则、DNS、FakeIP、FRS 规则集合与代理组处理 TCP/UDP 流量。
 
-当前版本为 **1.0.4**，正式支持 Linux x86_64 IPv4。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
+当前版本为 **1.0.4**，正式支持 Linux x86_64 IPv4/IPv6 双栈。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
 
 ## 主要能力
 
@@ -14,9 +14,11 @@ FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明�
 - 配置检查、事务重载、进程控制和宿主 C API。
 - Core、DNS、Proxy 与 TUN provider 模块化构建，可按组合裁剪。
 
-FTUN 当前不提供 IPv6、AnyTLS、管理 HTTP API、Full Cone、Mesh、NAT 穿透、P2P/Relay、QUIC 或协议混淆。`ftun version` 会列出产物实际内置的能力。
+FTUN 当前不提供 AnyTLS、管理 HTTP API、Full Cone、Mesh、NAT 穿透、P2P/Relay、QUIC 或协议混淆。`ftun version` 会列出产物实际内置的能力。
 
 ## 快速开始
+
+克隆时使用 `git clone --recurse-submodules`，已有克隆执行 `git submodule update --init --recursive`。
 
 需要 C99 编译器和 CMake 3.21 或更新版本。配置与构建默认不联网，第三方源码按仓库锁定版本使用。
 

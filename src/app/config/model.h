@@ -4,7 +4,6 @@
 #include "proxy/config/transport.h"
 #include "app/config/plan.h"
 #include "dns/config/model.h"
-#include "libs/transport/config.h"
 #include "proxy/config/plan.h"
 #include "libs/tun/config/model.h"
 #include "proxy/config/model.h"

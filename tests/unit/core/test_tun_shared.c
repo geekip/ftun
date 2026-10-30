@@ -256,9 +256,10 @@ static void fill_route(ftun_tun_consumer_spec_t *spec,
   spec->consumer.packet = raw_packet;
   spec->consumer.event = raw_event;
   spec->consumer.user = raw;
-  spec->route.kind = FTUN_TUN_ROUTE_IPV4_PREFIX;
-  memcpy(spec->route.network, network, 4u);
-  spec->route.prefix_length = prefix;
+  spec->route.kind = FTUN_TUN_ROUTE_PREFIX;
+  spec->route.prefix.address.family = FTUN_IP_V4;
+  memcpy(spec->route.prefix.address.bytes, network, 4u);
+  spec->route.prefix.prefix = prefix;
   spec->route.priority = priority;
 }
 
@@ -490,11 +491,11 @@ static int test_shared_dispatch(void)
   fill_route(&consumer_spec, &fast, specific_network, 16u, 20u);
   CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
           &consumer_spec.route, &consumer_spec.path) == FTUN_E_REJECTED);
-  consumer_spec.route.network[1] = 2u;
-  consumer_spec.route.network[3] = 1u;
+  consumer_spec.route.prefix.address.bytes[1] = 2u;
+  consumer_spec.route.prefix.address.bytes[3] = 1u;
   CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,
           &consumer_spec.route, &consumer_spec.path) == FTUN_E_INVALID);
-  consumer_spec.route.network[3] = 0u;
+  consumer_spec.route.prefix.address.bytes[3] = 0u;
   consumer_spec.path.carrier_mtu = 1200u;
   consumer_spec.path.headroom = 1200u;
   CHECK(ftun_tun_service_update_consumer(fast_lease, 1u,

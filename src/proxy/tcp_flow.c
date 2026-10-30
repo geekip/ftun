@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
 ftun_status_t ftun_proxy_runtime_flow_slot_acquire(
@@ -1118,12 +1119,12 @@ void ftun_proxy_runtime_proxy_resolved(
   flow->open_operation = NULL;
   if (error.status == FTUN_OK && (result == NULL ||
       result->address_count == 0u ||
-      result->address_count > FTUN_SESSION_MAX_RESOLVED_IPV4)) {
+      result->address_count > FTUN_SESSION_MAX_RESOLVED)) {
     error.status = FTUN_E_STATE_CORRUPT;
   }
   for (index = 0u; error.status == FTUN_OK &&
        index < result->address_count; index++) {
-    if (result->addresses[index].kind != FTUN_ADDRESS_IPV4) {
+    if (!ftun_endpoint_is_ip(&result->addresses[index])) {
       error.status = FTUN_E_UNSUPPORTED;
       break;
     }
@@ -1203,6 +1204,7 @@ ftun_status_t ftun_proxy_runtime_resolve_session(
   query->worker = flow->engine->worker;
   query->budget = flow->budget;
   query->domain = stored->domain;
+  query->ipv6 = ftun_config_base(config)->ipv6;
   query->protection.mark = flow->engine->socket_mark;
   query->protection.liveness = flow->engine->liveness;
   status = ftun_monotonic_now(&query->deadline_ms);
@@ -1321,7 +1323,7 @@ ftun_status_t ftun_proxy_runtime_route_open(ftun_proxy_runtime_flow_t *flow)
       ? FTUN_ROUTE_DENY : FTUN_ROUTE_READY;
     route.generation = runtime_info.generation;
     route.outbound_id = forced;
-    if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+    if (ftun_endpoint_is_ip(&metadata->original_target) &&
         !metadata->original_is_fake) {
       route.allowed = &metadata->original_target;
       route.allowed_count = 1u;
@@ -1573,7 +1575,7 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
     goto fail;
   }
   flow->handshake_deadline_ms = now + engine->handshake_ms;
-  if (peer != NULL && peer->kind == FTUN_ADDRESS_IPV4) flow->tcp_peer = *peer;
+  if (peer != NULL && ftun_endpoint_is_ip(peer)) flow->tcp_peer = *peer;
   status = ftun_proxy_runtime_stream_create(flow, &flow->client_socket, descriptor,
                                      &flow->client);
   if (status != FTUN_OK) goto fail;

@@ -1,7 +1,11 @@
 #ifndef FTUN_PLATFORM_THREAD_H
 #define FTUN_PLATFORM_THREAD_H
 #include "util/types.h"
+#if defined(__unix__) || defined(__APPLE__)
 #include "platform/posix/thread_types.h"
+#else
+#error "Synchronization storage is not implemented for this platform"
+#endif
 
 /* 同步对象嵌入调用方已准入的存储，不单独分配；初始化失败不产生拥有资源。
  * lock/unlock/wait 的调用方必须遵守锁所有权，违反原生同步不变量立即终止。

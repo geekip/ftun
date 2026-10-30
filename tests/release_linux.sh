@@ -1,6 +1,13 @@
 #!/bin/sh
 set -eu
 
+for tool in ip unshare mount; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "missing test prerequisite: $tool" >&2
+    exit 77
+  fi
+done
+
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 FTUN INTEGRATION_HELPER FRS_FIXTURE" >&2
   exit 2
@@ -11,7 +18,7 @@ helper_binary=$2
 fixture_binary=$3
 
 if [ "${FTUN_RELEASE_NAMESPACE:-0}" != 1 ]; then
-  if ! unshare -Urn true >/dev/null 2>&1; then
+  if ! unshare -Urnm true >/dev/null 2>&1; then
     echo "isolated user/network namespaces unavailable" >&2
     exit 77
   fi

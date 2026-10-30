@@ -119,20 +119,22 @@ def main():
           metadata.get("vendored_tree_sha256")):
         return fail(f"{dependency.get('name')} tree digest disagrees with metadata")
   modules = (root / ".gitmodules").read_text(encoding="utf-8")
-  if modules.count("path = ") != 1 or "path = third_party/wolfssl" not in modules:
-    return fail("only the locked wolfSSL source may be a submodule")
-  wolfssl = next(item for item in dependencies if item["name"] == "wolfSSL")
+  submodules = [item for item in dependencies if item.get("source_form") == "git-submodule"]
+  if modules.count("path = ") != len(submodules) or any(
+      f"path = {item['path']}" not in modules for item in submodules):
+    return fail("submodules differ from the public lock")
   try:
-    if (root / ".git").exists():
-      index = git(root, "ls-files", "-s", "third_party/wolfssl").split()
-      if len(index) < 2 or index[0] != "160000" or index[1] != wolfssl["revision"]:
-        return fail("wolfSSL gitlink differs from the public lock")
-    if git(root / wolfssl["path"], "rev-parse", "HEAD") != wolfssl["revision"]:
-      return fail("checked-out wolfSSL revision differs from the public lock")
-    if git(root / wolfssl["path"], "status", "--porcelain"):
-      return fail("wolfSSL submodule has local modifications")
+    for dependency in submodules:
+      if (root / ".git").exists():
+        index = git(root, "ls-files", "-s", dependency["path"]).split()
+        if len(index) < 2 or index[0] != "160000" or index[1] != dependency["revision"]:
+          return fail(f"{dependency['name']} gitlink differs from the public lock")
+      if git(root / dependency["path"], "rev-parse", "HEAD") != dependency["revision"]:
+        return fail(f"checked-out {dependency['name']} revision differs from the public lock")
+      if git(root / dependency["path"], "status", "--porcelain"):
+        return fail(f"{dependency['name']} submodule has local modifications")
   except (OSError, subprocess.CalledProcessError) as error:
-    return fail(f"cannot inspect wolfSSL submodule: {error}")
+    return fail(f"cannot inspect submodule: {error}")
   if (root / "THIRD_PARTY_NOTICES.md").exists():
     return fail("third-party notices must be generated, not maintained in the source tree")
   if check_notices(root, lock, cmake):

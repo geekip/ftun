@@ -364,7 +364,7 @@ static int test_cache_binding(void)
   CHECK(dispatch_one(operations) && completion.calls == 1u && completion.status == FTUN_OK);
   CHECK(transport.selects == 1u && transport.submits == 1u && !transport.pending);
   CHECK(ftun_dns_cache_lookup(cache, &query, &answer) == FTUN_OK);
-  CHECK(ftun_dns_answer_release(&answer) == FTUN_OK);
+  ftun_dns_answer_release(&answer);
   query.outbound_id = 11u;
   CHECK(ftun_dns_cache_lookup(cache, &query, &answer) == FTUN_E_EOF && answer == NULL);
   query.outbound_id = 42u;

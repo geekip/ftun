@@ -9,6 +9,7 @@
 #include "proxy/dns/runtime_adapter.h"
 #include "proxy/slot_pool.h"
 #include "proxy/http_route.h"
+#include "proxy/egress.h"
 
 #include "proxy/runtime_state.h"
 #include "proxy/session.h"
@@ -100,7 +101,8 @@ typedef struct {
   uint32_t mark;
   uintptr_t budget;
   ftun_tls_context_t **tls_context;
-  const ftun_transport_protocol_t *protocol;
+  const ftun_egress_provider_t *egress;
+  ftun_egress_id_t egress_id;
   uint64_t generation;
   ftun_dial_purpose_t purpose;
   ftun_control_resolver_plan_t resolver;
@@ -108,15 +110,9 @@ typedef struct {
   bool allow_system_resolver;
   uint64_t maximum_bytes;
   uint64_t deadline_ms;
-  uint16_t proxy_port;
-  uint8_t proxy_address[4];
-  char proxy_domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
-  uint8_t use_proxy;
   uint8_t validate_frs;
   uintptr_t runtime_snapshot;
   uint32_t url_length;
-  uint32_t username_length;
-  uint32_t password_length;
   uint32_t etag_length;
 } ftun_proxy_runtime_http_work_t;
 
@@ -224,9 +220,9 @@ typedef struct ftun_proxy_runtime_udp_slot {
   ftun_datagram_send_token_t pending[FTUN_PROXY_RUNTIME_DATAGRAM_CAPACITY];
   ftun_endpoint_t remote;
   ftun_endpoint_t proxy_server;
-  ftun_endpoint_t proxy_resolved[FTUN_SESSION_MAX_RESOLVED_IPV4];
-  ftun_endpoint_t target_candidates[FTUN_SESSION_MAX_RESOLVED_IPV4];
-  ftun_endpoint_t target_allowed[FTUN_SESSION_MAX_RESOLVED_IPV4];
+  ftun_endpoint_t proxy_resolved[FTUN_SESSION_MAX_RESOLVED];
+  ftun_endpoint_t target_candidates[FTUN_SESSION_MAX_RESOLVED];
+  ftun_endpoint_t target_allowed[FTUN_SESSION_MAX_RESOLVED];
   ftun_target_t socks_target;
   char proxy_domain[254];
   char target_domain[254];
@@ -255,7 +251,7 @@ struct ftun_proxy_runtime_udp_pending {
   ftun_datagram_t *inbound;
   ftun_packet_t packet;
   ftun_metadata_t metadata;
-  ftun_endpoint_t resolved[FTUN_UDP_FLOW_MAX_RESOLVED_IPV4];
+  ftun_endpoint_t resolved[FTUN_UDP_FLOW_MAX_RESOLVED];
   ftun_route_result_t route;
   char domain[254];
   size_t resume_rule;
@@ -357,7 +353,7 @@ struct ftun_proxy_runtime_flow {
   ftun_status_t preread_status;
   ftun_status_t accept_failure;
   ftun_metadata_t pending_metadata;
-  ftun_endpoint_t proxy_resolved[FTUN_SESSION_MAX_RESOLVED_IPV4];
+  ftun_endpoint_t proxy_resolved[FTUN_SESSION_MAX_RESOLVED];
   char sniff_domain[FTUN_SNIFF_DOMAIN_BYTES];
   size_t proxy_resolved_count;
   uint64_t sniff_deadline_ms;
@@ -418,6 +414,8 @@ struct ftun_proxy_runtime {
   ftun_resolver_provider_t *resolver_provider;
   ftun_path_provider_t *path_provider;
   ftun_control_path_binding_t control_path;
+  const ftun_egress_provider_t *egress, *pending_egress;
+  const ftun_egress_provider_t *const *egress_slot;
   const ftun_l3_provider_t *l3_provider;
   ftun_event_loop_t *loop;
   ftun_event_source_t *deadline_source;
@@ -764,13 +762,13 @@ ftun_status_t ftun_proxy_runtime_object_release(
   ftun_budget_t **budget, ftun_reservation_t *admission);
 ftun_status_t ftun_proxy_runtime_operation_complete(ftun_proxy_runtime_flow_t *flow,
   ftun_operation_t *operation, ftun_error_t error);
-/* SOCKS5 上游：IPv4 字面量或 域名:端口；域名指向 text，调用方保证其存活。 */
+/* SOCKS5 上游：IP 字面量或 域名:端口；域名指向 text，调用方保证其存活。 */
 ftun_status_t ftun_proxy_runtime_parse_server_endpoint(
   const char *text, ftun_endpoint_t *out);
-/* 引导 DNS：IPv4 字面量，端口缺省 53。 */
+/* 引导 DNS：IP 字面量，端口缺省 53。 */
 ftun_status_t ftun_proxy_runtime_parse_bootstrap_endpoint(
   const char *text, ftun_endpoint_t *out);
-ftun_status_t ftun_proxy_runtime_parse_ipv4_endpoint(
+ftun_status_t ftun_proxy_runtime_parse_ip_endpoint(
   const char *text, ftun_endpoint_t *out);
 void ftun_proxy_runtime_path_notify(ftun_path_t *path, uint32_t events,
   ftun_error_t error, void *user);
@@ -979,6 +977,6 @@ ftun_status_t ftun_proxy_runtime_wait_worker_until(ftun_proxy_runtime_t *engine,
 ftun_status_t ftun_proxy_runtime_worker_stop_until(ftun_worker_t *worker,
                                                     uint64_t deadline_ms);
 void ftun_proxy_runtime_worker_wakeup(void *user);
-bool ftun_proxy_runtime_zero_ipv4(const ftun_endpoint_t *endpoint);
+bool ftun_proxy_runtime_zero_ip(const ftun_endpoint_t *endpoint);
 
 #endif

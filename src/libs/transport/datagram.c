@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "libs/transport/datagram.h"
 #include <assert.h>
 #include <stdlib.h>
@@ -89,8 +90,7 @@ static ftun_status_t ftun_datagram_endpoint_valid(const ftun_endpoint_t *endpoin
 {
   size_t index;
   if (endpoint == NULL || endpoint->port == 0u) return FTUN_E_INVALID;
-  if (endpoint->kind == FTUN_ADDRESS_IPV4) return FTUN_OK;
-  if (endpoint->kind == FTUN_ADDRESS_IPV6_RESERVED) return FTUN_E_UNSUPPORTED;
+  if (ftun_endpoint_is_ip(endpoint)) return FTUN_OK;
   if (endpoint->kind != FTUN_ADDRESS_DOMAIN || endpoint->domain.data == NULL ||
       endpoint->domain.length == 0u ||
       endpoint->domain.length >= FTUN_DATAGRAM_DOMAIN_BYTES) {

@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/route/router.h"
 
 #include "proxy/runtime_state.h"
@@ -113,7 +114,7 @@ static ftun_status_t ftun_route_copy_all_candidates(
   const ftun_metadata_t *metadata, ftun_route_result_t *out)
 {
   size_t index;
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+  if (ftun_endpoint_is_ip(&metadata->original_target) &&
       !metadata->original_is_fake) {
     out->allowed_storage[0] = metadata->original_target;
     out->allowed = out->allowed_storage;
@@ -124,7 +125,7 @@ static ftun_status_t ftun_route_copy_all_candidates(
     return FTUN_E_LIMIT;
   }
   for (index = 0u; index < metadata->resolved_count; index++) {
-    if (metadata->resolved[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&metadata->resolved[index]) ||
         metadata->resolved[index].domain.length != 0u) return FTUN_E_INVALID;
     out->allowed_storage[index] = metadata->resolved[index];
   }
@@ -140,7 +141,7 @@ static ftun_status_t ftun_route_copy_matching_candidates(
   size_t index;
   bool matched;
   ftun_status_t status;
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+  if (ftun_endpoint_is_ip(&metadata->original_target) &&
       !metadata->original_is_fake) {
     status = ftun_rule_address_match(rule, &metadata->original_target,
                                      &matched);

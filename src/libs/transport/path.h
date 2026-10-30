@@ -21,6 +21,8 @@ typedef struct {
   /* 可选发送确认进展（见 ftun_socket_send_progress）；没有物理 TCP 连接的通道
    * 返回 UNSUPPORTED。 */
   ftun_status_t (*send_progress)(void *context, uint64_t *acked, uint32_t *queued);
+  /* 包装已有通道时由此回收拥有者；失败保留通道与 context，供下一轮清理。 */
+  ftun_status_t (*destroy)(void *context);
 } ftun_path_driver_t;
 
 typedef struct {
@@ -63,6 +65,11 @@ ftun_status_t ftun_path_adopt_stream(const ftun_path_spec_t *spec,
   ftun_stream_t **channel, ftun_path_t **out);
 ftun_status_t ftun_path_adopt_datagram(const ftun_path_spec_t *spec,
   ftun_datagram_t **channel, ftun_path_t **out);
+/* 包装协议拥有者的通道，不额外复制数据或转移通道的创建者引用。
+ * driver.stop 仅停止事件来源；driver.destroy 最终消费通道及其拥有者。
+ * 成功后拥有者由 Path 驱动回收；失败完全保留原拥有者。 */
+ftun_status_t ftun_path_wrap_channel(const ftun_path_spec_t *spec,
+  ftun_channel_t *channel, ftun_path_t **out);
 ftun_status_t ftun_path_retain(ftun_path_t *path);
 /* 有效存储中的拥有引用由 release 消费；空引用幂等，违反引用约定是程序错误。 */
 void ftun_path_release(ftun_path_t **path);
@@ -108,6 +115,10 @@ typedef struct {
   void *user;
   ftun_path_notify_fn notify;
   void *notify_user;
+  /* 出口编号（见 libs/transport/egress.h），由 Provider 原样转交工厂。
+   * 零值是 FTUN_EGRESS_DIRECT，现有零初始化的调用方语义不变；
+   * 非零值只有出口工厂能解释，物理工厂收到非零值必须拒绝。 */
+  uint32_t egress;
 } ftun_path_open_request_t;
 
 typedef struct {

@@ -166,9 +166,10 @@ static size_t socket_index(ftun_native_socket_t socket)
   return (size_t)(socket - SOCKET_BASE);
 }
 
-static ftun_status_t socket_open(void *user, ftun_dial_transport_t transport,
+static ftun_status_t socket_open(void *user, ftun_address_kind_t family, ftun_dial_transport_t transport,
                                  ftun_native_socket_t *out)
 {
+  if (family != FTUN_ADDRESS_IPV4) return FTUN_E_UNSUPPORTED;
   socket_state_t *state = (socket_state_t *)user;
   size_t index = state->open_calls;
   if (out != NULL) *out = FTUN_INVALID_SOCKET;
@@ -636,9 +637,9 @@ static int test_udp_associate_and_source(void)
 
 static int test_overlay_udp_domain_sticky(void)
 {
-  ftun_network_prefix_t prefix = {{198u, 0u, 0u, 0u}, 8u};
+  ftun_network_prefix_t prefix = {{FTUN_IP_V4, {198u, 0u, 0u, 0u}}, 8u};
   ftun_network_route_t route = {
-    {{198u, 0u, 0u, 0u}, 8u},
+    {{FTUN_IP_V4, {198u, 0u, 0u, 0u}}, 8u},
     FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_PROXY)
   };
   ftun_network_view_spec_t spec;

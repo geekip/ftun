@@ -1,18 +1,11 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
-int ftun_proxy_runtime_endpoint_equal(const ftun_endpoint_t *left,
-                                      const ftun_endpoint_t *right)
+int ftun_proxy_runtime_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  if (left == NULL || right == NULL || left->kind != right->kind ||
-      left->port != right->port) return 0;
-  if (left->kind == FTUN_ADDRESS_IPV4) {
-    return memcmp(left->address, right->address, 4u) == 0;
-  }
-  return left->kind == FTUN_ADDRESS_DOMAIN && left->domain.data != NULL &&
-    right->domain.data != NULL && left->domain.length == right->domain.length &&
-    memcmp(left->domain.data, right->domain.data, left->domain.length) == 0;
+  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
 }
 
 #if defined(FTUN_HAVE_MODULE_TUN)

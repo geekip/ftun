@@ -111,7 +111,7 @@ int main(void)
   ftun_path_provider_t *provider = NULL;
   ftun_path_provider_spec_t spec = {0};
   ftun_network_view_spec_t view_spec = {0};
-  ftun_network_prefix_t protected_prefix = {{127u, 0u, 0u, 0u}, 8u};
+  ftun_network_prefix_t protected_prefix = {{FTUN_IP_V4, {127u, 0u, 0u, 0u}}, 8u};
   ftun_network_view_t *open_view = NULL, *closed_view = NULL;
   ftun_dial_request_t request = {0};
   ftun_operation_t *operation = NULL;

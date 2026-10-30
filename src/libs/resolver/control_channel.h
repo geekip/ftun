@@ -1,7 +1,7 @@
 #ifndef FTUN_LIBS_RESOLVER_CONTROL_CHANNEL_H
 #define FTUN_LIBS_RESOLVER_CONTROL_CHANNEL_H
 
-#include "libs/transport/path.h"
+#include "libs/transport/egress.h"
 #include "libs/resolver/resolver.h"
 
 typedef struct ftun_control_channel ftun_control_channel_t;
@@ -23,6 +23,8 @@ typedef struct {
   ftun_dial_purpose_t purpose;
   bool allow_system_resolver;
   ftun_control_path_binding_t path;
+  const ftun_egress_provider_t *egress;
+  ftun_egress_id_t egress_id;
 } ftun_control_execution_t;
 
 /* 保留外层绝对期限；协议自身超时只能收窄，不得重新延长任务期限。 */
@@ -37,7 +39,7 @@ ftun_status_t ftun_control_channel_create(ftun_budget_t *budget,
   uint64_t generation, uint64_t deadline_ms, ftun_control_channel_t **out);
 ftun_status_t ftun_control_channel_create_execution(
   const ftun_control_execution_t *execution, ftun_control_channel_t **out);
-/* 一次解析占用一个 Provider/Operation，结果复制为首个 IPv4。工厂与 context
+/* 一次解析占用一个 Provider/Operation，结果复制为首个 IP。工厂与 context
  * 借用至 drain 完成；请求输入只借用至 start 返回。回调不得使用调用方输出。
  * 同一通道只接纳一次解析，loop/operations 和完成函数由本地 owner 注入。 */
 ftun_status_t ftun_control_channel_resolve(ftun_control_channel_t *channel,
@@ -57,7 +59,7 @@ ftun_status_t ftun_control_channel_write_all(ftun_control_channel_t *channel,
   const uint8_t *buffer, size_t length);
 /* 整包发送等待本地完成，不表示远端收到；允许空报文。接收只保留一包，
  * 调用方缓冲不足时丢弃整包并返回 LIMIT，不交付截断数据。AGAIN 后用 wait
- * 驱动同一 owner；接收源只接受数值 IPv4，不借用回调中的域名存储。 */
+ * 驱动同一 owner；接收源只接受数值 IP，不借用回调中的域名存储。 */
 ftun_status_t ftun_control_channel_send(ftun_control_channel_t *channel,
   const ftun_endpoint_t *target, const uint8_t *buffer, size_t length);
 ftun_status_t ftun_control_channel_receive(ftun_control_channel_t *channel,

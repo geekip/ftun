@@ -5,7 +5,7 @@
 #include "platform/protect.h"
 
 #define FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES 254u
-#define FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS 16u
+#define FTUN_SYSTEM_RESOLVER_MAX_RESULTS 16u
 
 #define FTUN_SYSTEM_RESOLVER_STAGE_ADMISSION 1u
 #define FTUN_SYSTEM_RESOLVER_STAGE_PATH 2u
@@ -32,6 +32,8 @@ typedef struct {
   ftun_worker_t *worker;
   ftun_budget_t *budget;
   ftun_string_t domain;
+  bool ipv6;
+  uint16_t query_type; /* 0/1为A，28为AAAA。 */
   ftun_socket_policy_t protection;
   uint64_t deadline_ms;
   ftun_system_resolver_path_check_fn check_path;
@@ -43,7 +45,7 @@ typedef struct {
 /* 系统解析适配。
  * libc/NSS 调用只在有界 Worker 上执行，结果由 worker_poll 回到 owner loop。
  * 域名在接纳前复制；成功结果同步借给 completion，最多保留 16 个有序去重
- * IPv4 地址。取消只逻辑终结，无法中断的 libc 调用仍由 Worker 排空。
+ * IP 地址。取消只逻辑终结，无法中断的 libc 调用仍由 Worker 排空。
  * check_path 是强制门禁，调用方必须在 Worker 生命周期内维持所验证的
  * 物理路径隔离；不得把隐藏 socket 假定为自动继承 protection.mark。
  */

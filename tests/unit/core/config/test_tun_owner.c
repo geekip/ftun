@@ -506,7 +506,7 @@ static bool network_matches(const host_state_t *host, const uint8_t address[4],
           resource->prefix_length != prefix) return false;
       addresses++;
     }
-    if (resource->kind == FTUN_LINUX_ROUTE_BLOCK_IPV6) blocks++;
+    if (resource->kind == FTUN_LINUX_ROUTE_BLOCK) blocks++;
   }
   return addresses == 1u && blocks == (strict_route ? 1u : 0u);
 }
@@ -547,12 +547,14 @@ static int test_network_update(ftun_core_t *core, ftun_budget_t *budget,
   CHECK(ftun_tun_service_get_usage(client.lease.service, &usage) == FTUN_OK &&
         usage.queued_inputs == 1u && usage.queued_packets == 1u);
   candidate.name = (ftun_string_t){"ftun-own0", 9u};
-  memcpy(candidate.ipv4_address, (uint8_t[]){172u, 30u, 5u, 1u}, 4u);
-  candidate.prefix_length = 24u;
+  memcpy(candidate.addresses[0].address.bytes, (uint8_t[]){172u, 30u, 5u, 1u}, 4u);
+  candidate.addresses[0].prefix = 24u;
+  candidate.addresses[0].address.family = FTUN_IP_V4;
+  candidate.address_count = 1u;
   candidate.protection_mark = binding->protection_mark;
   CHECK(ftun_tun_owner_update_network(owner, 1u, &candidate, &result) == FTUN_OK &&
         result.committed && result.ready && result.network_generation == 2u);
-  CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+  CHECK(network_matches(host, candidate.addresses[0].address.bytes, 24u, false));
   CHECK(ftun_tun_service_get_usage(client.lease.service, &usage) == FTUN_OK &&
         usage.queued_inputs == 0u && usage.queued_packets == 0u && usage.packets_dropped == 2u);
   client.stall = host->stall_writes = false;
@@ -570,14 +572,14 @@ static int test_network_update(ftun_core_t *core, ftun_budget_t *budget,
         result.network_generation == 2u && host->apply_attempts == attempts);
   CHECK(ftun_tun_owner_update_network(owner, 1u, &candidate, &result) == FTUN_E_STALE &&
         result.update_status == FTUN_E_STALE && host->apply_attempts == attempts);
-  candidate.prefix_length = 0u;
+  candidate.addresses[0].prefix = 0u;
   CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_INVALID &&
         result.update_status == FTUN_E_INVALID && host->apply_attempts == attempts);
-  candidate.prefix_length = 28u;
+  candidate.addresses[0].prefix = 28u;
   candidate.protection_mark++;
   CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_INVALID);
   candidate.protection_mark--;
-  memcpy(candidate.ipv4_address, (uint8_t[]){172u, 31u, 7u, 1u}, 4u);
+  memcpy(candidate.addresses[0].address.bytes, (uint8_t[]){172u, 31u, 7u, 1u}, 4u);
   candidate.strict_route = true;
   host->fail_apply_at = host->apply_attempts + 3u;
   CHECK(ftun_tun_owner_update_network(owner, 2u, &candidate, &result) == FTUN_E_IO &&
@@ -802,7 +804,9 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
   ftun_core_service_run_usage_t run;
   ftun_budget_usage_t baseline, final;
   ftun_tun_consumer_t consumer = {0};
-  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, 18004u, 11000u, false, NULL};
+  ftun_interface_spec_t candidate = {.name = {"ftun-own0", 9u},
+    .addresses = {{{FTUN_IP_V4, {172u, 30u, 5u, 1u}}, 24u}}, .address_count = 1u,
+    .protection_mark = 0u, .route_table = 18004u, .rule_priority = 11000u, .strict_route = false};
   size_t scenario;
   network.context = previous->context;
   network.async.context = &io;
@@ -860,13 +864,13 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
       CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK &&
         !result.pending && !result.ready && result.update_status == FTUN_E_CANCELLED);
     } else {
-      candidate.ipv4_address[3] = 99u;
+      candidate.addresses[0].address.bytes[3] = 99u;
       CHECK(drive_update(owner, &result) == 0);
-      candidate.ipv4_address[3] = 1u;
+      candidate.addresses[0].address.bytes[3] = 1u;
       if (scenario == 0u) {
         CHECK(result.committed && result.ready && result.update_status == FTUN_OK &&
           result.network_generation == 2u);
-        CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+        CHECK(network_matches(host, candidate.addresses[0].address.bytes, 24u, false));
         CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_E_STALE);
         CHECK(ftun_tun_owner_query_network_update(owner, &result) == FTUN_OK && result.committed);
       } else if (scenario == 1u) {
@@ -880,7 +884,7 @@ static int test_async_update(ftun_core_t *core, ftun_budget_t *budget,
         host->fail_apply_at = 0u;
         CHECK(ftun_tun_owner_start_network_update(owner, 1u, &candidate, deadline) == FTUN_OK);
         CHECK(drive_update(owner, &result) == 0 && result.ready && result.committed);
-        CHECK(network_matches(host, candidate.ipv4_address, 24u, false));
+        CHECK(network_matches(host, candidate.addresses[0].address.bytes, 24u, false));
       }
       CHECK(ftun_tun_owner_service.reload_prepare(owner, &config, 2u) == FTUN_OK);
       CHECK(ftun_tun_owner_service.reload_abort(owner) == FTUN_OK);
@@ -921,7 +925,9 @@ static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
   ftun_core_service_run_usage_t run;
   ftun_budget_usage_t baseline, final;
   ftun_tun_consumer_t consumer = {0};
-  ftun_interface_spec_t candidate = {{"ftun-own0", 9u}, {172u, 30u, 5u, 1u}, 24u, 0u, 18004u, 11000u, false, NULL};
+  ftun_interface_spec_t candidate = {.name = {"ftun-own0", 9u},
+    .addresses = {{{FTUN_IP_V4, {172u, 30u, 5u, 1u}}, 24u}}, .address_count = 1u,
+    .protection_mark = 0u, .route_table = 18004u, .rule_priority = 11000u, .strict_route = false};
   size_t scenario;
   network.context = previous->context;
   network.async.context = &io;
@@ -1015,7 +1021,7 @@ static int test_async_rebuild(ftun_core_t *core, ftun_budget_t *budget,
       CHECK(result.rebuild && result.ready && result.committed && result.update_status == FTUN_OK);
       CHECK(client.rebuilds == 1u && result.network_generation == (scenario == 0u ? 3u : 2u));
       CHECK(result.device_generation == ((scenario == 3u || scenario == 7u) ? 3u : 2u));
-      CHECK(network_matches(host, scenario == 0u ? candidate.ipv4_address :
+      CHECK(network_matches(host, scenario == 0u ? candidate.addresses[0].address.bytes :
         (uint8_t[]){172u, 19u, 0u, 1u}, scenario == 0u ? 24u : 30u, scenario != 0u));
       if (scenario == 0u) {
         CHECK(ftun_tun_service_refresh_network(client.lease.service, result.network_generation) == FTUN_E_AGAIN);
@@ -1331,9 +1337,9 @@ int main(void)
   memset(&stale_lease, 0, sizeof(stale_lease));
   stale_consumer.consumer.packet = consume_packet;
   stale_consumer.consumer.user = NULL;
-  stale_consumer.route.kind = FTUN_TUN_ROUTE_IPV4_PREFIX;
-  stale_consumer.route.network[0] = 10u;
-  stale_consumer.route.prefix_length = 8u;
+  stale_consumer.route.kind = FTUN_TUN_ROUTE_PREFIX;
+  stale_consumer.route.prefix.address.bytes[0] = 10u;
+  stale_consumer.route.prefix.prefix = 8u;
   CHECK(ftun_l3_provider_acquire(&provider, 1u, &stale_consumer,
         &stale_lease) == FTUN_E_STALE && stale_lease.service == NULL);
 

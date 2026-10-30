@@ -75,8 +75,9 @@ static int test_query_and_max_name(void)
   CHECK(message->question.type == 1u && message->question.class_code == 1u);
   CHECK(name_equals(message->question.name, query_wire + 12u, 17u));
   CHECK(message->wire != query_wire && message->wire_length == sizeof(query_wire));
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK && message == NULL);
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  ftun_dns_message_release(&message);
+  CHECK(message == NULL);
+  ftun_dns_message_release(&message);
 
   memset(maximum, 0, sizeof(maximum));
   maximum[4] = 0u;
@@ -98,7 +99,7 @@ static int test_query_and_max_name(void)
   CHECK(ftun_dns_message_parse((ftun_bytes_t){maximum, sizeof(maximum)},
                                &message) == FTUN_OK);
   CHECK(message->question.name.length == FTUN_DNS_MAX_NAME_BYTES);
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  ftun_dns_message_release(&message);
   return 0;
 }
 
@@ -142,7 +143,7 @@ static int test_records_and_ownership(void)
         record->extended_rcode == 1u && record->edns_version == 0u &&
         record->edns_flags == FTUN_DNS_EDNS_FLAG_DO &&
         record->rdata.length == 7u);
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  ftun_dns_message_release(&message);
   return 0;
 }
 
@@ -154,7 +155,7 @@ static int test_known_rdata(void)
           (ftun_bytes_t){cname_wire, sizeof(cname_wire)}, &message) == FTUN_OK);
   CHECK(message->record_count == 1u && message->records[0].type == 5u &&
         message->records[0].rdata.length == 4u);
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  ftun_dns_message_release(&message);
   memcpy(trailing, cname_wire, sizeof(cname_wire));
   trailing[sizeof(cname_wire)] = 0u;
   trailing[41] = 0u;
@@ -345,8 +346,8 @@ static int test_correlation(void)
   CHECK(ftun_dns_message_matches(response, &query, FTUN_DNS_TRANSPORT_UDP,
                                  &source, &matches) == FTUN_E_INVALID &&
         !matches);
-  CHECK(ftun_dns_message_release(&query_message) == FTUN_OK);
-  CHECK(ftun_dns_message_release(&response) == FTUN_OK);
+  ftun_dns_message_release(&query_message);
+  ftun_dns_message_release(&response);
   return 0;
 }
 
@@ -369,7 +370,7 @@ static int test_random_inputs(void)
     status = ftun_dns_message_parse((ftun_bytes_t){data, length}, &message);
     if (status == FTUN_OK) {
       CHECK(message != NULL);
-      CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+      ftun_dns_message_release(&message);
     } else {
       CHECK(message == NULL);
     }
@@ -390,7 +391,7 @@ static int test_owned_budget(void)
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
   bytes = usage.used_resources.memory_bytes;
   CHECK(bytes >= sizeof(*message) + message->question.name.length + input.length + sizeof(ftun_reservation_t));
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK);
+  ftun_dns_message_release(&message);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   CHECK(ftun_budget_create(NULL, bytes - 1u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_E_LIMIT && message == NULL);
@@ -400,7 +401,8 @@ static int test_owned_budget(void)
   CHECK(ftun_dns_message_parse_with_budget(budget, input, &message) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == bytes);
   CHECK(ftun_budget_destroy(&budget) == FTUN_E_AGAIN && budget != NULL);
-  CHECK(ftun_dns_message_release(&message) == FTUN_OK && message == NULL);
+  ftun_dns_message_release(&message);
+  CHECK(message == NULL);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
@@ -415,7 +417,6 @@ int main(void)
   CHECK(ftun_dns_message_parse(
           (ftun_bytes_t){query_wire, sizeof(query_wire)}, NULL) ==
         FTUN_E_INVALID);
-  CHECK(ftun_dns_message_release(NULL) == FTUN_E_INVALID);
   CHECK(test_query_and_max_name() == 0);
   CHECK(test_records_and_ownership() == 0);
   CHECK(test_known_rdata() == 0);

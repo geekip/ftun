@@ -453,7 +453,7 @@ static ftun_status_t ftun_route_async_policy_plan(
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (out == NULL || !ftun_route_policy_valid(policy)) return FTUN_E_INVALID;
   memset(&transaction, 0, sizeof(transaction));
-  if (!ftun_route_build(policy, &transaction)) return FTUN_E_LIMIT;
+  ftun_route_build(policy, &transaction);
   out->resource_count = transaction.resource_count;
   memcpy(out->resources, transaction.resources,
          transaction.resource_count * sizeof(transaction.resources[0]));

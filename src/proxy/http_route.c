@@ -1,5 +1,5 @@
 #include "proxy/http_route.h"
-#include "proxy/protocol/socks5.h"
+
 #include "proxy/outbound_id.h"
 #include <string.h>
 
@@ -46,12 +46,7 @@ ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
     if (status != FTUN_OK) return status;
     spec->generation = info.generation;
   }
-  spec->protocol = &ftun_socks5_protocol;
-  spec->use_proxy = false;
-  memset(&spec->proxy, 0, sizeof(spec->proxy));
-  memset(spec->proxy_domain, 0, sizeof(spec->proxy_domain));
-  memset(&spec->proxy_username, 0, sizeof(spec->proxy_username));
-  memset(&spec->proxy_password, 0, sizeof(spec->proxy_password));
+  spec->egress_id = FTUN_EGRESS_DIRECT;
   status = ftun_http_outbound_id(config, outbound_name, &current);
   for (depth = 0u; status == FTUN_OK && depth <= ftun_config_outbound_count(config);
        depth++) {
@@ -64,27 +59,7 @@ ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
     if (index >= ftun_config_outbound_count(config)) return FTUN_E_STATE_CORRUPT;
     item = &ftun_config_outbounds(config)[index];
     if (item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
-      ftun_endpoint_t parsed;
-      char domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
-      status = ftun_control_parse_endpoint(
-        item->server, 1u, &parsed, domain);
-      if (status == FTUN_OK && parsed.kind == FTUN_ADDRESS_DOMAIN) {
-        spec->proxy.kind = FTUN_ADDRESS_DOMAIN;
-        spec->proxy.port = parsed.port;
-        memcpy(spec->proxy_domain, domain, parsed.domain.length + 1u);
-        spec->proxy.domain.data = spec->proxy_domain;
-        spec->proxy.domain.length = parsed.domain.length;
-      } else if (status == FTUN_OK) {
-        spec->proxy = parsed;
-      }
-      if (status != FTUN_OK) return status;
-      spec->use_proxy = true;
-      if (item->username != NULL) {
-        spec->proxy_username.data = item->username;
-        spec->proxy_username.length = strlen(item->username);
-        spec->proxy_password.data = item->password;
-        spec->proxy_password.length = strlen(item->password);
-      }
+      spec->egress_id = current;
       return FTUN_OK;
     }
     if (runtime != NULL) {

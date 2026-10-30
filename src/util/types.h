@@ -75,10 +75,10 @@ typedef uintptr_t ftun_native_socket_t; /* 仅内部平台包装，不假定为 
 typedef struct { const char *data; size_t length; } ftun_string_t;
 typedef struct { const uint8_t *data; size_t length; } ftun_bytes_t;
 typedef enum { FTUN_ADDRESS_NONE=0, FTUN_ADDRESS_IPV4, FTUN_ADDRESS_DOMAIN,
-               FTUN_ADDRESS_IPV6_RESERVED } ftun_address_kind_t;
+               FTUN_ADDRESS_IPV6 } ftun_address_kind_t;
 typedef struct {
   ftun_address_kind_t kind;
-  uint8_t address[16]; /* 网络字节序；IPv6 仅类型预留。 */
+  uint8_t address[16]; /* 网络字节序；IPv4使用前4字节。 */
   ftun_string_t domain;
   uint16_t port; /* 主机字节序；序列化必须逐字段转换。 */
 } ftun_endpoint_t;

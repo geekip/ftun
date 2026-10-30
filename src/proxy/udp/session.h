@@ -6,7 +6,7 @@
 #include "libs/transport/datagram.h"
 #include "libs/transport/path.h"
 
-#define FTUN_UDP_FLOW_MAX_RESOLVED_IPV4 16u
+#define FTUN_UDP_FLOW_MAX_RESOLVED 16u
 
 typedef struct ftun_udp_flow_table ftun_udp_flow_table_t;
 

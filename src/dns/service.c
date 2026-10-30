@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 
+#include "util/endpoint.h"
 #include "dns/service_internal.h"
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -240,13 +241,10 @@ uint64_t ftun_dns_runtime_hash_bytes(uint64_t hash, const void *data,
 uint64_t ftun_dns_runtime_request_hash(
   uint32_t outbound_id, uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
-  ftun_dns_transport_t transport, uint8_t mode,
-  const ftun_endpoint_t *proxy, const char *username, const char *password,
+  ftun_dns_transport_t transport, ftun_egress_id_t egress_id,
   ftun_bytes_t query)
 {
   uint64_t hash = UINT64_C(1469598103934665603);
-  size_t username_length = username == NULL ? 0u : strlen(username);
-  size_t password_length = password == NULL ? 0u : strlen(password);
   uint8_t transport_byte = (uint8_t)transport;
   hash = ftun_dns_runtime_hash_bytes(hash, &outbound_id,
                                     sizeof(outbound_id));
@@ -256,25 +254,12 @@ uint64_t ftun_dns_runtime_request_hash(
                                     sizeof(server_fingerprint));
   hash = ftun_dns_runtime_hash_bytes(hash, &transport_byte,
                                     sizeof(transport_byte));
-  hash = ftun_dns_runtime_hash_bytes(hash, &mode, sizeof(mode));
+  hash = ftun_dns_runtime_hash_bytes(hash, &egress_id, sizeof(egress_id));
   hash = ftun_dns_runtime_hash_bytes(hash, &upstream->kind,
                                     sizeof(upstream->kind));
   hash = ftun_dns_runtime_hash_bytes(hash, &upstream->port,
                                     sizeof(upstream->port));
-  hash = ftun_dns_runtime_hash_bytes(hash, upstream->address, 4u);
-  hash = ftun_dns_runtime_hash_bytes(hash, &proxy->kind, sizeof(proxy->kind));
-  hash = ftun_dns_runtime_hash_bytes(hash, &proxy->port, sizeof(proxy->port));
-  hash = ftun_dns_runtime_hash_bytes(hash, proxy->address, 4u);
-  hash = ftun_dns_runtime_hash_bytes(hash, &username_length,
-                                    sizeof(username_length));
-  if (username_length != 0u) {
-    hash = ftun_dns_runtime_hash_bytes(hash, username, username_length);
-  }
-  hash = ftun_dns_runtime_hash_bytes(hash, &password_length,
-                                    sizeof(password_length));
-  if (password_length != 0u) {
-    hash = ftun_dns_runtime_hash_bytes(hash, password, password_length);
-  }
+  hash = ftun_dns_runtime_hash_bytes(hash, upstream->address, ftun_endpoint_address_bytes(upstream));
   hash = ftun_dns_runtime_hash_bytes(hash, &query.length,
                                     sizeof(query.length));
   return ftun_dns_runtime_hash_bytes(hash, query.data + 2u,
@@ -363,8 +348,6 @@ void ftun_dns_runtime_request_release(
     if (status == FTUN_OK) status = FTUN_E_AGAIN;
   }
   control_status = ftun_dns_runtime_request_path_close(&request->path);
-  if (status == FTUN_OK) status = control_status;
-  control_status = ftun_dns_runtime_request_path_close(&request->control_path);
   if (status == FTUN_OK) status = control_status;
   /* 被 Provider 拒收的工厂结果仍可能借用 notify_user，须先完成其回收。 */
   control_status = ftun_path_provider_collect(request->dns->paths);
@@ -513,8 +496,7 @@ ftun_status_t ftun_dns_runtime_packet_receive(ftun_datagram_t *channel,
   ftun_status_t status;
   (void)channel;
   if (request->closing || request->received_present) return FTUN_OK;
-  if (source->kind != request->peer.kind || source->port != request->peer.port ||
-      memcmp(source->address, request->peer.address, 4u) != 0) return FTUN_OK;
+  if (!ftun_endpoint_equal(source, &request->peer)) return FTUN_OK;
   status = ftun_packet_clone(packet, &request->received);
   if (status == FTUN_OK) request->received_present = true;
   else request->io_status = status;
@@ -528,13 +510,11 @@ void ftun_dns_runtime_path_opened(ftun_operation_t *operation,
   ftun_dns_runtime_transport_request_t *request = user;
   (void)operation;
   request->opening = NULL;
-  if (request->opening_control) request->control_path = path;
-  else request->path = path;
+  request->path = path;
   if (error.status != FTUN_OK) request->io_status = error.status;
   else if (request->io_status != FTUN_OK) {
     /* 保留在结果交付前到达的驱动错误，拥有权仍由请求负责回收。 */
-  } else if (request->opening_control ||
-           request->transport == FTUN_DNS_TRANSPORT_TCP) {
+  } else if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
     request->io_status = ftun_path_channel(path, &request->stream);
   } else {
     request->io_status = ftun_path_channel(path, &request->datagram);
@@ -543,18 +523,15 @@ void ftun_dns_runtime_path_opened(ftun_operation_t *operation,
 }
 
 ftun_status_t ftun_dns_runtime_request_open(
-  ftun_dns_runtime_transport_request_t *request, int type,
-  const ftun_endpoint_t *target, bool control)
+  ftun_dns_runtime_transport_request_t *request)
 {
   ftun_dns_runtime_t *dns = request->dns;
   ftun_path_open_request_t open = {0};
-  ftun_path_info_t info;
-  ftun_status_t status;
-  if (target == NULL || target->kind != FTUN_ADDRESS_IPV4 || target->port == 0u) {
+  const ftun_endpoint_t *target = &request->upstream;
+  if (target == NULL || !ftun_endpoint_is_ip(target) || target->port == 0u) {
     return FTUN_E_INVALID;
   }
   request->peer = *target;
-  request->opening_control = control;
   request->state = FTUN_DNS_RUNTIME_REQUEST_CONNECT;
   open.dial.loop = dns->loop;
   open.dial.operations = dns->operations;
@@ -566,15 +543,9 @@ ftun_status_t ftun_dns_runtime_request_open(
   open.dial.protection.mark = dns->socket_mark;
   open.dial.protection.liveness = dns->liveness;
   open.dial.deadline_ms = request->deadline_ms;
-  open.dial.transport = type == FTUN_DIAL_TCP ? FTUN_DIAL_TCP : FTUN_DIAL_UDP;
+  open.dial.transport = request->transport == FTUN_DNS_TRANSPORT_TCP ? FTUN_DIAL_TCP : FTUN_DIAL_UDP;
+  open.egress = request->egress_id;
   open.dial.purpose = FTUN_DIAL_PURPOSE_DNS;
-  if (!control && request->control_path != NULL) {
-    status = ftun_path_get_info(request->control_path, &info);
-    if (status != FTUN_OK) return status;
-    open.dial.network_view = info.network_view;
-    open.dial.network_generation = info.network_generation;
-    open.dial.requested_domain = info.domain;
-  }
   open.stream.budget = dns->budget;
   open.stream.operations = dns->operations;
   open.stream.max_pending_writes = 1u;
@@ -667,26 +638,11 @@ ftun_status_t ftun_dns_runtime_request_receive(
 }
 
 /* 握手状态机的下一步：有待发送的帧就编码进请求缓冲等待发送，否则等待回复。 */
-ftun_status_t ftun_dns_runtime_request_handshake_next(
-  ftun_dns_runtime_transport_request_t *request)
-{
-  request->buffer_offset = 0u;
-  request->buffer_length = 0u;
-  if (!request->dns->protocol->wants_output(request->protocol_state)) {
-    request->state = FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV;
-    return FTUN_OK;
-  }
-  if (request->dns->protocol->output(request->protocol_state, request->buffer,
-        FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES,
-        &request->buffer_length) != FTUN_OK) return FTUN_E_PROTOCOL;
-  request->state = FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND;
-  return FTUN_OK;
-}
+
 
 ftun_status_t ftun_dns_runtime_request_dns_send(
   ftun_dns_runtime_transport_request_t *request)
 {
-  size_t written;
   request->buffer_offset = 0u;
   request->buffer_length = 0u;
   if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
@@ -695,13 +651,6 @@ ftun_status_t ftun_dns_runtime_request_dns_send(
     request->buffer[1] = (uint8_t)request->query_length;
     memcpy(request->buffer + 2u, request->query, request->query_length);
     request->buffer_length = request->query_length + 2u;
-  } else if (request->mode == FTUN_DNS_RUNTIME_PROXY) {
-    written = 0u;
-    if (request->dns->protocol->encode_datagram(&request->upstream,
-        (ftun_bytes_t){request->query, request->query_length},
-        request->buffer, FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES,
-        &written) != FTUN_OK) return FTUN_E_PROTOCOL;
-    request->buffer_length = written;
   } else {
     memcpy(request->buffer, request->query, request->query_length);
     request->buffer_length = request->query_length;
@@ -714,171 +663,36 @@ ftun_status_t ftun_dns_runtime_resolve_upstream(
   ftun_budget_t *budget, const ftun_config_t *config, const char *text, uint32_t socket_mark,
   ftun_endpoint_t *out);
 
-ftun_status_t ftun_dns_runtime_outbound_id(
-  const ftun_config_t *config, const char *name, uint32_t *out);
-
-bool ftun_dns_runtime_group_member(const ftun_config_t *config,
-  const ftun_channel_config_t *group, uint32_t member)
-{
-  const char *name;
-  size_t index;
-  if (member == FTUN_DNS_OUTBOUND_DIRECT) name = "DIRECT";
-  else if (member == FTUN_DNS_OUTBOUND_REJECT) name = "REJECT";
-  else if ((size_t)(member - FTUN_DNS_OUTBOUND_NAMED_BASE) <
-             ftun_config_channel_count(config)) {
-    name = ftun_config_channel(config, member - FTUN_DNS_OUTBOUND_NAMED_BASE).name;
-  } else return false;
-  for (index = 0u; index < group->members.count; index++) {
-    if (strcmp(group->members.items[index], name) == 0) return true;
-  }
-  return false;
-}
-
 /* 仅解释已固定的终端；此处绝不再次调用活动 Runtime 的组选择。 */
-ftun_status_t ftun_dns_runtime_outbound(
-  ftun_dns_runtime_t *dns, uint32_t leaf, uint8_t *mode,
-  ftun_endpoint_t *proxy, const char **username, const char **password)
-{
-  ftun_channel_config_t item_view;
-  const ftun_channel_config_t *item;
-  size_t index;
-  *mode = 0u;
-  memset(proxy, 0, sizeof(*proxy));
-  *username = NULL;
-  *password = NULL;
-  if (leaf == FTUN_DNS_OUTBOUND_DIRECT) {
-    *mode = FTUN_DNS_RUNTIME_DIRECT;
-    return FTUN_OK;
-  }
-  if (leaf < FTUN_DNS_OUTBOUND_NAMED_BASE) return FTUN_E_REJECTED;
-  index = leaf - FTUN_DNS_OUTBOUND_NAMED_BASE;
-  if (index >= ftun_config_channel_count(dns->config)) return FTUN_E_REJECTED;
-  item_view = ftun_config_channel(dns->config, index);
-  item = &item_view;
-  if (item->kind != FTUN_CHANNEL_CONFIG_SOCKS5) return FTUN_E_REJECTED;
-  if (dns->proxy_endpoint_valid == NULL ||
-      (dns->proxy_endpoint_valid[index] & 1u) == 0u) return FTUN_E_RESOLVE;
-  *proxy = dns->proxy_endpoints[index];
-  *mode = FTUN_DNS_RUNTIME_PROXY;
-  *username = item->username;
-  *password = item->password;
-  return FTUN_OK;
-}
+
 
 ftun_status_t ftun_dns_runtime_transport_select(void *user,
   uint32_t root, ftun_dns_transport_binding_t *out)
 {
-  ftun_dns_runtime_t *dns = (ftun_dns_runtime_t *)user;
-  uint32_t current = root;
-  size_t depth;
-  if (out != NULL) memset(out, 0, sizeof(*out));
-  if (dns == NULL || dns->config == NULL || out == NULL) return FTUN_E_INVALID;
-  for (depth = 0u; depth <= 64u; depth++) {
-    ftun_channel_config_t item_view;
-  const ftun_channel_config_t *item;
-    size_t index;
-    uint32_t member = 0u;
-    ftun_status_t status;
-    if (current == FTUN_DNS_OUTBOUND_DIRECT) break;
-    if (current < FTUN_DNS_OUTBOUND_NAMED_BASE) return FTUN_E_REJECTED;
-    index = current - FTUN_DNS_OUTBOUND_NAMED_BASE;
-    if (index >= ftun_config_channel_count(dns->config)) return FTUN_E_REJECTED;
-    item_view = ftun_config_channel(dns->config, index);
-  item = &item_view;
-    if (item->kind == FTUN_CHANNEL_CONFIG_SOCKS5) break;
-    if (depth == 64u) return FTUN_E_LIMIT;
-    if (item->kind != FTUN_CHANNEL_CONFIG_GROUP) return FTUN_E_REJECTED;
-    if (dns->adapter.select_member == NULL) return FTUN_E_UNSUPPORTED;
-    status = dns->adapter.select_member(dns->adapter.user, dns->config,
-                                         current, &member);
-    if (status != FTUN_OK) return status;
-    if (!ftun_dns_runtime_group_member(dns->config, item, member)) {
-      return FTUN_E_REJECTED;
-    }
-    current = member;
-  }
-  out->scope = dns;
-  out->root_id = root;
-  out->leaf_id = current;
+  ftun_dns_runtime_t *dns = user;
+  ftun_egress_info_t info;
+  ftun_status_t status;
+  memset(out, 0, sizeof(*out));
+  status = dns->egress->query(dns->egress->context, root, dns->generation, &info);
+  if (status != FTUN_OK) return status;
+  if (info.state == FTUN_EGRESS_STATE_UNAVAILABLE) return FTUN_E_REJECTED;
+  *out = (ftun_dns_transport_binding_t){dns, root, info.id};
   return FTUN_OK;
-}
-
-/* 组图在配置校验时已限深。这里只借用 owner 私有 valid 的高位去重，
- * 不分配、不调用外部代码；返回 submit 前统一恢复，低位的解析事实不变。 */
-ftun_status_t ftun_dns_runtime_binding_reachable(
-  ftun_dns_runtime_t *dns, uint32_t current, uint32_t leaf, size_t depth,
-  size_t *first, size_t *last)
-{
-  ftun_channel_config_t item_view;
-  const ftun_channel_config_t *item;
-  size_t index;
-  size_t member;
-  if (depth > 64u) return FTUN_E_LIMIT;
-  if (current == leaf) return FTUN_OK;
-  if (current < FTUN_DNS_OUTBOUND_NAMED_BASE) return FTUN_E_REJECTED;
-  index = current - FTUN_DNS_OUTBOUND_NAMED_BASE;
-  if (index >= ftun_config_channel_count(dns->config)) return FTUN_E_REJECTED;
-  if (dns->proxy_endpoint_valid == NULL) return FTUN_E_LIMIT;
-  if ((dns->proxy_endpoint_valid[index] & 0x80u) != 0u) return FTUN_E_REJECTED;
-  dns->proxy_endpoint_valid[index] |= 0x80u;
-  if (index < *first) *first = index;
-  if (index > *last) *last = index;
-  item_view = ftun_config_channel(dns->config, index);
-  item = &item_view;
-  if (item->kind != FTUN_CHANNEL_CONFIG_GROUP) return FTUN_E_REJECTED;
-  for (member = 0u; member < item->members.count; member++) {
-    uint32_t member_id;
-    ftun_status_t status = ftun_dns_runtime_outbound_id(dns->config,
-      item->members.items[member], &member_id);
-    if (status != FTUN_OK) return status;
-    status = ftun_dns_runtime_binding_reachable(dns, member_id, leaf,
-                                                depth + 1u, first, last);
-    if (status != FTUN_E_REJECTED) return status;
-  }
-  return FTUN_E_REJECTED;
 }
 
 ftun_status_t ftun_dns_runtime_binding_validate(
   ftun_dns_runtime_t *dns, const ftun_dns_transport_binding_t *binding)
 {
-  size_t first = SIZE_MAX;
-  size_t last = 0u;
-  size_t index;
-  ftun_status_t status;
   if (binding == NULL || binding->scope != dns) return FTUN_E_STALE;
-  status = ftun_dns_runtime_binding_reachable(dns, binding->root_id,
-    binding->leaf_id, 0u, &first, &last);
-  if (first != SIZE_MAX) {
-    for (index = first; index <= last; index++) {
-      dns->proxy_endpoint_valid[index] &= 0x7fu;
-    }
-  }
-  return status;
+  return dns->egress->validate(dns->egress->context, binding->root_id,
+    binding->leaf_id, dns->generation);
 }
 
-ftun_status_t ftun_dns_runtime_request_drive_connected(
-  ftun_dns_runtime_transport_request_t *request)
+ftun_status_t ftun_dns_runtime_request_drive_connected(ftun_dns_runtime_transport_request_t *request)
 {
   bool connected = false;
-  ftun_status_t status = ftun_dns_runtime_request_connected(request,
-                                                            &connected);
-  if (status != FTUN_OK || !connected) return status;
-  if (request->mode == FTUN_DNS_RUNTIME_DIRECT ||
-      request->datagram != NULL) {
-    return ftun_dns_runtime_request_dns_send(request);
-  }
-  {
-    ftun_transport_protocol_options_t options = {0};
-    options.username = (ftun_bytes_t){request->username, request->username_length};
-    options.password = (ftun_bytes_t){request->password, request->password_length};
-    options.datagram = request->transport == FTUN_DNS_TRANSPORT_UDP;
-    options.peer = request->proxy;
-    options.target = request->upstream;
-    if (request->dns->protocol->init(request->protocol_state, &options) != FTUN_OK) {
-      return FTUN_E_PROTOCOL;
-    }
-  }
-  return ftun_dns_runtime_request_handshake_next(request);
+  ftun_status_t status = ftun_dns_runtime_request_connected(request, &connected);
+  return status != FTUN_OK || !connected ? status : ftun_dns_runtime_request_dns_send(request);
 }
 
 ftun_status_t ftun_dns_runtime_request_drive(
@@ -895,43 +709,6 @@ ftun_status_t ftun_dns_runtime_request_drive(
       case FTUN_DNS_RUNTIME_REQUEST_CONNECT:
         status = ftun_dns_runtime_request_drive_connected(request);
         break;
-      case FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_SEND:
-        status = ftun_dns_runtime_request_send(request);
-        if (status == FTUN_OK) {
-          status = request->dns->protocol->output_done(request->protocol_state);
-          if (status == FTUN_OK) status = ftun_dns_runtime_request_handshake_next(request);
-        }
-        break;
-      case FTUN_DNS_RUNTIME_REQUEST_HANDSHAKE_RECV:
-      {
-        size_t needed = request->dns->protocol->needed(request->protocol_state);
-        if (needed == 0u || needed > FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES) {
-          return FTUN_E_STATE_CORRUPT;
-        }
-        status = ftun_dns_runtime_request_receive(request, needed);
-        if (status == FTUN_OK) {
-          ftun_endpoint_t bound;
-          size_t consumed = 0u;
-          status = request->dns->protocol->input(request->protocol_state,
-            (ftun_bytes_t){request->buffer, needed}, &consumed, &bound);
-          request->buffer_length = 0u;
-          if (status == FTUN_E_AGAIN) {
-            status = ftun_dns_runtime_request_handshake_next(request);
-          } else if (status != FTUN_OK) {
-            return status;
-          } else if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
-            status = ftun_dns_runtime_request_dns_send(request);
-          } else {
-            ftun_endpoint_t relay = bound;
-            if (relay.kind != FTUN_ADDRESS_IPV4 || relay.port == 0u) {
-              return FTUN_E_UNSUPPORTED;
-            }
-            status = ftun_dns_runtime_request_open(request, FTUN_DIAL_UDP,
-                                                   &relay, false);
-          }
-        }
-        break;
-      }
       case FTUN_DNS_RUNTIME_REQUEST_DNS_SEND:
         status = ftun_dns_runtime_request_send(request);
         if (status == FTUN_OK) {
@@ -948,19 +725,6 @@ ftun_status_t ftun_dns_runtime_request_drive(
         if (!request->received_present) return FTUN_E_AGAIN;
         status = ftun_packet_view(&request->received, &wire);
         if (status != FTUN_OK) return status;
-        if (request->mode == FTUN_DNS_RUNTIME_PROXY) {
-          ftun_transport_datagram_t datagram;
-          size_t consumed = 0u;
-          status = request->dns->protocol->decode_datagram(wire, &datagram, &consumed);
-          if (status != FTUN_OK) return status;
-          if (consumed != wire.length ||
-              datagram.endpoint.kind != FTUN_ADDRESS_IPV4 ||
-              datagram.endpoint.port != request->upstream.port ||
-              memcmp(datagram.endpoint.address, request->upstream.address, 4u) != 0) {
-            return FTUN_E_REJECTED;
-          }
-          wire = datagram.payload;
-        }
         if (wire.length > FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES) return FTUN_E_LIMIT;
         if (wire.length == 0u) return FTUN_E_EOF;
         /* 事务 ID 必须与发出的查询一致：对不上的数据报丢弃，继续等正确的应答
@@ -1013,27 +777,15 @@ int ftun_dns_runtime_request_matches(
   const ftun_dns_runtime_transport_request_t *request,
   uint32_t outbound_id, uint64_t policy_fingerprint,
   uint64_t server_fingerprint, const ftun_endpoint_t *upstream,
-  ftun_dns_transport_t transport,
-  uint8_t mode, const ftun_endpoint_t *proxy, const char *username,
-  const char *password, ftun_bytes_t query)
+  ftun_dns_transport_t transport, ftun_egress_id_t egress_id, ftun_bytes_t query)
 {
-  size_t username_length = username == NULL ? 0u : strlen(username);
-  size_t password_length = password == NULL ? 0u : strlen(password);
   return request->outbound_id == outbound_id &&
     request->policy_fingerprint == policy_fingerprint &&
     request->server_fingerprint == server_fingerprint &&
-    request->transport == transport && request->mode == mode &&
+    request->transport == transport && request->egress_id == egress_id &&
     request->upstream.kind == upstream->kind &&
     request->upstream.port == upstream->port &&
-    memcmp(request->upstream.address, upstream->address, 4u) == 0 &&
-    request->proxy.kind == proxy->kind && request->proxy.port == proxy->port &&
-    memcmp(request->proxy.address, proxy->address, 4u) == 0 &&
-    request->username_length == username_length &&
-    request->password_length == password_length &&
-    (username_length == 0u ||
-     memcmp(request->username, username, username_length) == 0) &&
-    (password_length == 0u ||
-     memcmp(request->password, password, password_length) == 0) &&
+    ftun_endpoint_equal(&request->upstream, upstream) &&
     request->query_length == query.length && query.length >= 2u &&
     memcmp(request->query + 2u, query.data + 2u, query.length - 2u) == 0;
 }
@@ -1087,19 +839,13 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   ftun_dns_runtime_transport_request_t *request;
   ftun_dns_runtime_transport_request_t *parent;
   ftun_dns_runtime_transport_waiter_t *waiter = NULL;
-  ftun_endpoint_t proxy;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   size_t bytes;
-  size_t username_length;
-  size_t password_length;
   uint64_t identity_hash;
-  const char *username;
-  const char *password;
-  uint8_t mode;
   uint32_t outbound_id;
   ftun_status_t status;
   if (out_request != NULL) *out_request = NULL;
-  if (dns == NULL || upstream == NULL || upstream->kind != FTUN_ADDRESS_IPV4 ||
+  if (dns == NULL || upstream == NULL || !ftun_endpoint_is_ip(upstream) ||
       query.data == NULL || query.length < 12u || query.length > UINT32_MAX ||
       completion == NULL || out_request == NULL || deadline_ms == 0u) {
     return FTUN_E_INVALID;
@@ -1108,27 +854,16 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   status = ftun_dns_runtime_binding_validate(dns, binding);
   if (status != FTUN_OK) return status;
   outbound_id = binding->root_id;
-  status = ftun_dns_runtime_outbound(dns, binding->leaf_id, &mode, &proxy,
-                                    &username, &password);
-  if (status != FTUN_OK) return status;
-  if (mode == FTUN_DNS_RUNTIME_PROXY && dns->protocol == NULL) return FTUN_E_UNSUPPORTED;
-  username_length = username == NULL ? 0u : strlen(username);
-  password_length = password == NULL ? 0u : strlen(password);
-  if (username_length > UINT8_MAX || password_length > UINT8_MAX ||
-      (username_length == 0u) != (password_length == 0u) ||
-      query.length > SIZE_MAX - sizeof(*request) ||
-      sizeof(*request) + query.length > SIZE_MAX -
-        FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES) return FTUN_E_LIMIT;
+  if (query.length > SIZE_MAX - sizeof(*request) - FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES) return FTUN_E_LIMIT;
   identity_hash = ftun_dns_runtime_request_hash(outbound_id,
-    policy_fingerprint, server_fingerprint, upstream, transport, mode,
-    &proxy, username, password, query);
+    policy_fingerprint, server_fingerprint, upstream, transport, binding->leaf_id, query);
   parent = dns->delivering_request;
   if (transport != FTUN_DNS_TRANSPORT_TCP || parent == NULL ||
       !parent->closing || parent->completion_status != FTUN_OK ||
       parent->response_length < 3u || (parent->buffer[2] & 0x02u) == 0u ||
       !ftun_dns_runtime_request_matches(parent, outbound_id,
         policy_fingerprint, server_fingerprint, upstream,
-        FTUN_DNS_TRANSPORT_UDP, mode, &proxy, username, password, query)) {
+        FTUN_DNS_TRANSPORT_UDP, binding->leaf_id, query)) {
     parent = NULL;
   }
   for (request = dns->request_buckets[(size_t)identity_hash &
@@ -1139,8 +874,7 @@ ftun_status_t ftun_dns_runtime_transport_submit(
         !ftun_dns_runtime_request_matches(request, outbound_id,
                                          policy_fingerprint,
                                          server_fingerprint, upstream,
-                                         transport, mode, &proxy, username,
-                                         password, query)) {
+                                         transport, binding->leaf_id, query)) {
       continue;
     }
     status = ftun_dns_runtime_waiter_create(dns, request, query, deadline_ms,
@@ -1156,8 +890,7 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   }
   if (dns->request_count >= FTUN_DNS_RUNTIME_MAX_PENDING) return FTUN_E_LIMIT;
   bytes = sizeof(*request) + query.length +
-          FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES +
-          (mode == FTUN_DNS_RUNTIME_PROXY ? dns->protocol->state_bytes : 0u);
+          FTUN_DNS_RUNTIME_TRANSPORT_BUFFER_BYTES;
   status = ftun_budget_reserve(dns->budget, bytes, &reservation);
   if (status != FTUN_OK) return status;
   request = (ftun_dns_runtime_transport_request_t *)calloc(1u, bytes);
@@ -1168,36 +901,23 @@ ftun_status_t ftun_dns_runtime_transport_submit(
   request->dns = dns;
   request->reservation = reservation;
   request->upstream = *upstream;
-  request->proxy = proxy;
   request->deadline_ms = deadline_ms;
-  request->protocol_state = request + 1;
-  request->query = (uint8_t *)(request + 1) +
-    (mode == FTUN_DNS_RUNTIME_PROXY ? dns->protocol->state_bytes : 0u);
+  request->query = (uint8_t *)(request + 1);
   request->buffer = request->query + query.length;
   request->query_length = query.length;
-  request->username_length = username_length;
-  request->password_length = password_length;
   request->identity_hash = identity_hash;
   request->policy_fingerprint = policy_fingerprint;
   request->server_fingerprint = server_fingerprint;
   request->outbound_id = outbound_id;
   request->transport = transport;
-  request->mode = mode;
+  request->egress_id = binding->leaf_id;
   memcpy(request->query, query.data, query.length);
-  if (username_length != 0u) {
-    memcpy(request->username, username, username_length);
-    memcpy(request->password, password, password_length);
-  }
   request->previous = dns->request_tail;
   if (dns->request_tail != NULL) dns->request_tail->next = request;
   else dns->request_head = request;
   dns->request_tail = request;
   dns->request_count++;
-  status = ftun_dns_runtime_request_open(request,
-    mode == FTUN_DNS_RUNTIME_PROXY || transport == FTUN_DNS_TRANSPORT_TCP
-      ? FTUN_DIAL_TCP : FTUN_DIAL_UDP,
-    mode == FTUN_DNS_RUNTIME_PROXY ? &request->proxy : &request->upstream,
-    mode == FTUN_DNS_RUNTIME_PROXY);
+  status = ftun_dns_runtime_request_open(request);
   if (status != FTUN_OK) {
     ftun_dns_runtime_request_release(request);
     return status;

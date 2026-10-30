@@ -28,6 +28,8 @@ typedef struct {
   ftun_socket_policy_t protection;
   uint64_t deadline_ms;
   uint16_t query_id;
+  uint16_t query_type;
+  bool ipv6; /* 供Provider组合A/AAAA；单次Bootstrap使用query_type。 */
   ftun_system_resolver_path_check_fn check_system_path;
   void *system_path_user;
   ftun_system_resolve_completion_fn completion;
@@ -49,10 +51,10 @@ typedef struct {
 } ftun_bootstrap_io_t;
 
 /* 基础真实解析。
- * servers 非空时只按复制后的 IPv4 列表经 purpose=BOOTSTRAP 的受保护
+ * servers 非空时只按复制后的 IP 列表经 purpose=BOOTSTRAP 的受保护
  * UDP Dialer 顺序尝试，校验来源、ID 和完整 Question，绝不回退系统 DNS。
  * servers 为空时原样委托 SystemResolver，并要求其路径保护门禁。
- * 成功结果是有序去重 IPv4，同步借给 completion。接纳后 Operation
+ * 成功结果是有序去重 IP，同步借给 completion。接纳后 Operation
  * 恰好一次终结；取消消费当前 child/source/socket，失败可重试。
  * 当前最小 Bootstrap 不实现 TC 后 TCP fallback，收到 TC 明确 unsupported。
  */

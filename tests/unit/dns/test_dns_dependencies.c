@@ -1,5 +1,8 @@
 /* 使用真实 loopback Bootstrap 记录 prepare 实际解析集合。 */
-#include "proxy/protocol/socks5.h"
+#include "../../support/egress_fixture.h"
+#if defined(FTUN_TEST_PROXY)
+#include "proxy/egress_internal.h"
+#endif
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -268,14 +271,14 @@ static ftun_status_t prepare(fixture_t *fixture, ftun_config_t *config,
   ftun_status_t status = FTUN_OK;
   if (planned) status = ftun_dns_runtime_plan_prepare(fixture->budget, config, 0u, plan);
   if (status != FTUN_OK) return status;
-  if (planned) return ftun_dns_runtime_prepare_reload_planned(NULL,
+  if (planned) return ftun_test_dns_reload(NULL,
     fixture->core, fixture->budget, fixture->operations, fixture->loop,
     config, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, *plan, out);
-  return ftun_dns_runtime_prepare(fixture->core, fixture->budget,
+  return ftun_test_dns_prepare(fixture->core, fixture->budget,
     fixture->operations, fixture->loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, out);
 }
 
@@ -296,13 +299,16 @@ static int prepare_case(bootstrap_t *server, const char *label,
       CHECK(config_make(server, outbounds, servers, extra, enabled,
                         cache != 0u, &config) == FTUN_OK);
       bootstrap_reset(server, failure);
-      CHECK(prepare(&fixture, config, planned != 0u, &dns, &plan) == expected);
+      ftun_status_t actual = prepare(&fixture, config, planned != 0u, &dns, &plan);
+      if (actual != expected) fprintf(stderr, "%s: status=%s expected=%s\n", label, ftun_status_name(actual), ftun_status_name(expected));
+      CHECK(actual == expected);
       CHECK(queries(server, NULL) == resolved_count);
       for (index = 0u; index < resolved_count; index++) {
         CHECK(queries(server, resolved[index]) == 1u);
       }
       if (expected == FTUN_OK && enabled) {
         CHECK(dns != NULL);
+#if defined(FTUN_TEST_PROXY)
         for (index = 0u; index < config->outbound_count; index++) {
           char domain[254];
           const char *colon;
@@ -314,16 +320,17 @@ static int prepare_case(bootstrap_t *server, const char *label,
           CHECK(length < sizeof(domain));
           memcpy(domain, config->outbounds[index].server, length);
           domain[length] = '\0';
-          CHECK((dns->proxy_endpoint_valid[index] != 0u) ==
+          CHECK((((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].resolved != 0u) ==
                 (queries(server, domain) == 1u));
-          if (dns->proxy_endpoint_valid[index] != 0u) {
-            CHECK(dns->proxy_endpoints[index].kind == FTUN_ADDRESS_IPV4);
-            CHECK(dns->proxy_endpoints[index].address[0] == 127u &&
-                  dns->proxy_endpoints[index].address[3] == 7u);
-            CHECK(colon != NULL && dns->proxy_endpoints[index].port ==
+          if (((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].resolved != 0u) {
+            CHECK(((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.kind == FTUN_ADDRESS_IPV4);
+            CHECK(((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.address[0] == 127u &&
+                  ((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.address[3] == 7u);
+            CHECK(colon != NULL && ((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.port ==
                   (uint16_t)strtoul(colon + 1u, NULL, 10));
           }
         }
+#endif
         CHECK(ftun_dns_runtime_activate(dns) == FTUN_OK);
       } else if (!enabled) CHECK(dns == NULL);
       CHECK(ftun_dns_runtime_destroy(&dns) == FTUN_OK);
@@ -386,20 +393,20 @@ static int closure_cases(bootstrap_t *server)
     ",\"inbounds\":[{\"name\":\"i\",\"type\":\"mixed\",\"listen\":\"127.0.0.1:9\","
     "\"outbound\":\"A\"}]", true, "a.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "nondefault-failure", "[" LEAVES "," GROUP "]",
-    GROUP_SERVER, "", true, "b.example", FTUN_E_PROTOCOL, both, 2u) == 0);
+    GROUP_SERVER, "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
   CHECK(prepare_case(server, "nested-failure", "[" LEAVES "," GROUP ","
     "{\"name\":\"N\",\"type\":\"select\",\"outbounds\":[\"G\"],\"default\":\"G\"}]",
     ",\"servers\":[{\"name\":\"s\",\"type\":\"udp\",\"address\":[\"127.0.0.1:9\"],"
-    "\"outbound\":\"N\"}]", "", true, "b.example", FTUN_E_PROTOCOL, both, 2u) == 0);
+    "\"outbound\":\"N\"}]", "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
   CHECK(prepare_case(server, "urltest-failure", "[" LEAVES ","
     "{\"name\":\"G\",\"type\":\"url-test\",\"outbounds\":[\"A\",\"B\"],"
     "\"default\":\"A\",\"url\":\"http://127.0.0.1/x\"}]", GROUP_SERVER,
-    "", true, "b.example", FTUN_E_PROTOCOL, both, 2u) == 0);
+    "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
   CHECK(prepare_case(server, "all-server-roots", "[" LEAVES "," GROUP "]",
     ",\"default-server\":\"d\",\"servers\":[{\"name\":\"d\",\"type\":\"udp\","
     "\"address\":[\"127.0.0.1:9\"],\"outbound\":\"DIRECT\"},{\"name\":\"hidden\","
     "\"type\":\"tcp\",\"address\":[\"127.0.0.1:9\"],\"outbound\":\"G\"}]", "",
-    true, "b.example", FTUN_E_PROTOCOL, both, 2u) == 0);
+    true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
   CHECK(prepare_case(server, "shared-leaf", "[" LEAVES ","
     "{\"name\":\"H\",\"type\":\"select\",\"outbounds\":[\"A\",\"DIRECT\",\"REJECT\"],\"default\":\"A\"},"
     "{\"name\":\"G\",\"type\":\"select\",\"outbounds\":[\"H\",\"A\"],\"default\":\"H\"}]",
@@ -455,18 +462,18 @@ static int plan_pairing(bootstrap_t *server)
   CHECK(config->document.reference_count == 2u);
   saved = plan;
   CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &plan) == FTUN_E_AGAIN && plan == saved);
-  CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
+  CHECK(ftun_test_dns_reload(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, different, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &dns) == FTUN_E_STALE);
   CHECK(dns == NULL && different->document.reference_count == 1u && queries(server, NULL) == 0u);
-  CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
+  CHECK(ftun_test_dns_reload(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &dns) == FTUN_OK);
-  CHECK(ftun_dns_runtime_prepare_reload_planned(NULL, fixture.core, fixture.budget,
+  CHECK(ftun_test_dns_reload(NULL, fixture.core, fixture.budget,
     fixture.operations, fixture.loop, config, NULL,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &second) == FTUN_OK);
   CHECK(config->document.reference_count == 4u);
   CHECK(ftun_dns_runtime_destroy(&second) == FTUN_OK && config->document.reference_count == 3u);
@@ -508,7 +515,7 @@ static int allocation_and_cleanup(bootstrap_t *server)
 {
   unsigned int planned, fault;
   for (planned = 0u; planned < 2u; planned++) {
-    for (fault = 0u; fault < 3u; fault++) {
+    for (fault = 0u; fault < 2u; fault++) {
       fixture_t fixture;
       ftun_config_t *config = NULL;
       ftun_dns_runtime_plan_t *plan = NULL;
@@ -517,12 +524,13 @@ static int allocation_and_cleanup(bootstrap_t *server)
       CHECK(config_make(server, "[" LEAVES "," GROUP "]", GROUP_SERVER,
                         "", true, true, &config) == FTUN_OK);
       bootstrap_reset(server, "");
-      fail_count = fault == 0u ? 1u : config->outbound_count;
+      fail_count = 1u;
       fail_size = fault == 0u ? (planned != 0u ? sizeof(ftun_dns_runtime_plan_t) :
-        sizeof(ftun_dns_runtime_t)) : (fault == 1u ? sizeof(ftun_endpoint_t) : 1u);
+        sizeof(ftun_dns_runtime_t)) : ftun_test_egress_bytes(config);
       allocation_failures = 1u;
       CHECK(prepare(&fixture, config, planned != 0u, &dns, &plan) == FTUN_E_LIMIT);
-      CHECK(allocation_failures == 0u && queries(server, NULL) == 0u);
+      CHECK(allocation_failures == 0u && queries(server, NULL) ==
+        (fault == 0u && !planned ? 2u : 0u));
       CHECK(ftun_dns_runtime_destroy(&dns) == FTUN_OK);
       CHECK(ftun_dns_runtime_plan_destroy(&plan) == FTUN_OK);
       CHECK(config->document.reference_count == 1u);
@@ -536,19 +544,21 @@ static int allocation_and_cleanup(bootstrap_t *server)
     ftun_dns_runtime_plan_t *plan = NULL;
     ftun_dns_runtime_t *dns = NULL;
     CHECK(fixture_start(&fixture) == 0);
-    CHECK(config_make(server, "[" LEAVES "," GROUP "]", GROUP_SERVER,
-                      "", true, false, &config) == FTUN_OK);
+    CHECK(config_make(server, "[]",
+      ",\"default-server\":\"s\",\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
+      "\"address\":[\"b.example:9\"],\"outbound\":\"DIRECT\"}]",
+      "", true, false, &config) == FTUN_OK);
     bootstrap_reset(server, "b.example");
     destroy_target = config;
     destroy_failures = 1u;
-    CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &plan) == FTUN_E_PROTOCOL);
+    CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, config, 0u, &plan) == FTUN_E_RESOLVE);
     CHECK(plan != NULL && plan->config == config && config->document.reference_count == 2u);
     CHECK(destroy_failures == 0u && queries(server, "b.example") == 1u);
     CHECK(ftun_dns_runtime_plan_destroy(&plan) == FTUN_OK && plan == NULL);
     CHECK(config->document.reference_count == 1u);
     bootstrap_reset(server, "b.example");
     destroy_failures = 1u;
-    CHECK(prepare(&fixture, config, false, &dns, &plan) == FTUN_E_PROTOCOL);
+    CHECK(prepare(&fixture, config, false, &dns, &plan) == FTUN_E_RESOLVE);
     CHECK(dns != NULL && dns->cleanup_only && config->document.reference_count == 2u);
     CHECK(destroy_failures == 0u);
     CHECK(ftun_dns_runtime_destroy(&dns) == FTUN_OK && config->document.reference_count == 1u);
@@ -576,8 +586,7 @@ static int plan_budget(bootstrap_t *server)
 #else
   CHECK(config_make(server, "[]", direct_server, "", true, false, &config) == FTUN_OK);
 #endif
-  charge = sizeof(*first) + config->outbound_count *
-    (sizeof(*first->proxies) + sizeof(*first->proxy_valid));
+  charge = sizeof(*first);
   CHECK(ftun_budget_create(fixture.budget, charge - 1u, 0u, &child) == FTUN_OK);
   CHECK(ftun_budget_get_usage(fixture.budget, &baseline) == FTUN_OK);
   bootstrap_reset(server, "");

@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/route/rule.h"
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -105,13 +106,7 @@ static int ftun_rule_domain(const ftun_metadata_t *metadata,
   return ftun_rule_domain_valid(*out);
 }
 
-static uint32_t ftun_rule_ipv4_value(const uint8_t address[4])
-{
-  return ((uint32_t)address[0] << 24u) |
-         ((uint32_t)address[1] << 16u) |
-         ((uint32_t)address[2] << 8u) |
-         (uint32_t)address[3];
-}
+
 
 ftun_status_t ftun_rule_address_match(const ftun_rule_t *rule,
                                       const ftun_endpoint_t *address,
@@ -119,17 +114,18 @@ ftun_status_t ftun_rule_address_match(const ftun_rule_t *rule,
 {
   if (out != NULL) *out = false;
   if (rule == NULL || address == NULL || out == NULL ||
-      address->kind != FTUN_ADDRESS_IPV4 || address->domain.length != 0u) {
+      !ftun_endpoint_is_ip(address) || address->domain.length != 0u) {
     return FTUN_E_INVALID;
   }
   if (rule->kind == FTUN_RULE_IP_CIDR ||
       rule->kind == FTUN_RULE_SRC_IP_CIDR) {
-    uint32_t value = ftun_rule_ipv4_value(address->address);
-    *out = (value & rule->network_mask) == rule->network_address;
+    ftun_ip_t ip = ftun_endpoint_ip(address);
+    *out = ftun_cidr_contains(&rule->cidr, &ip);
     return FTUN_OK;
   }
   if (rule->kind == FTUN_RULE_FRS_IP) {
 #if defined(FTUN_HAVE_MODULE_FRS)
+    if (address->kind == FTUN_ADDRESS_IPV6) return FTUN_OK;
     if (rule->frs_set == NULL) return FTUN_E_STATE_CORRUPT;
     return ftun_frs_ip_contains(rule->frs_set, address->address, out);
 #else
@@ -147,7 +143,7 @@ static ftun_status_t ftun_rule_match_ip(const ftun_rule_t *rule,
   size_t index;
   bool matched;
   ftun_status_t status;
-  if (metadata->original_target.kind == FTUN_ADDRESS_IPV4 &&
+  if (ftun_endpoint_is_ip(&metadata->original_target) &&
       !metadata->original_is_fake) {
     status = ftun_rule_address_match(rule, &metadata->original_target,
                                      &matched);
@@ -191,7 +187,7 @@ ftun_status_t ftun_rule_match(const ftun_rule_t *rule,
   switch (rule->kind) {
     case FTUN_RULE_SRC_IP_CIDR:
       if ((metadata->known_fields & FTUN_META_SOURCE) == 0u ||
-          metadata->source.kind != FTUN_ADDRESS_IPV4) return FTUN_OK;
+          !ftun_endpoint_is_ip(&metadata->source)) return FTUN_OK;
       return ftun_rule_address_match(rule, &metadata->source, &out->matched);
     case FTUN_RULE_IP_CIDR:
     case FTUN_RULE_FRS_IP:
@@ -275,39 +271,9 @@ static int ftun_rule_decimal(ftun_string_t value, uint32_t maximum,
   return 1;
 }
 
-static int ftun_rule_cidr(ftun_string_t value, uint32_t *address,
-                          uint32_t *mask)
+static int ftun_rule_cidr(ftun_string_t value, ftun_cidr_t *out)
 {
-  const char *slash;
-  size_t cursor = 0u;
-  uint32_t result = 0u;
-  uint32_t prefix;
-  size_t part;
-  if (value.data == NULL || value.length == 0u) return 0;
-  slash = (const char *)memchr(value.data, '/', value.length);
-  if (slash == NULL) return 0;
-  for (part = 0u; part < 4u; part++) {
-    size_t end = cursor;
-    uint32_t octet;
-    size_t address_length = (size_t)(slash - value.data);
-    while (end < address_length && value.data[end] != '.') end++;
-    if (!ftun_rule_decimal((ftun_string_t){value.data + cursor, end - cursor},
-                           255u, &octet)) return 0;
-    result = (result << 8u) | octet;
-    if (part == 3u) {
-      if (end != address_length) return 0;
-    } else {
-      if (end == address_length) return 0;
-      cursor = end + 1u;
-    }
-  }
-  if (!ftun_rule_decimal(
-        (ftun_string_t){slash + 1u,
-                        value.length - (size_t)(slash + 1u - value.data)},
-        32u, &prefix)) return 0;
-  *mask = prefix == 0u ? 0u : UINT32_MAX << (32u - prefix);
-  *address = result & *mask;
-  return result == *address;
+  return ftun_cidr_parse(value.data, value.length, true, out);
 }
 
 static ftun_status_t ftun_rule_resolve_outbound(
@@ -434,8 +400,7 @@ ftun_status_t ftun_rule_compile_with_frs(
     if (status != FTUN_OK) goto fail;
   } else if (rule->kind == FTUN_RULE_SRC_IP_CIDR ||
       rule->kind == FTUN_RULE_IP_CIDR) {
-    if (!ftun_rule_cidr(operand, &rule->network_address,
-                        &rule->network_mask)) {
+    if (!ftun_rule_cidr(operand, &rule->cidr)) {
       status = FTUN_E_INVALID;
       goto fail;
     }

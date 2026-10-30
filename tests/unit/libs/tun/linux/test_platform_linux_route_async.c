@@ -63,11 +63,13 @@ static ftun_route_policy_t async_policy(void)
   memset(&policy, 0, sizeof(policy));
   policy.tun_interface.data = "ftun-route0";
   policy.tun_interface.length = strlen(policy.tun_interface.data);
-  policy.tun_ipv4[0] = 10u;
-  policy.tun_ipv4[1] = 77u;
-  policy.tun_ipv4[2] = 0u;
-  policy.tun_ipv4[3] = 1u;
-  policy.tun_prefix_length = 30u;
+  policy.tun_addresses[0].address.bytes[0] = 10u;
+  policy.tun_addresses[0].address.bytes[1] = 77u;
+  policy.tun_addresses[0].address.bytes[2] = 0u;
+  policy.tun_addresses[0].address.bytes[3] = 1u;
+  policy.tun_addresses[0].prefix = 30u;
+  policy.tun_addresses[0].address.family = FTUN_IP_V4;
+  policy.tun_address_count = 1u;
   policy.routing_domain = 100u;
   policy.precedence = 12340u;
   policy.bypass_tag = UINT32_C(0x46000001);
@@ -284,12 +286,12 @@ static int test_success_and_serialization(void)
   CHECK(async_drive(operation, &mock, &now_ms,
                     FTUN_ROUTE_ASYNC_READY, 1u));
   CHECK(ftun_route_async_get_info(operation, &info) == FTUN_OK &&
-        info.resource_count == FTUN_LINUX_ROUTE_MAX_RESOURCES &&
-        info.active_count == FTUN_LINUX_ROUTE_MAX_RESOURCES &&
+        info.resource_count == 7u &&
+        info.active_count == 7u &&
         info.stale_replies == 1u && info.result == FTUN_OK);
   CHECK(mock.reentrant_run_status == FTUN_E_AGAIN &&
         mock.reentrant_release_status == FTUN_E_AGAIN);
-  CHECK(async_present_count(&mock) == (int)FTUN_LINUX_ROUTE_MAX_RESOURCES);
+  CHECK(async_present_count(&mock) == 7);
   CHECK(ftun_route_async_destroy(&operation) == FTUN_E_AGAIN &&
         operation != NULL);
   CHECK(ftun_route_async_release(operation, now_ms,
@@ -298,7 +300,7 @@ static int test_success_and_serialization(void)
                                        now_ms + 1000u) == FTUN_E_AGAIN);
   CHECK(async_drive(operation, &mock, &now_ms,
                     FTUN_ROUTE_ASYNC_RELEASED, 1u));
-  for (index = 0u; index < FTUN_LINUX_ROUTE_MAX_RESOURCES; index++) {
+  for (index = 0u; index < mock.resource_count; index++) {
     CHECK(mock.remove_calls[index] == 1u && !mock.present[index]);
   }
   CHECK(ftun_route_async_release(operation, now_ms,
@@ -479,7 +481,7 @@ static int test_conflict_and_inputs(void)
   CHECK(async_drive(operation, &mock, &now_ms,
                     FTUN_ROUTE_ASYNC_READY, 8u));
   CHECK(mock.add_calls[1] == 0u && mock.present[1] &&
-        async_present_count(&mock) == (int)FTUN_LINUX_ROUTE_MAX_RESOURCES);
+        async_present_count(&mock) == 7);
   CHECK(ftun_route_async_release(operation, now_ms,
                                        now_ms + 1000u) == FTUN_OK);
   CHECK(async_drive(operation, &mock, &now_ms,
@@ -517,13 +519,13 @@ static int test_conflict_and_inputs(void)
 static int test_network_guard_and_overlay_transactions(void)
 {
   ftun_network_prefix_t protected_prefixes[2] = {
-    {{0u, 0u, 0u, 0u}, 0u},
-    {{172u, 16u, 0u, 0u}, 12u}
+    {{FTUN_IP_V4, {0u, 0u, 0u, 0u}}, 0u},
+    {{FTUN_IP_V4, {172u, 16u, 0u, 0u}}, 12u}
   };
   ftun_network_route_t routes[2] = {
-    {{{0u, 0u, 0u, 0u}, 0u},
+    {{{FTUN_IP_V4, {0u, 0u, 0u, 0u}}, 0u},
       FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_PROXY)},
-    {{{172u, 16u, 1u, 0u}, 24u},
+    {{{FTUN_IP_V4, {172u, 16u, 1u, 0u}}, 24u},
       FTUN_DIAL_PURPOSE_BIT(FTUN_DIAL_PURPOSE_BUSINESS)}
   };
   ftun_network_view_spec_t spec;
@@ -842,7 +844,9 @@ static int test_interface_async_adapter(void)
   ftun_route_async_io_t io;
   ftun_route_io_t sync_io = {sync_apply, sync_remove, &mock};
   ftun_interface_ops_t ops = ftun_interface_default_ops;
-  ftun_interface_spec_t spec = {{"ftun-route0", 11u}, {10u, 77u, 0u, 1u}, 30u, 0x4654u, 18004u, 11000u, true, NULL};
+  ftun_interface_spec_t spec = {.name = {"ftun-route0", 11u},
+    .addresses = {{{FTUN_IP_V4, {10u, 77u, 0u, 1u}}, 30u}}, .address_count = 1u,
+    .protection_mark = 0x4654u, .route_table = 18004u, .rule_priority = 11000u, .strict_route = true};
   ftun_interface_async_options_t options = {0};
   ftun_budget_t *budget = NULL;
   ftun_core_t *core = NULL;
@@ -935,7 +939,7 @@ static int test_repair_reconcile(void)
         info.active_count == info.resource_count);
   CHECK(mock.add_calls[1] == 2u && mock.add_calls[3] == 2u &&
         mock.add_calls[0] == 1u && mock.add_calls[2] == 1u);
-  CHECK(async_present_count(&mock) == (int)FTUN_LINUX_ROUTE_MAX_RESOURCES);
+  CHECK(async_present_count(&mock) == 7);
   {
     size_t previous = 0u;
     for (index = first; index < mock.request_count; index++) {
@@ -954,7 +958,7 @@ static int test_repair_reconcile(void)
   CHECK(ftun_route_async_get_info(operation, &info) == FTUN_OK &&
         info.repair_result == FTUN_E_IO && info.repair_failures == 1u &&
         info.active_count == info.resource_count && !info.repairing);
-  for (index = 0u; index < FTUN_LINUX_ROUTE_MAX_RESOURCES; index++) {
+  for (index = 0u; index < mock.resource_count; index++) {
     CHECK(mock.remove_calls[index] == 0u);
   }
   /* 条件恢复后下一次对账补回。 */
@@ -1043,7 +1047,7 @@ static int test_sweep_stale_objects(void)
   CHECK(async_drive(operation, &mock, &now_ms, FTUN_ROUTE_ASYNC_FAILED, 1u));
   CHECK(ftun_route_async_get_info(operation, &info) == FTUN_OK &&
         info.result == FTUN_E_IO && info.active_count == 0u);
-  for (index = 0u; index < FTUN_LINUX_ROUTE_MAX_RESOURCES; index++) {
+  for (index = 0u; index < mock.resource_count; index++) {
     CHECK(mock.add_calls[index] == 0u);
   }
   CHECK(ftun_route_async_destroy(&operation) == FTUN_OK);

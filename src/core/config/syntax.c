@@ -116,123 +116,67 @@ int ftun_domain_span(const char *value, size_t length)
   return 1;
 }
 
-int ftun_host_span(const char *value, size_t length, uint32_t *ipv4,
-                          int *is_ipv4)
+int ftun_host_span(const char *value, size_t length, ftun_ip_t *ip, int *is_ip)
 {
-  uint32_t address;
-  if (ftun_ipv4_span(value, length, &address)) {
-    if (ipv4 != NULL) *ipv4 = address;
-    if (is_ipv4 != NULL) *is_ipv4 = 1;
-    return 1;
-  }
-  if (!ftun_domain_span(value, length)) return 0;
-  if (is_ipv4 != NULL) *is_ipv4 = 0;
+  ftun_ip_t address;
+  bool numeric = ftun_ip_parse(value, length, &address);
+  if (!numeric && !ftun_domain_span(value, length)) return 0;
+  if (is_ip != NULL) *is_ip = numeric;
+  if (ip != NULL) *ip = numeric ? address : (ftun_ip_t){0};
   return 1;
 }
-
 int ftun_listen_address(const char *value, ftun_config_listener_t *out)
 {
-  const char *colon;
-  size_t host_length;
-  size_t port_length;
-  uint32_t address;
-  uint16_t port;
-  if (value == NULL) return 0;
-  colon = strchr(value, ':');
-  if (colon == NULL || strchr(colon + 1, ':') != NULL) return 0;
-  host_length = (size_t)(colon - value);
-  port_length = strlen(colon + 1);
-  if (!ftun_ipv4_span(value, host_length, &address) ||
-      !ftun_port_parse(colon + 1, port_length, &port)) return 0;
-  if (out != NULL) {
-    out->address = address;
-    out->port = port;
-  }
+  ftun_host_port_t parsed;
+  ftun_ip_t address;
+  if (value == NULL || !ftun_host_port_split(value, strlen(value), &parsed) ||
+      !parsed.has_port || !ftun_ip_parse(parsed.host, parsed.host_length, &address)) return 0;
+  if (out != NULL) *out = (ftun_config_listener_t){address, parsed.port};
   return 1;
 }
-
-int ftun_server_address(const char *value, int port_required,
-                               uint32_t *ipv4, int *is_ipv4)
+int ftun_server_address(const char *value, int port_required, ftun_ip_t *ip, int *is_ip)
 {
-  const char *colon;
-  size_t host_length;
-  uint16_t port;
-  if (value == NULL || value[0] == '\0') return 0;
-  colon = strchr(value, ':');
-  if (colon == NULL) {
-    if (port_required) return 0;
-    return ftun_host_span(value, strlen(value), ipv4, is_ipv4);
-  }
-  if (strchr(colon + 1, ':') != NULL) return 0;
-  host_length = (size_t)(colon - value);
-  if (!ftun_host_span(value, host_length, ipv4, is_ipv4)) return 0;
-  return ftun_port_parse(colon + 1, strlen(colon + 1), &port);
+  ftun_host_port_t parsed;
+  if (value == NULL || !ftun_host_port_split(value, strlen(value), &parsed) ||
+      (port_required && !parsed.has_port)) return 0;
+  return ftun_host_span(parsed.host, parsed.host_length, ip, is_ip);
 }
-
-int ftun_bootstrap_address(const char *value, uint32_t *out)
+int ftun_bootstrap_address(const char *value, ftun_ip_t *out)
 {
-  const char *colon;
-  uint32_t address;
-  uint16_t port;
-  if (value == NULL || value[0] == '\0') return 0;
-  colon = strchr(value, ':');
-  if (colon == NULL) {
-    if (!ftun_ipv4_span(value, strlen(value), &address)) return 0;
-    if (out != NULL) *out = address;
-    return 1;
-  }
-  if (strchr(colon + 1, ':') != NULL ||
-      !ftun_ipv4_span(value, (size_t)(colon - value), &address)) return 0;
-  if (!ftun_port_parse(colon + 1, strlen(colon + 1), &port)) return 0;
+  ftun_host_port_t parsed;
+  ftun_ip_t address;
+  if (value == NULL || !ftun_host_port_split(value, strlen(value), &parsed) ||
+      !ftun_ip_parse(parsed.host, parsed.host_length, &address)) return 0;
   if (out != NULL) *out = address;
   return 1;
 }
-
-int ftun_cidr(const char *value, int require_network,
-                     ftun_config_cidr_t *out)
+int ftun_cidr(const char *value, int require_network, ftun_config_cidr_t *out)
 {
   ftun_cidr_t cidr;
-  uint32_t network, broadcast;
-  if (value == NULL || !ftun_cidr_parse(value, strlen(value), require_network != 0, &cidr) ||
-      !ftun_cidr_ipv4_range(&cidr, &network, &broadcast)) return 0;
-  if (out != NULL) {
-    out->address = network;
-    out->mask = ftun_ipv4_mask(cidr.prefix);
-  }
+  if (value == NULL || !ftun_cidr_parse(value, strlen(value), require_network != 0, &cidr)) return 0;
+  if (out != NULL) *out = cidr;
   return 1;
 }
-
-int ftun_http_url(const char *value, uint32_t *ipv4, int *is_ipv4)
+int ftun_http_url(const char *value, ftun_ip_t *ip, int *is_ip)
 {
-  const char *authority;
-  const char *end;
-  const char *colon;
-  size_t host_length;
-  int host_is_ipv4;
-  uint32_t host_ipv4 = 0u;
-  uint16_t ignored_port;
-  const unsigned char *cursor;
+  const char *authority, *end;
+  char host[260];
+  size_t length;
   if (value == NULL) return 0;
   if (strncmp(value, "http://", 7u) == 0) authority = value + 7u;
   else if (strncmp(value, "https://", 8u) == 0) authority = value + 8u;
   else return 0;
   end = authority;
   while (*end != '\0' && *end != '/' && *end != '?' && *end != '#') end++;
-  if (end == authority || memchr(authority, '@', (size_t)(end - authority)) != NULL) return 0;
-  colon = memchr(authority, ':', (size_t)(end - authority));
-  if (colon != NULL) {
-    if (memchr(colon + 1, ':', (size_t)(end - colon - 1)) != NULL) return 0;
-    host_length = (size_t)(colon - authority);
-    if (!ftun_port_parse(colon + 1, (size_t)(end - colon - 1), &ignored_port)) return 0;
-  } else {
-    host_length = (size_t)(end - authority);
+  length = (size_t)(end - authority);
+  if (length == 0u || length >= sizeof(host) || memchr(authority, '@', length) != NULL) return 0;
+  memcpy(host, authority, length);
+  host[length] = '\0';
+  if (!ftun_server_address(host, 0, ip, is_ip)) return 0;
+  while (*end != '\0') {
+    if ((unsigned char)*end <= 0x20u || (unsigned char)*end == 0x7fu) return 0;
+    end++;
   }
-  if (!ftun_host_span(authority, host_length, &host_ipv4, &host_is_ipv4)) return 0;
-  for (cursor = (const unsigned char *)end; *cursor != 0u; cursor++) {
-    if (*cursor <= 0x20u || *cursor == 0x7fu) return 0;
-  }
-  if (ipv4 != NULL) *ipv4 = host_ipv4;
-  if (is_ipv4 != NULL) *is_ipv4 = host_is_ipv4;
   return 1;
 }
 
@@ -258,21 +202,26 @@ int ftun_ascii_token(const char *value, size_t length)
   return 1;
 }
 
-int ftun_config_cidr_has(const ftun_config_cidr_t *cidr, uint32_t address)
+int ftun_config_cidr_has(const ftun_config_cidr_t *cidr, const ftun_ip_t *address)
 {
-  return (address & cidr->mask) == cidr->address;
+  return ftun_cidr_contains(cidr, address);
 }
-
-int ftun_cidr_overlap(const ftun_config_cidr_t *left,
-                             const ftun_config_cidr_t *right)
+int ftun_cidr_overlap(const ftun_config_cidr_t *left, const ftun_config_cidr_t *right)
 {
-  uint32_t mask = left->mask < right->mask ? left->mask : right->mask;
-  return (left->address & mask) == (right->address & mask);
+  return ftun_cidr_contains(left, &right->address) || ftun_cidr_contains(right, &left->address);
 }
-
-int ftun_listener_conflict(const ftun_config_listener_t *left,
-                                  const ftun_config_listener_t *right)
+static bool unspecified(const ftun_ip_t *ip)
 {
-  return left->port == right->port &&
-         (left->address == right->address || left->address == 0u || right->address == 0u);
+  static const uint8_t zero[16] = {0};
+  return memcmp(ip->bytes, zero, ip->family == FTUN_IP_V6 ? 16u : 4u) == 0;
+}
+int ftun_listener_conflict(const ftun_config_listener_t *left, const ftun_config_listener_t *right)
+{
+  if (left->port != right->port) return 0;
+  if (left->address.family != right->address.family) {
+    return (left->address.family == FTUN_IP_V6 && unspecified(&left->address)) ||
+      (right->address.family == FTUN_IP_V6 && unspecified(&right->address));
+  }
+  return ftun_ip_equal(&left->address, &right->address) ||
+    unspecified(&left->address) || unspecified(&right->address);
 }

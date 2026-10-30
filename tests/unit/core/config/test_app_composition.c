@@ -274,7 +274,7 @@ int main(void)
   int descriptor = socket(AF_INET, SOCK_STREAM, 0);
   /* 当前公开配置只有 Proxy TUN inbound 会激活 TUN 根；纯 provider 构建
    * 不虚构新的使用入口，仍验证其默认 App 生命周期与能力拒绝。 */
-  if (!(modules & FTUN_BUILD_MODULE_PROXY)) modules &= ~FTUN_BUILD_MODULE_TUN;
+  if (!(modules & FTUN_BUILD_MODULE_PROXY)) modules &= ~(uint32_t)FTUN_BUILD_MODULE_TUN;
   CHECK(descriptor >= 0 && mkdtemp(directory) != NULL);
   memset(&address, 0, sizeof(address));
   address.sin_family = AF_INET;
@@ -287,9 +287,9 @@ int main(void)
   CHECK(snprintf(reload_path, sizeof(reload_path), "%s/reload.json", directory) > 0);
   CHECK(snprintf(changed_path, sizeof(changed_path), "%s/changed.json", directory) > 0);
   CHECK(snprintf(device_path, sizeof(device_path), "%s/device.json", directory) > 0);
-  changed = (modules & FTUN_BUILD_MODULE_TUN) ? modules & ~FTUN_BUILD_MODULE_TUN :
-    (modules & FTUN_BUILD_MODULE_DNS) ? modules & ~FTUN_BUILD_MODULE_DNS :
-    (modules & FTUN_BUILD_MODULE_PROXY) ? modules & ~FTUN_BUILD_MODULE_PROXY : FTUN_BUILD_MODULE_DNS;
+  changed = (modules & FTUN_BUILD_MODULE_TUN) ? modules & ~(uint32_t)FTUN_BUILD_MODULE_TUN :
+    (modules & FTUN_BUILD_MODULE_DNS) ? modules & ~(uint32_t)FTUN_BUILD_MODULE_DNS :
+    (modules & FTUN_BUILD_MODULE_PROXY) ? modules & ~(uint32_t)FTUN_BUILD_MODULE_PROXY : FTUN_BUILD_MODULE_DNS;
   CHECK(make_config(config_path, modules, port, 1420u) == 0);
   CHECK(make_config(reload_path, modules, port, 1420u) == 0);
   CHECK(make_config(changed_path, changed, port, 1420u) == 0);

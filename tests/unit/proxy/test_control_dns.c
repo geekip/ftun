@@ -1,7 +1,8 @@
 #define _POSIX_C_SOURCE 200809L
 #include <fcntl.h>
 #include "proxy/http_route.h"
-#include "proxy/protocol/socks5_transport.h"
+#define FTUN_TEST_PROXY 1
+#include "../../support/egress_fixture.h"
 #include "libs/transport/socket_path.h"
 #include "platform/clock.h"
 
@@ -26,7 +27,8 @@ static ftun_status_t test_path_open(void *context, ftun_core_t *core,
 {
   path_calls++;
   if (spec->configuration_generation != 7u ||
-      spec->purpose != FTUN_DIAL_PURPOSE_FRS_UPDATE ||
+      (spec->purpose != FTUN_DIAL_PURPOSE_FRS_UPDATE &&
+       spec->purpose != FTUN_DIAL_PURPOSE_PROXY) ||
       request->dial.endpoint.kind != FTUN_ADDRESS_IPV4 ||
       memcmp(request->dial.endpoint.address, "\177\0\0\1", 4u) != 0) return FTUN_E_REJECTED;
   fprintf(stderr, "path generation=7 purpose=%u transport=%u port=%u\n",
@@ -51,13 +53,14 @@ int main(int argc, char **argv)
   ftun_budget_t *budget = NULL;
   ftun_http_fetch_spec_t spec = {0};
   ftun_http_fetch_result_t result;
+  const ftun_egress_provider_t *egress = NULL;
   ftun_budget_usage_t before, after;
   char bootstrap[2048], domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
   char *entry;
   uint64_t now;
   ftun_status_t status;
   if ((argc != 8 && argc != 9) || strlen(argv[3]) >= sizeof(spec.resolver.upstream) ||
-      strlen(argv[4]) >= sizeof(spec.resolver.proxy) || strlen(argv[5]) >= sizeof(bootstrap)) return 2;
+      strlen(argv[4]) >= FTUN_CONTROL_ENDPOINT_TEXT_BYTES || strlen(argv[5]) >= sizeof(bootstrap)) return 2;
   if (ftun_budget_create(NULL, 8u * 1024u * 1024u, 128u, &budget) != FTUN_OK ||
       ftun_budget_get_usage(budget, &before) != FTUN_OK || ftun_monotonic_now(&now) != FTUN_OK) return 3;
   spec.budget = budget;
@@ -72,12 +75,12 @@ int main(int argc, char **argv)
   spec.resolver.named = strcmp(argv[2], "tcp") == 0 || strcmp(argv[2], "udp") == 0;
   spec.resolver.tcp = strcmp(argv[2], "tcp") == 0;
   memcpy(spec.resolver.upstream, argv[3], strlen(argv[3]) + 1u);
-  memcpy(spec.resolver.proxy, argv[4], strlen(argv[4]) + 1u);
-  spec.resolver.query = ftun_resolver_socks5_query_blocking;
-  spec.resolver.use_proxy = argv[4][0] != '\0';
-  if (atoi(argv[6]) != 0) {
-    memcpy(spec.resolver.proxy_username, "user", 5u);
-    memcpy(spec.resolver.proxy_password, "pass", 5u);
+  if (argv[4][0] != '\0') {
+    if (ftun_test_egress_node(budget, argv[4], atoi(argv[6]) ? "user" : "",
+        atoi(argv[6]) ? "pass" : "", argv[5], 7u, &egress) != FTUN_OK) return 7;
+    ftun_proxy_egress_set_path(egress, (ftun_path_provider_ops_t){.open = test_path_open}, NULL);
+    spec.egress = egress;
+    spec.resolver.egress_id = 2u;
   }
   memcpy(bootstrap, argv[5], strlen(argv[5]) + 1u);
   for (entry = strtok(bootstrap, ","); entry != NULL; entry = strtok(NULL, ",")) {
@@ -92,6 +95,7 @@ int main(int argc, char **argv)
     (unsigned)result.status, path_calls, system_calls, resolver_calls, result.length);
   if (result.length != 0u) (void)fwrite(result.data, 1u, result.length, stdout);
   ftun_http_fetch_release(&result);
+  ftun_egress_release(&egress);
   if (strcmp(argv[2], "system") != 0 && system_calls != 0u) return 5;
   if (ftun_budget_get_usage(budget, &after) != FTUN_OK || after.used_resources.memory_bytes != before.used_resources.memory_bytes ||
       after.metadata_bytes != before.metadata_bytes || after.used_resources.descriptors != 0u ||

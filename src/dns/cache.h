@@ -56,7 +56,8 @@ ftun_status_t ftun_dns_cache_store_failure(ftun_dns_cache_t *cache,
  * lookup 返回拥有型 answer，并按当前单调时刻重写 ID 与递减普通 RR TTL。
  */
 ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache, const ftun_dns_query_t *query, ftun_dns_answer_t **out);
-ftun_status_t ftun_dns_answer_release(ftun_dns_answer_t **answer);
+/* 消费拥有引用；外层指针有效，空拥有引用幂等。 */
+void ftun_dns_answer_release(ftun_dns_answer_t **answer);
 ftun_status_t ftun_dns_cache_get_usage(const ftun_dns_cache_t *cache,
                                        ftun_dns_cache_usage_t *out);
 ftun_status_t ftun_dns_cache_destroy(ftun_dns_cache_t **cache);

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
-#include "proxy/protocol/socks5.h"
+#define FTUN_TEST_PROXY 1
+#include "../../support/egress_fixture.h"
 #include "libs/http/http.h"
 #include "libs/tls/tls.h"
 #include "platform/clock.h"
@@ -139,6 +140,8 @@ int main(int argc, char **argv)
   ftun_budget_options_t options = {{8u * 1024u * 1024u, 16u, 4096u}, {128u, 0u, 0u}, {0}};
   ftun_http_fetch_spec_t spec = {0};
   ftun_tls_context_t *shared_context = NULL;
+  const ftun_egress_provider_t *egress = NULL;
+  char server[64];
   ftun_http_fetch_result_t result;
   ftun_budget_usage_t before, after;
   ftun_status_t status;
@@ -159,18 +162,13 @@ int main(int argc, char **argv)
   spec.purpose = FTUN_DIAL_PURPOSE_FRS_UPDATE;
   spec.if_none_match = (ftun_string_t){"\"control-test\"", 14u};
   if (atoi(argv[2]) != 0) {
-    spec.use_proxy = true;
-    spec.protocol = &ftun_socks5_protocol;
-    spec.proxy.kind = FTUN_ADDRESS_IPV4;
-    spec.proxy.port = (uint16_t)atoi(argv[2]);
-    spec.proxy.address[0] = 127u;
-    spec.proxy.address[3] = 1u;
-    if (atoi(argv[3]) != 0) {
-      spec.proxy_username = (ftun_string_t){"user", 4u};
-      spec.proxy_password = (ftun_string_t){"pass", 4u};
-    }
+    snprintf(server, sizeof(server), "127.0.0.1:%s", argv[2]);
+    CHECK(ftun_test_egress_node(budget, server, atoi(argv[3]) ? "user" : "",
+      atoi(argv[3]) ? "pass" : "", NULL, 7u, &egress) == FTUN_OK);
+    spec.egress = egress;
+    spec.egress_id = 2u;
   }
-  if (!spec.use_proxy && strncmp(argv[1], "https://", 8u) == 0) {
+  if (egress == NULL && strncmp(argv[1], "https://", 8u) == 0) {
     spec.tls_context = &shared_context;
   }
   status = ftun_http_fetch(&spec, &result);
@@ -184,6 +182,7 @@ int main(int argc, char **argv)
         !result.tls_verified || context_opens != 1u) return 8;
   }
   if (ftun_tls_context_destroy(&shared_context) != FTUN_OK) return 9;
+  ftun_egress_release(&egress);
   if (ftun_budget_get_usage(budget, &after) != FTUN_OK ||
       after.used_resources.memory_bytes != live_bytes || after.used_resources.memory_bytes != result.length +
         (result.etag == NULL ? 0u : strlen(result.etag) + 1u) ||

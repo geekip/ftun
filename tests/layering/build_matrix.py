@@ -33,6 +33,8 @@ def main():
             '-DCMAKE_EXPORT_COMPILE_COMMANDS=ON', '-DBUILD_TESTING=ON']
         run(configure + flags)
         run([args.cmake, '--build', build, '--target', 'ftun', 'ftun-build-modules-test', '--parallel', '4'])
+        if profile == 'dns-only':
+            run([args.cmake, '--build', build, '--parallel', '4'])
         run([build / 'ftun-build-modules-test'])
         manifest = dict(line.split('=', 1) for line in (build / 'ftun-build-modules.txt').read_text().splitlines())
         for module in MODULES:
@@ -41,6 +43,7 @@ def main():
         if 'PROXY' not in enabled:
             assert ' ftun_proxy_' not in symbols and ' ftun_runtime_prepare' not in symbols, profile
             assert ' wolfSSL_' not in symbols, profile
+            assert 'socks5' not in symbols.lower(), profile
         if 'TUN' not in enabled:
             assert ' ftun_packet_port_open' not in symbols and ' ftun_lwip_' not in symbols, profile
         run([sys.executable, root / 'tests/layering/include_policy.py', root,

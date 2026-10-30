@@ -1,5 +1,5 @@
 /* 在真实协议、事件源和 Operation 上注入单个系统调用的失败。 */
-#include "proxy/protocol/socks5.h"
+#include "../../support/egress_fixture.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -316,9 +316,9 @@ static int fixture_start(fixture_t *fixture)
   CHECK(port != 0u);
   fixture->config = make_config(false, false, false, port);
   CHECK(fixture->config != NULL);
-  CHECK(ftun_dns_runtime_prepare(fixture->core, fixture->budget,
+  CHECK(ftun_test_dns_prepare(fixture->core, fixture->budget,
     fixture->operations, fixture->loop, fixture->config, &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture->dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_activate(fixture->dns) == FTUN_OK);
   return 0;
@@ -479,10 +479,10 @@ static int reload_start(fixture_t *fixture, ftun_dns_runtime_t **retired)
   ftun_dns_runtime_t *prepared = NULL;
   ftun_dns_runtime_plan_t *plan = NULL;
   CHECK(ftun_dns_runtime_plan_prepare(fixture->budget, fixture->config, 0u, &plan) == FTUN_OK);
-  CHECK(ftun_dns_runtime_prepare_reload_planned(fixture->dns, fixture->core,
+  CHECK(ftun_test_dns_reload(fixture->dns, fixture->core,
     fixture->budget, fixture->operations, fixture->loop, fixture->config,
     &fixture->adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &prepared) == FTUN_OK);
   CHECK(ftun_dns_runtime_commit_reload(&fixture->dns, &prepared, retired) == FTUN_OK);
   CHECK(prepared == NULL && *retired != NULL);
@@ -769,7 +769,7 @@ static int hijack_admission_failure(void)
   return 0;
 }
 
-enum { PREPARE_ENDPOINT_ALLOC, PREPARE_VALID_ALLOC, PREPARE_RESOLVE, PREPARE_CACHE };
+enum { PREPARE_EGRESS_ALLOC, PREPARE_RUNTIME_ALLOC, PREPARE_RESOLVE, PREPARE_CACHE };
 
 static int prepare_case(bool cache, bool planned, int fault)
 {
@@ -783,40 +783,42 @@ static int prepare_case(bool cache, bool planned, int fault)
   bool proxy = false;
 #endif
   CHECK(fixture_init(&fixture) == 0);
-  fixture.config = make_config(cache, proxy, !planned && fault == PREPARE_RESOLVE, 0u);
+  fixture.config = make_config(cache, proxy, fault == PREPARE_RESOLVE, 0u);
   CHECK(fixture.config != NULL);
   if (planned) {
     CHECK(ftun_dns_runtime_plan_prepare(fixture.budget, fixture.config, 0u, &plan) == FTUN_OK);
-    /* 不完整的预解析结果同样不得被 cache 成功掩盖。 */
-    if (fault == PREPARE_RESOLVE) plan->proxy_valid[0] = 0u;
   }
   cache_calls = 0u;
   blocked_sockets = 0u;
-  if (fault == PREPARE_ENDPOINT_ALLOC || fault == PREPARE_VALID_ALLOC) {
-    fail_calloc_size = fault == PREPARE_ENDPOINT_ALLOC ? sizeof(ftun_endpoint_t) : 1u;
+  #if defined(FTUN_TEST_PROXY)
+  if (fault == PREPARE_EGRESS_ALLOC || fault == PREPARE_RUNTIME_ALLOC) {
+    fail_calloc_size = fault == PREPARE_EGRESS_ALLOC ? ftun_test_egress_bytes(fixture.config) : sizeof(ftun_dns_runtime_t);
     calloc_failures = 1u;
   } else if (fault == PREPARE_RESOLVE) {
-    block_socket = !planned;
-    expected = planned ? FTUN_E_RESOLVE : FTUN_E_IO;
-  } else {
+    block_socket = true;
+    expected = FTUN_E_REJECTED;
+  } else
+  #endif
+  {
     fail_cache = true;
     if (!cache) expected = FTUN_OK;
   }
-  status = planned ? ftun_dns_runtime_prepare_reload_planned(NULL,
+  status = planned ? ftun_test_dns_reload(NULL,
     fixture.core, fixture.budget, fixture.operations, fixture.loop,
     fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 2u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 2u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, plan, &fixture.dns) :
-    ftun_dns_runtime_prepare(fixture.core, fixture.budget, fixture.operations,
+    ftun_test_dns_prepare(fixture.core, fixture.budget, fixture.operations,
       fixture.loop, fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture.dns);
   block_socket = false;
   fail_cache = false;
+  if (status != expected) fprintf(stderr, "prepare fault=%d planned=%u: status=%s expected=%s\n", fault, planned, ftun_status_name(status), ftun_status_name(expected));
   CHECK(status == expected);
   CHECK(calloc_failures == 0u);
   CHECK(cache_calls == (fault == PREPARE_CACHE && cache ? 1u : 0u));
-  CHECK(blocked_sockets == (!planned && fault == PREPARE_RESOLVE ? 1u : 0u));
+  CHECK(blocked_sockets == (fault == PREPARE_RESOLVE ? 1u : 0u));
   if (expected != FTUN_OK) CHECK(fixture.dns == NULL);
   else CHECK(fixture.dns != NULL && fixture.dns->cache == NULL);
   CHECK(ftun_dns_runtime_plan_destroy(&plan) == FTUN_OK);
@@ -829,7 +831,7 @@ static int prepare_case(bool cache, bool planned, int fault)
 static int plan_resolution_failure(bool cache)
 {
   ftun_config_t *config = make_config(cache, true, true, 0u);
-  ftun_dns_runtime_plan_t *plan = NULL;
+  const ftun_egress_provider_t *plan = NULL;
   ftun_status_t status;
   ftun_budget_t *budget = NULL;
   size_t before = fd_count();
@@ -838,9 +840,9 @@ static int plan_resolution_failure(bool cache)
   block_socket = true;
   blocked_sockets = 0u;
   cache_calls = 0u;
-  status = ftun_dns_runtime_plan_prepare(budget, config, 0u, &plan);
+  status = ftun_test_egress(budget, config, 1u, NULL, NULL, &plan);
   block_socket = false;
-  CHECK(status == FTUN_E_IO && plan == NULL);
+  CHECK(status == FTUN_E_REJECTED && plan == NULL);
   CHECK(blocked_sockets == 1u && cache_calls == 0u);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(fd_count() == before);
@@ -874,13 +876,14 @@ static int bootstrap_budget(void)
   ftun_reservation_t hold = (ftun_reservation_t){0};
   ftun_budget_usage_t usage;
   ftun_config_t config = {0};
+  ftun_status_t status;
   ftun_config_bind_sections(&config);
   ftun_endpoint_t endpoint;
   char *bootstrap[] = {"127.0.0.1:9"};
-  options.limit = (ftun_budget_resources_t){65536u, 1u, 1u};
+  options.limit = (ftun_budget_resources_t){1024u * 1024u, 6u, 1024u};
   CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
   CHECK(ftun_budget_reserve_resources(budget,
-    (ftun_budget_resources_t){0u, 1u, 0u}, &hold) == FTUN_OK);
+    (ftun_budget_resources_t){0u, 6u, 0u}, &hold) == FTUN_OK);
   CHECK(ftun_dns_runtime_bootstrap_endpoint(budget, &config, &endpoint) == FTUN_E_LIMIT);
   config.dns.bootstrap.items = bootstrap;
   config.dns.bootstrap.count = 1u;
@@ -889,8 +892,9 @@ static int bootstrap_budget(void)
   CHECK(ftun_dns_runtime_resolve_upstream(budget, &config, "example.com:53", 0u,
     &endpoint) == FTUN_E_LIMIT && blocked_sockets == 0u);
   ftun_reservation_release(&hold);
-  CHECK(ftun_dns_runtime_resolve_upstream(budget, &config, "example.com:53", 0u,
-    &endpoint) != FTUN_OK && blocked_sockets == 1u);
+  status = ftun_dns_runtime_resolve_upstream(budget, &config, "example.com:53", 0u, &endpoint);
+  if (status == FTUN_OK || blocked_sockets != 1u) fprintf(stderr, "bootstrap fault: status=%d sockets=%zu\n", status, blocked_sockets);
+  CHECK(status != FTUN_OK && blocked_sockets == 1u);
   block_socket = false;
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK &&
     usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u);
@@ -956,9 +960,9 @@ static int listener_startup_waiting(void)
   fixture.config = make_config(false, false, false, reserve_port());
   config_listen_host = "127.0.0.1";
   CHECK(fixture.config != NULL);
-  CHECK(ftun_dns_runtime_prepare(fixture.core, fixture.budget,
+  CHECK(ftun_test_dns_prepare(fixture.core, fixture.budget,
     fixture.operations, fixture.loop, fixture.config, &fixture.adapter,
-    &(ftun_dns_runtime_network_t){.protocol = &ftun_socks5_protocol, .generation = 1u, .socket_mark = 0u,
+    &(ftun_dns_runtime_network_t){.generation = 1u, .socket_mark = 0u,
       .path = {.open = ftun_socket_path_open}}, &fixture.dns) == FTUN_OK);
   CHECK(ftun_dns_runtime_activate(fixture.dns) == FTUN_OK);
   slot = &fixture.dns->listeners[0];
@@ -1004,7 +1008,7 @@ int main(void)
   for (cache = 0u; cache < 2u; cache++) {
     for (planned = 0u; planned < 2u; planned++) {
 #if defined(FTUN_TEST_PROXY)
-      for (fault = PREPARE_ENDPOINT_ALLOC; fault <= PREPARE_CACHE; fault++) {
+      for (fault = PREPARE_EGRESS_ALLOC; fault <= PREPARE_CACHE; fault++) {
         CHECK(prepare_case(cache != 0u, planned != 0u, fault) == 0);
       }
 #else

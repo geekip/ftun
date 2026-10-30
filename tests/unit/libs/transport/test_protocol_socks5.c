@@ -353,7 +353,7 @@ static int test_request_failures(void)
   size_t consumed = 99u;
   size_t written = 99u;
   memset(&ipv6, 0, sizeof(ipv6));
-  ipv6.kind = FTUN_ADDRESS_IPV6_RESERVED;
+  ipv6.kind = FTUN_ADDRESS_IPV6;
 
   frame[0] = 0x04u;
   CHECK(ftun_socks5_decode_request(bytes(frame, 10u), &request,
@@ -382,9 +382,12 @@ static int test_request_failures(void)
         &consumed) == FTUN_E_PROTOCOL);
   frame[3] = 0x04u;
   CHECK(ftun_socks5_decode_request(bytes(frame, 4u), &request,
-        &consumed) == FTUN_E_UNSUPPORTED);
+        &consumed) == FTUN_E_AGAIN);
   CHECK(ftun_socks5_encode_request(FTUN_SOCKS5_COMMAND_CONNECT, &ipv6,
-        output, sizeof(output), &written) == FTUN_E_UNSUPPORTED);
+        output, sizeof(output), &written) == FTUN_OK && written == 22u);
+  CHECK(ftun_socks5_decode_request(bytes(output, written), &request,
+        &consumed) == FTUN_OK && consumed == 22u &&
+        request.endpoint.kind == FTUN_ADDRESS_IPV6);
   CHECK(ftun_socks5_encode_request(FTUN_SOCKS5_COMMAND_CONNECT, &bad_domain,
         output, sizeof(output), &written) == FTUN_E_INVALID);
 
@@ -413,7 +416,7 @@ static int test_request_failures(void)
     CHECK(ftun_socks5_decode_reply(bytes(ipv6_reply, sizeof(ipv6_reply)),
           &reply, &consumed) == FTUN_OK);
     CHECK(consumed == 22u && reply.reply == 0u &&
-          reply.endpoint.kind == FTUN_ADDRESS_IPV6_RESERVED &&
+          reply.endpoint.kind == FTUN_ADDRESS_IPV6 &&
           reply.endpoint.address[0] == 0x20u &&
           reply.endpoint.address[15] == 0x01u &&
           reply.endpoint.port == 8080u);
@@ -424,7 +427,7 @@ static int test_request_failures(void)
   /* 请求目标中的 IPv6 仍未开放，入站据此回复 ADDRESS_UNSUPPORTED。 */
   frame[1] = 0x01u;
   CHECK(ftun_socks5_decode_request(bytes(frame, 4u), &request,
-        &consumed) == FTUN_E_UNSUPPORTED);
+        &consumed) == FTUN_E_AGAIN);
 
   memset(output, 0xa5, sizeof(output));
   written = 99u;
@@ -484,8 +487,19 @@ static int test_udp_datagrams(void)
   CHECK(consumed == 0u && datagram.payload.data == NULL);
   output[2] = 0u;
   output[3] = 0x04u;
+  CHECK(ftun_socks5_decode_udp_datagram(bytes(output, 4u), &datagram,
+        &consumed) == FTUN_E_AGAIN);
+  endpoint = (ftun_endpoint_t){0};
+  endpoint.kind = FTUN_ADDRESS_IPV6;
+  endpoint.address[15] = 1u;
+  endpoint.port = 53u;
+  CHECK(ftun_socks5_encode_udp_datagram(&endpoint, bytes(payload, sizeof(payload)),
+        output, sizeof(output), &written) == FTUN_OK);
   CHECK(ftun_socks5_decode_udp_datagram(bytes(output, written), &datagram,
-        &consumed) == FTUN_E_UNSUPPORTED);
+        &consumed) == FTUN_OK && consumed == written &&
+        datagram.endpoint.kind == FTUN_ADDRESS_IPV6 &&
+        datagram.endpoint.address[15] == 1u &&
+        datagram.payload.length == sizeof(payload));
 
   memset(output, 0xa5, sizeof(output));
   written = 99u;

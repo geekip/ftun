@@ -1,4 +1,6 @@
 #include "libs/resolver/resolver.h"
+#include "libs/resolver/dual.h"
+#include "util/endpoint.h"
 #include "platform/clock.h"
 
 #include <assert.h>
@@ -58,7 +60,7 @@ static int ftun_resolver_provider_request_valid(
   if (request == NULL || request->source < FTUN_RESOLVER_SYSTEM ||
       request->source > FTUN_RESOLVER_NAMED ||
       request->server_count > FTUN_RESOLVER_MAX_SERVERS) return 0;
-  if (request->source != FTUN_RESOLVER_SYSTEM &&
+  if ((request->source != FTUN_RESOLVER_SYSTEM || request->system.ipv6) &&
       (request->loop == NULL || request->operations == NULL)) return 0;
   if (request->source == FTUN_RESOLVER_NAMED) {
     if (request->resolver_name.data == NULL || request->resolver_name.length == 0u ||
@@ -68,7 +70,7 @@ static int ftun_resolver_provider_request_valid(
   if (request->source != FTUN_RESOLVER_BOOTSTRAP && request->server_count != 0u) return 0;
   if (request->server_count != 0u && request->servers == NULL) return 0;
   for (index = 0u; index < request->server_count; index++) {
-    if (request->servers[index].kind != FTUN_ADDRESS_IPV4 ||
+    if (!ftun_endpoint_is_ip(&request->servers[index]) ||
         request->servers[index].port == 0u) return 0;
   }
   if (request->network_view == NULL && request->network_generation != 0u) return 0;
@@ -140,11 +142,11 @@ static void ftun_resolver_pending_completed(ftun_operation_t *operation,
     if (result == NULL || result->domain.data == NULL || result->domain.length == 0u ||
         result->domain.length > FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
         result->addresses == NULL || result->address_count == 0u ||
-        result->address_count > FTUN_SYSTEM_RESOLVER_MAX_IPV4_RESULTS) {
+        result->address_count > FTUN_SYSTEM_RESOLVER_MAX_RESULTS) {
       error.status = FTUN_E_STATE_CORRUPT;
     } else {
       for (index = 0u; index < result->address_count; index++) {
-        if (result->addresses[index].kind != FTUN_ADDRESS_IPV4) {
+        if (!ftun_endpoint_is_ip(&result->addresses[index])) {
           error.status = FTUN_E_UNSUPPORTED;
           break;
         }
@@ -198,7 +200,15 @@ static ftun_status_t ftun_resolver_provider_start_internal(
   delegated = *request;
   delegated.system.completion = ftun_resolver_pending_completed;
   delegated.system.user = pending;
-  status = provider->ops.start(provider->context, core, &delegated, &pending->operation);
+  ftun_ip_t numeric;
+  bool literal = ftun_ip_parse(delegated.system.domain.data, delegated.system.domain.length, &numeric);
+  if (literal) {
+    delegated.system.ipv6 = false;
+    delegated.system.query_type = numeric.family == FTUN_IP_V6 ? 28u : 1u;
+  }
+  status = delegated.system.ipv6
+    ? ftun_resolver_dual_start(&provider->ops, provider->context, core, &delegated, &pending->operation)
+    : provider->ops.start(provider->context, core, &delegated, &pending->operation);
   if (status != FTUN_OK || pending->operation == NULL) {
     if (pending->operation != NULL) {
       /* 错误接纳仍有后台引用时保留状态，禁止回调未接纳的调用方。 */

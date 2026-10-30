@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "proxy/outbound/direct.h"
 
 #include "platform/socket.h"
@@ -54,12 +55,9 @@ static int ftun_direct_domain_valid(ftun_string_t domain)
          memchr(domain.data, '\0', domain.length) == NULL;
 }
 
-static int ftun_direct_endpoint_equal(const ftun_endpoint_t *left,
-                                      const ftun_endpoint_t *right)
+static int ftun_direct_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
 {
-  return left->kind == FTUN_ADDRESS_IPV4 &&
-         right->kind == FTUN_ADDRESS_IPV4 && left->port == right->port &&
-         memcmp(left->address, right->address, 4u) == 0;
+  return ftun_endpoint_equal(left, right);
 }
 
 static int ftun_direct_contains(const ftun_endpoint_t *items, size_t count,
@@ -80,19 +78,19 @@ static ftun_status_t ftun_direct_target_validate(const ftun_target_t *target)
       (target->candidate_count != 0u && target->candidates == NULL) ||
       (target->allowed_count != 0u && target->allowed == NULL) ||
       target->allowed_count > target->candidate_count) return FTUN_E_INVALID;
-  if (target->original.kind != FTUN_ADDRESS_IPV4 &&
+  if (!ftun_endpoint_is_ip(&target->original) &&
       target->original.kind != FTUN_ADDRESS_DOMAIN) return FTUN_E_INVALID;
   if (target->original.kind == FTUN_ADDRESS_DOMAIN &&
       !ftun_direct_domain_valid(target->original.domain)) return FTUN_E_INVALID;
   for (index = 0u; index < target->candidate_count; index++) {
     const ftun_endpoint_t *endpoint = &target->candidates[index];
-    if (endpoint->kind != FTUN_ADDRESS_IPV4 || endpoint->port == 0u ||
+    if (!ftun_endpoint_is_ip(endpoint) || endpoint->port == 0u ||
         endpoint->port != target->original.port ||
         endpoint->domain.length != 0u) return FTUN_E_INVALID;
   }
   for (index = 0u; index < target->allowed_count; index++) {
     const ftun_endpoint_t *endpoint = &target->allowed[index];
-    if (endpoint->kind != FTUN_ADDRESS_IPV4 || endpoint->port == 0u ||
+    if (!ftun_endpoint_is_ip(endpoint) || endpoint->port == 0u ||
         endpoint->domain.length != 0u) return FTUN_E_INVALID;
     if (!ftun_direct_contains(target->candidates, target->candidate_count,
                               endpoint)) return FTUN_E_REJECTED;

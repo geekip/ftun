@@ -235,7 +235,7 @@ static ftun_status_t ftun_cache_ttls(ftun_budget_t *budget, ftun_bytes_t wire, s
 protocol:
   status = status == FTUN_OK ? FTUN_E_PROTOCOL : status;
 done:
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return status;
 }
 
@@ -515,7 +515,7 @@ ftun_status_t ftun_dns_cache_store(ftun_dns_cache_t *cache,
   if (status != FTUN_OK) return status;
   status = ftun_dns_message_matches(message, query, query->transport,
                                     &query->upstream, &matches);
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   if (status != FTUN_OK || !matches) return status == FTUN_OK ?
     FTUN_E_PROTOCOL : status;
   status = ftun_cache_ttls(cache->budget, wire, offsets, ttls, FTUN_DNS_MAX_RECORDS,
@@ -606,7 +606,7 @@ ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache,
     uint32_t ttl = elapsed_seconds >= entry->ttls[index] ? 0u :
       entry->ttls[index] - (uint32_t)elapsed_seconds;
     if (entry->ttl_offsets[index] + 4u > answer->wire_length) {
-      (void)ftun_dns_answer_release(&answer);
+      ftun_dns_answer_release(&answer);
       return FTUN_E_STATE_CORRUPT;
     }
     ftun_cache_put_u32(answer->wire + entry->ttl_offsets[index], ttl);
@@ -615,18 +615,16 @@ ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_dns_answer_release(ftun_dns_answer_t **answer)
+void ftun_dns_answer_release(ftun_dns_answer_t **answer)
 {
   ftun_dns_answer_t *owned;
   ftun_reservation_t reservation;
-  if (answer == NULL) return FTUN_E_INVALID;
   owned = *answer;
-  if (owned == NULL) return FTUN_OK;
+  if (owned == NULL) return;
   reservation = owned->reservation;
   free(owned->owned_block);
   *answer = NULL;
   ftun_reservation_release(&reservation);
-  return FTUN_OK;
 }
 
 ftun_status_t ftun_dns_cache_get_usage(const ftun_dns_cache_t *cache,

@@ -5,25 +5,15 @@
 #if defined(FTUN_HAVE_MODULE_DNS)
 
 ftun_status_t ftun_dns_runtime_outbound_id(
-  const ftun_config_t *config, const char *name, uint32_t *out)
+  ftun_dns_runtime_t *dns, const char *name, uint32_t required, uint32_t *out)
 {
-  size_t index;
-  if (config == NULL || name == NULL || out == NULL) return FTUN_E_INVALID;
-  if (strcmp(name, "DIRECT") == 0) {
-    *out = FTUN_DNS_OUTBOUND_DIRECT;
-    return FTUN_OK;
-  }
-  if (strcmp(name, "REJECT") == 0) {
-    *out = FTUN_DNS_OUTBOUND_REJECT;
-    return FTUN_OK;
-  }
-  for (index = 0u; index < ftun_config_channel_count(config); index++) {
-    if (strcmp(ftun_config_channel(config, index).name, name) == 0) {
-      *out = (uint32_t)index + FTUN_DNS_OUTBOUND_NAMED_BASE;
-      return FTUN_OK;
-    }
-  }
-  return FTUN_E_INVALID;
+  ftun_egress_info_t info;
+  ftun_status_t status = dns->egress->resolve(dns->egress->context, dns->config,
+    (ftun_string_t){name, strlen(name)}, &info);
+  if (status == FTUN_OK && info.state != FTUN_EGRESS_STATE_UNAVAILABLE &&
+      (info.capabilities & required) != required) status = FTUN_E_UNSUPPORTED;
+  if (status == FTUN_OK) *out = info.id;
+  return status;
 }
 
 ftun_status_t ftun_dns_runtime_named_index(ftun_string_t name,
@@ -42,20 +32,14 @@ ftun_status_t ftun_dns_runtime_named_index(ftun_string_t name,
   return FTUN_E_INVALID;
 }
 
-ftun_status_t ftun_dns_runtime_select(uint32_t outbound_id,
-                                             size_t *out, void *user)
+ftun_status_t ftun_dns_runtime_select(uint32_t outbound_id, size_t *out, void *user)
 {
-  ftun_dns_runtime_t *dns = (ftun_dns_runtime_t *)user;
-  if (outbound_id >= FTUN_DNS_OUTBOUND_NAMED_BASE) {
-    size_t index = outbound_id - FTUN_DNS_OUTBOUND_NAMED_BASE;
-    if (index < ftun_config_channel_count(dns->config)) {
-      const char *name = ftun_config_channel(dns->config, index).dns_server;
-      if (name != NULL && name[0] != '\0') {
-        return ftun_dns_runtime_named_index(
-          (ftun_string_t){name, strlen(name)}, out, user);
-      }
-    }
-  }
+  ftun_dns_runtime_t *dns = user;
+  ftun_egress_info_t info;
+  ftun_status_t status = dns->egress->query(dns->egress->context, outbound_id,
+    dns->generation, &info);
+  if (status != FTUN_OK) return status;
+  if (info.resolver.length != 0u) return ftun_dns_runtime_named_index(info.resolver, out, user);
   *out = dns->default_server;
   return FTUN_OK;
 }
@@ -349,11 +333,9 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
       network->path.open == NULL) return FTUN_E_INVALID;
   socket_mark = network->socket_mark;
   if (plan != NULL && (plan->config != config || plan->server_count !=
-      (ftun_config_dns(config)->server_count == 0u ? 1u : ftun_config_dns(config)->server_count) ||
-      plan->outbound_count != ftun_config_channel_count(config))) return FTUN_E_STALE;
+      (ftun_config_dns(config)->server_count == 0u ? 1u : ftun_config_dns(config)->server_count))) return FTUN_E_STALE;
   if (ftun_config_dns(config)->server_count > FTUN_DNS_RUNTIME_MAX_SERVERS ||
-      ftun_config_dns(config)->listener_count > FTUN_DNS_RUNTIME_MAX_LISTENERS ||
-      ftun_config_channel_count(config) > UINT32_MAX - FTUN_DNS_OUTBOUND_NAMED_BASE) {
+      ftun_config_dns(config)->listener_count > FTUN_DNS_RUNTIME_MAX_LISTENERS) {
     return FTUN_E_LIMIT;
   }
   /* UDP/TCP socket 与对应事件源在重载 prepare 期间和旧代并存。每个 DNS
@@ -392,11 +374,16 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
   dns->socket_mark = socket_mark;
   dns->liveness = ftun_dns_config_binding(config).liveness;
   dns->generation = network->generation;
-  dns->protocol = network->protocol;
+  dns->egress = network->egress == NULL ? ftun_egress_direct_provider() : network->egress;
+  ftun_egress_retain(dns->egress);
   path_spec.budget = budget;
   path_spec.generation = network->generation;
   path_spec.ops = network->path;
   path_spec.context = network->context;
+  if (network->egress != NULL) {
+    path_spec.ops.open = ftun_egress_path_open;
+    path_spec.context = (void *)dns->egress;
+  }
   path_spec.max_pending = FTUN_DNS_RUNTIME_MAX_PENDING;
   path_spec.max_paths = FTUN_DNS_RUNTIME_MAX_PENDING * 2u;
   status = ftun_path_provider_create(&path_spec, &dns->paths);
@@ -404,36 +391,6 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
   status = ftun_config_retain((ftun_config_t *)config);
   if (status != FTUN_OK) goto fail;
   dns->config = (ftun_config_t *)config;
-  if (ftun_config_channel_count(config) != 0u) {
-    dns->proxy_endpoints = (ftun_endpoint_t *)calloc(ftun_config_channel_count(config),
-      sizeof(*dns->proxy_endpoints));
-    dns->proxy_endpoint_valid = (uint8_t *)calloc(ftun_config_channel_count(config),
-      sizeof(*dns->proxy_endpoint_valid));
-    if (dns->proxy_endpoints == NULL || dns->proxy_endpoint_valid == NULL) {
-      status = FTUN_E_LIMIT;
-    }
-  }
-  if (status == FTUN_OK) {
-    status = ftun_dns_runtime_proxy_dependencies(config,
-      dns->proxy_endpoint_valid);
-  }
-  for (index = 0u; status == FTUN_OK && index < ftun_config_channel_count(config);
-       index++) {
-    ftun_channel_config_t item_view = ftun_config_channel(config, index);
-    const ftun_channel_config_t *item = &item_view;
-    if (dns->proxy_endpoint_valid[index] == 0u) continue;
-    if (plan != NULL) {
-      if (plan->proxy_valid[index] == 0u) status = FTUN_E_RESOLVE;
-      else {
-        dns->proxy_endpoints[index] = plan->proxies[index];
-        dns->proxy_endpoint_valid[index] = 1u;
-      }
-    } else {
-      status = ftun_dns_runtime_resolve_upstream(budget, config, item->server,
-        socket_mark, &dns->proxy_endpoints[index]);
-      if (status == FTUN_OK) dns->proxy_endpoint_valid[index] = 1u;
-    }
-  }
   memset(&transport, 0, sizeof(transport));
   transport.select = ftun_dns_runtime_transport_select;
   transport.submit = ftun_dns_runtime_transport_submit;
@@ -479,8 +436,9 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
       if (status != FTUN_OK) break;
       server.upstream_set = dns->upstream_sets[index];
     }
-    status = ftun_dns_runtime_outbound_id(config, item->outbound,
-                                         &outbound_id);
+    status = ftun_dns_runtime_outbound_id(dns, item->outbound,
+      FTUN_EGRESS_CAP_STREAM | (strcmp(item->type, "udp") == 0 ? FTUN_EGRESS_CAP_DATAGRAM : 0u),
+      &outbound_id);
     if (status != FTUN_OK) break;
     server.outbound_id = outbound_id;
     server.fingerprint = (uint64_t)index + 1u;
@@ -1714,8 +1672,7 @@ ftun_status_t ftun_dns_runtime_destroy(ftun_dns_runtime_t **dns_ptr)
   if (status != FTUN_OK) return status;
   if (ftun_config_destroy(&dns->config) != FTUN_OK) return FTUN_E_AGAIN;
   ftun_reservation_release(&dns->listener_reservation);
-  free(dns->proxy_endpoints);
-  free(dns->proxy_endpoint_valid);
+  ftun_egress_release(&dns->egress);
   memset(dns, 0, sizeof(*dns));
   free(dns);
   *dns_ptr = NULL;

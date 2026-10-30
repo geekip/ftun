@@ -114,8 +114,9 @@ static int exercise_wire_parsers(const uint8_t *data, size_t length)
     (ftun_bytes_t){data, length}, &message);
   if (!status_is_parser_result(status)) return 0;
   if (status == FTUN_OK) {
-    if (message == NULL || ftun_dns_message_release(&message) != FTUN_OK ||
-        message != NULL) return 0;
+    if (message == NULL) return 0;
+    ftun_dns_message_release(&message);
+    if (message != NULL) return 0;
   } else if (message != NULL) {
     return 0;
   }

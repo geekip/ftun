@@ -12,6 +12,7 @@ ftun_status_t ftun_dns_message_parse(ftun_bytes_t wire,
 /* 生产解析按实际拥有字节准入，release 同时归还额度。 */
 ftun_status_t ftun_dns_message_parse_with_budget(ftun_budget_t *budget,
   ftun_bytes_t wire, ftun_dns_message_t **out);
-ftun_status_t ftun_dns_message_release(ftun_dns_message_t **message);
+/* 消费拥有引用；外层指针有效，空拥有引用幂等。 */
+void ftun_dns_message_release(ftun_dns_message_t **message);
 
 #endif

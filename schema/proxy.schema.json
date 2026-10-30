@@ -313,6 +313,9 @@
           "minimum": 1,
           "maximum": 32000,
           "default": 11000
+        },
+        "ipv6": {
+          "$ref": "#/$defs/TunIPv6"
         }
       },
       "additionalProperties": false,
@@ -339,6 +342,20 @@
             "properties": {
               "auto-route": {
                 "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "ipv6"
+            ]
+          },
+          "then": {
+            "properties": {
+              "mtu": {
+                "minimum": 1280
               }
             }
           }
@@ -588,20 +605,22 @@
     },
     "SourceIPRule": {
       "type": "string",
-      "pattern": "^(?:[Ss][Rr][Cc]-[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:(?:[Ss][Rr][Cc]-[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])|[Ss][Rr][Cc]-[Ii][Pp]-[Cc][Ii][Dd][Rr],(?=[0-9A-Fa-f:.]*:)[0-9A-Fa-f:.]{2,45}/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "SourceIPRule",
-      "description": "匹配实际客户端源 IPv4。",
+      "description": "匹配实际客户端源 IPv4/IPv6。",
       "examples": [
-        "SRC-IP-CIDR,192.168.1.0/24,DIRECT"
+        "SRC-IP-CIDR,192.168.1.0/24,DIRECT",
+        "SRC-IP-CIDR,2001:db8::/32,DIRECT"
       ]
     },
     "IPRule": {
       "type": "string",
-      "pattern": "^(?:[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
+      "pattern": "^(?:(?:[Ii][Pp]-[Cc][Ii][Dd][Rr],(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])(?:\\.(?:0|[1-9][0-9]?|1[0-9]{2}|2[0-4][0-9]|25[0-5])){3}/(?:[0-9]|[12][0-9]|3[0-2]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])|[Ii][Pp]-[Cc][Ii][Dd][Rr],(?=[0-9A-Fa-f:.]*:)[0-9A-Fa-f:.]{2,45}/(?:[0-9]|[1-9][0-9]|1[01][0-9]|12[0-8]),[^,\\u0000-\\u001f\\u007f]+)(?![\\s\\S])",
       "title": "IPRule",
       "description": "匹配真实目的地址；缺 IP 时按当前规则等待真实解析。",
       "examples": [
-        "IP-CIDR,10.0.0.0/8,DIRECT"
+        "IP-CIDR,10.0.0.0/8,DIRECT",
+        "IP-CIDR,2001:db8::/32,DIRECT"
       ]
     },
     "DomainRule": {
@@ -711,6 +730,20 @@
         }
       ],
       "description": "First Match Wins。保留配置顺序，解析失败终止；IP 命中后只拨命中子集。无正则、no-resolve 或 INBOUND matcher。"
+    },
+    "TunIPv6": {
+      "title": "TUN IPv6",
+      "type": "object",
+      "properties": {
+        "address": {
+          "$ref": "#/$defs/IPv6CIDR",
+          "description": "可选设备 IPv6 地址及前缀；配置后安装 IPv6 路由，MTU 至少 1280。"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "address"
+      ]
     }
   }
 }

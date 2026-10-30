@@ -52,6 +52,27 @@ ftun_status_t ftun_proxy_runtime_event_source_capacity(
   return FTUN_OK;
 }
 
+static ftun_status_t ftun_proxy_runtime_egress_prepare(ftun_proxy_runtime_t *engine,
+  const ftun_config_t *config, uint64_t generation, const ftun_egress_provider_t **out)
+{
+  const ftun_egress_provider_t *provider = engine->egress_slot == NULL ? NULL : *engine->egress_slot;
+  ftun_egress_info_t info;
+  ftun_status_t status;
+  /* 独立宿主和FRS内部代次没有宿主预计划，复制它们自己的不可变快照。 */
+  if (provider != NULL && provider->query(provider->context, FTUN_EGRESS_DIRECT,
+      generation, &info) == FTUN_OK) {
+    *out = ftun_proxy_egress_worker(provider);
+    ftun_egress_retain(*out);
+    return FTUN_OK;
+  }
+  status = ftun_proxy_egress_prepare(engine->budget, config, engine->socket_mark, &provider);
+  if (status == FTUN_OK) {
+    ftun_proxy_egress_bind(provider, generation, NULL, NULL);
+    *out = ftun_proxy_egress_worker(provider);
+  }
+  return status;
+}
+
 ftun_status_t ftun_proxy_runtime_prepare(ftun_core_t *core, ftun_budget_t *budget,
                                   ftun_operation_queue_t *operations,
                                   const ftun_proxy_bindings_t *bindings,
@@ -145,6 +166,7 @@ ftun_status_t ftun_proxy_runtime_prepare(ftun_core_t *core, ftun_budget_t *budge
   engine->l3_provider = bindings->l3;
   engine->loop = bindings->loop;
   engine->control_path = bindings->control_path;
+  engine->egress_slot = bindings->egress_slot;
   engine->dns_adapter = bindings->dns;
   engine->fakeip_slot = bindings->fakeip_slot;
   engine->flow_capacity = flow_capacity;
@@ -227,6 +249,7 @@ ftun_status_t ftun_proxy_runtime_prepare(ftun_core_t *core, ftun_budget_t *budge
     &engine->health_groups, &engine->health_group_count,
     &engine->health_slots, &engine->health_slot_count,
     &engine->health_reservation);
+  if (status == FTUN_OK) status = ftun_proxy_runtime_egress_prepare(engine, config, generation, &engine->egress);
   if (status == FTUN_OK) {
     status = ftun_worker_create(budget, 64u, &engine->worker);
   }
@@ -473,7 +496,8 @@ ftun_status_t ftun_proxy_runtime_reload_prepare_owned(
     return FTUN_E_INVALID;
   }
 #endif
-  status = ftun_resolver_provider_reload_prepare(engine->resolver_provider,
+  status = ftun_proxy_runtime_egress_prepare(engine, config, generation, &engine->pending_egress);
+  if (status == FTUN_OK) status = ftun_resolver_provider_reload_prepare(engine->resolver_provider,
                                                   generation);
   if (status == FTUN_OK) {
     status = ftun_path_provider_reload_prepare(engine->path_provider,
@@ -581,6 +605,9 @@ ftun_status_t ftun_proxy_runtime_reload_commit_owned(
   engine->tcp_idle_ms = engine->pending_timeouts.tcp_idle_ms;
   engine->write_progress_ms = engine->pending_timeouts.write_progress_ms;
   engine->generation = generation;
+  ftun_egress_release(&engine->egress);
+  engine->egress = engine->pending_egress;
+  engine->pending_egress = NULL;
   engine->reload_prepared = false;
   engine->reload_pending = false;
   engine->reload_owner = FTUN_PROXY_RELOAD_OWNER_NONE;
@@ -633,6 +660,7 @@ ftun_status_t ftun_proxy_runtime_reload_abort_owned(
     }
   }
   if (status == FTUN_OK) {
+    ftun_egress_release(&engine->pending_egress);
     engine->reload_prepared = false;
     engine->reload_pending = false;
     engine->reload_owner = FTUN_PROXY_RELOAD_OWNER_NONE;
@@ -1338,6 +1366,8 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
       return FTUN_E_AGAIN;
     }
   }
+  ftun_egress_release(&owned->egress);
+  ftun_egress_release(&owned->pending_egress);
   if (ftun_tls_context_destroy(&owned->http_tls_context) != FTUN_OK) return FTUN_E_AGAIN;
 #if defined(FTUN_HAVE_MODULE_FAKEIP)
   if (owned->fakeip_worker != NULL &&

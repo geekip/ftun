@@ -23,9 +23,14 @@ void *ftun_lwip_port_malloc(size_t size);
 void *ftun_lwip_port_calloc(size_t count, size_t size);
 void ftun_lwip_port_free(void *pointer);
 
-/* v0.2 的 TUN 数据面只接纳 IPv4 TCP/UDP。 */
+/* IPv4/IPv6共用raw TCP/UDP数据面。 */
 #define LWIP_IPV4 1
-#define LWIP_IPV6 0
+#define LWIP_IPV6 1
+#define IPV6_FRAG_COPYHEADER 1
+#define LWIP_IPV6_AUTOCONFIG 0
+#define LWIP_IPV6_SEND_ROUTER_SOLICIT 0
+#define LWIP_IPV6_MLD 0
+#define LWIP_IPV6_NUM_ADDRESSES 1
 #define LWIP_ARP 0
 #define LWIP_ETHERNET 0
 #define LWIP_RAW 0

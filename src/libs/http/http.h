@@ -2,7 +2,7 @@
 #define FTUN_LIBS_HTTP_HTTP_H
 
 #include "core/limits.h"
-#include "libs/transport/protocol.h"
+#include "libs/transport/egress.h"
 #include "libs/resolver/control.h"
 #include "util/types.h"
 
@@ -11,10 +11,8 @@ typedef struct {
   /* 可选长寿命 context 槽；同一 worker 串行使用，全部任务退场后由 owner 销毁。 */
   ftun_tls_context_t **tls_context;
   ftun_string_t url;
-  ftun_endpoint_t proxy;
-  char proxy_domain[FTUN_CONTROL_ENDPOINT_TEXT_BYTES];
-  ftun_string_t proxy_username;
-  ftun_string_t proxy_password;
+  const ftun_egress_provider_t *egress;
+  ftun_egress_id_t egress_id;
   ftun_string_t if_none_match;
   size_t maximum_bytes;
   uint64_t deadline_ms;
@@ -24,8 +22,6 @@ typedef struct {
   ftun_control_path_binding_t path;
   bool allow_system_resolver;
   ftun_control_resolver_plan_t resolver;
-  bool use_proxy;
-  const ftun_transport_protocol_t *protocol;
 } ftun_http_fetch_spec_t;
 
 typedef struct {

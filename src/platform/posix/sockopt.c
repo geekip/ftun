@@ -57,7 +57,7 @@ ftun_status_t ftun_socket_apply_liveness(ftun_handle_t descriptor,
 ftun_status_t ftun_socket_send_progress(ftun_handle_t descriptor, uint64_t *acked,
   uint32_t *queued)
 {
-#if defined(TCP_INFO) && defined(TIOCOUTQ)
+#if defined(__linux__) && defined(TCP_INFO) && defined(TIOCOUTQ)
   unsigned char info[FTUN_TCP_INFO_BUFFER_BYTES];
   socklen_t length = (socklen_t)sizeof(info);
   int outstanding = 0;

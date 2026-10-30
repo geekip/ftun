@@ -1,13 +1,14 @@
 #ifndef FTUN_LIBS_TUN_INTERFACE_H
 #define FTUN_LIBS_TUN_INTERFACE_H
 #include "util/types.h"
+#include "util/ip.h"
 
 /* 设备网络状态与平台路由对象分离。输入只在 restore 调用期间借用；失败
  * 可返回部分事务，必须保留并重复 withdraw，成功撤销才清空句柄。 */
 typedef struct {
   ftun_string_t name;
-  uint8_t ipv4_address[4];
-  uint8_t prefix_length;
+  ftun_cidr_t addresses[2];
+  size_t address_count;
   uint32_t protection_mark;
   uint32_t route_table;
   uint32_t rule_priority;

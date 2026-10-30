@@ -311,12 +311,14 @@ ftun_status_t __wrap_ftun_socket_path_open(void *context, ftun_core_t *core,
    * 入站的一个 FD；UDP 对象使用共享 listener，本身没有独占 FD。 */
   status = ftun_budget_get_usage(request->dial.budget, &usage);
   if (status != FTUN_OK) return status;
+  #if !defined(FTUN_TEST_DNS_MEMORY)
   if (request->dial.purpose != FTUN_DIAL_PURPOSE_DNS &&
       usage.used_resources.descriptors >
       (request->dial.transport == FTUN_DIAL_TCP ? 1u : 0u)) {
     fprintf(stderr, "Memory path inherited a synthetic outbound descriptor charge\n");
     return FTUN_E_STATE_CORRUPT;
   }
+  #endif
   status = ftun_budget_reserve(request->dial.budget, sizeof(*state), &reservation);
   if (status != FTUN_OK) return status;
   state = calloc(1u, sizeof(*state));
@@ -324,7 +326,11 @@ ftun_status_t __wrap_ftun_socket_path_open(void *context, ftun_core_t *core,
   state->reservation = reservation;
   state->loop = request->dial.loop;
   state->phase = request->dial.purpose == FTUN_DIAL_PURPOSE_PROXY ? 1u : 0u;
+  #if defined(FTUN_TEST_DNS_MEMORY)
+  state->dns = true;
+  #else
   state->dns = request->dial.purpose == FTUN_DIAL_PURPOSE_DNS;
+  #endif
   state->banner = request->dial.purpose == FTUN_DIAL_PURPOSE_BUSINESS &&
     request->dial.transport == FTUN_DIAL_TCP &&
     request->dial.endpoint.kind == FTUN_ADDRESS_IPV4 &&

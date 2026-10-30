@@ -1,6 +1,7 @@
 #ifndef FTUN_LIBS_TUN_SERVICE_H
 #define FTUN_LIBS_TUN_SERVICE_H
 
+#include "util/ip.h"
 #include "core/limits.h"
 #include "core/event/loop.h"
 #include "libs/tun/device.h"
@@ -50,8 +51,7 @@ typedef struct {
   size_t packet_length;
   uint32_t inner_mtu;
   uint16_t headroom;
-  uint8_t source[4];
-  uint8_t destination[4];
+  ftun_ip_t source, destination;
   bool dont_fragment;
   bool fragmented;
   bool feedback_sent;
@@ -87,13 +87,12 @@ typedef struct {
 
 typedef enum {
   FTUN_TUN_ROUTE_DEFAULT = 1,
-  FTUN_TUN_ROUTE_IPV4_PREFIX
+  FTUN_TUN_ROUTE_PREFIX
 } ftun_tun_route_kind_t;
 
 typedef struct {
   ftun_tun_route_kind_t kind;
-  uint8_t network[4];
-  uint8_t prefix_length;
+  ftun_cidr_t prefix;
   /* 数值越小优先级越高；最长前缀始终先于 priority。 */
   uint16_t priority;
 } ftun_tun_route_t;
@@ -230,7 +229,7 @@ ftun_status_t ftun_tun_service_acquire(
   ftun_tun_service_t *service, const ftun_tun_consumer_t *consumer,
   ftun_tun_lease_t *out);
 /* routed acquire 用于共享设备。相同 kind/network/prefix/priority 冲突；
- * IPv4 先最长前缀匹配，再选较小 priority，最后才使用 DEFAULT。 */
+ * IP 先最长前缀匹配，再选较小 priority，最后才使用 DEFAULT。 */
 ftun_status_t ftun_tun_service_acquire_routed(
   ftun_tun_service_t *service, const ftun_tun_consumer_spec_t *consumer,
   ftun_tun_lease_t *out);

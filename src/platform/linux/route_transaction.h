@@ -18,7 +18,7 @@ struct ftun_platform_route_transaction {
 /* 以表号为键的 flock：第二个实例在改动网络前即被拒绝；table 为 0 时不加锁。 */
 ftun_status_t ftun_route_lock_table(uint32_t table, ftun_handle_t *out);
 int ftun_route_policy_valid(const ftun_route_policy_t *policy);
-int ftun_route_build(const ftun_route_policy_t *policy,
+void ftun_route_build(const ftun_route_policy_t *policy,
                      ftun_platform_route_transaction_t *transaction);
 int ftun_route_plan_valid(const ftun_route_plan_t *plan);
 size_t ftun_platform_route_async_allocation_size(void);

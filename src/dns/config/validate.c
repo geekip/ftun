@@ -19,18 +19,18 @@ ftun_status_t ftun_config_validate_dns(const ftun_config_dns_t *dns,
   ftun_config_cidr_t fake_range;
   size_t index;
   size_t other;
-  if (!ftun_cidr(dns->fake_ip.range, 0, &fake_range)) {
+  if (!ftun_cidr(dns->fake_ip.range, 0, &fake_range) || fake_range.address.family != FTUN_IP_V4) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/fake-ip/range",
                                   "FakeIP range is invalid");
   }
   for (index = 0u; index < dns->bootstrap.count; index++) {
-    uint32_t address;
+    ftun_ip_t address;
     if (!ftun_bootstrap_address(dns->bootstrap.items[index], &address)) {
       return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/bootstrap",
                                     "bootstrap address is invalid");
     }
     if (dns->enable && dns->fake_ip.enable &&
-        ftun_config_cidr_has(&fake_range, address)) {
+        ftun_config_cidr_has(&fake_range, &address)) {
       return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/bootstrap",
                                     "bootstrap address overlaps FakeIP range");
     }
@@ -56,14 +56,14 @@ ftun_status_t ftun_config_validate_dns(const ftun_config_dns_t *dns,
                                     "DNS server has more than 4 addresses");
     }
     for (other = 0u; other < server->addresses.count; other++) {
-      uint32_t address = 0u;
+      ftun_ip_t address = {0};
       int is_ipv4 = 0;
       if (!ftun_server_address(server->addresses.items[other], 0, &address, &is_ipv4)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
                                       "DNS server address is invalid");
       }
       if (dns->enable && dns->fake_ip.enable && is_ipv4 &&
-          ftun_config_cidr_has(&fake_range, address)) {
+          ftun_config_cidr_has(&fake_range, &address)) {
         return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
                                       "DNS server address overlaps FakeIP range");
       }

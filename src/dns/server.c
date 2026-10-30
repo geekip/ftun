@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "dns/server.h"
 
 #include "core/context.h"
@@ -76,7 +77,7 @@ static uint64_t ftun_dns_server_default_now(void *user)
 
 static int ftun_dns_server_endpoint_valid(const ftun_endpoint_t *endpoint)
 {
-  return endpoint != NULL && endpoint->kind == FTUN_ADDRESS_IPV4 &&
+  return endpoint != NULL && ftun_endpoint_is_ip(endpoint) &&
          endpoint->port != 0u && endpoint->domain.length == 0u;
 }
 
@@ -116,7 +117,7 @@ static ftun_status_t ftun_dns_server_query_validate(
                                   query->question.name)) {
     status = FTUN_E_PROTOCOL;
   }
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   return status;
 }
 
@@ -313,7 +314,7 @@ static void ftun_dns_server_transport_completed(
                                       source, &matches);
   }
   if (status != FTUN_OK || !matches) {
-    (void)ftun_dns_message_release(&message);
+    ftun_dns_message_release(&message);
     /* 应答无法解析或与查询对不上：按上游不健康处理。解析失败的原因可能是畸形的
      * 计数或标签（解析器对它们返回 LIMIT/PROTOCOL），无法与本地预算不足可靠区分；
      * 代价只是该地址进入一次退避，每次查询最多换一个地址。 */
@@ -324,7 +325,7 @@ static void ftun_dns_server_transport_completed(
     return;
   }
   if ((message->flags & 0x0200u) != 0u && transport == FTUN_DNS_TRANSPORT_UDP) {
-    (void)ftun_dns_message_release(&message);
+    ftun_dns_message_release(&message);
     if (!server->tcp_fallback) {
       (void)ftun_dns_server_finish(context, FTUN_E_UNSUPPORTED,
                                    FTUN_DNS_SERVER_STAGE_RESPONSE);
@@ -335,7 +336,7 @@ static void ftun_dns_server_transport_completed(
     (void)ftun_dns_server_submit(context, FTUN_DNS_TRANSPORT_TCP);
     return;
   }
-  (void)ftun_dns_message_release(&message);
+  ftun_dns_message_release(&message);
   memcpy(context->response, response.data, response.length);
   context->response_length = response.length;
   if (server->cache != NULL) {
@@ -444,19 +445,19 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
         query->question.name.length ||
       sizeof(*context) + query->wire.length + query->question.name.length >
         SIZE_MAX - response_capacity) {
-    (void)ftun_dns_answer_release(&cached);
+    ftun_dns_answer_release(&cached);
     return FTUN_E_LIMIT;
   }
   bytes = sizeof(*context) + query->wire.length + query->question.name.length +
           response_capacity;
   status = ftun_budget_reserve(server->budget, bytes, &reservation);
   if (status != FTUN_OK) {
-    (void)ftun_dns_answer_release(&cached);
+    ftun_dns_answer_release(&cached);
     return status;
   }
   context = (ftun_dns_exchange_context_t *)calloc(1u, bytes);
   if (context == NULL) {
-    (void)ftun_dns_answer_release(&cached);
+    ftun_dns_answer_release(&cached);
     ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
@@ -492,11 +493,11 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
     if (cached->wire_length <= server->max_response_bytes) {
       memcpy(context->response, cached->wire, cached->wire_length);
       context->response_length = cached->wire_length;
-      (void)ftun_dns_answer_release(&cached);
+      ftun_dns_answer_release(&cached);
       return ftun_dns_server_finish(context, FTUN_OK,
                                     FTUN_DNS_SERVER_STAGE_RESPONSE);
     }
-    (void)ftun_dns_answer_release(&cached);
+    ftun_dns_answer_release(&cached);
     return ftun_dns_server_finish(context, FTUN_E_LIMIT,
                                   FTUN_DNS_SERVER_STAGE_RESPONSE);
   }
@@ -507,7 +508,7 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   return ftun_dns_server_submit(context, server->transport);
 
 fail:
-  (void)ftun_dns_answer_release(&cached);
+  ftun_dns_answer_release(&cached);
   free(context);
   ftun_reservation_release(&reservation);
   return status;

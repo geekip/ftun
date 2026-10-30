@@ -366,7 +366,7 @@ static int test_tcp_lifecycle(void)
 
 static int test_failure_and_cancel(void)
 {
-  static const uint8_t invalid_ipv6[40] = {0x60u};
+  static const uint8_t invalid_ipv6[39] = {0x60u};
   ftun_budget_t *budget = NULL;
   ftun_budget_t *small_budget = NULL;
   ftun_lwip_t *stack = NULL;

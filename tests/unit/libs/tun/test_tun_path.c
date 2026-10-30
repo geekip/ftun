@@ -398,9 +398,10 @@ static int test_path_contract(void)
   spec.consumer.event = consume_event;
   spec.consumer.packet_error = consume_error;
   spec.consumer.user = &state;
-  spec.route.kind = FTUN_TUN_ROUTE_IPV4_PREFIX;
-  memcpy(spec.route.network, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
-  spec.route.prefix_length = 16u;
+  spec.route.kind = FTUN_TUN_ROUTE_PREFIX;
+  spec.route.prefix.address.family = FTUN_IP_V4;
+  memcpy(spec.route.prefix.address.bytes, (uint8_t[]){198u, 18u, 0u, 0u}, 4u);
+  spec.route.prefix.prefix = 16u;
   spec.route.priority = 1u;
   spec.path.carrier_mtu = 1280u;
   spec.path.headroom = 80u;
@@ -414,8 +415,8 @@ static int test_path_contract(void)
 
   invalid_spec = spec;
   invalid_spec.route.kind = FTUN_TUN_ROUTE_DEFAULT;
-  memset(invalid_spec.route.network, 0, sizeof(invalid_spec.route.network));
-  invalid_spec.route.prefix_length = 0u;
+  memset(invalid_spec.route.prefix.address.bytes, 0, sizeof(invalid_spec.route.prefix.address.bytes));
+  invalid_spec.route.prefix.prefix = 0u;
   invalid_spec.route.priority = 2u;
   CHECK(ftun_tun_service_acquire_routed(
           service, &invalid_spec, &invalid_lease) == FTUN_E_INVALID &&
@@ -493,7 +494,7 @@ static int test_path_contract(void)
                     UINT16_C(0x4000)));
   CHECK(run_reads(service, 1u));
   CHECK(!state.last_error.feedback_sent && state.feedback_sent == 5u &&
-        memcmp(state.last_error.source,
+        memcmp(state.last_error.source.bytes,
                (uint8_t[]){0u, 0u, 0u, 0u}, 4u) == 0);
   CHECK(append_read(&device, 1300u, local, remote, UINT16_C(0x4000)));
   device.reads[device.read_count - 1u][9] = 1u;
@@ -674,9 +675,82 @@ static int test_callback_packet_borrow(void)
   return 0;
 }
 
+static int test_ipv6_path(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_buffer_pool_t *buffers = NULL;
+  ftun_event_loop_t *loop = NULL;
+  ftun_tun_service_t *service = NULL;
+  ftun_tun_service_spec_t service_spec = {0};
+  ftun_tun_device_ops_t ops = {fake_open, fake_get_info, fake_read, fake_write, fake_close, NULL};
+  ftun_tun_consumer_spec_t spec = {0};
+  ftun_tun_lease_t lease = {0};
+  ftun_budget_usage_t usage;
+  fake_device_t device = {0};
+  consumer_state_t state = {0};
+  uint8_t packet[TEST_MTU] = {0};
+  uint8_t pseudo[1280u + 40u] = {0};
+  const uint8_t local[16] = {0xfd, 0, 0, 0x77, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2};
+  const uint8_t remote[16] = {0x20, 1, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7};
+  CHECK(ftun_budget_create(NULL, 4u * 1024u * 1024u, 4096u, &budget) == FTUN_OK);
+  CHECK(ftun_buffer_pool_create(budget, 2048u, 64u, &buffers) == FTUN_OK);
+  CHECK(ftun_event_loop_create(NULL, &loop) == FTUN_OK);
+  service_spec.budget = budget; service_spec.buffers = buffers; service_spec.loop = loop;
+  service_spec.device.name = (ftun_string_t){"ftun-pth0", 9u};
+  service_spec.device.mtu = TEST_MTU;
+  service_spec.consumer_capacity = 1u; service_spec.input_capacity = 4u;
+  service_spec.output_capacity = 4u; service_spec.read_quota = 4u; service_spec.write_quota = 4u;
+  ops.user = &device;
+  CHECK(ftun_tun_service_create_with_ops(&service_spec, &ops, &service) == FTUN_OK);
+  spec.consumer = (ftun_tun_consumer_t){consume_packet, consume_event, consume_error, &state};
+  spec.route.kind = FTUN_TUN_ROUTE_PREFIX;
+  CHECK(ftun_cidr_parse("2001:db8::/120", sizeof("2001:db8::/120") - 1u, true, &spec.route.prefix));
+  spec.path.carrier_mtu = 1279u;
+  spec.path.flags = FTUN_TUN_PATH_VALIDATE_OUTPUT_SOURCE;
+  CHECK(ftun_tun_service_acquire_routed(service, &spec, &lease) == FTUN_E_INVALID);
+  spec.path.carrier_mtu = 1280u;
+  CHECK(ftun_tun_service_acquire_routed(service, &spec, &lease) == FTUN_OK);
+  state.expected = lease;
+  packet[0] = 0x60u; packet[6] = 17u; packet[7] = 64u;
+  memcpy(packet + 8u, local, 16u); memcpy(packet + 24u, remote, 16u);
+  packet[4] = 4u; packet[5] = 236u; /* 1300 - 40 */
+  memcpy(device.reads[0], packet, 1300u);
+  device.read_lengths[0] = 1300u; device.read_count = 1u;
+  CHECK(run_reads(service, 1u));
+  CHECK(state.oversized == 1u && state.feedback_sent == 1u && device.write_count == 1u);
+  CHECK(state.last_error.source.family == FTUN_IP_V6 && state.last_error.inner_mtu == 1280u);
+  CHECK(device.write_lengths[0] == 1280u && device.writes[0][6] == 58u &&
+    device.writes[0][40] == 2u && device.writes[0][46] == 5u && device.writes[0][47] == 0u);
+  CHECK(memcmp(device.writes[0] + 8u, remote, 16u) == 0 &&
+    memcmp(device.writes[0] + 24u, local, 16u) == 0 &&
+    memcmp(device.writes[0] + 48u, packet, 1232u) == 0);
+  memcpy(pseudo, device.writes[0] + 8u, 32u);
+  pseudo[34] = 4u; pseudo[35] = 216u; pseudo[39] = 58u; /* 1240 字节 ICMPv6。 */
+  memcpy(pseudo + 40u, device.writes[0] + 40u, 1240u);
+  CHECK(checksum(pseudo, 1280u) == 0u);
+  /* 长前缀来源校验使用全部 16 字节；错误地址不能写回设备。 */
+  packet[4] = 0u; packet[5] = 60u;
+  memcpy(packet + 8u, remote, 16u); memcpy(packet + 24u, local, 16u);
+  CHECK(ftun_tun_service_write(lease, (ftun_bytes_t){packet, 100u}) == FTUN_OK);
+  packet[22] ^= 1u;
+  CHECK(ftun_tun_service_write(lease, (ftun_bytes_t){packet, 100u}) == FTUN_E_REJECTED);
+  packet[22] ^= 1u;
+  packet[5] = 59u;
+  CHECK(ftun_tun_service_write(lease, (ftun_bytes_t){packet, 100u}) == FTUN_E_PROTOCOL);
+  CHECK(ftun_tun_service_release(&lease) == FTUN_OK);
+  CHECK(ftun_tun_service_destroy(&service) == FTUN_OK);
+  CHECK(ftun_event_loop_stop(loop) == FTUN_OK);
+  CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
+  CHECK(ftun_buffer_pool_destroy(&buffers) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_callback_packet_borrow() == 0);
   CHECK(test_path_contract() == 0);
+  CHECK(test_ipv6_path() == 0);
   return 0;
 }

@@ -4,6 +4,7 @@ set(ftun_sources_lib_resolver
   control_channel.c
   control_transport.c
   dnswire.c
+  dual.c
   resolver.c
   system.c
 )

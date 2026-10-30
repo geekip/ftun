@@ -22,6 +22,10 @@ class Server(socketserver.ThreadingTCPServer):
     daemon_threads = True
 
 
+class Server6(Server):
+    address_family = socket.AF_INET6
+
+
 class HTTP(socketserver.BaseRequestHandler):
     def handle(self):
         self.request.settimeout(3)
@@ -84,10 +88,11 @@ class SOCKS(socketserver.BaseRequestHandler):
                 password = receive(client, receive(client, 1)[0])
                 assert (username, password) == (b'user', b'pass')
                 client.sendall(b'\x01\x00')
-            header = receive(client, 10)
-            assert header[:4] == b'\x05\x01\x00\x01'
-            target = socket.inet_ntoa(header[4:8]), struct.unpack('!H', header[8:])[0]
-            assert target[0] == '127.0.0.1', target
+            header = receive(client, 4)
+            assert header[:3] == b'\x05\x01\x00' and header[3] in (1, 4)
+            family, size = (socket.AF_INET6, 16) if header[3] == 4 else (socket.AF_INET, 4)
+            target = socket.inet_ntop(family, receive(client, size)), struct.unpack('!H', receive(client, 2))[0]
+            assert target[0] in ('127.0.0.1', '::1'), target
             with socket.create_connection(target, timeout=3) as peer:
                 for byte in b'\x05\x00\x00\x01\x7f\0\0\x01\x12\x34':
                     client.sendall(bytes([byte]))
@@ -106,8 +111,8 @@ class SOCKS(socketserver.BaseRequestHandler):
 
 
 @contextmanager
-def serving(handler, context=None, auth=False):
-    server = Server(('127.0.0.1', 0), handler)
+def serving(handler, context=None, auth=False, host='127.0.0.1'):
+    server = (Server6 if ':' in host else Server)((host, 0), handler)
     server.auth = auth
     server.connections = 0
     server.requests = []
@@ -139,13 +144,13 @@ def fetch(binary, url, proxy=0, auth=False, ca='', expected=200, body=BODY, tls=
     assert b'AddressSanitizer' not in result.stderr and b'runtime error:' not in result.stderr
 
 
-def certificates(root):
+def certificates(root, ipv6=True):
     def run(*args):
         result = subprocess.run(['openssl', *args], cwd=root, capture_output=True)
         assert result.returncode == 0, result.stderr
     run('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=Control Test CA', '-keyout', 'ca.key', '-out', 'ca.pem')
     run('req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost', '-keyout', 'server.key', '-out', 'server.csr')
-    (root / 'extensions').write_text('subjectAltName=DNS:localhost\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
+    (root / 'extensions').write_text('subjectAltName=DNS:localhost' + (',IP:::1' if ipv6 else '') + '\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
     run('x509', '-req', '-in', 'server.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '1', '-extfile', 'extensions', '-out', 'server.pem')
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(root / 'server.pem', root / 'server.key')

@@ -13,11 +13,11 @@
 
 每个静态目标通过构建目录中的头文件目录获得自身及显式依赖的头文件。除负责装配的 app 外，目标没有整个 `src` 的搜索路径。路径写法从 `src/` 起，例如 `libs/transport/path.h`。因此下层直接 include 业务头文件会在编译时失败。测试另外核验编译命令的源码归属、业务之间的引用及依赖环，并用非法输入验证检查器。
 
-DNS 与 Proxy 的协作在 `app/composition` 接通。基础解析、DNS 报文、传输和通道控制由公共库提供；Proxy 接收 DNS hook 表，保留明确的失败状态。关闭业务的构建不产生该业务的实现符号；关闭 TUN 时也不链接 lwIP。
+DNS 与 Proxy 的协作在 `app/composition` 接通。DNS、HTTP 和控制解析只保存不透明出口编号，经 `libs/transport/egress` 请求到最终目标的 Path；Proxy 独立拥有协议字段、组选择和握手。请求绑定配置代次与已选叶子，旧请求不因组切换或重载重新选路。Worker 使用独立的不可变出口快照，不读取 owner 的可变组状态。基础解析、DNS 报文、传输和通道控制由公共库提供；Proxy 接收 DNS hook 表，保留明确的失败状态。关闭业务的构建不产生该业务的实现符号；关闭 TUN 时也不链接 lwIP。
 
 Linux 事件后端由 `platform/linux/poller_epoll.c` 等待 epoll 并处理 eventfd，`core/event` 管理源、定时器、跨线程投递和公平分派。同一 FD 的兴趣合并后在等待前更新，取消会撤销未交付的通知。所有内核 readiness 先入有界前端队列，业务回调仍在 owner loop 上运行。
 
-`util/ip`、`util/hash` 和 `util/dnswire` 无 OS 头文件、无全局可变状态和 I/O。DNS 解析器先计算布局，再写入调用方提供的对齐存储；resolver 的拥有型包装负责预算、分配和释放。IPv6 文本转换使用有许可记录的 musl 算法，这不表示运行时已经支持 IPv6 转发。
+`util/ip`、`util/hash` 和 `util/dnswire` 无 OS 头文件、无全局可变状态和 I/O。DNS 解析器先计算布局，再写入调用方提供的对齐存储；resolver 的拥有型包装负责预算、分配和释放。IPv6 文本转换使用有许可记录的 musl 算法；Socket 与 lwIP 数据面支持 IPv4/IPv6，DNS 在启用双栈解析时并发查询 A/AAAA。
 
 `core/config` 只负责有界 JSON 文档、通用字段读取和配置引用及预算所有权，不包含业务模型。聚合模型在 `app/config` 私有定义；DNS、Proxy、TUN 通过声明在对应业务或共享库中的只读段访问配置，DDRA 只借用通用模块位计划。JSON AST 仅在配置构造期间存在，发布后的配置由 owner 串行管理和显式引用。
 
@@ -35,6 +35,6 @@ Core 通过 `platform/thread`、`platform/atomic`、`platform/file`、`platform/
 
 `libs/tls` 只接纳和交付有界内存密文，保留 CA、主机名验证和最低 TLS 版本。固定 CA 配置的 context 可以供多个会话共享；原生会话构造单独同步，各会话数据 I/O 由各自 owner 推进。双向密文环随包装对象先准入，原生库的证书与内部堆仍不构成精确的 RSS 硬限额。`libs/http` 显式推进密文和传输背压，跨重定向复用 context，始终保留请求的绝对期限；业务配置与组选择计划由 Proxy 生成。
 
-Mesh、其他操作系统和新增代理协议尚未实现。
+CI 的 macOS 任务只使用真实 SDK 编译 POSIX 平台源，不生成可运行产品。Mesh、其他操作系统原生服务和新增代理协议尚未实现。
 
 公开 C API 位于 `include/ftun`，实现位于 `app/capi`。ABI 1 的结构布局、函数签名和符号保留；`ftun.h` 汇总拆分后的头文件，`error.h` 继续支持已有宿主的 include 路径。宿主通过安装后的 `FTUN::Runtime` CMake 目标链接完整静态依赖，而不是单独链接内部 core 库。

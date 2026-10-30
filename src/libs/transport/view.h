@@ -2,6 +2,7 @@
 #define FTUN_LIBS_TRANSPORT_VIEW_H
 
 #include "util/types.h"
+#include "util/ip.h"
 
 #define FTUN_NETWORK_VIEW_MAX_PREFIXES 64u
 #define FTUN_NETWORK_VIEW_MAX_ROUTES 64u
@@ -28,10 +29,7 @@ typedef enum {
   FTUN_DIAL_DOMAIN_OVERLAY
 } ftun_dial_domain_t;
 
-typedef struct {
-  uint8_t network[4];
-  uint8_t prefix_length;
-} ftun_network_prefix_t;
+typedef ftun_cidr_t ftun_network_prefix_t;
 
 typedef struct {
   ftun_network_prefix_t prefix;

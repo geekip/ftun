@@ -314,6 +314,7 @@ void ftun_config_clear_inbounds(ftun_config_inbound_t *items, size_t count)
     free(inbound->interface_name);
     free(inbound->stack);
     free(inbound->ipv4_address);
+    free(inbound->ipv6_address);
   }
   free(items);
 }

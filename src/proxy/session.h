@@ -3,7 +3,7 @@
 
 #include "util/types.h"
 
-#define FTUN_SESSION_MAX_RESOLVED_IPV4 16u
+#define FTUN_SESSION_MAX_RESOLVED 16u
 
 typedef enum {
   FTUN_SESSION_ACCEPTED = 1,
@@ -60,7 +60,7 @@ ftun_status_t ftun_session_operation_complete(ftun_session_t *session,
 ftun_status_t ftun_session_operation_complete_for_reply(ftun_session_t *session,
   ftun_operation_t *operation, ftun_error_t result);
 /* RESOLVING completion 在清零 operation 前调用。addresses 是解析器返回的
- * 无端口 IPv4，同步复制进 Session 并补 original target 端口；只允许首次
+ * 无端口 IP，同步复制进 Session 并补 original target 端口；只允许首次
  * 写入，后续路由和出口必须复用，不能以再次解析扩大候选。 */
 ftun_status_t ftun_session_store_resolved(
   ftun_session_t *session, ftun_operation_t *operation,

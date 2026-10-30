@@ -18,6 +18,7 @@ static int ftun_core_tun_device_equal(const ftun_config_t *left,
                               right->tun.interface_name) &&
        ftun_core_string_equal(left->tun.ipv4_address,
                               right->tun.ipv4_address) &&
+       ftun_core_string_equal(left->tun.ipv6_address, right->tun.ipv6_address) &&
        left->tun.mtu == right->tun.mtu &&
        left->tun.auto_route == right->tun.auto_route &&
        left->tun.strict_route == right->tun.strict_route));
@@ -69,6 +70,7 @@ static ftun_status_t ftun_core_reload_compatible(const ftun_config_t *active,
             !ftun_core_string_equal(left->interface_name, right->interface_name) ||
             !ftun_core_string_equal(left->stack, right->stack) ||
             !ftun_core_string_equal(left->ipv4_address, right->ipv4_address) ||
+            !ftun_core_string_equal(left->ipv6_address, right->ipv6_address) ||
             left->mtu != right->mtu || left->tcp != right->tcp ||
             left->udp != right->udp || left->auto_route != right->auto_route ||
             left->strict_route != right->strict_route ||

@@ -12,8 +12,8 @@ static ftun_status_t restore(void *context, const ftun_interface_spec_t *spec, v
   ftun_status_t status;
   if (spec == NULL || state == NULL || *state != NULL) return FTUN_E_INVALID;
   route.tun_interface = spec->name;
-  memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
-  route.tun_prefix_length = spec->prefix_length;
+  memcpy(route.tun_addresses, spec->addresses, sizeof(route.tun_addresses));
+  route.tun_address_count = spec->address_count;
   route.routing_domain = spec->route_table;
   route.precedence = spec->rule_priority;
   route.bypass_tag = spec->protection_mark;
@@ -88,8 +88,8 @@ static ftun_status_t async_start(void *context, const ftun_interface_spec_t *spe
   status = async_allocate(context, options, false, &owned);
   if (status != FTUN_OK) return status;
   route.tun_interface = spec->name;
-  memcpy(route.tun_ipv4, spec->ipv4_address, sizeof(route.tun_ipv4));
-  route.tun_prefix_length = spec->prefix_length;
+  memcpy(route.tun_addresses, spec->addresses, sizeof(route.tun_addresses));
+  route.tun_address_count = spec->address_count;
   route.routing_domain = spec->route_table;
   route.precedence = spec->rule_priority;
   route.bypass_tag = spec->protection_mark;

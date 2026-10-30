@@ -194,8 +194,12 @@ static int test_route_and_metadata_failures(void)
   metadata.generation = 0u;
   CHECK(ftun_target_from_metadata(&metadata, &target) == FTUN_E_INVALID);
   metadata.generation = 7u;
-  metadata.original_target.kind = FTUN_ADDRESS_IPV6_RESERVED;
-  CHECK(ftun_target_from_metadata(&metadata, &target) == FTUN_E_UNSUPPORTED);
+  metadata.original_target = (ftun_endpoint_t){0};
+  metadata.original_target.kind = FTUN_ADDRESS_IPV6;
+  metadata.original_target.port = 443u;
+  metadata.original_target.address[15] = 1u;
+  CHECK(ftun_target_from_metadata(&metadata, &target) == FTUN_OK);
+  CHECK(target.original.kind == FTUN_ADDRESS_IPV6);
   metadata.original_target = ipv4(198u, 18u, 0u, 2u, 443u);
   metadata.original_is_fake = true;
   metadata.known_fields &= ~FTUN_META_DOMAIN;

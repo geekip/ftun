@@ -1,4 +1,4 @@
-#include "proxy/protocol/socks5.h"
+#include "app/composition/egress.h"
 #include "app/config/model.h"
 #include "app/composition/bridges.h"
 #include "core/core.h"
@@ -77,6 +77,7 @@ typedef struct {
   ftun_operation_queue_t *operations;
   /* 网络变化事件源；不可用时回到各恢复实体自己的退避，不影响启动。 */
   ftun_netmon_t *netmon;
+  const ftun_egress_provider_t *egress, *pending_egress, *egress_binding;
   ftun_status_t first_error;
   ftun_status_t cleanup_error;
 #if defined(FTUN_HAVE_MODULE_PROXY)
@@ -116,6 +117,7 @@ static ftun_status_t ftun_default_resolve_start(
     query.worker = request->system.worker;
     query.budget = request->system.budget;
     query.domain = request->system.domain;
+    query.query_type = request->system.query_type;
     query.protection = request->system.protection;
     query.deadline_ms = request->system.deadline_ms;
     query.check_system_path = request->system.check_path;
@@ -186,28 +188,45 @@ static const ftun_core_module_catalog_t ftun_default_catalog = {
   0u
 };
 
+typedef struct {
+  ftun_core_module_reload_plan_t *modules;
+  const ftun_egress_provider_t *egress;
+  ftun_reservation_t reservation;
+} ftun_default_plan_t;
+
 static ftun_status_t ftun_default_plan_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t socket_mark, void **out)
 {
-  ftun_core_module_reload_plan_t *plan = NULL;
+  ftun_default_plan_t *plan;
+  ftun_reservation_t reservation = {0};
   ftun_status_t status;
-  if (out == NULL) return FTUN_E_INVALID;
   if (*out != NULL) return FTUN_E_AGAIN;
-  status = ftun_core_module_reload_plan_prepare(&ftun_default_catalog, budget, config,
-                                                 socket_mark, &plan, NULL);
+  status = ftun_budget_reserve(budget, sizeof(*plan), &reservation);
+  if (status != FTUN_OK) return status;
+  plan = calloc(1u, sizeof(*plan));
+  if (plan == NULL) { ftun_reservation_release(&reservation); return FTUN_E_LIMIT; }
+  plan->reservation = reservation;
   *out = plan;
+  status = ftun_app_egress_prepare(budget, config, socket_mark, &plan->egress);
+  if (status == FTUN_OK) status = ftun_core_module_reload_plan_prepare(
+    &ftun_default_catalog, budget, config, socket_mark, &plan->modules, NULL);
   return status;
 }
 
-static ftun_status_t ftun_default_plan_destroy(void **plan)
+static ftun_status_t ftun_default_plan_destroy(void **pointer)
 {
-  ftun_core_module_reload_plan_t *owned;
+  ftun_default_plan_t *plan = *pointer;
+  ftun_reservation_t reservation;
   ftun_status_t status;
-  if (plan == NULL) return FTUN_E_INVALID;
-  owned = (ftun_core_module_reload_plan_t *)*plan;
-  status = ftun_core_module_reload_plan_destroy(&owned);
-  if (status == FTUN_OK) *plan = NULL;
-  return status;
+  if (plan == NULL) return FTUN_OK;
+  status = ftun_core_module_reload_plan_destroy(&plan->modules);
+  if (status != FTUN_OK) return status;
+  ftun_egress_release(&plan->egress);
+  reservation = plan->reservation;
+  free(plan);
+  ftun_reservation_release(&reservation);
+  *pointer = NULL;
+  return FTUN_OK;
 }
 
 static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
@@ -229,21 +248,20 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
   runtime->proxy.path.start = ftun_default_path_start;
   runtime->proxy.path.open = ftun_socket_path_open;
   runtime->proxy.control_path.open = ftun_socket_path_open;
+  runtime->proxy.egress_slot = &runtime->egress_binding;
   runtime->proxy.fakeip_slot = &runtime->fakeip;
 #endif
 #if defined(FTUN_HAVE_MODULE_DNS)
   runtime->dns_binding.loop = runtime->loop;
   runtime->dns_binding.slot = &runtime->dns;
   runtime->dns_binding.path.open = ftun_socket_path_open;
-  runtime->dns_binding.protocol = &ftun_socks5_protocol;
+  runtime->dns_binding.egress = runtime->egress_binding;
 #if defined(FTUN_HAVE_MODULE_PROXY)
   runtime->proxy_dns.core = runtime->core;
   ftun_app_dns_bridge_init(&runtime->proxy_dns);
   runtime->proxy_dns.slot = &runtime->dns;
   runtime->proxy_dns.fakeip_slot = &runtime->fakeip;
   runtime->proxy.dns = &runtime->proxy_dns;
-  runtime->dns_binding.adapter.select_member =
-    ftun_proxy_dns_select_member;
   runtime->dns_binding.adapter.dispatch = ftun_proxy_dns_dispatch;
   runtime->dns_binding.adapter.user = &runtime->proxy_dns;
 #endif
@@ -338,7 +356,14 @@ static ftun_status_t ftun_default_prepare(
   status = ftun_event_loop_create_with_budget(
     core, budget, source_capacity, &runtime->loop);
   if (status == FTUN_OK) status = ftun_event_backend_attach(runtime->loop);
-  if (status == FTUN_OK) ftun_default_bind_modules(runtime, config);
+  if (status == FTUN_OK) status = ftun_app_egress_prepare(budget, config,
+    (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
+      ? config->base.proxy.routing_mark : 0u, &runtime->egress);
+  if (status == FTUN_OK) {
+    ftun_app_egress_bind(runtime->egress, core, generation);
+    runtime->egress_binding = runtime->egress;
+    ftun_default_bind_modules(runtime, config);
+  }
   if (status == FTUN_OK) {
     status = ftun_core_module_runtime_prepare(&runtime->catalog, core,
       budget, operations, config, generation, &runtime->modules_runtime, NULL);
@@ -354,6 +379,7 @@ static ftun_status_t ftun_default_prepare(
     } else {
       runtime->cleanup_error = ftun_default_loop_destroy(runtime);
       if (runtime->cleanup_error == FTUN_OK) {
+        ftun_egress_release(&runtime->egress);
         free(runtime);
         ftun_reservation_release(&reservation);
         runtime = NULL;
@@ -392,40 +418,66 @@ static ftun_status_t ftun_default_activate(void *implementation)
   return status;
 }
 
+static void ftun_default_egress_pending(ftun_default_runtime_t *runtime,
+  const ftun_egress_provider_t *egress, uint64_t generation)
+{
+  ftun_egress_retain(egress);
+  runtime->pending_egress = egress;
+  ftun_app_egress_bind(egress, runtime->core, generation);
+  runtime->egress_binding = egress;
+#if defined(FTUN_HAVE_MODULE_DNS)
+  runtime->dns_binding.egress = egress;
+#endif
+}
+
 static ftun_status_t ftun_default_reload_prepare(
   void *implementation, const ftun_config_t *config, uint64_t generation)
 {
-  ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_reload_prepare(
-      runtime->modules_runtime, config, generation);
+  ftun_default_runtime_t *runtime = implementation;
+  const ftun_egress_provider_t *egress = NULL;
+  ftun_status_t status = ftun_app_egress_prepare(runtime->reservation.budget,
+    config, (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
+      ? config->base.proxy.routing_mark : 0u, &egress);
+  if (status != FTUN_OK) return status;
+  ftun_default_egress_pending(runtime, egress, generation);
+  ftun_egress_release(&egress);
+  return ftun_core_module_runtime_reload_prepare(runtime->modules_runtime, config, generation);
 }
 
 static ftun_status_t ftun_default_reload_prepare_planned(
-  void *implementation, const ftun_config_t *config, uint64_t generation,
-  const void *plan)
+  void *implementation, const ftun_config_t *config, uint64_t generation, const void *prepared)
 {
-  ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_reload_prepare_planned(
-      runtime->modules_runtime, config, generation,
-      (const ftun_core_module_reload_plan_t *)plan);
+  ftun_default_runtime_t *runtime = implementation;
+  const ftun_default_plan_t *plan = prepared;
+  ftun_default_egress_pending(runtime, plan->egress, generation);
+  return ftun_core_module_runtime_reload_prepare_planned(runtime->modules_runtime,
+    config, generation, plan->modules);
 }
 
-static ftun_status_t ftun_default_reload_commit(void *implementation,
-                                                 uint64_t generation)
+static ftun_status_t ftun_default_reload_commit(void *implementation, uint64_t generation)
 {
-  ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_reload_commit(
-      runtime->modules_runtime, generation);
+  ftun_default_runtime_t *runtime = implementation;
+  ftun_status_t status = ftun_core_module_runtime_reload_commit(runtime->modules_runtime, generation);
+  if (status == FTUN_OK) {
+    ftun_egress_release(&runtime->egress);
+    runtime->egress = runtime->pending_egress;
+    runtime->pending_egress = NULL;
+  }
+  return status;
 }
 
 static ftun_status_t ftun_default_reload_abort(void *implementation)
 {
-  ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
-  return runtime == NULL ? FTUN_E_INVALID :
-    ftun_core_module_runtime_reload_abort(runtime->modules_runtime);
+  ftun_default_runtime_t *runtime = implementation;
+  ftun_status_t status = ftun_core_module_runtime_reload_abort(runtime->modules_runtime);
+  if (status == FTUN_OK) {
+    ftun_egress_release(&runtime->pending_egress);
+    runtime->egress_binding = runtime->egress;
+#if defined(FTUN_HAVE_MODULE_DNS)
+    runtime->dns_binding.egress = runtime->egress;
+#endif
+  }
+  return status;
 }
 
 /* 取走已去抖的网络变化，转交给各服务（提前触发恢复），并记一条事件。 */
@@ -542,6 +594,8 @@ static ftun_status_t ftun_default_destroy_until(void **implementation,
     return status;
   }
   reservation = runtime->reservation;
+  ftun_egress_release(&runtime->egress);
+  ftun_egress_release(&runtime->pending_egress);
   free(runtime);
   *implementation = NULL;
   ftun_reservation_release(&reservation);

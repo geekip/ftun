@@ -337,7 +337,10 @@ static ftun_status_t ftun_normalize_tun_device(ftun_config_t *config)
       ftun_config_string_copy(config, config->tun.interface_name);
     inbound->ipv4_address =
       ftun_config_string_copy(config, config->tun.ipv4_address);
-    if (inbound->interface_name == NULL || inbound->ipv4_address == NULL) {
+    if (config->tun.ipv6_address != NULL) inbound->ipv6_address =
+      ftun_config_string_copy(config, config->tun.ipv6_address);
+    if (inbound->interface_name == NULL || inbound->ipv4_address == NULL ||
+        (config->tun.ipv6_address != NULL && inbound->ipv6_address == NULL)) {
       return FTUN_E_LIMIT;
     }
     inbound->mtu = config->tun.mtu;
@@ -414,28 +417,11 @@ static void destroy_fields(ftun_config_t *owned)
   ftun_config_string_list_clear(&owned->rules);
 }
 
-static size_t channel_count(const ftun_config_t *config)
-{
-  return config->outbound_count;
-}
-static ftun_channel_config_t channel_at(const ftun_config_t *config, size_t index)
-{
-  const ftun_config_outbound_t *item = &config->outbounds[index];
-  ftun_channel_config_t view = {0};
-  view.kind = item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5 ? FTUN_CHANNEL_CONFIG_SOCKS5 : FTUN_CHANNEL_CONFIG_GROUP;
-  view.name = item->name;
-  view.dns_server = item->dns_server;
-  view.server = item->server;
-  view.username = item->username;
-  view.password = item->password;
-  view.udp = item->udp;
-  view.members = item->members;
-  return view;
-}
 static ftun_config_resolver_t resolver_view(const ftun_config_t *config)
 {
   ftun_config_resolver_t view = {0};
   view.enable = config->dns.enable;
+  view.ipv6 = config->base.proxy.ipv6;
   view.bootstrap = config->dns.bootstrap;
   view.default_server = config->dns.default_server;
   view.fake_ip = config->dns.fake_ip;
@@ -471,7 +457,6 @@ static ftun_proxy_config_plan_t proxy_plan(const ftun_config_t *config)
   view.prepare_frs_count = plan->prepare_frs_count;
   return view;
 }
-static const ftun_channel_catalog_t channels = {channel_count, channel_at};
 static const ftun_config_resolver_ops_t resolver = {resolver_view};
 static const ftun_dns_config_binding_ops_t dns_bindings = {dns_binding};
 static const ftun_proxy_config_plan_ops_t proxy_plans = {proxy_plan};
@@ -492,7 +477,6 @@ static const void *section(const ftun_config_t *config, uint32_t section_id)
   case FTUN_CONFIG_SECTION_RULES: return &config->rules;
   case FTUN_CONFIG_SECTION_TUN: return &config->tun;
   case FTUN_CONFIG_SECTION_PLAN: return config->plan;
-  case FTUN_CONFIG_SECTION_CHANNELS: return &channels;
   case FTUN_CONFIG_SECTION_RESOLVER: return &resolver;
   case FTUN_CONFIG_SECTION_DNS_BINDING: return &dns_bindings;
   case FTUN_CONFIG_SECTION_PROXY_PLAN: return &proxy_plans;

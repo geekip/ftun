@@ -318,3 +318,15 @@ bool ftun_cidr_ipv4_hosts(const ftun_cidr_t *cidr, uint32_t *first,
   if (end != NULL) *end = broadcast;
   return true;
 }
+
+bool ftun_cidr_valid(const ftun_cidr_t *cidr, bool require_network)
+{
+  size_t bits, i;
+  if (cidr->address.family != FTUN_IP_V4 && cidr->address.family != FTUN_IP_V6) return false;
+  bits = cidr->address.family == FTUN_IP_V6 ? 128u : 32u;
+  if (cidr->prefix > bits) return false;
+  if (require_network) for (i = cidr->prefix; i < bits; i++) {
+    if ((cidr->address.bytes[i / 8u] & (1u << (7u - i % 8u))) != 0u) return false;
+  }
+  return true;
+}

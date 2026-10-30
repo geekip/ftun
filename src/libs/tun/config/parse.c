@@ -8,7 +8,7 @@ ftun_status_t ftun_config_parse_tun_device(const cJSON *item,
 {
   static const char *const fields[] = {
     "interface", "mtu", "ipv4", "auto-route", "strict-route",
-    "route-table", "rule-priority"
+    "route-table", "rule-priority", "ipv6"
   };
   static const char *const ipv4_fields[] = {"address"};
   const cJSON *ipv4;
@@ -16,7 +16,7 @@ ftun_status_t ftun_config_parse_tun_device(const cJSON *item,
   if (item == NULL || config == NULL || !cJSON_IsObject(item)) {
     return FTUN_E_INVALID;
   }
-  status = ftun_config_check_fields(item, fields, 7u);
+  status = ftun_config_check_fields(item, fields, 8u);
   if (status == FTUN_OK) {
     status = ftun_config_replace_string(config, &tun->interface_name,
       cJSON_GetObjectItemCaseSensitive(item, "interface"), 1);
@@ -31,6 +31,12 @@ ftun_status_t ftun_config_parse_tun_device(const cJSON *item,
   if (status == FTUN_OK) {
     status = ftun_config_replace_string(config, &tun->ipv4_address,
       cJSON_GetObjectItemCaseSensitive(ipv4, "address"), 1);
+  }
+  const cJSON *ipv6 = cJSON_GetObjectItemCaseSensitive(item, "ipv6");
+  if (status == FTUN_OK && ipv6 != NULL) {
+    status = ftun_config_check_fields(ipv6, ipv4_fields, 1u);
+    if (status == FTUN_OK) status = ftun_config_replace_string(config, &tun->ipv6_address,
+      cJSON_GetObjectItemCaseSensitive(ipv6, "address"), 1);
   }
   if (status == FTUN_OK) {
     status = ftun_config_optional_bool(item, "auto-route",
@@ -57,6 +63,7 @@ void ftun_config_clear_tun(ftun_config_tun_t *tun)
 {
   free(tun->interface_name);
   free(tun->ipv4_address);
+  free(tun->ipv6_address);
 }
 
 void ftun_config_defaults_tun(ftun_config_tun_t *tun)

@@ -5,7 +5,7 @@
 #include "app/config/compile.h"
 #include "app/config/model.h"
 #include "proxy/runtime.c"
-#include "proxy/protocol/socks5.h"
+#include "proxy/egress_internal.h"
 #include "app/config/parser.h"
 #include "core/event/backend.h"
 #include "proxy/inbound/socks5.h"
@@ -27,6 +27,12 @@ static size_t health_submit_calls;
 static bool handoff_probe, handoff_seen;
 static size_t handoff_calls;
 static ftun_tls_context_t **handoff_slot;
+static size_t handoff_refs;
+static void handoff_retain(void *context) { (void)context; handoff_refs++; }
+static void handoff_release(void *context) { (void)context; handoff_refs--; }
+static const ftun_egress_provider_t handoff_egress = {
+  .retain = handoff_retain, .release = handoff_release
+};
 ftun_status_t __real_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
   ftun_http_fetch_result_t *out);
 ftun_status_t __wrap_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
@@ -35,9 +41,7 @@ ftun_status_t __wrap_ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
   if (!handoff_probe) return __real_ftun_http_fetch(spec, out);
   handoff_calls++;
   handoff_seen = spec->tls_context == handoff_slot &&
-    spec->protocol == &ftun_socks5_protocol && spec->use_proxy &&
-    spec->proxy.port == 1080u && spec->proxy_username.length == 1u &&
-    spec->proxy_username.data[0] == 'u';
+    spec->egress == &handoff_egress && spec->egress_id == 42u && handoff_refs == 1u;
   memset(out, 0, sizeof(*out));
   return handoff_seen ? FTUN_E_IO : FTUN_E_STATE_CORRUPT;
 }
@@ -159,18 +163,14 @@ static int http_handoff(void)
   spec.url = (ftun_string_t){url, sizeof(url) - 1u};
   spec.maximum_bytes = 8u;
   spec.deadline_ms = UINT64_MAX;
-  spec.use_proxy = true;
-  spec.proxy.kind = FTUN_ADDRESS_IPV4;
-  spec.proxy.port = 1080u;
-  spec.proxy_username = (ftun_string_t){"u", 1u};
-  spec.proxy_password = (ftun_string_t){"p", 1u};
-  spec.protocol = &ftun_socks5_protocol;
+  spec.egress = &handoff_egress;
+  spec.egress_id = 42u;
   handoff_slot = &engine.http_tls_context;
   handoff_probe = true;
   for (i = 1u; i <= 2u; i++) {
     CHECK(ftun_proxy_runtime_http_submit(&engine, &spec, false, NULL,
       http_unused, NULL, &operation) == FTUN_E_IO);
-    CHECK(operation == NULL && handoff_seen && handoff_calls == i && memory(engine.budget, 0u) == 0);
+    CHECK(operation == NULL && handoff_seen && handoff_calls == i && handoff_refs == 0u && memory(engine.budget, 0u) == 0);
   }
   handoff_probe = false;
   CHECK(ftun_budget_destroy(&engine.budget) == FTUN_OK);
@@ -769,9 +769,10 @@ static int publish_ownership(void)
             value == (round == 0u ? 1u : 2u));
     }
     CHECK(strcmp(engine.frs_etag, round == 0u ? "old" : "candidate") == 0);
-    CHECK(memory(engine.budget, baseline.used_resources.memory_bytes + (round == 0u ? 4u : 10u)) == 0);
+    CHECK(memory(engine.budget, baseline.used_resources.memory_bytes + (round == 0u ? 4u : 10u + sizeof(ftun_proxy_egress_t))) == 0);
   }
   CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK);
+  ftun_egress_release(&engine.egress);
   CHECK(ftun_resolver_provider_stop_until(engine.resolver_provider, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_path_provider_stop_until(engine.path_provider, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_resolver_provider_destroy(&engine.resolver_provider) == FTUN_OK);
@@ -851,6 +852,7 @@ static int reload_owner_isolation(void)
         engine.reload_owner == FTUN_PROXY_RELOAD_OWNER_NONE);
 
   CHECK(ftun_proxy_runtime_replace_etag(&engine, NULL, 0u) == FTUN_OK);
+  ftun_egress_release(&engine.egress);
   CHECK(ftun_resolver_provider_stop_until(engine.resolver_provider, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_path_provider_stop_until(engine.path_provider, UINT64_MAX) == FTUN_OK);
   CHECK(ftun_resolver_provider_destroy(&engine.resolver_provider) == FTUN_OK);

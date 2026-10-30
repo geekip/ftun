@@ -1,3 +1,4 @@
+#include "util/endpoint.h"
 #include "libs/resolver/control_transport.h"
 
 #if defined(FTUN_HAVE_MODULE_DNS)
@@ -42,13 +43,16 @@ ftun_status_t ftun_dns_query_blocking(
   ftun_endpoint_t source;
   ftun_status_t status;
   if (out_response_size != NULL) *out_response_size = 0u;
-  if (query == NULL || query->upstream.kind != FTUN_ADDRESS_IPV4 ||
+  if (query == NULL || !ftun_endpoint_is_ip(&query->upstream) ||
       query->upstream.port == 0u || wire.data == NULL ||
       wire.length < FTUN_DNS_HEADER_BYTES || wire.length > UINT16_MAX ||
       response == NULL || response_capacity == 0u ||
       out_response_size == NULL) return FTUN_E_INVALID;
   status = ftun_control_execution_limit(execution, FTUN_DNS_CONTROL_TIMEOUT_MS, &limited);
-  if (status == FTUN_OK) status = ftun_control_channel_create_execution(&limited, &channel);
+  if (status == FTUN_OK) {
+    limited.egress_id = query->egress_id;
+    status = ftun_control_channel_create_execution(&limited, &channel);
+  }
   if (status == FTUN_OK) {
     status = query->tcp
       ? ftun_control_channel_connect(channel, &query->upstream, query->socket_mark, limited.purpose)
@@ -64,9 +68,7 @@ ftun_status_t ftun_dns_query_blocking(
       if (status != FTUN_E_AGAIN) break;
       status = ftun_control_channel_wait(channel);
     }
-    if (status == FTUN_OK && (source.kind != FTUN_ADDRESS_IPV4 ||
-        source.port != query->upstream.port ||
-        memcmp(source.address, query->upstream.address, 4u) != 0)) status = FTUN_E_REJECTED;
+    if (status == FTUN_OK && (!ftun_endpoint_equal(&source, &query->upstream))) status = FTUN_E_REJECTED;
     if (status == FTUN_OK && *out_response_size == 0u) status = FTUN_E_EOF;
   }
   if (status != FTUN_OK) *out_response_size = 0u;

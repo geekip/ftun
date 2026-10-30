@@ -88,7 +88,7 @@ ftun_status_t ftun_socks5_decode_request(
 ftun_status_t ftun_socks5_encode_request(
   ftun_socks5_command_t command, const ftun_endpoint_t *endpoint,
   uint8_t *output, size_t capacity, size_t *written);
-/* 回复的 BND 字段允许 ATYP=IPv6，解析为 FTUN_ADDRESS_IPV6_RESERVED；
+/* 回复的 BND 字段允许 ATYP=IPv6，解析为 FTUN_ADDRESS_IPV6；
  * 是否可用该地址（如 UDP relay）由调用方按自身能力判断。请求和 UDP 封装
  * 中的 IPv6 目标仍返回 UNSUPPORTED。 */
 ftun_status_t ftun_socks5_decode_reply(

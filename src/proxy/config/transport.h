@@ -33,6 +33,7 @@ typedef struct {
   uint32_t mtu;
   char *stack;
   char *ipv4_address;
+  char *ipv6_address;
   bool tcp;
   bool auto_route;
   bool strict_route;

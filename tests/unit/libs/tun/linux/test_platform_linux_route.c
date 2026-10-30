@@ -68,11 +68,13 @@ static ftun_route_policy_t route_policy(bool lan, bool strict_route)
   memset(&policy, 0, sizeof(policy));
   policy.tun_interface.data = "ftun-route0";
   policy.tun_interface.length = strlen(policy.tun_interface.data);
-  policy.tun_ipv4[0] = 10u;
-  policy.tun_ipv4[1] = 77u;
-  policy.tun_ipv4[2] = 0u;
-  policy.tun_ipv4[3] = 1u;
-  policy.tun_prefix_length = 30u;
+  policy.tun_addresses[0].address.bytes[0] = 10u;
+  policy.tun_addresses[0].address.bytes[1] = 77u;
+  policy.tun_addresses[0].address.bytes[2] = 0u;
+  policy.tun_addresses[0].address.bytes[3] = 1u;
+  policy.tun_addresses[0].prefix = 30u;
+  policy.tun_addresses[0].address.family = FTUN_IP_V4;
+  policy.tun_address_count = 1u;
   policy.routing_domain = 100u;
   policy.precedence = 12340u;
   policy.bypass_tag = UINT32_C(0x46000001);
@@ -88,7 +90,7 @@ static ftun_route_policy_t route_policy(bool lan, bool strict_route)
 
 static int check_resource_plan(const route_mock_t *mock)
 {
-  CHECK(mock->apply_calls == FTUN_LINUX_ROUTE_MAX_RESOURCES);
+  CHECK(mock->apply_calls == 7u);
   CHECK(mock->applied[0].kind == FTUN_LINUX_ROUTE_ADDRESS &&
         mock->applied[0].family == AF_INET &&
         strcmp(mock->applied[0].interface_name, "ftun-route0") == 0 &&
@@ -109,11 +111,11 @@ static int check_resource_plan(const route_mock_t *mock)
   CHECK(mock->applied[4].kind == FTUN_LINUX_ROUTE_CAPTURE_RULE &&
         strcmp(mock->applied[4].interface_name, "lan0") == 0 &&
         mock->applied[4].priority == 12342u);
-  CHECK(mock->applied[5].kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
+  CHECK(mock->applied[5].kind == FTUN_LINUX_ROUTE_BLOCK &&
         mock->applied[5].family == AF_INET6 &&
         strcmp(mock->applied[5].interface_name, "lo") == 0 &&
         mock->applied[5].priority == 12341u);
-  CHECK(mock->applied[6].kind == FTUN_LINUX_ROUTE_BLOCK_IPV6 &&
+  CHECK(mock->applied[6].kind == FTUN_LINUX_ROUTE_BLOCK &&
         strcmp(mock->applied[6].interface_name, "lan0") == 0 &&
         mock->applied[6].priority == 12342u);
   CHECK(mock->applied[6].protocol == FTUN_LINUX_ROUTE_PROTOCOL);
@@ -204,11 +206,16 @@ static int prefix_family(void)
 {
   ftun_cidr_t prefix = {{FTUN_IP_V6, {0x20u, 1u, 0x0du, 0xb8u}}, 32u};
   ftun_route_plan_t plan;
-  CHECK(ftun_platform_route_guard_plan(&prefix, 1u, 1000u, 1000u, &plan) == FTUN_E_UNSUPPORTED);
-  CHECK(plan.resource_count == 0u);
+  CHECK(ftun_platform_route_guard_plan(&prefix, 1u, 1000u, 1000u, &plan) == FTUN_OK);
+  CHECK(plan.resource_count == 2u && plan.resources[0].family == AF_INET6 &&
+    plan.resources[1].family == AF_INET6 && plan.resources[0].prefix_length == 32u &&
+    memcmp(plan.resources[0].address, prefix.address.bytes, 16u) == 0);
   CHECK(ftun_platform_route_overlay_plan(&prefix, 1u,
-    (ftun_string_t){"ftun-test", 9u}, 1000u, 1u, &plan) == FTUN_E_UNSUPPORTED);
-  CHECK(plan.resource_count == 0u);
+    (ftun_string_t){"ftun-test", 9u}, 1000u, 1u, &plan) == FTUN_OK);
+  CHECK(plan.resource_count == 1u && plan.resources[0].family == AF_INET6 &&
+    memcmp(plan.resources[0].address, prefix.address.bytes, 16u) == 0);
+  prefix.prefix = 129u;
+  CHECK(ftun_platform_route_guard_plan(&prefix, 1u, 1000u, 1000u, &plan) == FTUN_E_INVALID);
   return 0;
 }
 
@@ -255,8 +262,27 @@ static int owned_budget(void)
   return 0;
 }
 
+static int dualstack_plan(void)
+{
+  ftun_route_policy_t policy = route_policy(true, true);
+  ftun_route_transaction_t *transaction = NULL;
+  route_mock_t mock = {0};
+  ftun_route_io_t io = mock_io(&mock);
+  CHECK(ftun_cidr_parse("2001:db8:1::9/64", sizeof("2001:db8:1::9/64") - 1u, false, &policy.tun_addresses[1]));
+  policy.tun_address_count = 2u;
+  CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) == FTUN_OK);
+  CHECK(mock.apply_calls == 10u && mock.applied[5].kind == FTUN_LINUX_ROUTE_ADDRESS &&
+    mock.applied[5].family == AF_INET6 &&
+    memcmp(mock.applied[5].address, policy.tun_addresses[1].address.bytes, 16u) == 0);
+  for (size_t index = 0u; index < 10u; index++) CHECK(mock.applied[index].family == (index < 5u ? AF_INET : AF_INET6));
+  CHECK(ftun_route_release(&transaction) == FTUN_OK && transaction == NULL && mock.remove_calls == 10u);
+  for (size_t index = 0u; index < 10u; index++) CHECK(memcmp(&mock.removed[index], &mock.applied[9u - index], sizeof(mock.removed[index])) == 0);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
+  CHECK(dualstack_plan() == 0);
   route_mock_t mock;
   ftun_route_io_t io;
   ftun_route_io_t incomplete;
@@ -377,7 +403,9 @@ int main(int argc, char **argv)
   CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(false, false);
-  policy.tun_prefix_length = 0u;
+  policy.tun_addresses[0].prefix = 0u;
+  policy.tun_addresses[0].address.family = FTUN_IP_V4;
+  policy.tun_address_count = 1u;
   CHECK(ftun_route_prepare_with_io(&policy, &io, &transaction) ==
         FTUN_E_INVALID);
   policy = route_policy(true, false);
