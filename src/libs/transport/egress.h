@@ -19,6 +19,11 @@
 typedef uint32_t ftun_egress_id_t;
 /* 零值即直连，与零初始化的 ftun_path_open_request_t 一致。 */
 #define FTUN_EGRESS_DIRECT ((ftun_egress_id_t)0u)
+/* 代理使用低半区；高半区留给Mesh，NONE不分配给任何提供者。 */
+#define FTUN_EGRESS_PROXY_FIRST ((ftun_egress_id_t)1u)
+#define FTUN_EGRESS_PROXY_LAST ((ftun_egress_id_t)0x7fffffffu)
+#define FTUN_EGRESS_MESH_FIRST ((ftun_egress_id_t)0x80000000u)
+#define FTUN_EGRESS_MESH_LAST ((ftun_egress_id_t)0xfffffffeu)
 #define FTUN_EGRESS_NONE ((ftun_egress_id_t)UINT32_MAX)
 
 /* 能力位只描述「能做什么」，不暴露「是什么」。 */
@@ -53,13 +58,17 @@ typedef struct {
    * 已知但本构建未内置（例如 proxy 模块关闭）返回 FTUN_E_UNSUPPORTED。 */
   ftun_status_t (*resolve)(const void *context, const ftun_config_t *config,
                            ftun_string_t name, ftun_egress_info_t *out);
-  /* 运行期：查询可用性，用于状态展示和消费方的选择策略。
+  /* 运行期：查询当前选择及其可用性；out->id可为本次选中的绑定ID。
+   * 消费方可直接open原ID，也可固定返回ID，后续用validate验证其归属。
    * 代次不符返回 FTUN_E_STALE。不阻塞，不触发探测。 */
   ftun_status_t (*query)(const void *context, ftun_egress_id_t egress,
                          uint64_t configuration_generation,
                          ftun_egress_info_t *out);
   /* 运行期：与 ftun_path_provider_ops_t.open 同签名，可直接作为
    * Path Provider 的工厂；出口编号取自 request->egress。
+   * 接受逻辑ID与query返回的绑定ID，逻辑ID在打开时选择。
+   * UNAVAILABLE为最近状态；open允许在本请求期限内异步恢复（如解析），
+   * 失败仅终结该请求，不启动无限重试。
    *
    * 交付的 Path 对调用方等价于「直连 request->dial.endpoint」：
    * - 流：出口握手已完成，读写的就是与最终目标之间的字节；
@@ -83,7 +92,7 @@ typedef struct {
    * retain/release 必须可跨 worker 使用，不能访问可变的主循环状态。 */
   void (*retain)(void *context);
   void (*release)(void *context);
-  /* 验证已固定叶子仍属于原出口；不重新选择活动组。 */
+  /* 验证已固定绑定ID仍属于原出口；不重新选择，不暴露提供者内部拓扑。 */
   ftun_status_t (*validate)(const void *context, ftun_egress_id_t root,
     ftun_egress_id_t leaf, uint64_t generation);
 } ftun_egress_provider_t;

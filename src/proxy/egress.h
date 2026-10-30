@@ -3,7 +3,7 @@
 #include "libs/transport/egress.h"
 
 /* 快照复制出站字段、成员及Bootstrap；不借用配置存储。
- * prepare 在配置准备线程解析DNS实际会使用的节点，不接触当前组选择。
+ * prepare只复制/校验配置，不执行网络I/O；owner首次open异步解析域名。
  * bind 仅在交给owner前调用一次，设置代次和组选择回调。 */
 typedef ftun_status_t (*ftun_proxy_egress_select_fn)(void *context,
   uint64_t generation, uint32_t group, uint32_t *member);

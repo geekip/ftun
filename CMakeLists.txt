@@ -1,12 +1,18 @@
 cmake_minimum_required(VERSION 3.21)
-project(FTUN VERSION 1.0.4 LANGUAGES C)
+project(FTUN VERSION 1.0.5 LANGUAGES C)
 include(cmake/FtunOptions.cmake)
-# 只编译平台公共源；不生成尚未实现原生服务的平台产品。
-option(FTUN_PLATFORM_COMPILE_CHECK "Compile POSIX platform sources only" OFF)
+# 编译公共层；不生成尚未实现原生服务的平台产品。
+option(FTUN_PLATFORM_COMPILE_CHECK "Compile util, platform, core and libs without a native application" OFF)
 if(FTUN_PLATFORM_COMPILE_CHECK)
+  include(cmake/FtunDependencies.cmake)
   include(cmake/FtunLayers.cmake)
   add_subdirectory(src/util)
   add_subdirectory(src/platform)
+  add_subdirectory(src/core)
+  add_subdirectory(src/libs)
+  add_custom_target(ftun_compile_check DEPENDS ftun_util ftun_platform ftun_core
+    ftun_lib_buffer ftun_lib_transport ftun_lib_resolver ftun_lib_tls ftun_lib_http
+    ftun_lib_tun_config)
   return()
 endif()
 include(cmake/FtunDependencies.cmake)

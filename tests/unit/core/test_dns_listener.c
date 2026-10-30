@@ -261,6 +261,15 @@ int main(void)
   CHECK(dispatch(operations) && result.calls == 3u);
   CHECK(ftun_dns_listener_get_info(listener, &info) == FTUN_OK &&
         info.tcp_connections == 1u && info.inflight == 0u && info.accepting);
+  query(request, 16u);
+  CHECK(ftun_dns_listener_receive_udp(listener, 101u,
+    (ftun_bytes_t){request, sizeof(request)}, &operation) == FTUN_OK && transport.pending);
+  transport.pending = 0;
+  transport.completion(transport.user, FTUN_E_RESOLVE, transport.protocol,
+    &transport.source, (ftun_bytes_t){NULL, 0u});
+  CHECK(dispatch(operations) && result.calls == 4u && result.status == FTUN_OK &&
+        result.length == 27u && result.response[0] == 0x22u && result.response[1] == 0x33u &&
+        result.response[2] == 0x81u && result.response[3] == 0x82u);
   CHECK(ftun_dns_connection_close(&connection) == FTUN_OK);
   CHECK(ftun_dns_listener_stop(listener) == FTUN_OK);
   CHECK(ftun_dns_listener_tcp_open(listener, 300u, &connection) ==

@@ -1,6 +1,10 @@
 #include "core/context.h"
 #include "libs/transport/egress.h"
 
+#if defined(FTUN_TEST_PROXY)
+#include "app/config/model.h"
+#include "proxy/egress.h"
+#endif
 #include <stdio.h>
 #include <string.h>
 
@@ -218,9 +222,72 @@ static int direct_factory_rejects_foreign_ids(void)
   return 0;
 }
 
+#if defined(FTUN_TEST_PROXY)
+static ftun_status_t choose(void *context, uint64_t generation,
+  uint32_t root, uint32_t *out)
+{
+  (void)generation; (void)root;
+  *out = *(uint32_t *)context;
+  return FTUN_OK;
+}
+
+static int proxy_selection_contract(void)
+{
+  fixture_t fixture;
+  ftun_config_t config = {0};
+  ftun_config_outbound_t nodes[2] = {{0}};
+  char *members[] = {"DIRECT", "REJECT", "leaf"};
+  const ftun_egress_provider_t *provider = NULL;
+  ftun_egress_info_t info;
+  ftun_path_open_request_t request;
+  ftun_path_spec_t spec = {0};
+  ftun_operation_t *operation = NULL;
+  ftun_path_provider_ops_t physical = {0};
+  uint32_t selected = 0u;
+  fake_t fake = {0};
+  CHECK(setup(&fixture, ftun_egress_direct_provider()) == 0);
+  nodes[0].kind = FTUN_CONFIG_OUTBOUND_SOCKS5;
+  nodes[0].name = "leaf";
+  nodes[0].server = "offline.test:1080";
+  nodes[0].udp = true;
+  nodes[1].kind = FTUN_CONFIG_OUTBOUND_SELECT;
+  nodes[1].name = "group";
+  nodes[1].members = (ftun_config_string_list_t){members, 3u};
+  nodes[1].default_member = "DIRECT";
+  config.outbounds = nodes;
+  config.outbound_count = 2u;
+  ftun_config_bind_sections(&config);
+  CHECK(ftun_proxy_egress_prepare(fixture.budget, &config, 0u, &provider) == FTUN_OK);
+  ftun_proxy_egress_bind(provider, 7u, choose, &selected);
+  physical.open = fake_open;
+  ftun_proxy_egress_set_path(provider, physical, &fake);
+  CHECK(provider->resolve(provider->context, &config, (ftun_string_t){"group", 5u}, &info) == FTUN_OK && info.id == 3u);
+  CHECK(provider->query(provider->context, 3u, 7u, &info) == FTUN_OK && info.id == FTUN_EGRESS_DIRECT);
+  request_init(&fixture, 3u, &request);
+  spec.configuration_generation = 7u;
+  spec.endpoint = request.dial.endpoint;
+  CHECK(provider->open(provider->context, fixture.core, &request, &spec, &operation) == FTUN_E_REJECTED);
+  CHECK(fake.opens == 1u && fake.last_egress == FTUN_EGRESS_DIRECT && operation == NULL);
+  selected = 1u;
+  CHECK(provider->open(provider->context, fixture.core, &request, &spec, &operation) == FTUN_E_REJECTED && fake.opens == 1u);
+  selected = 2u;
+  CHECK(provider->query(provider->context, 3u, 7u, &info) == FTUN_OK && info.id == 2u && info.state == FTUN_EGRESS_STATE_UNAVAILABLE);
+  CHECK(provider->validate(provider->context, 3u, 2u, 7u) == FTUN_OK);
+  CHECK(provider->query(provider->context, 3u, 8u, &info) == FTUN_E_STALE);
+  CHECK(provider->query(provider->context, FTUN_EGRESS_MESH_FIRST, 7u, &info) == FTUN_E_REJECTED);
+  CHECK(provider->query(provider->context, FTUN_EGRESS_NONE, 7u, &info) == FTUN_E_REJECTED);
+  ftun_egress_release(&provider);
+  CHECK(cleanup(&fixture) == 0);
+  return 0;
+}
+#endif
+
 int main(void)
 {
   CHECK(direct_provider_contract() == 0);
+#if defined(FTUN_TEST_PROXY)
+  CHECK(proxy_selection_contract() == 0);
+#endif
   CHECK(capability_contract() == 0);
   CHECK(provider_routes_to_fake() == 0);
   CHECK(direct_factory_rejects_foreign_ids() == 0);

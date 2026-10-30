@@ -34,6 +34,7 @@ typedef struct {
 /* UDP 和 TCP DNS 接入。
  * listen 建立无平台 fd 的协议接入器，宿主把完整 UDP 数据报或 TCP 字节流
  * 喂入；响应经 reply 返回。UDP 超限时重建仅含 Question 的合法 TC 响应，
+ * 已接纳查询的上游失败生成SERVFAIL，停止取消保持错误终态。
  * TCP 处理二字节长度、半包、粘包和每连接在途上限。stop 后关闭新接纳。
  */
 ftun_status_t ftun_dns_listen(ftun_core_t *core,

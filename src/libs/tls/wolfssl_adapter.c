@@ -12,6 +12,7 @@
 #include <wolfssl/options.h>
 #include <wolfssl/ssl.h>
 #include <wolfssl/wolfio.h>
+#include <wolfssl/wolfcrypt/asn.h>
 
 /* TLS 标准记录上限 2^14 + 2^11 密文扩展 + 5 字节头；复用 wolfSSL 回调，
  * 第一方只保存有界字节，不借用或模拟 socket。 */
@@ -41,6 +42,7 @@ struct ftun_tls_client {
   size_t maximum_plaintext;
   bool handshake_complete;
   bool peer_verified;
+  ftun_ip_t identity_ip;
   bool wants_read;
   bool wants_write;
 };
@@ -172,6 +174,31 @@ ftun_status_t ftun_tls_client_consume(ftun_tls_client_t *client, size_t length)
   return FTUN_OK;
 }
 
+/* 证书链/有效期仍由wolfSSL验证；只追加叶证书的严格IP SAN类型匹配。
+ * 使用锁定上游的证书解析器，不把DNS SAN或CN中的数值文本当作IP身份。 */
+static int verify_peer(int verified, WOLFSSL_X509_STORE_CTX *store)
+{
+  ftun_tls_client_t *client = store->userCtx;
+  DecodedCert cert;
+  bool matched = false;
+  size_t length;
+  if (!verified) return 0;
+  if (store->error_depth != 0 || client->identity_ip.family == FTUN_IP_NONE) return 1;
+  length = client->identity_ip.family == FTUN_IP_V4 ? 4u : 16u;
+  wc_InitDecodedCert(&cert, store->certs[0].buffer, store->certs[0].length, NULL);
+  if (wc_ParseCert(&cert, CERT_TYPE, NO_VERIFY, NULL) == 0) {
+    for (DNS_entry *name = cert.altNames; name != NULL; name = name->next) {
+      if (name->type == ASN_IP_TYPE && name->len == (int)length &&
+          memcmp(name->name, client->identity_ip.bytes, length) == 0) {
+        matched = true;
+        break;
+      }
+    }
+  }
+  wc_FreeDecodedCert(&cert);
+  return matched ? 1 : 0;
+}
+
 ftun_status_t ftun_wolfssl_prepare(const ftun_tls_options_t *options, ftun_tls_context_t **out)
 {
   ftun_tls_context_t *context;
@@ -218,7 +245,7 @@ ftun_status_t ftun_wolfssl_prepare(const ftun_tls_options_t *options, ftun_tls_c
     (void)ftun_wolfssl_context_destroy(&context);
     return FTUN_E_UNSUPPORTED;
   }
-  wolfSSL_CTX_set_verify(context->native, WOLFSSL_VERIFY_PEER, NULL);
+  wolfSSL_CTX_set_verify(context->native, WOLFSSL_VERIFY_PEER, verify_peer);
   if (options->ca_pem.length != 0u) {
     loaded = wolfSSL_CTX_load_verify_buffer(
       context->native, options->ca_pem.data, (long)options->ca_pem.length,
@@ -294,9 +321,10 @@ ftun_status_t ftun_wolfssl_client_create(ftun_tls_context_t *context,
   wolfSSL_SetIOWriteCtx(client->native, client);
   ftun_ip_t ip;
   bool literal = ftun_ip_parse(client->server_name, options->server_name.length, &ip);
-  /* 数值地址由 wolfSSL 的 IP SAN 校验处理；SNI 只携带域名。 */
-  int identity = literal
-    ? wolfSSL_X509_VERIFY_PARAM_set1_ip_asc(wolfSSL_get0_param(client->native), client->server_name)
+  /* 数值地址由verify_peer校验IP SAN；SNI只携带域名。 */
+  if (literal) client->identity_ip = ip;
+  wolfSSL_SetCertCbCtx(client->native, client);
+  int identity = literal ? WOLFSSL_SUCCESS
     : wolfSSL_check_domain_name(client->native, client->server_name);
   if (identity != WOLFSSL_SUCCESS ||
       (!literal && wolfSSL_UseSNI(client->native, WOLFSSL_SNI_HOST_NAME,

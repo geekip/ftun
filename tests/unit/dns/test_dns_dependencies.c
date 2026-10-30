@@ -310,25 +310,14 @@ static int prepare_case(bootstrap_t *server, const char *label,
         CHECK(dns != NULL);
 #if defined(FTUN_TEST_PROXY)
         for (index = 0u; index < config->outbound_count; index++) {
-          char domain[254];
-          const char *colon;
-          size_t length;
+          ftun_egress_info_t info;
+          const char *name = config->outbounds[index].name;
           if (config->outbounds[index].kind != FTUN_CONFIG_OUTBOUND_SOCKS5) continue;
-          colon = strrchr(config->outbounds[index].server, ':');
-          length = colon == NULL ? strlen(config->outbounds[index].server) :
-            (size_t)(colon - config->outbounds[index].server);
-          CHECK(length < sizeof(domain));
-          memcpy(domain, config->outbounds[index].server, length);
-          domain[length] = '\0';
-          CHECK((((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].resolved != 0u) ==
-                (queries(server, domain) == 1u));
-          if (((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].resolved != 0u) {
-            CHECK(((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.kind == FTUN_ADDRESS_IPV4);
-            CHECK(((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.address[0] == 127u &&
-                  ((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.address[3] == 7u);
-            CHECK(colon != NULL && ((ftun_proxy_egress_t *)dns->egress->context)->nodes[index].endpoint.port ==
-                  (uint16_t)strtoul(colon + 1u, NULL, 10));
-          }
+          CHECK(dns->egress->resolve(dns->egress->context, config,
+            (ftun_string_t){name, strlen(name)}, &info) == FTUN_OK);
+          CHECK(dns->egress->query(dns->egress->context, info.id, dns->generation, &info) == FTUN_OK);
+          CHECK(info.state == FTUN_EGRESS_STATE_UNAVAILABLE);
+
         }
 #endif
         CHECK(ftun_dns_runtime_activate(dns) == FTUN_OK);
@@ -385,36 +374,34 @@ static int basic_cases(bootstrap_t *server)
 
 static int closure_cases(bootstrap_t *server)
 {
-  const char *both[] = {"a.example", "b.example"};
-  const char *a[] = {"a.example"};
   CHECK(prepare_case(server, "unreferenced", "[" LEAVES "]", direct_server,
     "", true, "a.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "route-only", "[" LEAVES "]", direct_server,
     ",\"inbounds\":[{\"name\":\"i\",\"type\":\"mixed\",\"listen\":\"127.0.0.1:9\","
     "\"outbound\":\"A\"}]", true, "a.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "nondefault-failure", "[" LEAVES "," GROUP "]",
-    GROUP_SERVER, "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
+    GROUP_SERVER, "", true, "b.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "nested-failure", "[" LEAVES "," GROUP ","
     "{\"name\":\"N\",\"type\":\"select\",\"outbounds\":[\"G\"],\"default\":\"G\"}]",
     ",\"servers\":[{\"name\":\"s\",\"type\":\"udp\",\"address\":[\"127.0.0.1:9\"],"
-    "\"outbound\":\"N\"}]", "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
+    "\"outbound\":\"N\"}]", "", true, "b.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "urltest-failure", "[" LEAVES ","
     "{\"name\":\"G\",\"type\":\"url-test\",\"outbounds\":[\"A\",\"B\"],"
     "\"default\":\"A\",\"url\":\"http://127.0.0.1/x\"}]", GROUP_SERVER,
-    "", true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
+    "", true, "b.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "all-server-roots", "[" LEAVES "," GROUP "]",
     ",\"default-server\":\"d\",\"servers\":[{\"name\":\"d\",\"type\":\"udp\","
     "\"address\":[\"127.0.0.1:9\"],\"outbound\":\"DIRECT\"},{\"name\":\"hidden\","
     "\"type\":\"tcp\",\"address\":[\"127.0.0.1:9\"],\"outbound\":\"G\"}]", "",
-    true, "b.example", FTUN_E_RESOLVE, both, 2u) == 0);
+    true, "b.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "shared-leaf", "[" LEAVES ","
     "{\"name\":\"H\",\"type\":\"select\",\"outbounds\":[\"A\",\"DIRECT\",\"REJECT\"],\"default\":\"A\"},"
     "{\"name\":\"G\",\"type\":\"select\",\"outbounds\":[\"H\",\"A\"],\"default\":\"H\"}]",
     ",\"servers\":[{\"name\":\"s\",\"type\":\"udp\",\"address\":[\"127.0.0.1:9\"],\"outbound\":\"G\"},"
     "{\"name\":\"t\",\"type\":\"udp\",\"address\":[\"127.0.0.1:9\"],\"outbound\":\"H\"}]",
-    "", true, "b.example", FTUN_OK, a, 1u) == 0);
-  CHECK(prepare_case(server, "members-ready", "[" LEAVES "," GROUP "]",
-    GROUP_SERVER, "", true, "", FTUN_OK, both, 2u) == 0);
+    "", true, "b.example", FTUN_OK, NULL, 0u) == 0);
+  CHECK(prepare_case(server, "members-deferred", "[" LEAVES "," GROUP "]",
+    GROUP_SERVER, "", true, "", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "disabled-proxies", "[" LEAVES "]", "", "",
     false, "a.example", FTUN_OK, NULL, 0u) == 0);
   CHECK(prepare_case(server, "implicit-proxies", "[" LEAVES "]", "", "",
@@ -529,8 +516,7 @@ static int allocation_and_cleanup(bootstrap_t *server)
         sizeof(ftun_dns_runtime_t)) : ftun_test_egress_bytes(config);
       allocation_failures = 1u;
       CHECK(prepare(&fixture, config, planned != 0u, &dns, &plan) == FTUN_E_LIMIT);
-      CHECK(allocation_failures == 0u && queries(server, NULL) ==
-        (fault == 0u && !planned ? 2u : 0u));
+      CHECK(allocation_failures == 0u && queries(server, NULL) == 0u);
       CHECK(ftun_dns_runtime_destroy(&dns) == FTUN_OK);
       CHECK(ftun_dns_runtime_plan_destroy(&plan) == FTUN_OK);
       CHECK(config->document.reference_count == 1u);

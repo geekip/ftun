@@ -556,6 +556,9 @@ if(BUILD_TESTING)
   if(FTUN_STATIC)
     target_link_options(ftun-egress-test PRIVATE -static)
   endif()
+  if(FTUN_MODULE_PROXY STREQUAL "BUILTIN")
+    target_compile_definitions(ftun-egress-test PRIVATE FTUN_TEST_PROXY=1)
+  endif()
   add_test(NAME egress-contract COMMAND ftun-egress-test)
   add_executable(ftun-path-provider-test tests/unit/core/test_path_provider.c)
   target_include_directories(ftun-path-provider-test PRIVATE src)
@@ -692,7 +695,6 @@ if(BUILD_TESTING)
       add_executable(ftun-http-fetch-test tests/unit/proxy/test_http_fetch.c)
       target_include_directories(ftun-http-fetch-test PRIVATE src)
       target_link_libraries(ftun-http-fetch-test PRIVATE ftun_runtime ftun_options)
-      target_link_options(ftun-http-fetch-test PRIVATE -Wl,--wrap=ftun_tls_context_open)
       if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
         add_executable(ftun-control-dns-test tests/unit/proxy/test_control_dns.c)
         target_include_directories(ftun-control-dns-test PRIVATE src)
@@ -1476,6 +1478,10 @@ if(BUILD_TESTING)
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
     if(TARGET ftun AND FTUN_MODULE_PROXY STREQUAL "BUILTIN" AND FTUN_MODULE_DNS STREQUAL "BUILTIN")
+    add_test(NAME egress-resolution-production COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/egress_resolution_product.py $<TARGET_FILE:ftun>)
+    set_tests_properties(egress-resolution-production PROPERTIES
+      SKIP_RETURN_CODE 77 TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
     add_test(NAME ipv6-product COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/tests/ipv6_product.py $<TARGET_FILE:ftun>)
     set_tests_properties(ipv6-product PROPERTIES
@@ -1584,7 +1590,7 @@ if(BUILD_TESTING)
           ${CMAKE_CURRENT_SOURCE_DIR}/tests/liveness_product.py
           $<TARGET_FILE:ftun>)
       set_tests_properties(liveness-product PROPERTIES
-        TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
+        SKIP_RETURN_CODE 77 TIMEOUT 45 RESOURCE_LOCK ftun_host_socket)
       if(FTUN_MODULE_DNS STREQUAL "BUILTIN")
         add_test(NAME dns-failover-product
           COMMAND ${Python3_EXECUTABLE}

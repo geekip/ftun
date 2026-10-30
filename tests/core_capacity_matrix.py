@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import resource
 import selectors
+import shutil
 import signal
 import socket
 import struct
@@ -567,6 +568,9 @@ def enter_isolated_namespace(binary):
 
 
 def orchestrate(binary):
+  if any(shutil.which(tool) is None for tool in ("ip", "unshare")):
+    print("SKIP: ip and unshare are required for the capacity matrix")
+    return 77
   if raise_descriptor_limit() < 8192:
     print("core capacity matrix skipped: RLIMIT_NOFILE below 8192")
     return 77

@@ -144,13 +144,15 @@ def fetch(binary, url, proxy=0, auth=False, ca='', expected=200, body=BODY, tls=
     assert b'AddressSanitizer' not in result.stderr and b'runtime error:' not in result.stderr
 
 
-def certificates(root, ipv6=True):
+def certificates(root, ipv6=True, san=None, common_name="localhost"):
     def run(*args):
         result = subprocess.run(['openssl', *args], cwd=root, capture_output=True)
         assert result.returncode == 0, result.stderr
     run('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1', '-subj', '/CN=Control Test CA', '-keyout', 'ca.key', '-out', 'ca.pem')
-    run('req', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=localhost', '-keyout', 'server.key', '-out', 'server.csr')
-    (root / 'extensions').write_text('subjectAltName=DNS:localhost' + (',IP:::1' if ipv6 else '') + '\nbasicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
+    run('req', '-newkey', 'rsa:2048', '-nodes', '-subj', f'/CN={common_name}', '-keyout', 'server.key', '-out', 'server.csr')
+    if san is None:
+        san = 'DNS:localhost' + (',IP:::1' if ipv6 else '')
+    (root / 'extensions').write_text(('subjectAltName=' + san + '\n' if san else '') + 'basicConstraints=CA:FALSE\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth\n')
     run('x509', '-req', '-in', 'server.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-days', '1', '-extfile', 'extensions', '-out', 'server.pem')
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(root / 'server.pem', root / 'server.key')

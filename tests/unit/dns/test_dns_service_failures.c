@@ -796,7 +796,7 @@ static int prepare_case(bool cache, bool planned, int fault)
     calloc_failures = 1u;
   } else if (fault == PREPARE_RESOLVE) {
     block_socket = true;
-    expected = FTUN_E_REJECTED;
+    expected = FTUN_OK;
   } else
   #endif
   {
@@ -817,10 +817,10 @@ static int prepare_case(bool cache, bool planned, int fault)
   if (status != expected) fprintf(stderr, "prepare fault=%d planned=%u: status=%s expected=%s\n", fault, planned, ftun_status_name(status), ftun_status_name(expected));
   CHECK(status == expected);
   CHECK(calloc_failures == 0u);
-  CHECK(cache_calls == (fault == PREPARE_CACHE && cache ? 1u : 0u));
-  CHECK(blocked_sockets == (fault == PREPARE_RESOLVE ? 1u : 0u));
+  CHECK(cache_calls == ((fault == PREPARE_CACHE || fault == PREPARE_RESOLVE) && cache ? 1u : 0u));
+  CHECK(blocked_sockets == 0u);
   if (expected != FTUN_OK) CHECK(fixture.dns == NULL);
-  else CHECK(fixture.dns != NULL && fixture.dns->cache == NULL);
+  else CHECK(fixture.dns != NULL && (fixture.dns->cache != NULL) == (fault == PREPARE_RESOLVE && cache));
   CHECK(ftun_dns_runtime_plan_destroy(&plan) == FTUN_OK);
   CHECK(fixture_destroy(&fixture) == 0);
   printf("prepare cache=%u planned=%u fault=%d passed\n", cache, planned, fault);
@@ -828,7 +828,7 @@ static int prepare_case(bool cache, bool planned, int fault)
 }
 
 #if defined(FTUN_TEST_PROXY)
-static int plan_resolution_failure(bool cache)
+static int plan_offline(bool cache)
 {
   ftun_config_t *config = make_config(cache, true, true, 0u);
   const ftun_egress_provider_t *plan = NULL;
@@ -842,12 +842,16 @@ static int plan_resolution_failure(bool cache)
   cache_calls = 0u;
   status = ftun_test_egress(budget, config, 1u, NULL, NULL, &plan);
   block_socket = false;
-  CHECK(status == FTUN_E_REJECTED && plan == NULL);
-  CHECK(blocked_sockets == 1u && cache_calls == 0u);
+  CHECK(status == FTUN_OK && plan != NULL);
+  CHECK(blocked_sockets == 0u && cache_calls == 0u);
+  ftun_egress_info_t info;
+  CHECK(plan->query(plan->context, 2u, 1u, &info) == FTUN_OK &&
+    info.state == FTUN_EGRESS_STATE_UNAVAILABLE);
+  ftun_egress_release(&plan);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(fd_count() == before);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
-  printf("plan resolution failure cache=%u passed\n", cache);
+  printf("offline plan without network cache=%u passed\n", cache);
   return 0;
 }
 #else
@@ -1016,7 +1020,7 @@ int main(void)
 #endif
     }
 #if defined(FTUN_TEST_PROXY)
-    CHECK(plan_resolution_failure(cache != 0u) == 0);
+    CHECK(plan_offline(cache != 0u) == 0);
 #endif
   }
 #if defined(FTUN_TEST_PROXY)

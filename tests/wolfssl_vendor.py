@@ -9,7 +9,6 @@ import sys
 
 
 REVISION = "59f4fa568615396fbf381b073b220d1e8d61e4c2"
-TAG = "v5.8.4-stable"
 COPYING_SHA256 = "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
 
 
@@ -32,8 +31,6 @@ def main():
   try:
     if git(vendor, "rev-parse", "HEAD") != REVISION:
       return fail("submodule revision differs from the reviewed release")
-    if git(vendor, "describe", "--tags", "--exact-match") != TAG:
-      return fail("submodule is not at the reviewed release tag")
     if git(vendor, "status", "--porcelain"):
       return fail("submodule contains local modifications")
   except (OSError, subprocess.CalledProcessError) as error:
@@ -51,6 +48,10 @@ def main():
   if any(any(option not in entry["command"] for option in required)
          for entry in wolfssl):
     return fail("TLS 1.3, obsolete-TLS removal or SNI options are missing")
+  if any("-DOPENSSL_EXTRA" in entry["command"] for entry in wolfssl):
+    return fail("unused OpenSSL compatibility layer was enabled")
+  if any("-DWOLFSSL_ALWAYS_VERIFY_CB" not in entry["command"] for entry in wolfssl):
+    return fail("successful certificate verification must invoke the IP SAN callback")
   forbidden = ("/examples/", "/tests/", "/benchmark/")
   if any(any(path in entry["file"] for path in forbidden)
          for entry in wolfssl):

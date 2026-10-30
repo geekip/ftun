@@ -675,7 +675,8 @@ ftun_status_t ftun_dns_runtime_transport_select(void *user,
   memset(out, 0, sizeof(*out));
   status = dns->egress->query(dns->egress->context, root, dns->generation, &info);
   if (status != FTUN_OK) return status;
-  if (info.state == FTUN_EGRESS_STATE_UNAVAILABLE) return FTUN_E_REJECTED;
+  /* 不可用出口可在open期限内恢复；无能力的拒绝出口仍立即失败。 */
+  if (info.capabilities == 0u) return FTUN_E_REJECTED;
   *out = (ftun_dns_transport_binding_t){dns, root, info.id};
   return FTUN_OK;
 }

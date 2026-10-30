@@ -3,6 +3,7 @@
 import json
 from pathlib import Path
 import re
+import shutil
 import signal
 import socket
 import struct
@@ -69,6 +70,9 @@ def closed(client):
 
 
 def main():
+    if shutil.which('ss') is None:
+        print('SKIP: ss is required for keepalive inspection')
+        return 77
     binary = str(Path(sys.argv[1]).resolve())
     sink = socket.socket()
     sink.bind(('127.0.0.1', 0))
@@ -130,4 +134,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

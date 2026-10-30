@@ -11,11 +11,16 @@
 
 static void *observed_malloc(size_t size);
 static void observed_free(void *value);
+static ftun_status_t observed_tls_context_open(const ftun_tls_options_t *options,
+  ftun_tls_context_t **out);
 #define malloc observed_malloc
 #define free observed_free
+/* 与分配观察使用同一编译期注入，避免LTO内联绕过链接器wrap。 */
+#define ftun_tls_context_open observed_tls_context_open
 #include "libs/http/http.c"
 #undef malloc
 #undef free
+#undef ftun_tls_context_open
 
 static ftun_budget_t *observed_budget;
 static struct { void *value; size_t bytes; } allocations[32];
@@ -123,15 +128,13 @@ static int memory_contract(void)
 static const char *test_ca;
 static size_t context_opens;
 
-ftun_status_t __real_ftun_tls_context_open(const ftun_tls_options_t *options,
-  ftun_tls_context_t **out);
-ftun_status_t __wrap_ftun_tls_context_open(const ftun_tls_options_t *options,
+static ftun_status_t observed_tls_context_open(const ftun_tls_options_t *options,
   ftun_tls_context_t **out)
 {
   ftun_tls_options_t copy = *options;
   context_opens++;
   if (test_ca != NULL && test_ca[0] != '\0') copy.ca_file = test_ca;
-  return __real_ftun_tls_context_open(&copy, out);
+  return ftun_tls_context_open(&copy, out);
 }
 
 int main(int argc, char **argv)

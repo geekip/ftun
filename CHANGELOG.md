@@ -1,5 +1,28 @@
 # 变更记录
 
+## 1.0.5
+
+- 代理出口准备阶段不再解析服务器域名。离线时服务和无关SOCKS入站可启动；DNS上游首次打开出口时异步解析，失败返回SERVFAIL，网络恢复后新查询自动恢复。解析沿用请求期限和取消机制，不会退回直连。
+- 出口打开接口接纳逻辑编号及已固定编号，组选择在出口内部完成；明确代理与未来Mesh的编号区间。
+- 移除wolfSSL的OpenSSL兼容层。证书链、有效期及域名继续由wolfSSL校验；数值IPv4/IPv6地址严格匹配iPAddress SAN，不接受同文本的DNS SAN或CN。
+- macOS编译CI覆盖util、platform、core及公共libs，仍不提供macOS原生服务。修正缺少网络测试工具时的跳过判定，以及浅克隆无tag的依赖校验。
+
+### 配置迁移
+
+旧JSON配置可继续使用。`base.ipv6`默认`false`；设为`true`时域名解析同时查询A/AAAA，数值IPv6目标和双栈监听不依赖此开关。TUN需要IPv6时增加`"ipv6":{"address":"fd00::1/64"}`并保证MTU至少1280，未配置时保留IPv4行为。IPv6监听/带端口地址使用`[::1]:端口`。FakeIP地址池及FRS IP数据仍使用IPv4。字段与示例见[配置说明](docs/configuration.md)。
+
+### 二进制体积基线
+
+Linux x86_64，GCC 14.2.0/glibc，MinSizeRel、`FTUN_OPTIMIZATION=size`（`-Os`）、`FTUN_LTO=OFF`、`FTUN_SECTION_GC=ON`、`FTUN_HARDENING=ON`，动态链接、未strip、关闭测试。同一工具链和设置：
+
+| 档位 | 内置模块 | ELF字节数 |
+|---|---|---:|
+| DNS-only | DNS | 342,640 |
+| Proxy-only | Proxy | 843,792 |
+| 全模块 | Proxy、DNS、FakeIP、TUN、FRS | 1,157,368 |
+
+复现：`cmake -S . -B build/size-profile -DCMAKE_BUILD_TYPE=MinSizeRel -DFTUN_OPTIMIZATION=size -DFTUN_LTO=OFF -DFTUN_SECTION_GC=ON -DFTUN_HARDENING=ON -DBUILD_TESTING=OFF`，再显式设置五个`FTUN_MODULE_{PROXY,DNS,FAKEIP,TUN,FRS}`为表中模块`BUILTIN`、其余`OFF`，执行`cmake --build build/size-profile --target ftun`和`stat -c %s build/size-profile/ftun`。体积随工具链及链接方式变化，不与静态musl产物混用。
+
 ## 1.0.4
 
 ### 新增

@@ -133,6 +133,14 @@ static void ftun_dns_listener_completed(ftun_operation_t *operation,
     FTUN_DNS_TRANSPORT_UDP : FTUN_DNS_TRANSPORT_TCP;
   ftun_bytes_t reply = response;
   (void)operation;
+  /* 已接纳查询的上游失败应回复SERVFAIL；停止取消不再产生网络响应。 */
+  if (error.status != FTUN_OK && error.status != FTUN_E_CANCELLED && listener->accepting) {
+    ftun_dns_listener_tc(request, (ftun_bytes_t){NULL, 0u}, &reply);
+    request->tc_response[2] &= (uint8_t)~0x02u;
+    request->tc_response[3] |= 0x82u; /* RA + SERVFAIL */
+    error = (ftun_error_t){0};
+    response = reply;
+  }
   if (error.status == FTUN_OK && connection == NULL &&
       response.length > request->udp_limit) {
     ftun_dns_listener_tc(request, response, &reply);

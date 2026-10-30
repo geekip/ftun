@@ -2,8 +2,6 @@
 #include "util/endpoint.h"
 #include "proxy/outbound_id.h"
 #include "libs/resolver/config.h"
-#include "platform/sysresolve.h"
-#include "platform/clock.h"
 #include "libs/transport/socket_path.h"
 #include <assert.h>
 #include <stdlib.h>
@@ -87,6 +85,7 @@ static ftun_status_t query(const void *context, uint32_t id,
     }
     if (node == NULL || node->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
       status = info(plan, id, 0u, out);
+      if (status == FTUN_OK && node != NULL && !node->resolved) out->state = FTUN_EGRESS_STATE_UNAVAILABLE;
       if (status == FTUN_OK && resolver.length != 0u) out->resolver = resolver;
       return status;
     }
@@ -175,46 +174,6 @@ static ftun_string_t copy_text(char **cursor, const char *text)
   return result;
 }
 
-static ftun_status_t resolve_needed(ftun_proxy_egress_t *plan, uint32_t id, size_t depth)
-{
-  ftun_proxy_egress_node_t *node;
-  ftun_status_t status = FTUN_OK;
-  size_t i;
-  if (id < FTUN_OUTBOUND_ID_NAMED_BASE) return FTUN_OK;
-  if (depth > 64u || id - FTUN_OUTBOUND_ID_NAMED_BASE >= plan->count) return FTUN_E_INVALID;
-  node = &plan->nodes[id - FTUN_OUTBOUND_ID_NAMED_BASE];
-  if (node->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
-    ftun_control_execution_t execution = {0};
-    ftun_control_resolver_plan_t bootstrap = plan->bootstrap;
-    uint64_t now;
-    if (node->resolved) return FTUN_OK;
-    status = ftun_monotonic_now(&now);
-    if (status != FTUN_OK) return status;
-    execution.budget = plan->reservation.budget;
-    execution.generation = 1u;
-    execution.deadline_ms = now + 5000u;
-    execution.purpose = FTUN_DIAL_PURPOSE_BOOTSTRAP;
-    /* 配置准备沿用DNS首个Bootstrap；命名解析失败不能改走其他来源。 */
-    if (bootstrap.bootstrap_count == 0u) {
-      ftun_reservation_t descriptor = {0};
-      status = ftun_budget_reserve_resources(execution.budget,
-        (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
-      if (status == FTUN_OK) status = ftun_system_nameserver(&bootstrap.bootstrap[0]);
-      ftun_reservation_release(&descriptor);
-      if (status != FTUN_OK) return status;
-    }
-    bootstrap.bootstrap_count = 1u;
-    status = ftun_control_resolve_bootstrap(&execution, &bootstrap,
-      node->proxy.server.domain, node->proxy.server.port, &node->endpoint);
-    if (status == FTUN_OK) node->resolved = true;
-    return status;
-  }
-  for (i = 0u; status == FTUN_OK && i < node->member_count; i++) {
-    status = resolve_needed(plan, node->members[i], depth + 1u);
-  }
-  return status;
-}
-
 ftun_status_t ftun_proxy_egress_prepare(ftun_budget_t *budget,
   const ftun_config_t *config, uint32_t mark, const ftun_egress_provider_t **out)
 {
@@ -228,7 +187,7 @@ ftun_status_t ftun_proxy_egress_prepare(ftun_budget_t *budget,
   ftun_status_t status = FTUN_OK;
   *out = NULL;
   if (count > (SIZE_MAX - bytes) / sizeof(*plan->nodes) ||
-      count > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) return FTUN_E_LIMIT;
+      count > FTUN_EGRESS_PROXY_LAST - FTUN_OUTBOUND_ID_NAMED_BASE + 1u) return FTUN_E_LIMIT;
   bytes += count * sizeof(*plan->nodes);
   for (i = 0u; i < count; i++) {
     const ftun_config_outbound_t *item = &ftun_config_outbounds(config)[i];
@@ -294,12 +253,6 @@ ftun_status_t ftun_proxy_egress_prepare(ftun_budget_t *budget,
       &plan->bootstrap.bootstrap[i], domain);
     if (status == FTUN_OK && !ftun_endpoint_is_ip(&plan->bootstrap.bootstrap[i])) status = FTUN_E_INVALID;
     if (status == FTUN_OK) plan->bootstrap.bootstrap_count++;
-  }
-  for (i = 0u; status == FTUN_OK && dns.enable && i < dns.server_count; i++) {
-    const char *name = dns.servers[i].outbound;
-    uint32_t id;
-    status = named(plan, (ftun_string_t){name, strlen(name)}, &id);
-    if (status == FTUN_OK) status = resolve_needed(plan, id, 0u);
   }
   if (status != FTUN_OK) { release(plan); return status; }
   plan->provider.validate = validate;
