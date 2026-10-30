@@ -104,7 +104,7 @@ class SOCKS(socketserver.BaseRequestHandler):
             else:
                 assert header[1] == 3
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as relay:
-                    relay.bind(('127.0.0.1', 0))
+                    relay.bind((self.server.server_address[0], 0))
                     relay.settimeout(2)
                     # 零地址必须规范化为代理端点 IP，不能当作独立解析目标。
                     client.sendall(b'\5\0\0\1' + b'\0' * 4 + struct.pack('!H', relay.getsockname()[1]))
@@ -126,8 +126,8 @@ class SOCKS(socketserver.BaseRequestHandler):
 
 
 @contextmanager
-def serving(handler, mode='ok', auth=False):
-    server = (UDP if handler is DNSUDP else TCP)(('127.0.0.1', 0), handler)
+def serving(handler, mode='ok', auth=False, host='127.0.0.1', port=0):
+    server = (UDP if handler is DNSUDP else TCP)((host, port), handler)
     server.mode, server.auth = mode, auth
     server.queries, server.targets, server.errors = [], [], []
     thread = threading.Thread(target=server.serve_forever, kwargs={'poll_interval': 0.01})

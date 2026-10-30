@@ -121,11 +121,7 @@ static void ftun_socks5_data_completed(ftun_operation_t *operation,
 
 static ftun_error_t ftun_socks5_error(ftun_status_t status, uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
+  return (ftun_error_t){status, stage, 0};
 }
 
 static int ftun_socks5_domain_valid(ftun_string_t domain, size_t maximum)
@@ -135,17 +131,12 @@ static int ftun_socks5_domain_valid(ftun_string_t domain, size_t maximum)
          memchr(domain.data, '\0', domain.length) == NULL;
 }
 
-static int ftun_socks5_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
-}
-
 static int ftun_socks5_contains(const ftun_endpoint_t *items, size_t count,
                                 const ftun_endpoint_t *endpoint)
 {
   size_t index;
   for (index = 0u; index < count; index++) {
-    if (ftun_socks5_endpoint_equal(&items[index], endpoint)) return 1;
+    if (ftun_endpoint_equal(&items[index], endpoint)) return 1;
   }
   return 0;
 }
@@ -215,7 +206,7 @@ static ftun_status_t ftun_socks5_target_select(const ftun_target_t *target,
     if (!ftun_socks5_contains(target->candidates, target->candidate_count,
                               &target->allowed[index])) return FTUN_E_REJECTED;
     for (previous = 0u; previous < index; previous++) {
-      if (ftun_socks5_endpoint_equal(&target->allowed[previous],
+      if (ftun_endpoint_equal(&target->allowed[previous],
                                      &target->allowed[index])) {
         return FTUN_E_INVALID;
       }
@@ -1055,11 +1046,6 @@ static void ftun_socks5_path_completed(ftun_operation_t *operation,
     ftun_socks5_error(status, FTUN_SOCKS5_STAGE_METHOD));
 }
 
-static bool ftun_socks5_logical_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return left != NULL && right != NULL && ftun_endpoint_equal(left, right);
-}
-
 static ftun_status_t ftun_socks5_datagram_send_start(void *user,
   ftun_datagram_send_token_t send, const ftun_endpoint_t *target, const ftun_packet_t *packet)
 {
@@ -1074,7 +1060,7 @@ static ftun_status_t ftun_socks5_datagram_send_start(void *user,
   bool was_busy = connection->busy;
   if (!connection->ready || connection->wire_datagram == NULL) return FTUN_E_AGAIN;
   if (connection->channel_failure != FTUN_OK) return connection->channel_failure;
-  if (!ftun_socks5_logical_endpoint_equal(target, &connection->target)) return FTUN_E_REJECTED;
+  if (!ftun_endpoint_equal(target, &connection->target)) return FTUN_E_REJECTED;
   if (connection->datagram_send.channel != NULL) return FTUN_E_AGAIN;
   status = ftun_packet_view(packet, &payload);
   if (status != FTUN_OK) return status;
@@ -1170,7 +1156,7 @@ static ftun_status_t ftun_socks5_wire_receive(ftun_datagram_t *channel,
   status = ftun_packet_view(packet, &wire);
   if (status == FTUN_OK) status = ftun_socks5_connection_decode_udp(connection, source, wire, &decoded, &consumed);
   if (status == FTUN_OK && consumed != wire.length) status = FTUN_E_PROTOCOL;
-  if (status == FTUN_OK && !ftun_socks5_logical_endpoint_equal(&decoded.endpoint, &connection->target) &&
+  if (status == FTUN_OK && !ftun_endpoint_equal(&decoded.endpoint, &connection->target) &&
       !(connection->target.kind == FTUN_ADDRESS_DOMAIN && ftun_endpoint_is_ip(&decoded.endpoint) &&
         decoded.endpoint.port == connection->target.port)) status = FTUN_E_REJECTED;
   if (status != FTUN_OK) {
@@ -1433,7 +1419,7 @@ ftun_status_t ftun_socks5_connection_decode_udp(
   if (connection == NULL || !connection->ready ||
       connection->transport != FTUN_DIAL_UDP || physical_source == NULL ||
       out == NULL || consumed == NULL) return FTUN_E_INVALID;
-  if (!ftun_socks5_endpoint_equal(&connection->relay, physical_source)) {
+  if (!ftun_endpoint_equal(&connection->relay, physical_source)) {
     return FTUN_E_REJECTED;
   }
   return ftun_socks5_decode_udp_datagram(input, out, consumed);

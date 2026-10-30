@@ -64,12 +64,6 @@ static int ftun_network_endpoint_valid(const ftun_endpoint_t *endpoint)
          endpoint->port != 0u && endpoint->domain.length == 0u;
 }
 
-static int ftun_network_endpoint_equal(const ftun_endpoint_t *left,
-                                       const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
-}
-
 static int ftun_network_mask_valid(uint32_t mask)
 {
   return mask != 0u && (mask & ~FTUN_NETWORK_PURPOSE_ALL) == 0u;
@@ -132,7 +126,7 @@ static int ftun_network_spec_valid(const ftun_network_view_spec_t *spec)
     if (!ftun_network_endpoint_valid(&item->endpoint) ||
         !ftun_network_mask_valid(item->purpose_mask)) return 0;
     for (previous = 0u; previous < index; previous++) {
-      if (ftun_network_endpoint_equal(&item->endpoint,
+      if (ftun_endpoint_equal(&item->endpoint,
             &spec->underlay_exceptions[previous].endpoint)) return 0;
     }
   }
@@ -259,7 +253,7 @@ ftun_status_t ftun_network_view_select_dial(
     const ftun_network_underlay_exception_t *item =
       &view->underlay_exceptions[index];
     if ((item->purpose_mask & purpose_bit) != 0u &&
-        ftun_network_endpoint_equal(&item->endpoint, endpoint)) {
+        ftun_endpoint_equal(&item->endpoint, endpoint)) {
       if (requested == FTUN_DIAL_DOMAIN_OVERLAY) return FTUN_E_REJECTED;
       out->domain = FTUN_DIAL_DOMAIN_UNDERLAY;
       out->purpose_exception = true;

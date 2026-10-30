@@ -1,9 +1,7 @@
 #include "proxy/egress_internal.h"
 #include "libs/transport/socket_path.h"
 #include "platform/clock.h"
-#include "platform/sysresolve.h"
 #include "proxy/outbound_id.h"
-#include "libs/resolver/dual.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,7 +16,8 @@ typedef struct {
   ftun_datagram_options_t datagram;
   ftun_endpoint_t endpoint;
   char interface_name[FTUN_SOCKET_INTERFACE_BYTES];
-  ftun_event_source_t *pump;
+  ftun_event_source_t *pump, *deadline;
+  ftun_proxy_resolution_waiter_t resolver;
   ftun_operation_t *operation, *child;
   ftun_operation_token_t token;
   ftun_error_t error;
@@ -99,9 +98,10 @@ static void pump(ftun_event_source_t *source, uint32_t events, void *context)
   session_t *session = context;
   ftun_status_t status = FTUN_OK;
   (void)source; (void)events;
-  if (session->child != NULL) return;
+  if (session->child != NULL || session->resolver.job != NULL) return;
   if (session->cancelling) session->error.status = FTUN_E_CANCELLED;
-  if (session->error.status != FTUN_OK) {
+  status = ftun_event_source_cancel(&session->deadline);
+  if (status == FTUN_OK && session->error.status != FTUN_OK) {
     if (session->path != NULL) {
       status = ftun_path_revoke(session->path);
       if (status == FTUN_OK) status = ftun_path_destroy(&session->path);
@@ -127,6 +127,13 @@ static ftun_status_t cancel(void *context)
     return status;
   }
   session->cancelling = true;
+  status = ftun_proxy_resolution_cancel(&session->resolver, FTUN_E_CANCELLED);
+  if (status != FTUN_OK) {
+    ftun_status_t scheduled = ftun_event_task_ready(session->pump);
+    assert(scheduled == FTUN_OK);
+    (void)scheduled;
+    return status;
+  }
   if (session->child != NULL) {
     status = ftun_operation_cancel(session->child);
     if (status != FTUN_OK && status != FTUN_E_STALE) return status;
@@ -215,82 +222,32 @@ static ftun_status_t connect_proxy(session_t *session)
   return ftun_socks5_connect(session->core, &connect, &session->child);
 }
 
-static void resolved(ftun_operation_t *operation, ftun_error_t error,
-  const ftun_system_resolve_result_t *result, void *context)
+static void resolved(void *context, ftun_error_t error,
+  const ftun_endpoint_t *endpoint)
 {
   session_t *session = context;
-  (void)operation;
-  session->child = NULL;
+  ftun_status_t status = ftun_event_source_cancel(&session->deadline);
+  if (status != FTUN_OK) error.status = status;
   if (!session->cancelling && error.status == FTUN_OK) {
-    assert(result != NULL && result->address_count != 0u);
-    session->endpoint = result->addresses[0];
-    session->endpoint.port = session->node->proxy.server.port;
-    /* 只更新本owner、同代快照；worker视图不读取此缓存。 */
-    session->node->endpoint = session->endpoint;
-    session->node->resolved = true;
+    session->endpoint = *endpoint;
     error.status = connect_proxy(session);
     if (error.status == FTUN_OK) return;
   }
   session->error = error;
-  ftun_status_t status = ftun_event_task_ready(session->pump);
+  status = ftun_event_task_ready(session->pump);
   assert(status == FTUN_OK);
   (void)status;
 }
 
-static ftun_status_t bootstrap_start(void *context, ftun_core_t *core,
-  const ftun_resolver_provider_request_t *request, ftun_operation_t **out)
+static void expired(ftun_event_source_t *source, uint32_t events, void *context)
 {
-  ftun_bootstrap_request_t query = {0};
-  (void)context;
-  query.loop = request->loop;
-  query.operations = request->operations;
-  query.budget = request->system.budget;
-  query.domain = request->system.domain;
-  query.servers = request->servers;
-  query.server_count = request->server_count;
-  query.network_view = request->network_view;
-  query.network_generation = request->network_generation;
-  query.protection = request->system.protection;
-  query.deadline_ms = request->system.deadline_ms;
-  query.query_id = request->query_id;
-  query.query_type = request->system.query_type;
-  query.completion = request->system.completion;
-  query.user = request->system.user;
-  return ftun_bootstrap_resolve(core, &query, out);
-}
-
-static ftun_status_t resolve_proxy(session_t *session, const ftun_proxy_egress_t *plan)
-{
-  ftun_resolver_provider_request_t request = {0};
-  ftun_endpoint_t server;
-  ftun_status_t status = FTUN_OK;
-  if (plan->bootstrap.bootstrap_count != 0u) server = plan->bootstrap.bootstrap[0];
-  else {
-    ftun_reservation_t descriptor = {0};
-    status = ftun_budget_reserve_resources(session->dial.budget,
-      (ftun_budget_resources_t){0u, 1u, 0u}, &descriptor);
-    if (status == FTUN_OK) status = ftun_system_nameserver(&server);
-    ftun_reservation_release(&descriptor);
-    if (status != FTUN_OK) return status;
-  }
-  request.loop = session->dial.loop;
-  request.operations = session->dial.operations;
-  request.system.budget = session->dial.budget;
-  request.system.domain = session->node->proxy.server.domain;
-  request.system.protection = session->dial.protection;
-  request.system.deadline_ms = session->dial.deadline_ms;
-  request.system.completion = resolved;
-  request.system.user = session;
-  request.network_view = session->result->network_view;
-  request.network_generation = session->dial.network_generation;
-  request.servers = &server;
-  request.server_count = 1u;
-  request.query_id = (uint16_t)session->result->path_generation;
-  if (plan->bootstrap.ipv6) {
-    const ftun_resolver_provider_ops_t ops = {bootstrap_start, NULL, NULL, NULL, NULL, NULL};
-    return ftun_resolver_dual_start(&ops, NULL, session->core, &request, &session->child);
-  }
-  return bootstrap_start(NULL, session->core, &request, &session->child);
+  session_t *session = context;
+  (void)source; (void)events;
+  ftun_status_t status = ftun_proxy_resolution_cancel(&session->resolver, FTUN_E_TIMEOUT);
+  session->error.status = status == FTUN_OK ? FTUN_E_TIMEOUT : status;
+  status = ftun_event_task_ready(session->pump);
+  assert(status == FTUN_OK);
+  (void)status;
 }
 
 static ftun_status_t open_path(void *context, ftun_core_t *core,
@@ -305,6 +262,7 @@ static ftun_status_t open_path(void *context, ftun_core_t *core,
   ftun_endpoint_t endpoint;
   session_t *session;
   size_t bytes;
+  uint64_t now = 0u;
   ftun_reservation_t reservation = {0};
   ftun_status_t status;
   *out = NULL;
@@ -331,7 +289,11 @@ static ftun_status_t open_path(void *context, ftun_core_t *core,
     status = ftun_control_resolve_bootstrap(&execution, &plan->bootstrap,
       node->proxy.server.domain, node->proxy.server.port, &endpoint);
     if (status != FTUN_OK) return status;
-  } else if (!blocking && node->resolved) endpoint = node->endpoint;
+  } else if (!blocking && endpoint.kind == FTUN_ADDRESS_DOMAIN) {
+    status = ftun_monotonic_now(&now);
+    if (status != FTUN_OK) return status;
+    (void)ftun_proxy_resolution_cached(node, &request->dial, now, &endpoint);
+  }
   if (request->dial.allowed_count > (SIZE_MAX - sizeof(*session)) / sizeof(ftun_endpoint_t)) return FTUN_E_LIMIT;
   bytes = sizeof(*session) + request->dial.allowed_count * sizeof(ftun_endpoint_t);
   status = ftun_budget_reserve(request->dial.budget, bytes, &reservation);
@@ -375,9 +337,24 @@ static ftun_status_t open_path(void *context, ftun_core_t *core,
   if (status == FTUN_OK) status = ftun_operation_accept(request->dial.operations,
     completed, session, &session->operation, &session->token);
   if (status == FTUN_OK) status = ftun_operation_set_cancel_hook(session->operation, cancel, session);
-  if (status == FTUN_OK) status = endpoint.kind == FTUN_ADDRESS_DOMAIN
-    ? resolve_proxy(session, plan) : connect_proxy(session);
+  if (status == FTUN_OK && endpoint.kind == FTUN_ADDRESS_DOMAIN) {
+    session->resolver.completion = resolved;
+    session->resolver.user = session;
+    status = ftun_event_timer_start(request->dial.loop, request->dial.deadline_ms,
+      expired, session, &session->deadline);
+    if (status == FTUN_OK) status = ftun_proxy_resolution_start(plan, node,
+      core, &session->dial, now, &session->resolver);
+  } else if (status == FTUN_OK) status = connect_proxy(session);
   if (status != FTUN_OK) {
+    ftun_status_t cancelled = ftun_event_source_cancel(&session->deadline);
+    if (cancelled != FTUN_OK) {
+      session->error.status = status;
+      ftun_status_t scheduled = ftun_event_task_ready(session->pump);
+      assert(scheduled == FTUN_OK);
+      (void)scheduled;
+      *out = session->operation;
+      return FTUN_OK;
+    }
     if (session->operation != NULL) {
       ftun_status_t rejected = ftun_operation_set_cancel_hook(session->operation, NULL, NULL);
       if (rejected == FTUN_OK) rejected = ftun_operation_reject(&session->operation);

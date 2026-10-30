@@ -51,7 +51,7 @@
         "routing-mark" :
         {
           "default" : 18004,
-          "description" : "\u51fa\u7ad9 socket \u7684 fwmark\uff0c\u540c\u65f6\u662f TUN \u8def\u7531\u4fdd\u62a4\u89c4\u5219\u5339\u914d\u503c\uff1b\u540c\u673a\u591a\u5b9e\u4f8b\u5fc5\u987b\u4e0d\u540c\u3002",
+          "description" : "Linux TUN \u7684\u51fa\u7ad9 socket fwmark\uff0c\u540c\u65f6\u662f\u81ea\u52a8\u8def\u7531\u4fdd\u62a4\u89c4\u5219\u5339\u914d\u503c\uff1b\u540c\u673a\u591a\u5b9e\u4f8b\u5fc5\u987b\u4e0d\u540c\u3002Windows \u624b\u52a8\u8def\u7531\u6a21\u5f0f\u4e0d\u8bbe\u7f6e mark\u3002",
           "maximum" : 4294967295,
           "minimum" : 1,
           "type" : "integer"
@@ -953,6 +953,7 @@
         "auto-route" :
         {
           "default" : false,
+          "description" : "Linux \u81ea\u52a8\u8def\u7531\uff1bWindows Wintun \u8981\u6c42 false\uff0c\u5730\u5740/MTU \u4e0e\u624b\u52a8\u8def\u7531\u6b65\u9aa4\u89c1\u5e73\u53f0\u6784\u5efa\u8bf4\u660e\u3002",
           "type" : "boolean"
         },
         "interface" :
@@ -993,6 +994,7 @@
         "strict-route" :
         {
           "default" : false,
+          "description" : "Linux \u81ea\u52a8\u8def\u7531\u4fdd\u62a4\uff1bWindows \u4e0d\u652f\u6301\u3002",
           "type" : "boolean"
         }
       },
@@ -1023,7 +1025,7 @@
         "address" :
         {
           "$ref" : "#/$defs/IPv6CIDR",
-          "description" : "\u53ef\u9009\u8bbe\u5907 IPv6 \u5730\u5740\u53ca\u524d\u7f00\uff1b\u914d\u7f6e\u540e\u5b89\u88c5 IPv6 \u8def\u7531\uff0cMTU \u81f3\u5c11 1280\u3002"
+          "description" : "\u53ef\u9009\u8bbe\u5907 IPv6 \u5730\u5740\u53ca\u524d\u7f00\uff1bMTU \u81f3\u5c11 1280\u3002Windows \u914d\u7f6e\u5730\u5740\u53ca\u76f4\u8fde\u8def\u7531\uff0c\u5176\u4ed6\u524d\u7f00\u7531\u7528\u6237\u624b\u52a8\u7ba1\u7406\u3002"
         }
       },
       "required" : [ "address" ],

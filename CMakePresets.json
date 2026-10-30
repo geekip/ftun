@@ -145,6 +145,108 @@
         "FTUN_MODULE_FRS": "BUILTIN",
         "CMAKE_EXPORT_COMPILE_COMMANDS": true
       }
+    },
+    {
+      "name": "distribution",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "MinSizeRel",
+        "FTUN_OPTIMIZATION": "size",
+        "FTUN_LTO": false,
+        "BUILD_TESTING": false,
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true,
+        "FTUN_MODULE_PROXY": "BUILTIN",
+        "FTUN_MODULE_DNS": "BUILTIN",
+        "FTUN_MODULE_FAKEIP": "BUILTIN",
+        "FTUN_MODULE_FRS": "BUILTIN",
+        "FTUN_MODULE_TUN": "BUILTIN"
+      }
+    },
+    {
+      "name": "linux-amd64-musl",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/linux-amd64-musl",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-amd64-musl.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": true
+      }
+    },
+    {
+      "name": "linux-arm64-musl",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/linux-arm64-musl",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-arm64-musl.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": true
+      }
+    },
+    {
+      "name": "linux-armv7-musl",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/linux-armv7-musl",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-armv7-musl.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": true
+      }
+    },
+    {
+      "name": "linux-mips-musl",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/linux-mips-musl",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-mips-musl.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": true
+      }
+    },
+    {
+      "name": "linux-mipsel-musl",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/linux-mipsel-musl",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/linux-mipsel-musl.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": true
+      }
+    },
+    {
+      "name": "darwin-amd64",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/darwin-amd64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/darwin-amd64.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": false,
+        "FTUN_MODULE_TUN": "OFF"
+      }
+    },
+    {
+      "name": "darwin-arm64",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/darwin-arm64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/darwin-arm64.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": false,
+        "FTUN_MODULE_TUN": "OFF"
+      }
+    },
+    {
+      "name": "windows-amd64",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/windows-amd64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-amd64.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": false,
+        "FTUN_MODULE_TUN": "BUILTIN"
+      }
+    },
+    {
+      "name": "windows-arm64",
+      "inherits": "distribution",
+      "binaryDir": "${sourceDir}/build/windows-arm64",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/windows-arm64.cmake",
+      "cacheVariables": {
+        "FTUN_STATIC": false,
+        "FTUN_MODULE_TUN": "BUILTIN"
+      }
     }
   ],
   "buildPresets": [
@@ -183,6 +285,42 @@
     {
       "name": "linux-x86_64-musl",
       "configurePreset": "linux-x86_64-musl"
+    },
+    {
+      "name": "linux-amd64-musl",
+      "configurePreset": "linux-amd64-musl"
+    },
+    {
+      "name": "linux-arm64-musl",
+      "configurePreset": "linux-arm64-musl"
+    },
+    {
+      "name": "linux-armv7-musl",
+      "configurePreset": "linux-armv7-musl"
+    },
+    {
+      "name": "linux-mips-musl",
+      "configurePreset": "linux-mips-musl"
+    },
+    {
+      "name": "linux-mipsel-musl",
+      "configurePreset": "linux-mipsel-musl"
+    },
+    {
+      "name": "darwin-amd64",
+      "configurePreset": "darwin-amd64"
+    },
+    {
+      "name": "darwin-arm64",
+      "configurePreset": "darwin-arm64"
+    },
+    {
+      "name": "windows-amd64",
+      "configurePreset": "windows-amd64"
+    },
+    {
+      "name": "windows-arm64",
+      "configurePreset": "windows-arm64"
     }
   ],
   "testPresets": [

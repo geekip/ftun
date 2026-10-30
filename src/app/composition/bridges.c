@@ -5,41 +5,6 @@
 #include "app/composition/dns_dispatch.h"
 #include "proxy/runtime_state.h"
 
-ftun_status_t ftun_proxy_dns_select_member(
-  void *user, const ftun_config_t *expected_config,
-  uint32_t group_id, uint32_t *out_member)
-{
-  const ftun_proxy_dns_runtime_adapter_t *adapter =
-    (const ftun_proxy_dns_runtime_adapter_t *)user;
-  ftun_runtime_t *runtime = NULL;
-  const ftun_config_t *config = NULL;
-  bool is_group = false;
-  bool degraded = false;
-  ftun_string_t dns_server;
-  ftun_status_t status;
-  if (out_member != NULL) *out_member = 0u;
-  if (!ftun_proxy_dns_runtime_adapter_valid(adapter) ||
-      expected_config == NULL || out_member == NULL) {
-    return FTUN_E_INVALID;
-  }
-  status = ftun_runtime_active_acquire(adapter->core, &runtime);
-  if (status == FTUN_OK) status = ftun_runtime_config(runtime, &config);
-  if (status == FTUN_OK && config != expected_config) status = FTUN_E_STALE;
-  if (status == FTUN_OK) {
-    status = ftun_runtime_group_selected(runtime, group_id, out_member,
-                                          &is_group, &degraded, &dns_server);
-  }
-  (void)degraded;
-  (void)dns_server;
-  if (status == FTUN_OK && !is_group) status = FTUN_E_STATE_CORRUPT;
-  if (runtime != NULL && ftun_runtime_release(&runtime) != FTUN_OK &&
-      status == FTUN_OK) {
-    status = FTUN_E_STATE_CORRUPT;
-  }
-  if (status != FTUN_OK) *out_member = 0u;
-  return status;
-}
-
 #if defined(FTUN_HAVE_MODULE_DNS)
 
 static ftun_status_t ftun_proxy_dns_runtime_get(

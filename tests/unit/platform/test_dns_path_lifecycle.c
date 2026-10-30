@@ -6,8 +6,10 @@
 #include "app/config/model.h"
 #include "platform/clock.h"
 static uint64_t fanout_now_ms;
+static ftun_status_t clock_status;
 static ftun_status_t fanout_monotonic_now(uint64_t *out)
 {
+  if (clock_status != FTUN_OK) return clock_status;
   if (fanout_now_ms == 0u) return ftun_monotonic_now(out);
   *out = fanout_now_ms;
   return FTUN_OK;
@@ -22,6 +24,13 @@ static ftun_status_t fanout_monotonic_now(uint64_t *out)
 #define CHECK(x) do { if (!(x)) { \
   fprintf(stderr, "DNS path lifecycle failed: %s:%d: %s\n", __FILE__, __LINE__, #x); \
   return 1; } } while (0)
+
+static uint64_t test_now(void)
+{
+  uint64_t now;
+  if (ftun_dns_runtime_now(NULL, &now) != FTUN_OK) abort();
+  return now;
+}
 
 typedef struct {
   ftun_budget_t *budget;
@@ -101,7 +110,7 @@ static int query_begin(fixture_t *f, ftun_operation_t **operation)
   query.question.type = 1u;
   query.question.class_code = 1u;
   query.wire = (ftun_bytes_t){wire, sizeof(wire)};
-  query.deadline_ms = ftun_dns_runtime_now(NULL) + 3000u;
+  query.deadline_ms = test_now() + 3000u;
   query.completion = query_done;
   query.completion_user = f;
   CHECK(ftun_dns_exchange(f->core, f->dns->servers[0], &query, operation) == FTUN_OK);
@@ -163,7 +172,7 @@ static int pending_case(bool tcp, bool writing, bool cancel)
   }
   if (cancel) CHECK(ftun_operation_cancel(operation) == FTUN_OK);
   else CHECK(ftun_dns_runtime_stop_until(f.dns,
-    ftun_dns_runtime_now(NULL) + 1000u) == FTUN_E_AGAIN);
+    test_now() + 1000u) == FTUN_E_AGAIN);
   CHECK(f.dns->request_count == 1u && f.dns->request_head == request && request->closing);
   CHECK(fixture_close(&f, 1u, FTUN_E_CANCELLED) == 0);
   return 0;
@@ -208,7 +217,7 @@ static int fanout_begin(fixture_t *f, fanout_query_t *state, bool cold,
   query.question.type = 1u;
   query.question.class_code = 1u;
   query.wire = (ftun_bytes_t){wire, sizeof(wire)};
-  query.deadline_ms = ftun_dns_runtime_now(NULL) + (cold ? 300000u : 30000u);
+  query.deadline_ms = test_now() + (cold ? 300000u : 30000u);
   query.completion = fanout_done;
   query.completion_user = state;
   CHECK(ftun_dns_exchange(f->core, f->dns->servers[0], &query, out) == FTUN_OK);
@@ -258,7 +267,7 @@ static int fanout_case(bool tcp, bool truncated, size_t quota)
       CHECK(fanout_begin(&f, &queries[HOT], true, &operations[HOT]) == 0);
       CHECK(ftun_dns_runtime_quiesce(f.dns) == FTUN_OK);
       /* 响应已提交后再跨越期限，不得把排队交付改为超时。 */
-      fanout_now_ms = ftun_dns_runtime_now(NULL) + 60000u;
+      fanout_now_ms = test_now() + 60000u;
     }
     if (committed && round - committed_round >= 16u) CHECK(cold_progress);
   }
@@ -300,7 +309,7 @@ static bool expired_in_callback(fixture_t *f)
   query.question.type = 1u;
   query.question.class_code = 1u;
   query.wire = (ftun_bytes_t){wire, sizeof(wire)};
-  query.deadline_ms = ftun_dns_runtime_now(NULL) + 1000u;
+  query.deadline_ms = test_now() + 1000u;
   query.completion = query_done;
   query.completion_user = f;
   fanout_now_ms = query.deadline_ms + 60000u;
@@ -323,7 +332,7 @@ static void direct_done(void *user, ftun_status_t status,
   if (state->reenter) {
     state->valid = state->valid &&
       ftun_dns_runtime_run_once(f->dns, 1u, &work) == FTUN_E_AGAIN && work == 0u &&
-      ftun_dns_runtime_stop_until(f->dns, ftun_dns_runtime_now(NULL) + 1000u) == FTUN_E_AGAIN &&
+      ftun_dns_runtime_stop_until(f->dns, test_now() + 1000u) == FTUN_E_AGAIN &&
       ftun_dns_runtime_destroy(&f->dns) == FTUN_E_AGAIN && f->dns != NULL;
     if (state->cancel_other != NULL) {
       state->valid = state->valid &&
@@ -342,7 +351,7 @@ static int direct_begin(fixture_t *f, ftun_dns_runtime_transport_request_t *requ
   ftun_dns_runtime_transport_waiter_t *waiter = NULL;
   state->fixture = f;
   CHECK(ftun_dns_runtime_waiter_create(f->dns, request,
-    (ftun_bytes_t){wire, sizeof(wire)}, ftun_dns_runtime_now(NULL) + 30000u,
+    (ftun_bytes_t){wire, sizeof(wire)}, test_now() + 30000u,
     direct_done, state, &waiter) == FTUN_OK);
   *out = waiter;
   return 0;
@@ -370,7 +379,7 @@ static int fanout_stop_case(void)
   states[0].cancel_other = &handles[EXTRA - 1u];
   CHECK(ftun_dns_runtime_stop_until(f.dns, 1u) == FTUN_E_TIMEOUT);
   CHECK(f.dns->waiter_count == EXTRA + 1u && states[0].calls == 0u);
-  deadline = ftun_dns_runtime_now(NULL) + 10000u;
+  deadline = test_now() + 10000u;
   for (round = 0u; round < 256u && status == FTUN_E_AGAIN; round++) {
     size_t before = total + f.calls;
     status = ftun_dns_runtime_stop_until(f.dns, deadline);
@@ -443,7 +452,7 @@ static int fallback_stop_case(void)
     }
   }
   CHECK(fallback && f.path_opens == 2u && total == 0u);
-  deadline = ftun_dns_runtime_now(NULL) + 10000u;
+  deadline = test_now() + 10000u;
   for (round = 0u; round < 128u && status == FTUN_E_AGAIN; round++) {
     size_t before = total;
     status = ftun_dns_runtime_stop_until(f.dns, deadline);
@@ -458,9 +467,22 @@ static int fallback_stop_case(void)
   return 0;
 }
 
+static int clock_failure_case(void)
+{
+  fixture_t f;
+  size_t work;
+  CHECK(fixture_open(&f, false) == 0);
+  clock_status = FTUN_E_IO;
+  CHECK(ftun_dns_runtime_run_once(f.dns, 1u, &work) == FTUN_E_IO);
+  clock_status = FTUN_OK;
+  CHECK(fixture_close(&f, 0u, FTUN_OK) == 0);
+  return 0;
+}
+
 int main(void)
 {
   size_t tcp, writing, cancel;
+  CHECK(clock_failure_case() == 0);
   for (tcp = 0u; tcp < 2u; tcp++) {
     for (writing = 0u; writing < 2u; writing++) {
       for (cancel = 0u; cancel < 2u; cancel++) {

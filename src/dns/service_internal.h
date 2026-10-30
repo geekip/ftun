@@ -286,7 +286,7 @@ ftun_status_t ftun_dns_runtime_listener_udp_one(
   size_t listener_index, bool *out_work);
 ftun_status_t ftun_dns_runtime_named_index(ftun_string_t name,
                                                   size_t *out, void *user);
-uint64_t ftun_dns_runtime_now(void *user);
+ftun_status_t ftun_dns_runtime_now(void *user, uint64_t *out);
 ftun_status_t ftun_dns_runtime_outbound_id(
   ftun_dns_runtime_t *dns, const char *name, uint32_t required, uint32_t *out);
 void ftun_dns_runtime_packet_done(ftun_datagram_t *channel,
@@ -366,7 +366,7 @@ void ftun_dns_runtime_request_unlink(
 ftun_status_t ftun_dns_runtime_resolve_upstream(
   ftun_budget_t *budget, const ftun_config_t *config, const char *text, uint32_t socket_mark,
   ftun_endpoint_t *out);
-uint64_t ftun_dns_runtime_response_now(void *user);
+ftun_status_t ftun_dns_runtime_response_now(void *user, uint64_t *out);
 ftun_status_t ftun_dns_runtime_run_slice(ftun_dns_runtime_t *dns,
                                                 size_t quota, size_t *out_work);
 ftun_status_t ftun_dns_runtime_select(uint32_t outbound_id,

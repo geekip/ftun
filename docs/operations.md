@@ -4,7 +4,7 @@
 
 ## 1. 运行条件
 
-- 正式支持 Linux x86_64 IPv4；产物可构建为 musl 全静态程序（见 README）。
+- Linux 提供 amd64/arm64/armv7/mips/mipsel 的 IPv4/IPv6 musl 全静态程序。Darwin/Windows 用户态运行要求与限制见[平台构建说明](building.md)。
 - 只使用 SOCKS5/Mixed 入站、DIRECT 或 SOCKS5 出站时，普通用户即可运行，需要监听端口、配置文件和状态文件的访问权限。
 - 使用 TUN 与自动路由（`tun.auto-route`）需要 root 或 `CAP_NET_ADMIN`；绑定 1024 以下端口需要 `CAP_NET_BIND_SERVICE`。
 - 系统无法建立必需的出口保护（socket 标记、路由规则）时，FTUN 在启动阶段失败并报告原因，不会降级为无保护运行。

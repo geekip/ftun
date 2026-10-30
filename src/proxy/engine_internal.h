@@ -595,8 +595,6 @@ ftun_status_t ftun_proxy_runtime_build_inbound_spec(
   ftun_proxy_runtime_flow_t *flow, const ftun_config_inbound_t *config,
   ftun_inbound_spec_t *spec, ftun_inbound_user_t **out_users,
   ftun_reservation_t *out_reservation);
-ftun_status_t ftun_proxy_runtime_config_outbound_id(
-  const ftun_config_t *config, const char *name, uint32_t *out);
 ftun_status_t ftun_proxy_runtime_copy_etag(ftun_budget_t *budget,
   const uint8_t *value, size_t length, char **out,
   ftun_reservation_t *out_reservation);

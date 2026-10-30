@@ -42,11 +42,7 @@ typedef struct {
 
 static ftun_error_t ftun_direct_error(ftun_status_t status, uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
+  return (ftun_error_t){status, stage, 0};
 }
 
 static int ftun_direct_domain_valid(ftun_string_t domain)
@@ -55,17 +51,12 @@ static int ftun_direct_domain_valid(ftun_string_t domain)
          memchr(domain.data, '\0', domain.length) == NULL;
 }
 
-static int ftun_direct_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
-}
-
 static int ftun_direct_contains(const ftun_endpoint_t *items, size_t count,
                                 const ftun_endpoint_t *endpoint)
 {
   size_t index;
   for (index = 0u; index < count; index++) {
-    if (ftun_direct_endpoint_equal(&items[index], endpoint)) return 1;
+    if (ftun_endpoint_equal(&items[index], endpoint)) return 1;
   }
   return 0;
 }
@@ -95,7 +86,7 @@ static ftun_status_t ftun_direct_target_validate(const ftun_target_t *target)
     if (!ftun_direct_contains(target->candidates, target->candidate_count,
                               endpoint)) return FTUN_E_REJECTED;
     for (previous = 0u; previous < index; previous++) {
-      if (ftun_direct_endpoint_equal(&target->allowed[previous], endpoint)) {
+      if (ftun_endpoint_equal(&target->allowed[previous], endpoint)) {
         return FTUN_E_INVALID;
       }
     }

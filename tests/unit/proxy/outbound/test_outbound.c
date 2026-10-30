@@ -123,12 +123,10 @@ static int fixture_start(fixture_t *fixture)
   fixture->request.transport = FTUN_DIAL_TCP;
   fixture->request.direct = &fixture->direct;
   /* 注入的登记表：两个 Connector 都是计数的假实现，能力位与真实实现一致。 */
-  if (ftun_connector_register(&fixture->registry,
-        &(ftun_connector_ops_t){"direct", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP,
-                                mock_direct_open, fixture}) != FTUN_OK ||
-      ftun_connector_register(&fixture->registry,
-        &(ftun_connector_ops_t){"socks5", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP,
-                                mock_socks5_open, fixture}) != FTUN_OK) return 1;
+  fixture->registry = (ftun_connector_registry_t){{
+    {"direct", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP, mock_direct_open, fixture},
+    {"socks5", FTUN_CONNECTOR_TCP | FTUN_CONNECTOR_UDP, mock_socks5_open, fixture}
+  }, 2u};
   return 0;
 }
 
@@ -229,13 +227,12 @@ static int test_registry(void)
   ftun_reject_result_t reject;
   ftun_connector_registry_t registry;
   ftun_connector_ops_t tcp_only = {"socks5", FTUN_CONNECTOR_TCP, mock_socks5_open, NULL};
-  size_t index;
-  char names[FTUN_CONNECTOR_MAX + 1u][8];
   CHECK(fixture_start(&fixture) == 0);
   /* 只支持 TCP 的 socks5：UDP 请求在到达 Connector 之前就被拒绝。 */
   memset(&registry, 0, sizeof(registry));
   tcp_only.context = &fixture;
-  CHECK(ftun_connector_register(&registry, &tcp_only) == FTUN_OK);
+  registry.entries[0] = tcp_only;
+  registry.count = 1u;
   fixture.leaf.kind = FTUN_OUTBOUND_LEAF_SOCKS5;
   fixture.request.direct = NULL;
   fixture.request.socks5 = &fixture.socks5;
@@ -256,25 +253,8 @@ static int test_registry(void)
   fixture.request.direct = &fixture.direct;
   CHECK(ftun_outbound_open_with_registry(NULL, &fixture.request, &registry,
         &reject, &operation) == FTUN_E_UNSUPPORTED && fixture.direct_calls == 0);
-  /* 登记的合法性。 */
-  CHECK(ftun_connector_register(&registry, &tcp_only) == FTUN_E_INVALID); /* 重复 */
-  CHECK(ftun_connector_register(&registry,
-    &(ftun_connector_ops_t){"x", FTUN_CONNECTOR_TCP, NULL, NULL}) == FTUN_E_INVALID);
-  CHECK(ftun_connector_register(&registry,
-    &(ftun_connector_ops_t){"x", FTUN_CONNECTOR_KEEPALIVE, mock_socks5_open, NULL}) == FTUN_E_INVALID);
-  CHECK(ftun_connector_register(&registry,
-    &(ftun_connector_ops_t){"", FTUN_CONNECTOR_TCP, mock_socks5_open, NULL}) == FTUN_E_INVALID);
   CHECK(ftun_connector_lookup(&registry, "nope") == NULL &&
         ftun_connector_lookup(&registry, "socks5") != NULL);
-  for (index = 1u; index < FTUN_CONNECTOR_MAX; index++) {
-    ftun_connector_ops_t ops = {names[index], FTUN_CONNECTOR_UDP, mock_socks5_open, NULL};
-    snprintf(names[index], sizeof(names[index]), "k%zu", index);
-    CHECK(ftun_connector_register(&registry, &ops) == FTUN_OK);
-  }
-  snprintf(names[FTUN_CONNECTOR_MAX], sizeof(names[0]), "full");
-  CHECK(ftun_connector_register(&registry,
-    &(ftun_connector_ops_t){names[FTUN_CONNECTOR_MAX], FTUN_CONNECTOR_TCP,
-                            mock_socks5_open, NULL}) == FTUN_E_LIMIT);
   /* 默认登记表含 direct 与 socks5 两个真实实现，socks5 带域名目标能力。 */
   CHECK(ftun_connector_lookup(ftun_outbound_default_registry(), "direct") != NULL);
   CHECK(ftun_connector_lookup(ftun_outbound_default_registry(), "socks5") != NULL &&

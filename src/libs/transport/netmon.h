@@ -32,8 +32,6 @@ ftun_status_t ftun_netmon_destroy(ftun_netmon_t **netmon);
 /* 取走已到期的合并变化；没有则 AGAIN。now_ms 用于频率统计。 */
 ftun_status_t ftun_netmon_take(ftun_netmon_t *netmon, uint64_t now_ms,
                                ftun_network_change_t *out);
-ftun_status_t ftun_netmon_get_stats(const ftun_netmon_t *netmon,
-                                    ftun_netmon_stats_t *out);
 
 /* 解析一块 netlink 数据并并入 change；供测试直接使用。返回处理的消息数。 */
 

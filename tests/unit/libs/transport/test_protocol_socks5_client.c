@@ -195,61 +195,6 @@ static int test_failures(void)
   return 0;
 }
 
-typedef struct {
-  const uint8_t *script;
-  size_t script_length, script_offset;
-  uint8_t written[512];
-  size_t written_length;
-} script_t;
-
-static ftun_status_t script_write(void *context, const uint8_t *data, size_t length)
-{
-  script_t *script = (script_t *)context;
-  memcpy(script->written + script->written_length, data, length);
-  script->written_length += length;
-  return FTUN_OK;
-}
-
-static ftun_status_t script_read(void *context, uint8_t *data, size_t length)
-{
-  script_t *script = (script_t *)context;
-  if (script->script_offset + length > script->script_length) return FTUN_E_EOF;
-  memcpy(data, script->script + script->script_offset, length);
-  script->script_offset += length;
-  return FTUN_OK;
-}
-
-/* 阻塞驱动：整个握手由同一个状态机推进，恰好读完回复、不多读。 */
-static int test_blocking_driver(void)
-{
-  ftun_socks5_client_t client;
-  ftun_socks5_client_options_t options;
-  ftun_socks5_client_result_t result;
-  static const uint8_t server[] = {5, 0, 5, 0, 0, 1, 9, 9, 9, 9, 0, 80, 'x', 'y'};
-  static const uint8_t client_bytes[] = {5, 1, 0, 5, 1, 0, 1, 203, 0, 113, 9, 1, 0xbb};
-  script_t script;
-  ftun_socks5_client_io_t io = {script_write, script_read, &script};
-  memset(&options, 0, sizeof(options));
-  memset(&script, 0, sizeof(script));
-  script.script = server;
-  script.script_length = sizeof(server);
-  options.command = FTUN_SOCKS5_COMMAND_CONNECT;
-  options.target = ipv4(203, 0, 113, 9, 443u);
-  CHECK(ftun_socks5_client_init(&client, &options) == FTUN_OK);
-  io.context = &script;
-  CHECK(ftun_socks5_client_run(&client, &io, &result) == FTUN_OK);
-  CHECK(script.written_length == sizeof(client_bytes) &&
-        memcmp(script.written, client_bytes, sizeof(client_bytes)) == 0);
-  CHECK(script.script_offset == 12u && result.bound.port == 80u);
-  /* 对端提前断开：读取错误原样返回。 */
-  script.script_length = 4u;
-  script.script_offset = 0u;
-  script.written_length = 0u;
-  CHECK(ftun_socks5_client_init(&client, &options) == FTUN_OK);
-  CHECK(ftun_socks5_client_run(&client, &io, &result) == FTUN_E_EOF);
-  return 0;
-}
-
 int main(void)
 {
   size_t chunk;
@@ -259,7 +204,6 @@ int main(void)
   CHECK(test_auth() == 0);
   CHECK(test_udp_associate_and_ipv6_bnd() == 0);
   CHECK(test_failures() == 0);
-  CHECK(test_blocking_driver() == 0);
-  puts("SOCKS5 client: handshake phases, incremental input, BND forms, failures and blocking driver passed");
+  puts("SOCKS5 client: handshake phases, incremental input, BND forms, failures and exact reply consumption passed");
   return 0;
 }

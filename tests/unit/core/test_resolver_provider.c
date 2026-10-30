@@ -47,7 +47,7 @@ static void completed(ftun_operation_t *operation, ftun_error_t error, void *use
 {
   backend_t *backend = user;
   ftun_endpoint_t address = {0};
-  ftun_system_resolve_result_t result;
+  ftun_system_resolve_result_t result = {0};
   address.kind = FTUN_ADDRESS_IPV4;
   address.address[0] = 192u; address.address[1] = 0u;
   address.address[2] = 2u; address.address[3] = 53u;

@@ -9,6 +9,8 @@
 #define FTUN_EVENT_ERROR 4u
 #define FTUN_EVENT_TIMER 8u
 #define FTUN_EVENT_TASK 16u
+/* 仅用于io_start标识原生等待事件，不进入回调位；更新保持最初的对象类型。 */
+#define FTUN_EVENT_WAITABLE 32u
 
 typedef void (*ftun_event_callback_fn)(ftun_event_source_t *source,
                                        uint32_t events, void *user);

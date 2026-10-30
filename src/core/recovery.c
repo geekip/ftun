@@ -242,21 +242,6 @@ ftun_status_t ftun_recovery_report_failure(
   return FTUN_OK;
 }
 
-ftun_status_t ftun_recovery_report_success(
-  ftun_recovery_scheduler_t *scheduler, ftun_recovery_id_t id,
-  uint64_t now_ms)
-{
-  ftun_recovery_slot_t *slot;
-  if (scheduler == NULL) return FTUN_E_INVALID;
-  slot = ftun_recovery_find(scheduler, id);
-  if (slot == NULL || slot->retiring) return FTUN_E_STALE;
-  if (slot->state == FTUN_RECOVERY_WAITING) {
-    slot->state = FTUN_RECOVERY_AVAILABLE;
-    slot->available_since_ms = now_ms;
-  }
-  return FTUN_OK;
-}
-
 ftun_status_t ftun_recovery_attempt_finish(
   ftun_recovery_scheduler_t *scheduler, ftun_recovery_id_t id,
   uint64_t now_ms, ftun_status_t status, ftun_recovery_fault_t fault)

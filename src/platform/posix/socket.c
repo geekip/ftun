@@ -49,20 +49,3 @@ bool ftun_blocking_socket_wait(ftun_handle_t descriptor, uint32_t events,
   return result == 1 &&
     (item.revents & (item.events | POLLERR | POLLHUP | POLLNVAL)) != 0;
 }
-
-bool ftun_blocking_socket_send_all(ftun_handle_t descriptor, const uint8_t *data,
-                                   size_t length, uint64_t deadline_ms)
-{
-  size_t offset = 0u;
-  while (offset < length) {
-    ssize_t sent = send((int)descriptor, data + offset, length - offset,
-                        MSG_NOSIGNAL);
-    if (sent > 0) offset += (size_t)sent;
-    else if (sent < 0 && errno == EINTR) continue;
-    else if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) &&
-             ftun_blocking_socket_wait(descriptor, FTUN_POLLER_WRITE, deadline_ms)) {
-      continue;
-    } else return false;
-  }
-  return true;
-}

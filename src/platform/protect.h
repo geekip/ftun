@@ -14,6 +14,9 @@ typedef struct {
   uint32_t user_timeout_ms;
 } ftun_socket_liveness_t;
 
+/* 原生TCP确认期限是可选增强；DNS仍保持应用层绝对期限。 */
+bool ftun_socket_has_user_timeout(void);
+
 /* 所需出口约束由平台实现；协议和通道不依赖平台操作表。 */
 struct ftun_socket_policy {
   uint32_t mark;

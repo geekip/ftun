@@ -26,6 +26,9 @@ ftun_status_t ftun_platform_file_write(ftun_file_handle_t *file,
   ftun_bytes_t contents, size_t *written);
 /* 用于日志编号轮转：来源不存在时无需改名，其他失败明确返回错误。 */
 ftun_status_t ftun_platform_file_rename_if_exists(const char *from, const char *to);
+/* 返回原生绝对路径的根前缀长度，0表示相对路径；normalize原地统一平台分隔符。 */
+size_t ftun_file_path_root_length(const char *path);
+void ftun_file_path_normalize(char *path);
 /* 同步文件原语，不做堆分配或资源准入；调用方先准入所需 FD 和路径存储。
  * parent 返回输入 path 或静态文本的借用，借用期不超过 path；不写入输入。 */
 ftun_status_t ftun_platform_file_parent(const char *path, ftun_string_t *out);
@@ -80,5 +83,7 @@ ftun_status_t ftun_user_home(char *storage, size_t capacity, ftun_string_t *home
 ftun_status_t ftun_file_duplicate(ftun_handle_t descriptor, ftun_handle_t *out);
 /* 等待一次可写，超时返回 AGAIN；信号中断交还上层检查截止时间。 */
 ftun_status_t ftun_file_wait_writable(ftun_handle_t descriptor, uint32_t timeout_ms);
+/* 借用SSL_CERT_FILE或平台PEM路径；缺失时返回NULL，TLS不得取消验证。 */
+const char *ftun_file_system_ca(void);
 int ftun_file_standard_error(void);
 #endif

@@ -102,13 +102,6 @@ ftun_status_t ftun_channel_write_ref_with_completion(ftun_channel_t *channel,
     completion, user, accepted, out);
 }
 
-ftun_status_t ftun_channel_shutdown_write(ftun_channel_t *channel)
-{
-  if (channel == NULL) return FTUN_E_INVALID;
-  if (channel->transport != FTUN_DIAL_TCP) return FTUN_E_UNSUPPORTED;
-  return ftun_stream_shutdown_write(channel->data.stream);
-}
-
 ftun_status_t ftun_channel_send(ftun_channel_t *channel,
   const ftun_endpoint_t *target, ftun_packet_t *packet)
 {

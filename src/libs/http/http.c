@@ -162,23 +162,6 @@ static ftun_status_t ftun_http_redirect_url(ftun_budget_t *budget, ftun_string_t
   return FTUN_OK;
 }
 
-static const char *ftun_http_ca_file(void)
-{
-  static const char *const candidates[] = {
-    "/etc/ssl/certs/ca-certificates.crt",
-    "/etc/pki/tls/certs/ca-bundle.crt",
-    "/etc/ssl/ca-bundle.pem"
-  };
-  ftun_file_info_t info;
-  size_t index;
-  for (index = 0u; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
-    if (ftun_file_inspect_path(candidates[index], &info) == FTUN_OK && info.regular) {
-      return candidates[index];
-    }
-  }
-  return NULL;
-}
-
 static ftun_status_t ftun_http_tls_flush(ftun_tls_client_t *tls,
   ftun_control_channel_t *channel)
 {
@@ -469,7 +452,7 @@ static ftun_status_t ftun_http_fetch_once(
     &endpoint, spec->socket_mark,
     spec->purpose == 0 ? FTUN_DIAL_PURPOSE_FRS_UPDATE : spec->purpose);
   if (status == FTUN_OK && url.https) {
-    const char *ca_file = ftun_http_ca_file();
+    const char *ca_file = ftun_file_system_ca();
     if (ca_file == NULL) status = FTUN_E_REJECTED;
     memset(&tls_options, 0, sizeof(tls_options));
     tls_options.budget = spec->budget;

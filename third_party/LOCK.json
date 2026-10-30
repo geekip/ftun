@@ -2,7 +2,7 @@
   "schema": "ftun.third-party-lock/v1",
   "status": "locked-and-reviewed",
   "offline_build": true,
-  "target_abi": "linux-x86_64-musl",
+  "target_abi": "multi-platform",
   "dependencies": [
     {
       "name": "cJSON",
@@ -68,6 +68,78 @@
       },
       "build_boundary": "pure IPv6 text codecs adapted in src/util/ip.c; no musl OS code is compiled",
       "notice": "IPv6 text conversion is adapted from musl inet_pton and inet_ntop. Copyright \u00a9 2005-2020 Rich Felker, et al.; MIT license retained with original source snapshots. FTUN removes the socket address-family API and errno dependency."
+    },
+    {
+      "name": "wepoll",
+      "version": "1.5.8",
+      "revision": "0598a791bf9cbbf480793d778930fc635b044980",
+      "source": "https://github.com/piscisaureus/wepoll.git",
+      "path": "third_party/wepoll",
+      "source_form": "git-submodule",
+      "license": "BSD-2-Clause",
+      "selected_license": "BSD-2-Clause",
+      "license_file": "third_party/wepoll/LICENSE",
+      "license_sha256": "3e56262d2c0e9492f113089916ed624e98f88b31dfd6acae24ede59cdfda5a69",
+      "local_patches": [],
+      "build_boundary": "Windows readiness backend only; upstream single-file implementation compiled privately with admitted allocation hooks; no changes to submodule sources",
+      "notice": "FTUN includes the unmodified wepoll 1.5.8 distribution as a pinned Git submodule. Copyright 2012-2020 Bert Belder. Windows builds use its epoll-style socket readiness API, backed by AFD and IOCP."
+    },
+    {
+      "name": "Wintun API",
+      "version": "0.14.1",
+      "revision": "bfef136abfa1665c2592be09a7e383d646cdbe6e",
+      "source": "https://git.zx2c4.com/wintun",
+      "path": "third_party/wintun",
+      "source_form": "git-submodule",
+      "license": "GPL-2.0 OR MIT (API header); GPL-2.0 (unused driver sources)",
+      "selected_license": "MIT (API header)",
+      "license_file": "third_party/wintun-api-LICENSE",
+      "license_sha256": "a9ac182713a3a69fee867dfa483330f22e8a001909f4b92b72cca8b86739de7d",
+      "local_patches": [],
+      "build_boundary": "Windows only; public api/wintun.h declarations; no upstream driver or API implementation is compiled; official signed DLL loaded at runtime via the public API",
+      "notice": "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved. FTUN uses the API header under its MIT alternative. The unmodified official wintun.dll is a separate runtime component distributed under the Wintun Prebuilt Binaries License (LICENSE-Wintun-binaries), including the permission to accompany software using only its public API. Driver sources in this submodule are not compiled or distributed in FTUN binary packages.",
+      "source_files": {
+        "api/wintun.h": "1c484d46851582c6800b1c3e608cee231ad4690df3e45d6959d4fb8468b8cf69"
+      }
     }
-  ]
+  ],
+  "distribution_targets": [
+    "darwin-amd64",
+    "darwin-arm64",
+    "windows-amd64",
+    "windows-arm64",
+    "linux-amd64-musl",
+    "linux-arm64-musl",
+    "linux-armv7-musl",
+    "linux-mips-musl",
+    "linux-mipsel-musl"
+  ],
+  "distribution_toolchain": {
+    "name": "Zig",
+    "version": "0.15.2",
+    "source": "https://ziglang.org/download/0.15.2/",
+    "license_files": [
+      "LICENSE",
+      "lib/libc/musl/COPYRIGHT",
+      "lib/libc/mingw/COPYING"
+    ],
+    "notice": "Zig compiler runtime and target-specific static musl or MinGW-w64 CRT are supplied by the pinned Zig distribution. macOS and Windows also use operating-system libraries."
+  },
+  "wintun_runtime": {
+    "version": "0.14.1",
+    "source": "https://www.wintun.net/builds/wintun-0.14.1.zip",
+    "archive_sha256": "07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51",
+    "license_file": "wintun/LICENSE.txt",
+    "license_sha256": "183adac21e7d96c508c8fd34d394b7b6708bc81564ad1bad61ab66143a008cd2",
+    "binaries": {
+      "amd64": {
+        "file": "wintun/bin/amd64/wintun.dll",
+        "sha256": "e5da8447dc2c320edc0fc52fa01885c103de8c118481f683643cacc3220dafce"
+      },
+      "arm64": {
+        "file": "wintun/bin/arm64/wintun.dll",
+        "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
+      }
+    }
+  }
 }

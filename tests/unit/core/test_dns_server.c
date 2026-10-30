@@ -43,9 +43,13 @@ typedef struct {
   size_t response_length;
 } completion_t;
 
-static uint64_t fake_now(void *user)
+static ftun_status_t fake_clock_status;
+
+static ftun_status_t fake_now(void *user, uint64_t *out)
 {
-  return *(uint64_t *)user;
+  if (fake_clock_status != FTUN_OK) return fake_clock_status;
+  *out = *(uint64_t *)user;
+  return FTUN_OK;
 }
 
 static ftun_status_t transport_select(void *user, uint32_t root,
@@ -246,6 +250,10 @@ static int test_cancel_delivery(ftun_status_t cancel_status, int stop,
   options.now_user = &now;
   CHECK(ftun_dns_server_create(&options, &server) == FTUN_OK);
   query_init(&query, &completion, request, 5000u);
+  fake_clock_status = FTUN_E_IO;
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_E_IO &&
+    operation == NULL && completion.calls == 0u && transport.submits == 0u);
+  fake_clock_status = FTUN_OK;
   transport.next_leaf = 11u;
   CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
   CHECK(transport.selects == 1u && transport.submitted_leaf == 11u);
@@ -548,7 +556,8 @@ static int test_upstream_failover(void)
   CHECK(dispatch_one(operations) && completion.status == FTUN_OK);
 
   CHECK(ftun_dns_server_destroy(&server) == FTUN_OK);
-  CHECK(ftun_upstream_set_destroy(&set) == FTUN_OK);
+  ftun_upstream_set_destroy(&set);
+  CHECK(set == NULL);
   CHECK(ftun_recovery_scheduler_destroy(&scheduler) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
   CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
@@ -628,6 +637,15 @@ int main(void)
   response_init(response, 0x8180u, 0x9999u);
   CHECK(transport_deliver(&transport, FTUN_OK, response, sizeof(response)));
   CHECK(dispatch_one(operations) && completion.status == FTUN_E_PROTOCOL);
+
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, 5000u);
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  response_init(response, 0x8180u, query.id);
+  fake_clock_status = FTUN_E_IO;
+  CHECK(transport_deliver(&transport, FTUN_OK, response, sizeof(response)));
+  fake_clock_status = FTUN_OK;
+  CHECK(dispatch_one(operations) && completion.calls == 1u && completion.status == FTUN_E_IO);
 
   memset(&completion, 0, sizeof(completion));
   query_init(&query, &completion, request, 5000u);

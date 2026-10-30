@@ -203,5 +203,5 @@ static ftun_status_t async_destroy(void *context, void **state)
 
 const ftun_interface_ops_t ftun_interface_default_ops = {
   restore, withdraw, NULL,
-  {async_start, async_adopt, async_withdraw, async_run, async_query, async_destroy, async_repair, NULL}
+  {async_start, async_adopt, async_withdraw, async_run, async_query, async_destroy, async_repair, NULL}, false
 };

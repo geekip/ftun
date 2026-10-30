@@ -9,8 +9,9 @@ typedef struct {
   bool async_thread_safe;
 } ftun_event_backend_info_t;
 
-/* 通过 platform/poller 等待 readiness，eventfd 唤醒单一 owner。
- * 先为 adapter/两个自有 FD 准入，source 成员与共享 FD group 分别计内存；
+/* 通过 platform/poller 等待 readiness，平台唤醒单一 owner。
+ * 先为adapter/平台固定句柄峰值准入，内部原生分配独立持有凭据至实际释放；
+ * source 成员与共享 FD group 分别计内存；
  * 业务 FD 由上层计量。每 FD 一个原生 watcher，成员通知按配额轮转，
  * 所有 timer 共用一个原生唤醒。source 必须在其业务 FD 关闭前取消。
  */

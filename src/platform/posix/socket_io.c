@@ -107,8 +107,11 @@ static ftun_status_t ftun_system_protect_socket(
 #if defined(__linux__)
   return ftun_linux_socket_protect(socket, policy);
 #else
-  (void)socket; (void)policy;
-  return FTUN_E_UNSUPPORTED;
+  if (policy->mark != 0u || policy->interface_name.length != 0u) return FTUN_E_UNSUPPORTED;
+  int type;
+  socklen_t length = sizeof(type);
+  if (getsockopt((int)socket, SOL_SOCKET, SO_TYPE, &type, &length) != 0) return FTUN_E_IO;
+  return type == SOCK_STREAM ? ftun_socket_apply_liveness((ftun_handle_t)socket, &policy->liveness) : FTUN_OK;
 #endif
 }
 
@@ -422,30 +425,4 @@ ptrdiff_t ftun_socket_send_to(ftun_handle_t descriptor, const void *buffer, size
   } while (count < 0 && errno == EINTR);
   *status = count < 0 ? ftun_socket_stream_status(errno) : FTUN_OK;
   return (ptrdiff_t)count;
-}
-
-ftun_status_t ftun_socket_connect_udp(const ftun_endpoint_t *peer, uint32_t mark,
-  ftun_handle_t *out)
-{
-  struct sockaddr_storage address;
-  int descriptor;
-  ftun_status_t status;
-  *out = -1;
-  descriptor = ftun_posix_socket(peer->kind == FTUN_ADDRESS_IPV6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
-  if (descriptor < 0) return ftun_blocking_socket_status(errno);
-  if (mark != 0u) {
-    ftun_socket_policy_t policy = {0};
-    policy.mark = mark;
-    status = ftun_system_protect_socket(NULL, (ftun_native_socket_t)descriptor, &policy);
-    if (status != FTUN_OK) { close(descriptor); return status; }
-  }
-  socklen_t address_length = ftun_socket_address(peer, &address);
-  if (connect(descriptor, (const struct sockaddr *)&address, address_length) != 0 &&
-      errno != EINPROGRESS) {
-    status = ftun_blocking_socket_status(errno);
-    (void)close(descriptor);
-    return status;
-  }
-  *out = descriptor;
-  return FTUN_OK;
 }

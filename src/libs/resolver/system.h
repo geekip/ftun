@@ -17,6 +17,8 @@ typedef struct {
   ftun_string_t domain;
   const ftun_endpoint_t *addresses;
   size_t address_count;
+  /* 单调毫秒的绝对有效期限；0表示来源不提供TTL，不得持久缓存。 */
+  uint64_t expires_at_ms;
 } ftun_system_resolve_result_t;
 
 typedef void (*ftun_system_resolve_completion_fn)(

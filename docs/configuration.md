@@ -20,7 +20,7 @@
 | `base.ipv6` | 布尔 | `false` |  | 为域名解析同时查询 A/AAAA，默认仅查询 A；数值 IPv6 目标与双栈监听独立可用。 |
 | `base.reload-retain` | 对象 | `{}` |  |  |
 | `base.reload-retain.count` | 整数 | `4` | 最小 1；最大 64 | 同时保留的旧代次数量；满了以后拒绝 reload。只在启动时读取，修改需要重启。 |
-| `base.routing-mark` | 整数 | `18004` | 最小 1；最大 4294967295 | 出站 socket 的 fwmark，同时是 TUN 路由保护规则匹配值；同机多实例必须不同。 |
+| `base.routing-mark` | 整数 | `18004` | 最小 1；最大 4294967295 | Linux TUN 的出站 socket fwmark，同时是自动路由保护规则匹配值；同机多实例必须不同。Windows 手动路由模式不设置 mark。 |
 | `base.state-cache` | 布尔 | `true` |  | Group/Health 状态持久化开关，独立于 FakeIP persist 和未来 api.cache。 |
 | `base.timeouts` | 对象 | `{}` |  | 握手、建连、存活探测与空闲回收期限。 |
 | `base.timeouts.connect` | 字符串 | `10s` | 格式见 Schema | 出站建连期限。 |
@@ -167,13 +167,13 @@
 | 字段 | 类型 | 默认值 | 取值范围 | 说明 |
 |---|---|---|---|---|
 | `tun` | 对象 |  |  | 物理 TUN 的规范配置；TUN 入站只描述 Proxy 消费者，不接受设备字段。 |
-| `tun.auto-route` | 布尔 | `false` |  |  |
+| `tun.auto-route` | 布尔 | `false` |  | Linux 自动路由；Windows Wintun 要求 false，地址/MTU 与手动路由步骤见平台构建说明。 |
 | `tun.interface（必填）` | 字符串 |  | 最短 1；最长 15 | 平台 TUN 设备名。 |
 | `tun.ipv4（必填）` | 对象 |  |  |  |
 | `tun.ipv4.address（必填）` | 字符串 |  | 格式见 Schema | 设备 IPv4 地址及前缀；保留主机地址语义，不能将此字段当路由网络地址清除主机位。 |
 | `tun.ipv6` | 对象 |  |  |  |
-| `tun.ipv6.address（必填）` | 字符串 |  | 格式见 Schema | 可选设备 IPv6 地址及前缀；配置后安装 IPv6 路由，MTU 至少 1280。 |
+| `tun.ipv6.address（必填）` | 字符串 |  | 格式见 Schema | 可选设备 IPv6 地址及前缀；MTU 至少 1280。Windows 配置地址及直连路由，其他前缀由用户手动管理。 |
 | `tun.mtu` | 整数 | `1500` | 最小 1 |  |
 | `tun.route-table` | 整数 | `18004` | 最小 256；最大 4294967280 |  |
 | `tun.rule-priority` | 整数 | `11000` | 最小 1；最大 32000 |  |
-| `tun.strict-route` | 布尔 | `false` |  |  |
+| `tun.strict-route` | 布尔 | `false` |  | Linux 自动路由保护；Windows 不支持。 |

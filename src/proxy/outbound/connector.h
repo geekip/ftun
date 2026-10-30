@@ -27,8 +27,6 @@ typedef struct {
 } ftun_connector_registry_t;
 
 /* 名字不能为空或重复，open 不能为空，能力位至少含 TCP 或 UDP；满了返回 LIMIT。 */
-ftun_status_t ftun_connector_register(ftun_connector_registry_t *registry,
-                                      const ftun_connector_ops_t *ops);
 /* 没有该名字返回 NULL。返回的项借用登记表。 */
 const ftun_connector_ops_t *ftun_connector_lookup(
   const ftun_connector_registry_t *registry, const char *kind);

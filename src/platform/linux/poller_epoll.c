@@ -12,8 +12,9 @@ static ftun_status_t error_status(void)
 {
   return errno == EMFILE || errno == ENFILE || errno == ENOMEM ? FTUN_E_LIMIT : FTUN_E_IO;
 }
-ftun_status_t ftun_poller_create(ftun_poller_t *poller)
+ftun_status_t ftun_poller_create(ftun_poller_t *poller, ftun_poller_memory_t memory)
 {
+  (void)memory;
   native_poller_t *native = (void *)&poller->native;
   struct epoll_event event = {0};
   native->wakeup = -1;
@@ -28,10 +29,13 @@ ftun_status_t ftun_poller_create(ftun_poller_t *poller)
   }
   return FTUN_OK;
 }
-ftun_status_t ftun_poller_update(ftun_poller_t *poller, ftun_native_socket_t fd,
-  uint32_t previous, uint32_t interests, void *user)
+ftun_status_t ftun_poller_update(ftun_poller_t *poller, ftun_poller_io_t *io,
+  uint32_t interests, void *user)
 {
+  if (io->kind == FTUN_POLLER_WAITABLE) return FTUN_E_UNSUPPORTED;
   native_poller_t *native = (void *)&poller->native;
+  ftun_native_socket_t fd = io->socket;
+  uint32_t previous = io->events;
   struct epoll_event event = {0};
   int operation;
   if (fd > INT_MAX) return FTUN_E_INVALID;

@@ -58,7 +58,7 @@ struct ftun_event_backend_group {
   bool dirty;
   uint32_t desired_events;
   ftun_event_backend_group_t *dirty_previous, *dirty_next;
-  struct { ftun_native_socket_t socket; uint32_t events; } io;
+  ftun_poller_io_t io;
   /* 大多数 FD 只有一个 source，共享组直接拥有首个成员及其额度。 */
   ftun_event_backend_watcher_t first;
 };
@@ -77,10 +77,10 @@ static ftun_event_backend_group_t **ftun_event_backend_bucket(
 }
 
 static ftun_event_backend_group_t *ftun_event_backend_group_find(
-  ftun_event_backend_adapter_t *adapter, ftun_native_socket_t socket)
+  ftun_event_backend_adapter_t *adapter, ftun_native_socket_t socket, uint32_t kind)
 {
   ftun_event_backend_group_t *group = *ftun_event_backend_bucket(adapter, socket);
-  while (group != NULL && group->io.socket != socket) group = group->hash_next;
+  while (group != NULL && (group->io.socket != socket || group->io.kind != kind)) group = group->hash_next;
   return group;
 }
 
@@ -241,7 +241,7 @@ static void ftun_event_backend_group_free(ftun_event_backend_group_t *group)
   ftun_event_backend_ready_unlink(group);
   dirty_remove(group);
   ftun_event_backend_record(group->adapter, ftun_poller_update(&group->adapter->poller,
-    (ftun_native_socket_t)group->io.socket, group->io.events, 0u, group));
+    &group->io, 0u, group));
   ftun_event_backend_group_unlink(group);
   free(group);
   ftun_reservation_release(&reservation);
@@ -255,7 +255,9 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
   ftun_event_backend_group_t *group;
   ftun_status_t status;
   if (socket == (ftun_native_socket_t)UINTPTR_MAX) return FTUN_E_INVALID;
-  group = ftun_event_backend_group_find(adapter, socket);
+  uint32_t kind = (interests & FTUN_EVENT_WAITABLE) != 0u ? FTUN_POLLER_WAITABLE : 0u;
+  interests &= ~FTUN_EVENT_WAITABLE;
+  group = ftun_event_backend_group_find(adapter, socket, kind);
   if (group == NULL) {
     ftun_reservation_t reservation = (ftun_reservation_t){0};
     if (adapter->budget != NULL) {
@@ -270,6 +272,7 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
     group->reservation = reservation;
     group->adapter = adapter;
     group->io.socket = socket;
+    group->io.kind = kind;
     ftun_event_backend_group_insert(group);
   }
   status = ftun_event_backend_watcher_create(adapter, group, &watcher);
@@ -375,8 +378,7 @@ static ftun_status_t ftun_event_backend_run_once(void *context, bool block)
   while (adapter->dirty != NULL) {
     ftun_event_backend_group_t *group = adapter->dirty;
     dirty_remove(group);
-    status = ftun_poller_update(&adapter->poller, (ftun_native_socket_t)group->io.socket,
-      group->io.events, group->desired_events, group);
+    status = ftun_poller_update(&adapter->poller, &group->io, group->desired_events, group);
     if (status != FTUN_OK) return status;
     group->io.events = group->desired_events;
   }
@@ -387,7 +389,7 @@ static ftun_status_t ftun_event_backend_run_once(void *context, bool block)
   for (index = 0; index < count; index++) ftun_event_backend_io_callback(events[index].user, events[index].events);
   delivered = ftun_event_backend_deliver(adapter);
   ftun_event_loop_backend_report(adapter->front, end - now, adapter->poller.collected + delivered,
-    adapter->ready_head != NULL || adapter->poller.collected == FTUN_POLLER_CAPACITY);
+    adapter->ready_head != NULL || adapter->poller.collected >= FTUN_POLLER_CAPACITY);
   return adapter->pending_error;
 }
 
@@ -431,6 +433,32 @@ static const ftun_event_backend_ops_t ftun_event_backend_ops = {
   false
 };
 
+/* 凭据随原生后端分配一起存活；注销不等于wepoll内部轮询已完成。 */
+typedef union {
+  ftun_reservation_t reservation;
+  long double alignment;
+} ftun_backend_memory_t;
+static void *ftun_event_backend_allocate(void *context, size_t bytes, size_t descriptors)
+{
+  ftun_event_backend_adapter_t *adapter = context;
+  ftun_reservation_t reservation = {0};
+  if (adapter->budget != NULL && ftun_budget_reserve_resources(adapter->budget,
+      (ftun_budget_resources_t){sizeof(ftun_backend_memory_t) + bytes, descriptors, 0u},
+      &reservation) != FTUN_OK) return NULL;
+  ftun_backend_memory_t *memory = malloc(sizeof(*memory) + bytes);
+  if (memory == NULL) { ftun_reservation_release(&reservation); return NULL; }
+  memory->reservation = reservation;
+  return memory + 1u;
+}
+static void ftun_event_backend_release(void *context, void *allocation)
+{
+  (void)context;
+  ftun_backend_memory_t *memory = (ftun_backend_memory_t *)allocation - 1u;
+  ftun_reservation_t reservation = memory->reservation;
+  free(memory);
+  ftun_reservation_release(&reservation);
+}
+
 /* owner 的通用事件后端，系统等待由 platform/poller 实现。 */
 ftun_status_t ftun_event_backend_attach(ftun_event_loop_t *loop)
 {
@@ -449,8 +477,8 @@ ftun_status_t ftun_event_backend_attach(ftun_event_loop_t *loop)
   status = ftun_event_loop_budget(loop, &budget);
   if (status != FTUN_OK) return status;
   if (budget != NULL) {
-    /* 平台轮询/唤醒至多两个句柄，就绪数组位于固定栈帧。 */
-    const ftun_budget_resources_t charge = {sizeof(*adapter), 2u, 0u};
+    /* 平台给出构造期句柄峰值；就绪数组位于固定栈帧。 */
+    const ftun_budget_resources_t charge = {sizeof(*adapter), FTUN_POLLER_HANDLES, 0u};
     status = ftun_budget_reserve_resources(budget, charge, &reservation);
     if (status != FTUN_OK) return status;
   }
@@ -462,7 +490,8 @@ ftun_status_t ftun_event_backend_attach(ftun_event_loop_t *loop)
   adapter->reservation = reservation;
   adapter->budget = budget;
   adapter->front = loop;
-  status = ftun_poller_create(&adapter->poller);
+  status = ftun_poller_create(&adapter->poller, (ftun_poller_memory_t){
+    ftun_event_backend_allocate, ftun_event_backend_release, adapter});
   if (status != FTUN_OK) goto failed;
   status = ftun_event_loop_attach_backend(loop, &ftun_event_backend_ops, adapter);
   if (status == FTUN_OK) return FTUN_OK;
@@ -483,7 +512,7 @@ ftun_status_t ftun_event_backend_get_info(ftun_event_loop_t *loop, ftun_event_ba
   if (status != FTUN_OK) return status;
   out->version_major = 1u;
   out->version_minor = 0u;
-  out->backend = "epoll";
+  out->backend = FTUN_POLLER_NAME;
   out->async_thread_safe = true;
   return FTUN_OK;
 }

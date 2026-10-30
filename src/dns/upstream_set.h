@@ -12,15 +12,16 @@
 #define FTUN_UPSTREAM_SET_RECOVERY_KIND UINT32_C(2)
 
 typedef struct ftun_upstream_set ftun_upstream_set_t;
-typedef uint64_t (*ftun_upstream_now_fn)(void *user);
+/* 时钟失败如实返回，输出仅在OK时有效。 */
+typedef ftun_status_t (*ftun_upstream_now_fn)(void *user, uint64_t *out);
 
 /* endpoints 按优先级排列并被复制；scheduler 被借用，须晚于集合销毁。 */
 ftun_status_t ftun_upstream_set_create(ftun_budget_t *budget,
   ftun_recovery_scheduler_t *scheduler, const ftun_endpoint_t *endpoints,
   size_t count, ftun_upstream_now_fn now, void *now_user,
   ftun_upstream_set_t **out);
-ftun_status_t ftun_upstream_set_destroy(ftun_upstream_set_t **set);
-size_t ftun_upstream_set_count(const ftun_upstream_set_t *set);
+/* owner同步释放；scheduler晚于集合销毁，空拥有引用幂等。 */
+void ftun_upstream_set_destroy(ftun_upstream_set_t **set);
 const ftun_endpoint_t *ftun_upstream_set_endpoint(
   const ftun_upstream_set_t *set, size_t index);
 /* 取 after 之后第一个可用地址；after 为 SIZE_MAX 表示从头开始。
@@ -29,5 +30,5 @@ const ftun_endpoint_t *ftun_upstream_set_endpoint(
 ftun_status_t ftun_upstream_set_pick(ftun_upstream_set_t *set, size_t after,
   size_t *out_index, bool *out_recovering);
 /* 网络类失败（超时、不可达、连接中断）。上游自己返回的 SERVFAIL/REFUSED 不算。 */
-void ftun_upstream_set_report_failure(ftun_upstream_set_t *set, size_t index);
+ftun_status_t ftun_upstream_set_report_failure(ftun_upstream_set_t *set, size_t index);
 #endif

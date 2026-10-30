@@ -24,7 +24,7 @@ def allowed(layer, dependency):
     return dependency in {'core', 'platform', 'util'} or dependency.startswith('libs/')
 
 def check_include(layer, header):
-    if layer != 'platform' and re.match(r'platform/(linux|posix|bsd)/', header):
+    if layer != 'platform' and re.match(r'platform/(linux|posix|bsd|darwin|windows)/', header):
         return False
     return allowed(layer, owner(header))
 
@@ -38,7 +38,7 @@ def direct_atomic_api(layer, source):
 
 def direct_system_header(layer, source):
     return layer != 'platform' and bool(re.search(
-        r'#\s*include\s*<(?:pthread\.h|stdatomic\.h|time\.h|sys/[^>]+|unistd\.h|fcntl\.h|signal\.h|poll\.h|sched\.h|pwd\.h|(?:arpa|net|netinet|linux)/[^>]+)>', source))
+        r'#\s*include\s*<(?:windows\.h|winsock2\.h|ws2tcpip\.h|io\.h|pthread\.h|stdatomic\.h|time\.h|sys/[^>]+|unistd\.h|fcntl\.h|signal\.h|poll\.h|sched\.h|pwd\.h|(?:arpa|net|netinet|linux)/[^>]+)>', source))
 
 def audit(root, database):
     errors, seen, graph = [], set(), {}
@@ -118,6 +118,8 @@ def main():
             assert not check_include(layer, 'platform/linux/route.h')
             assert not check_include(layer, 'platform/posix/error.h')
             assert not check_include(layer, 'platform/bsd/poller.h')
+            assert not check_include(layer, 'platform/windows/thread_types.h')
+            assert not check_include(layer, 'platform/darwin/process.h')
             assert check_include(layer, 'platform/route.h')
         assert not check_include('core', 'proxy/runtime.h')
         assert not check_include('dns', 'proxy/runtime.h')
@@ -128,6 +130,8 @@ def main():
         assert direct_atomic_api('app', '_Atomic uint64_t request;')
         assert not direct_atomic_api('app', 'ftun_atomic_load(&request);')
         assert not direct_thread_api('platform', 'pthread_mutex_lock(&mutex);')
+        assert direct_system_header('core', '#include <windows.h>')
+        assert direct_system_header('proxy', '#include <winsock2.h>')
         assert direct_system_header('core', '#include <sys/stat.h>')
         assert direct_system_header('core', '#include <stdatomic.h>')
         assert not direct_system_header('core', '#include <stdint.h>')

@@ -27,17 +27,12 @@ static int ftun_target_string_equal(ftun_string_t left, ftun_string_t right)
          memcmp(left.data, right.data, left.length) == 0;
 }
 
-static int ftun_target_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
-}
-
 static int ftun_target_contains(const ftun_endpoint_t *items, size_t count,
                                 const ftun_endpoint_t *endpoint)
 {
   size_t index;
   for (index = 0u; index < count; index++) {
-    if (ftun_target_endpoint_equal(&items[index], endpoint)) return 1;
+    if (ftun_endpoint_equal(&items[index], endpoint)) return 1;
   }
   return 0;
 }
@@ -138,7 +133,7 @@ ftun_status_t ftun_target_apply_route(ftun_target_t *target,
     if (!ftun_target_contains(target->allowed, target->allowed_count,
                               &route->allowed[index])) return FTUN_E_REJECTED;
     for (previous = 0u; previous < index; previous++) {
-      if (ftun_target_endpoint_equal(&route->allowed[previous],
+      if (ftun_endpoint_equal(&route->allowed[previous],
                                      &route->allowed[index])) {
         return FTUN_E_INVALID;
       }

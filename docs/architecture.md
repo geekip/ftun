@@ -35,6 +35,6 @@ Core 通过 `platform/thread`、`platform/atomic`、`platform/file`、`platform/
 
 `libs/tls` 只接纳和交付有界内存密文，保留 CA、主机名验证和最低 TLS 版本。固定 CA 配置的 context 可以供多个会话共享；原生会话构造单独同步，各会话数据 I/O 由各自 owner 推进。双向密文环随包装对象先准入，原生库的证书与内部堆仍不构成精确的 RSS 硬限额。`libs/http` 显式推进密文和传输背压，跨重定向复用 context，始终保留请求的绝对期限；业务配置与组选择计划由 Proxy 生成。
 
-CI 的 macOS 任务只使用真实 SDK 编译 POSIX 平台源，不生成可运行产品。Mesh、其他操作系统原生服务和新增代理协议尚未实现。
+Darwin 复用 POSIX 服务并使用原生 kqueue；Windows 提供文件、线程、Socket、wepoll 和进程控制服务，生成用户态程序。平台实现和能力边界见[平台构建说明](building.md)。CI 配置包含两个系统的 amd64/arm64 原生构建与协议冒烟，尚未执行的 runner 不计作运行资格。Mesh 和新增代理协议尚未实现。
 
 公开 C API 位于 `include/ftun`，实现位于 `app/capi`。ABI 1 的结构布局、函数签名和符号保留；`ftun.h` 汇总拆分后的头文件，`error.h` 继续支持已有宿主的 include 路径。宿主通过安装后的 `FTUN::Runtime` CMake 目标链接完整静态依赖，而不是单独链接内部 core 库。

@@ -3,141 +3,52 @@ name: Release
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  linux-x86_64-musl:
+  platforms:
     if: github.event.deleted == false
+    uses: ./.github/workflows/platforms.yml
+
+  publish:
+    needs: platforms
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    env:
-      BUILD_PRESET: linux-x86_64-musl
-      RELEASE_PLATFORM: linux-x86_64-musl
-
+    permissions:
+      contents: write
     steps:
-      - name: Check out tagged source
-        uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          fetch-depth: 0
-          submodules: recursive
-
-      - name: Validate release tag
-        shell: bash
+          pattern: ftun-*
+          path: dist
+          merge-multiple: true
+      - name: Verify complete asset set
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
-            echo "unsupported release tag: ${tag}" >&2
-            exit 1
-          fi
-          version="$({ sed -n \
-            's/^project(FTUN VERSION \([^ ]*\) LANGUAGES C)$/\1/p' \
-            CMakeLists.txt; } | head -n 1)"
-          if [[ -z "${version}" ]]; then
-            echo "cannot read FTUN version from CMakeLists.txt" >&2
-            exit 1
-          fi
-          case "${tag#v}" in
-            "${version}"|"${version}"-*) ;;
-            *)
-              echo "tag ${tag} does not match FTUN ${version}" >&2
-              exit 1
-              ;;
-          esac
-
-      - name: Install musl build tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install --no-install-recommends -y \
-            binutils cmake file make musl-tools python3
-
-          musl_cc="$(command -v x86_64-linux-musl-gcc || command -v musl-gcc)"
-          musl_ar="$(command -v x86_64-linux-musl-gcc-ar || \
-            command -v gcc-ar || command -v ar)"
-          musl_ranlib="$(command -v x86_64-linux-musl-gcc-ranlib || \
-            command -v gcc-ranlib || command -v ranlib)"
-          printf 'FTUN_MUSL_CC=%s\n' "${musl_cc}" >> "${GITHUB_ENV}"
-          printf 'FTUN_MUSL_AR=%s\n' "${musl_ar}" >> "${GITHUB_ENV}"
-          printf 'FTUN_MUSL_RANLIB=%s\n' "${musl_ranlib}" >> "${GITHUB_ENV}"
-
-      - name: Build and test static binary
-        shell: bash
-        run: |
-          set -euo pipefail
-          cmake --preset "${BUILD_PRESET}"
-          cmake --build --preset "${BUILD_PRESET}" --parallel
-          ctest --preset "${BUILD_PRESET}" --output-on-failure
-
-          binary="build/${BUILD_PRESET}/ftun"
-          version="${GITHUB_REF_NAME#v}"
-          version="${version%%-*}"
-          revision="$(git rev-parse --short=12 HEAD)"
-          "${binary}" version | tee "build/${BUILD_PRESET}/version.txt"
-          grep -Fx "FTUN ${version}" "build/${BUILD_PRESET}/version.txt"
-          grep -Fx "source: ${revision}" "build/${BUILD_PRESET}/version.txt"
-          file "${binary}" | grep -E 'ELF 64-bit.*x86-64.*statically linked'
-          if readelf -W -l "${binary}" | grep -q ' INTERP '; then
-            echo "release binary contains PT_INTERP" >&2
-            exit 1
-          fi
-          if readelf -W -d "${binary}" | grep -q '(NEEDED)'; then
-            echo "release binary contains DT_NEEDED" >&2
-            exit 1
-          fi
-
-      - name: Package release asset
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          package="ftun-${GITHUB_REF_NAME}-${RELEASE_PLATFORM}"
-          install_root="${RUNNER_TEMP}/ftun-install"
-          package_root="dist/${package}"
-          archive="dist/${package}.tar.gz"
-
-          cmake --install "build/${BUILD_PRESET}" --prefix "${install_root}"
-          mkdir -p "${package_root}"
-          install -m 0755 "${install_root}/bin/ftun" "${package_root}/ftun"
-          mkdir -p "${package_root}/docs"
-          cp -a "${install_root}/share/doc/ftun/." "${package_root}/docs/"
-
-          source_date_epoch="$(git show -s --format=%ct HEAD)"
-          tar --sort=name --mtime="@${source_date_epoch}" \
-            --owner=0 --group=0 --numeric-owner \
-            -C dist -cf - "${package}" | gzip -n -9 > "${archive}"
-          (
-            cd dist
-            sha256sum "${package}.tar.gz" > "${package}.tar.gz.sha256"
-          )
-          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
-          printf 'checksum=%s\n' "${archive}.sha256" >> "${GITHUB_OUTPUT}"
-
-      - name: Create or update GitHub Release
-        shell: bash
+          test "$(find dist -type f | wc -l)" -eq 18
+          for checksum in dist/*.sha256; do (cd dist && sha256sum -c "${checksum#dist/}"); done
+          for platform in darwin-amd64 darwin-arm64 windows-amd64 windows-arm64 linux-amd64-musl linux-arm64-musl linux-armv7-musl linux-mips-musl linux-mipsel-musl; do
+            extension=tar.gz
+            case "${platform}" in windows-*) extension=zip;; esac
+            test -f "dist/ftun-${RELEASE_TAG}-${platform}.${extension}"
+          done
+      - name: Publish verified release assets
         env:
           GH_TOKEN: ${{ github.token }}
-          ARCHIVE: ${{ steps.package.outputs.archive }}
-          CHECKSUM: ${{ steps.package.outputs.checksum }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          if gh release view "${tag}" >/dev/null 2>&1; then
-            gh release upload "${tag}" "${ARCHIVE}" "${CHECKSUM}" --clobber
-            exit 0
+          flags=(--verify-tag --title "FTUN ${RELEASE_TAG#v}" --generate-notes)
+          case "${RELEASE_TAG}" in *-*) flags+=(--prerelease);; esac
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" dist/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/* "${flags[@]}"
           fi
-
-          release_flags=(--verify-tag --title "FTUN ${tag#v}" --generate-notes)
-          if [[ "${tag}" == *-* ]]; then
-            release_flags+=(--prerelease)
-          fi
-          gh release create "${tag}" "${ARCHIVE}" "${CHECKSUM}" \
-            "${release_flags[@]}"

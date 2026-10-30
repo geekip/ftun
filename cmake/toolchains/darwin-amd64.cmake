@@ -1,0 +1,7 @@
+set(CMAKE_SYSTEM_NAME Darwin)
+set(CMAKE_SYSTEM_PROCESSOR x86_64)
+set(FTUN_ZIG_TARGET "x86_64-macos.12.0")
+set(CMAKE_OSX_ARCHITECTURES "x86_64" CACHE STRING "Darwin architecture")
+set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
+find_program(CMAKE_INSTALL_NAME_TOOL NAMES install_name_tool llvm-install-name-tool llvm-install-name-tool-19 REQUIRED)
+include("${CMAKE_CURRENT_LIST_DIR}/zig.cmake")

@@ -22,15 +22,16 @@ ftun_status_t ftun_packet_port_open_with_budget(ftun_core_t *core,
 ftun_status_t ftun_packet_port_get_info(const ftun_packet_port_t *port,
                                         ftun_packet_port_info_t *out)
 {
-  ftun_tun_port_info_t linux_info;
+  ftun_tun_port_info_t info;
   ftun_status_t status;
   if (out != NULL) memset(out, 0, sizeof(*out));
   if (out == NULL) return FTUN_E_INVALID;
-  status = ftun_tun_port_get_info(port, &linux_info);
+  status = ftun_tun_port_get_info(port, &info);
   if (status != FTUN_OK) return status;
-  memcpy(out->name, linux_info.name, sizeof(out->name));
-  out->mtu = linux_info.mtu;
-  out->native_socket = (ftun_native_socket_t)linux_info.descriptor;
+  memcpy(out->name, info.name, sizeof(out->name));
+  out->mtu = info.mtu;
+  out->native_socket = (ftun_native_socket_t)info.descriptor;
+  out->flags = info.flags;
   return FTUN_OK;
 }
 

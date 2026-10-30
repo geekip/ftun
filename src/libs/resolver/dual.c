@@ -11,6 +11,7 @@ typedef struct {
   ftun_operation_t *operation;
   ftun_status_t status;
   size_t count;
+  uint64_t expires_at_ms;
   ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
 } answer_t;
 struct dual {
@@ -57,6 +58,7 @@ static void answered(ftun_operation_t *operation, ftun_error_t error,
         memcmp(result->domain.data, dual->domain, dual->domain_length) != 0) answer->status = FTUN_E_STATE_CORRUPT;
     else {
       answer->count = result->address_count;
+      answer->expires_at_ms = result->expires_at_ms;
       memcpy(answer->addresses, result->addresses, answer->count * sizeof(*answer->addresses));
     }
   }
@@ -81,12 +83,14 @@ static void completed(ftun_operation_t *operation, ftun_error_t error, void *con
 {
   dual_t *dual = context;
   ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
-  ftun_system_resolve_result_t result = {{dual->domain, dual->domain_length}, addresses, 0u};
+  ftun_system_resolve_result_t result = {{dual->domain, dual->domain_length}, addresses, 0u, UINT64_MAX};
   ftun_reservation_t reservation = dual->reservation;
   if (error.status == FTUN_OK) for (size_t i = 0u; i < 2u; i++) {
     memcpy(addresses + result.address_count, dual->answers[i].addresses,
       dual->answers[i].count * sizeof(*addresses));
     result.address_count += dual->answers[i].count;
+    if (dual->answers[i].count != 0u && dual->answers[i].expires_at_ms < result.expires_at_ms)
+      result.expires_at_ms = dual->answers[i].expires_at_ms;
   }
   dual->completion(operation, error, &result, dual->user);
   free(dual);

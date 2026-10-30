@@ -67,12 +67,10 @@ static void ftun_cache_put_u32(uint8_t *data, uint32_t value)
   data[3] = (uint8_t)value;
 }
 
-static uint64_t ftun_cache_default_now(void *user)
+static ftun_status_t ftun_cache_default_now(void *user, uint64_t *out)
 {
-  uint64_t now = 0u;
   (void)user;
-  (void)ftun_monotonic_now(&now);
-  return now;
+  return ftun_monotonic_now(out);
 }
 
 static int ftun_cache_name_valid(ftun_dns_name_t name)
@@ -362,7 +360,7 @@ static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
                                         ftun_status_t failure,
                                         uint64_t lifetime_ms)
 {
-  uint64_t now = cache->now(cache->now_user);
+  uint64_t now;
   uint32_t existing;
   size_t slot;
   size_t bytes;
@@ -371,6 +369,8 @@ static ftun_status_t ftun_cache_install(ftun_dns_cache_t *cache,
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_dns_cache_entry_t *entry;
   ftun_status_t status;
+  status = cache->now(cache->now_user, &now);
+  if (status != FTUN_OK) return status;
   if (lifetime_ms == 0u || now > UINT64_MAX - lifetime_ms) return FTUN_E_INVALID;
   status = ftun_hash_lookup(cache->index,
     (ftun_bytes_t){key, key_length}, &existing);
@@ -574,7 +574,8 @@ ftun_status_t ftun_dns_cache_lookup(ftun_dns_cache_t *cache,
     return FTUN_E_STATE_CORRUPT;
   }
   entry = &cache->entries[slot];
-  now = cache->now(cache->now_user);
+  status = cache->now(cache->now_user, &now);
+  if (status != FTUN_OK) return status;
   if (now >= entry->expires_ms) {
     cache->expirations++;
     cache->misses++;

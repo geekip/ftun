@@ -1,3 +1,4 @@
+#include "platform/tun.h"
 #include "app/composition/egress.h"
 #include "app/config/model.h"
 #include "app/composition/bridges.h"
@@ -266,7 +267,7 @@ static void ftun_default_bind_modules(ftun_default_runtime_t *runtime,
   runtime->dns_binding.adapter.user = &runtime->proxy_dns;
 #endif
   runtime->dns_binding.socket_mark =
-    (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
+    ftun_platform_tun_auto_route_supported() && (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
       ? config->base.proxy.routing_mark : 0u;
 #endif
 #if defined(FTUN_HAVE_MODULE_TUN)
@@ -357,7 +358,7 @@ static ftun_status_t ftun_default_prepare(
     core, budget, source_capacity, &runtime->loop);
   if (status == FTUN_OK) status = ftun_event_backend_attach(runtime->loop);
   if (status == FTUN_OK) status = ftun_app_egress_prepare(budget, config,
-    (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
+    ftun_platform_tun_auto_route_supported() && (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
       ? config->base.proxy.routing_mark : 0u, &runtime->egress);
   if (status == FTUN_OK) {
     ftun_app_egress_bind(runtime->egress, core, generation);
@@ -436,7 +437,7 @@ static ftun_status_t ftun_default_reload_prepare(
   ftun_default_runtime_t *runtime = implementation;
   const ftun_egress_provider_t *egress = NULL;
   ftun_status_t status = ftun_app_egress_prepare(runtime->reservation.budget,
-    config, (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
+    config, ftun_platform_tun_auto_route_supported() && (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
       ? config->base.proxy.routing_mark : 0u, &egress);
   if (status != FTUN_OK) return status;
   ftun_default_egress_pending(runtime, egress, generation);

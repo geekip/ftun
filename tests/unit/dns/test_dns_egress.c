@@ -13,6 +13,13 @@ struct ftun_config {
   uint64_t marker;
   ftun_config_dns_t dns;
 };
+static uint64_t test_now(void)
+{
+  uint64_t now;
+  if (ftun_dns_runtime_now(NULL, &now) != FTUN_OK) abort();
+  return now;
+}
+
 static ftun_dns_config_binding_t binding(const ftun_config_t *config)
 {
   (void)config;
@@ -128,7 +135,7 @@ static int run(bool tcp, bool fallback, bool stream_only)
     request.question.name = (ftun_dns_name_t){wire + 12u, 11u};
     request.question.type = request.question.class_code = 1u;
     request.wire = (ftun_bytes_t){wire, sizeof(wire)};
-    request.deadline_ms = ftun_dns_runtime_now(NULL) + 3000u;
+    request.deadline_ms = test_now() + 3000u;
     request.completion = done;
     request.completion_user = &result;
     CHECK(ftun_dns_exchange(core, dns->servers[0], &request, &operation) == FTUN_OK);

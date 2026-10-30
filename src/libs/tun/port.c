@@ -13,14 +13,16 @@ ftun_status_t ftun_tun_port_open_with_io_and_budget(ftun_budget_t *budget,
 {
   ftun_packet_port_t *port;
   ftun_reservation_t reservation = (ftun_reservation_t){0}, control = (ftun_reservation_t){0};
+  size_t external_bytes, handles, temporary_handles;
   ftun_status_t status = FTUN_OK;
   if (out != NULL) *out = NULL;
   if (out == NULL || !ftun_platform_tun_spec_valid(spec, io)) return FTUN_E_INVALID;
+  ftun_platform_tun_resources(&external_bytes, &handles, &temporary_handles);
   if (budget != NULL) {
     status = ftun_budget_reserve_resources(budget,
-      (ftun_budget_resources_t){sizeof(*port) + ftun_platform_tun_allocation_size(), 1u, 0u}, &reservation);
-    if (status == FTUN_OK) status = ftun_budget_reserve_resources(budget,
-      (ftun_budget_resources_t){0u, 1u, 0u}, &control);
+      (ftun_budget_resources_t){sizeof(*port) + ftun_platform_tun_allocation_size() + external_bytes, handles, 0u}, &reservation);
+    if (status == FTUN_OK && temporary_handles != 0u) status = ftun_budget_reserve_resources(budget,
+      (ftun_budget_resources_t){0u, temporary_handles, 0u}, &control);
   }
   if (status != FTUN_OK) { ftun_reservation_release(&reservation); return status; }
   port = calloc(1u, sizeof(*port) + ftun_platform_tun_allocation_size());
@@ -64,6 +66,7 @@ ftun_status_t ftun_tun_port_get_info(const ftun_packet_port_t *port, ftun_tun_po
     memcpy(out->name, info.name, sizeof(out->name));
     out->mtu = info.mtu;
     out->descriptor = (ftun_handle_t)info.native_socket;
+    out->flags = info.flags;
   }
   return FTUN_OK;
 }

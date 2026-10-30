@@ -206,11 +206,12 @@ static ftun_status_t ftun_tun_owner_network_restore(void *context)
 {
   ftun_tun_owner_t *owner = context;
   ftun_interface_spec_t spec = {0};
-  if (!owner->network_plan.auto_route) return FTUN_OK;
+  if (!owner->network_plan.auto_route && !owner->network.configure_when_manual) return FTUN_OK;
   if (owner->routes != NULL || owner->async_routes != NULL || (owner->network_updating && owner->network_phase != FTUN_TUN_UPDATE_IDLE)) {
     return FTUN_E_AGAIN;
   }
   spec.budget = owner->budget;
+  spec.mtu = owner->network_plan.mtu;
   spec.name = (ftun_string_t){owner->network_plan.name, strlen(owner->network_plan.name)};
   memcpy(spec.addresses, owner->network_plan.addresses, sizeof(spec.addresses));
   spec.address_count = owner->network_plan.address_count;
@@ -274,7 +275,7 @@ static ftun_status_t ftun_tun_owner_prepare(
     config, host->protection_mark, &owner->plan);
   if (status != FTUN_OK) goto fail;
   owner->network_plan = owner->plan;
-  if (owner->plan.auto_route && (owner->network.restore == NULL ||
+  if ((owner->plan.auto_route || owner->network.configure_when_manual) && (owner->network.restore == NULL ||
       owner->network.withdraw == NULL)) { status = FTUN_E_INVALID; goto fail; }
   status = ftun_buffer_pool_create(
     budget, FTUN_TUN_OWNER_POOL_BYTES, FTUN_TUN_OWNER_POOL_BUFFERS,

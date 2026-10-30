@@ -64,6 +64,7 @@ struct ftun_tun_service {
   ftun_tun_network_lifecycle_t network;
   ftun_packet_port_t *port;
   ftun_event_source_t *source;
+  ftun_event_source_t *write_timer;
   ftun_packet_port_info_t info;
   ftun_tun_service_consumer_t *consumers;
   ftun_tun_service_packet_t *input_entries;
@@ -108,6 +109,7 @@ struct ftun_tun_service {
 
 ftun_tun_service_consumer_t *ftun_tun_service_lease_consumer(
   const ftun_tun_service_t *service, ftun_tun_lease_t lease);
+ftun_status_t ftun_tun_service_cancel_io(ftun_tun_service_t *service);
 ftun_status_t ftun_tun_service_interests(ftun_tun_service_t *service);
 void ftun_tun_service_consumer_clear(
   ftun_tun_service_t *service, ftun_tun_service_consumer_t *consumer);

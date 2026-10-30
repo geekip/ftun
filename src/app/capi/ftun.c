@@ -129,16 +129,19 @@ ftun_status_t ftun_core_prepare_parent(const char *path)
 {
   char *copy;
   char *cursor;
-  if (path == NULL || path[0] != '/') return FTUN_E_INVALID;
+  if (path == NULL) return FTUN_E_INVALID;
+  size_t root_length = ftun_file_path_root_length(path);
+  if (root_length == 0u) return FTUN_E_INVALID;
   copy = strdup(path);
   if (copy == NULL) return FTUN_E_LIMIT;
+  ftun_file_path_normalize(copy);
   cursor = strrchr(copy, '/');
-  if (cursor == NULL || cursor == copy) {
+  if (cursor == NULL || (size_t)(cursor - copy) < root_length) {
     free(copy);
     return FTUN_OK;
   }
   *cursor = '\0';
-  for (cursor = copy + 1u; ; cursor++) {
+  for (cursor = copy + root_length; ; cursor++) {
     if (*cursor != '/' && *cursor != '\0') continue;
     {
       char saved = *cursor;

@@ -1,11 +1,7 @@
 #include "frs_fixture.h"
 
-#include "core/limits.h"
-#include "core/operation.h"
-#include "proxy/runtime_state.h"
 #include "proxy/frs/domain.h"
 #include "proxy/frs/frs.h"
-#include "proxy/outbound/group/health.h"
 #include "proxy/outbound/group/url_test.h"
 #include "proxy/inbound/mixed.h"
 
@@ -17,11 +13,6 @@
   fprintf(stderr, "v0.4 integration failed: %s\n", #x); return 1; \
 } } while (0)
 
-typedef struct {
-  size_t calls;
-  ftun_status_t status;
-} completion_t;
-
 static ftun_bytes_t raw(const void *data, size_t length)
 {
   return (ftun_bytes_t){(const uint8_t *)data, length};
@@ -30,30 +21,6 @@ static ftun_bytes_t raw(const void *data, size_t length)
 static ftun_string_t text(const char *value)
 {
   return (ftun_string_t){value, strlen(value)};
-}
-
-static void completed(ftun_operation_t *operation, ftun_error_t error,
-                      void *user)
-{
-  completion_t *completion = (completion_t *)user;
-  (void)operation;
-  completion->calls++;
-  completion->status = error.status;
-}
-
-static ftun_status_t perform_unverified_https(
-  void *user, ftun_string_t url, uint32_t member_id,
-  uint64_t deadline_ms, ftun_probe_result_t *out)
-{
-  (void)user;
-  (void)url;
-  memset(out, 0, sizeof(*out));
-  out->http_status = 204u;
-  out->latency_ms = 7u;
-  out->finished_ms = deadline_ms - 1u;
-  out->path_member_id = member_id;
-  out->tls_verified = false;
-  return FTUN_OK;
 }
 
 int main(void)
@@ -77,15 +44,7 @@ int main(void)
   ftun_health_sample_t failed_samples[2];
   ftun_health_snapshot_t health;
   ftun_group_choice_t choice;
-  ftun_budget_t *budget = NULL;
-  ftun_core_t *core = NULL;
-  ftun_operation_queue_t *operations = NULL;
-  ftun_operation_t *operation = NULL;
-  completion_t completion;
-  ftun_probe_request_t probe;
-  ftun_health_sample_t probe_sample;
   size_t consumed = 0u;
-  size_t dispatched = 0u;
   bool matched = false;
 
   CHECK(ftun_test_frs_fixture(&fixture, &fixture_bytes));
@@ -130,34 +89,8 @@ int main(void)
         mixed_event.wire.length != 0u);
   CHECK(ftun_mixed_connection_destroy(&mixed) == FTUN_OK);
 
-  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
-  CHECK(ftun_runtime_manager_create(budget, 1u, &core) == FTUN_OK);
-  CHECK(ftun_operation_queue_create(budget, 4u, &operations) == FTUN_OK);
-  memset(&completion, 0, sizeof(completion));
-  memset(&probe, 0, sizeof(probe));
-  probe.generation = 9u;
-  probe.member_id = choice.leaf_id;
-  probe.url = text("https://probe.example/204");
-  probe.expected_status = 204u;
-  probe.now_ms = 100u;
-  probe.deadline_ms = 200u;
-  probe.operations = operations;
-  probe.completion = completed;
-  probe.completion_user = &completion;
-  probe.perform = perform_unverified_https;
-  probe.sample = &probe_sample;
-  CHECK(ftun_health_probe(core, &probe, &operation) == FTUN_OK &&
-        operation != NULL && !probe_sample.success);
-  CHECK(ftun_operation_dispatch(operations, 1u, &dispatched) == FTUN_OK &&
-        dispatched == 1u && completion.calls == 1u &&
-        completion.status == FTUN_E_REJECTED);
-
   CHECK(ftun_frs_set_release(&domain) == FTUN_OK);
   CHECK(ftun_frs_view_release(&view) == FTUN_OK);
   free(fixture);
-  CHECK(ftun_operation_queue_stop(operations) == FTUN_OK);
-  CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
-  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
-  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;
 }

@@ -20,8 +20,6 @@ typedef enum {
 ftun_status_t ftun_blocking_socket_status(int error_code);
 bool ftun_blocking_socket_wait(ftun_handle_t descriptor, uint32_t events,
                                uint64_t deadline_ms);
-bool ftun_blocking_socket_send_all(ftun_handle_t descriptor, const uint8_t *data,
-                                   size_t length, uint64_t deadline_ms);
 
 #define FTUN_INVALID_SOCKET ((ftun_native_socket_t)UINTPTR_MAX)
 typedef enum {
@@ -70,6 +68,7 @@ typedef enum {
 ftun_status_t ftun_socket_listen(const ftun_endpoint_t *address,
   ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
   ftun_socket_bind_issue_t *bind_issue);
+/* peer可为空：调用方不需要保存对端地址。 */
 ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out, ftun_endpoint_t *peer,
   ftun_socket_accept_disposition_t *disposition);
 ftun_status_t ftun_socket_duplicate(ftun_handle_t descriptor, ftun_handle_t *out);
@@ -80,8 +79,6 @@ ptrdiff_t ftun_socket_receive_from(ftun_handle_t descriptor, void *buffer, size_
 ptrdiff_t ftun_socket_send_to(ftun_handle_t descriptor, const void *buffer, size_t length,
   const ftun_endpoint_t *peer, ftun_status_t *status);
 /* 仅给隔离的 bootstrap worker 使用；不解析名字、不包含业务授权。 */
-ftun_status_t ftun_socket_connect_udp(const ftun_endpoint_t *peer, uint32_t mark,
-  ftun_handle_t *out);
 /* 在已创建的 TCP socket 上设置存活探测与发送确认期限：
  * SO_KEEPALIVE、TCP_KEEPIDLE、TCP_KEEPINTVL、TCP_KEEPCNT，以及 TCP_USER_TIMEOUT
  * （已发送的数据在 user_timeout_ms 内一直没有被确认则由内核关闭连接）。

@@ -234,7 +234,12 @@ ptrdiff_t ftun_file_write_some(ftun_handle_t descriptor, const void *buffer, siz
 
 ftun_status_t ftun_file_sync(ftun_handle_t descriptor, bool data_only)
 {
+#if defined(__APPLE__)
+  (void)data_only;
+  int result = fsync((int)descriptor);
+#else
   int result = data_only ? fdatasync((int)descriptor) : fsync((int)descriptor);
+#endif
   return result == 0 ? FTUN_OK : FTUN_E_IO;
 }
 
@@ -307,4 +312,22 @@ ftun_status_t ftun_file_wait_writable(ftun_handle_t descriptor, uint32_t timeout
 int ftun_file_standard_error(void)
 {
   return STDERR_FILENO;
+}
+
+size_t ftun_file_path_root_length(const char *path) { return path[0] == '/' ? 1u : 0u; }
+void ftun_file_path_normalize(char *path) { (void)path; }
+
+const char *ftun_file_system_ca(void)
+{
+  const char *configured = getenv("SSL_CERT_FILE");
+  if (configured != NULL && configured[0] != '\0') return configured;
+  static const char *const candidates[] = {
+    "/etc/ssl/certs/ca-certificates.crt", "/etc/pki/tls/certs/ca-bundle.crt",
+    "/etc/ssl/ca-bundle.pem", "/etc/ssl/cert.pem"
+  };
+  ftun_file_info_t info;
+  for (size_t i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); i++) {
+    if (ftun_file_inspect_path(candidates[i], &info) == FTUN_OK && info.regular) return candidates[i];
+  }
+  return NULL;
 }

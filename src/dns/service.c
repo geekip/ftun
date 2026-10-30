@@ -128,19 +128,19 @@ void ftun_dns_runtime_waiter_heap_remove(
   }
 }
 
-uint64_t ftun_dns_runtime_now(void *user)
+ftun_status_t ftun_dns_runtime_now(void *user, uint64_t *out)
 {
-  uint64_t now = 0u;
   (void)user;
-  (void)ftun_monotonic_now(&now);
-  return now;
+  return ftun_monotonic_now(out);
 }
 
 /* server 校验响应时使用接收完成时刻；新查询和 fallback 仍检查真实期限。 */
-uint64_t ftun_dns_runtime_response_now(void *user)
+ftun_status_t ftun_dns_runtime_response_now(void *user, uint64_t *out)
 {
   ftun_dns_runtime_t *dns = user;
-  return dns->delivering ? dns->delivery_now_ms : ftun_dns_runtime_now(NULL);
+  if (!dns->delivering) return ftun_dns_runtime_now(NULL, out);
+  *out = dns->delivery_now_ms;
+  return FTUN_OK;
 }
 
 void ftun_dns_runtime_record(ftun_dns_runtime_t *dns,
@@ -412,8 +412,14 @@ void ftun_dns_runtime_waiter_finish(
   ftun_dns_runtime_transport_request_t *previous_request = dns->delivering_request;
   request->completion_depth++;
   ftun_dns_runtime_waiter_unlink(waiter);
-  dns->delivery_now_ms = request->closing ? request->completed_ms :
-    ftun_dns_runtime_now(NULL);
+  if (request->closing) dns->delivery_now_ms = request->completed_ms;
+  else {
+    ftun_status_t clock_status = ftun_dns_runtime_now(NULL, &dns->delivery_now_ms);
+    if (clock_status != FTUN_OK) {
+      status = clock_status;
+      ftun_dns_runtime_record(dns, clock_status);
+    }
+  }
   dns->delivering = true;
   dns->delivering_request = request;
   completion(completion_user, status, transport, &upstream, response);
@@ -429,7 +435,11 @@ void ftun_dns_runtime_request_finish(
 {
   request->closing = true;
   request->completion_status = status;
-  request->completed_ms = ftun_dns_runtime_now(NULL);
+  ftun_status_t clock_status = ftun_dns_runtime_now(NULL, &request->completed_ms);
+  if (clock_status != FTUN_OK) {
+    request->completion_status = clock_status;
+    ftun_dns_runtime_record(request->dns, clock_status);
+  }
   /* 同一 UDP 合并批次尚未交付完时，保留其 TCP fallback 的合并窗口。 */
   if (request->fallback_parent == NULL) ftun_dns_runtime_request_index_remove(request);
 }
@@ -703,7 +713,10 @@ ftun_status_t ftun_dns_runtime_request_drive(
   for (steps = 0u; steps < 16u; steps++) {
     ftun_status_t status;
     if (request->io_status != FTUN_OK) return request->io_status;
-    if (ftun_dns_runtime_now(NULL) >= request->deadline_ms) {
+    uint64_t now;
+    status = ftun_dns_runtime_now(NULL, &now);
+    if (status != FTUN_OK) return status;
+    if (now >= request->deadline_ms) {
       return FTUN_E_TIMEOUT;
     }
     switch (request->state) {
@@ -851,7 +864,10 @@ ftun_status_t ftun_dns_runtime_transport_submit(
       completion == NULL || out_request == NULL || deadline_ms == 0u) {
     return FTUN_E_INVALID;
   }
-  if (ftun_dns_runtime_now(NULL) >= deadline_ms) return FTUN_E_TIMEOUT;
+  uint64_t now;
+  status = ftun_dns_runtime_now(NULL, &now);
+  if (status != FTUN_OK) return status;
+  if (now >= deadline_ms) return FTUN_E_TIMEOUT;
   status = ftun_dns_runtime_binding_validate(dns, binding);
   if (status != FTUN_OK) return status;
   outbound_id = binding->root_id;
@@ -1036,7 +1052,7 @@ ftun_status_t ftun_dns_runtime_run_once(ftun_dns_runtime_t *dns, size_t quota,
   if (out_work != NULL) *out_work = 0u;
   return quota == 0u || out_work == NULL ? FTUN_E_INVALID : FTUN_OK;
 }
-bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns)
+bool ftun_dns_runtime_has_ready(ftun_dns_runtime_t *dns)
 { (void)dns; return false; }
 size_t ftun_dns_runtime_quarantined(const ftun_dns_runtime_t *dns)
 { (void)dns; return 0u; }

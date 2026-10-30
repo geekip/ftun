@@ -83,7 +83,7 @@
           "minimum": 1,
           "maximum": 4294967295,
           "default": 18004,
-          "description": "出站 socket 的 fwmark，同时是 TUN 路由保护规则匹配值；同机多实例必须不同。"
+          "description": "Linux TUN 的出站 socket fwmark，同时是自动路由保护规则匹配值；同机多实例必须不同。Windows 手动路由模式不设置 mark。"
         },
         "timeouts": {
           "$ref": "#/$defs/Timeouts",

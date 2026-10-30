@@ -1,5 +1,7 @@
 #include "proxy/outbound/outbound.h"
 #include "util/endpoint.h"
+#include "proxy/config/model.h"
+#include "proxy/outbound_id.h"
 
 #include <string.h>
 
@@ -168,4 +170,30 @@ ftun_status_t ftun_outbound_open(ftun_core_t *core,
 {
   return ftun_outbound_open_with_registry(core, request,
     ftun_outbound_default_registry(), reject_result, out);
+}
+
+ftun_status_t ftun_proxy_outbound_id(const ftun_config_t *config,
+                                            const char *name,
+                                            uint32_t *out)
+{
+  size_t index;
+  if (config == NULL || name == NULL || out == NULL) return FTUN_E_INVALID;
+  if (strcmp(name, "DIRECT") == 0) {
+    *out = FTUN_OUTBOUND_ID_DIRECT;
+    return FTUN_OK;
+  }
+  if (strcmp(name, "REJECT") == 0) {
+    *out = FTUN_OUTBOUND_ID_REJECT;
+    return FTUN_OK;
+  }
+  for (index = 0u; index < ftun_config_outbound_count(config); index++) {
+    if (strcmp(name, ftun_config_outbounds(config)[index].name) == 0) {
+      if (index > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) {
+        return FTUN_E_LIMIT;
+      }
+      *out = (uint32_t)index + FTUN_OUTBOUND_ID_NAMED_BASE;
+      return FTUN_OK;
+    }
+  }
+  return FTUN_E_REJECTED;
 }

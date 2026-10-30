@@ -2,7 +2,7 @@
 #define FTUN_PROXY_DNS_RUNTIME_ADAPTER_H
 
 #include "libs/resolver/basic.h"
-typedef struct ftun_dns_service_slot ftun_dns_service_slot_t;
+struct ftun_dns_service_slot;
 
 
 /* Composition 拥有适配器和槽；Proxy/DNS 只借用。DNS service 通过中立
@@ -16,16 +16,13 @@ typedef struct {
 } ftun_proxy_dns_hooks_t;
 struct ftun_proxy_dns_runtime_adapter {
   ftun_core_t *core;
-  ftun_dns_service_slot_t *slot;
+  struct ftun_dns_service_slot *slot;
   ftun_fakeip_service_t *const *fakeip_slot;
   const ftun_proxy_dns_hooks_t *hooks;
 };
 
 bool ftun_proxy_dns_runtime_adapter_valid(
   const ftun_proxy_dns_runtime_adapter_t *adapter);
-ftun_status_t ftun_proxy_dns_select_member(
-  void *user, const ftun_config_t *expected_config,
-  uint32_t group_id, uint32_t *out_member);
 bool ftun_proxy_dns_has_hijack(
   const ftun_proxy_dns_runtime_adapter_t *adapter);
 ftun_status_t ftun_proxy_dns_hijack_tcp(

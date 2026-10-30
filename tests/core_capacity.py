@@ -48,61 +48,56 @@ class TcpEcho:
     self.port = self.listener.getsockname()[1]
     self.selector.register(self.listener, selectors.EVENT_READ, None)
     self.stopping = threading.Event()
+    self.error = None
     self.thread = threading.Thread(target=self.run, daemon=True)
     self.thread.start()
 
   def run(self):
-    while not self.stopping.is_set():
-      try:
-        events = self.selector.select(0.05)
-      except OSError:
-        break
-      for key, mask in events:
-        if key.data is None:
+    try:
+      while not self.stopping.is_set():
+        for key, mask in self.selector.select(0.05):
+          if key.data is None:
+            try:
+              while True:
+                connection, _ = self.listener.accept()
+                connection.setblocking(False)
+                self.selector.register(connection, selectors.EVENT_READ, bytearray())
+            except BlockingIOError:
+              pass
+            continue
+          connection = key.fileobj
+          pending = key.data
           try:
-            while True:
-              connection, _ = self.listener.accept()
-              connection.setblocking(False)
-              self.selector.register(connection, selectors.EVENT_READ,
-                                     bytearray())
+            if mask & selectors.EVENT_READ:
+              chunk = connection.recv(65536)
+              if not chunk:
+                self.selector.unregister(connection)
+                connection.close()
+                continue
+              pending.extend(chunk)
+            if mask & selectors.EVENT_WRITE and pending:
+              del pending[:connection.send(pending)]
+            interests = selectors.EVENT_READ | (selectors.EVENT_WRITE if pending else 0)
+            self.selector.modify(connection, interests, pending)
           except BlockingIOError:
             pass
-          except OSError:
-            pass
-          continue
-        connection = key.fileobj
-        pending = key.data
-        try:
-          if mask & selectors.EVENT_READ:
-            chunk = connection.recv(65536)
-            if not chunk:
-              self.selector.unregister(connection)
-              connection.close()
-              continue
-            pending.extend(chunk)
-          if mask & selectors.EVENT_WRITE and pending:
-            del pending[:connection.send(pending)]
-          interests = selectors.EVENT_READ
-          if pending:
-            interests |= selectors.EVENT_WRITE
-          self.selector.modify(connection, interests, pending)
-        except OSError:
-          try:
+          except (ConnectionResetError, BrokenPipeError):
             self.selector.unregister(connection)
-          except Exception:
-            pass
-          connection.close()
+            connection.close()
+    except OSError as error:
+      if not self.stopping.is_set():
+        self.error = error
+    except Exception as error:
+      self.error = error
 
   def close(self):
     self.stopping.set()
-    self.listener.close()
-    self.thread.join(timeout=2)
+    self.thread.join()
     for key in list(self.selector.get_map().values()):
-      try:
-        key.fileobj.close()
-      except OSError:
-        pass
+      key.fileobj.close()
     self.selector.close()
+    if self.error is not None:
+      raise RuntimeError("TCP echo worker failed") from self.error
 
 
 class UdpEcho:
@@ -368,8 +363,10 @@ def main():
       except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
-    tcp_echo.close()
-    udp_echo.close()
+    try:
+      tcp_echo.close()
+    finally:
+      udp_echo.close()
   if process is None or process.returncode != 0:
     print(f"core capacity failed: FTUN exit={None if process is None else process.returncode}",
           file=sys.stderr)

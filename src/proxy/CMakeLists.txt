@@ -1,6 +1,7 @@
 set(ftun_sources_proxy
   egress.c
   egress_path.c
+  egress_resolution.c
   bindings.c
   control_resolver.c
   deadline.c

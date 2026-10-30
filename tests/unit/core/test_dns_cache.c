@@ -12,9 +12,13 @@
   } \
 } while (0)
 
-static uint64_t fake_now(void *user)
+static ftun_status_t fake_clock_status;
+
+static ftun_status_t fake_now(void *user, uint64_t *out)
 {
-  return *(uint64_t *)user;
+  if (fake_clock_status != FTUN_OK) return fake_clock_status;
+  *out = *(uint64_t *)user;
+  return FTUN_OK;
 }
 
 static void query_init(ftun_dns_query_t *query, uint16_t id,
@@ -124,6 +128,11 @@ int main(void)
   response_init(response, query.id, 7u, 10u, 0u);
   CHECK(ftun_dns_cache_store(cache, &query,
     (ftun_bytes_t){response, sizeof(response)}) == FTUN_OK);
+  fake_clock_status = FTUN_E_IO;
+  CHECK(ftun_dns_cache_lookup(cache, &query, &answer) == FTUN_E_IO && answer == NULL);
+  CHECK(ftun_dns_cache_store(cache, &query,
+    (ftun_bytes_t){response, sizeof(response)}) == FTUN_E_IO);
+  fake_clock_status = FTUN_OK;
   now = 3500u;
   query.id = 0x4567u;
   CHECK(ftun_dns_cache_lookup(cache, &query, &answer) == FTUN_OK &&

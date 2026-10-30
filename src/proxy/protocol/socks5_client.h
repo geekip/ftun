@@ -64,15 +64,6 @@ size_t ftun_socks5_client_needed(const ftun_socks5_client_t *client);
 ftun_status_t ftun_socks5_client_input(ftun_socks5_client_t *client,
   ftun_bytes_t in, size_t *consumed, ftun_socks5_client_result_t *result);
 
-/* 阻塞驱动：用 write_all/read_exact 跑完整个握手。 */
-typedef struct {
-  ftun_status_t (*write_all)(void *context, const uint8_t *data, size_t length);
-  ftun_status_t (*read_exact)(void *context, uint8_t *data, size_t length);
-  void *context;
-} ftun_socks5_client_io_t;
-ftun_status_t ftun_socks5_client_run(ftun_socks5_client_t *client,
-  const ftun_socks5_client_io_t *io, ftun_socks5_client_result_t *result);
-
 /* 回复码到状态的统一映射。 */
 ftun_status_t ftun_socks5_client_reply_status(uint8_t reply);
 

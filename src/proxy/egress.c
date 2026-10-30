@@ -3,6 +3,7 @@
 #include "proxy/outbound_id.h"
 #include "libs/resolver/config.h"
 #include "libs/transport/socket_path.h"
+#include "platform/clock.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -85,7 +86,12 @@ static ftun_status_t query(const void *context, uint32_t id,
     }
     if (node == NULL || node->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
       status = info(plan, id, 0u, out);
-      if (status == FTUN_OK && node != NULL && !node->resolved) out->state = FTUN_EGRESS_STATE_UNAVAILABLE;
+      if (status == FTUN_OK && node != NULL) {
+        uint64_t now;
+        status = ftun_monotonic_now(&now);
+        if (status == FTUN_OK && !ftun_proxy_resolution_valid(node, now))
+          out->state = FTUN_EGRESS_STATE_UNAVAILABLE;
+      }
       if (status == FTUN_OK && resolver.length != 0u) out->resolver = resolver;
       return status;
     }
@@ -157,6 +163,7 @@ static void release(void *context)
   assert(previous != 0u);
   if (previous == 1u) {
     ftun_reservation_t reservation = plan->reservation;
+    for (size_t i = 0u; i < plan->count; i++) ftun_proxy_resolution_destroy(plan->nodes[i].resolution);
     free(plan);
     ftun_reservation_release(&reservation);
   }

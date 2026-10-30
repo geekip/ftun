@@ -20,8 +20,6 @@ int ftun_span_equal_ascii_fold(const char *data, size_t length,
 int ftun_name_span_valid(const char *value, size_t length);
 int ftun_name_valid(const char *value);
 int ftun_path_valid(const char *value);
-int ftun_ipv4_span(const char *value, size_t length, uint32_t *out);
-int ftun_domain_span(const char *value, size_t length);
 int ftun_host_span(const char *value, size_t length, ftun_ip_t *ip,
                           int *is_ip);
 int ftun_listen_address(const char *value, ftun_config_listener_t *out);

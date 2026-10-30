@@ -133,7 +133,8 @@ static inline ftun_socket_liveness_t ftun_config_socket_liveness(
   liveness.idle_s = ftun_config_base(config)->timeouts.keepalive.idle_s;
   liveness.interval_s = ftun_config_base(config)->timeouts.keepalive.interval_s;
   liveness.count = ftun_config_base(config)->timeouts.keepalive.count;
-  liveness.user_timeout_ms = ftun_config_base(config)->timeouts.write_progress_ms;
+  liveness.user_timeout_ms = ftun_socket_has_user_timeout()
+    ? ftun_config_base(config)->timeouts.write_progress_ms : 0u;
   return liveness;
 }
 

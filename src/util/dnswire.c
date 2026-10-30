@@ -407,11 +407,6 @@ static int ftun_dns_endpoint_valid(const ftun_endpoint_t *endpoint)
          endpoint->port != 0u && endpoint->domain.length == 0u;
 }
 
-static int ftun_dns_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
-}
-
 ftun_status_t ftun_dns_message_matches(
   const ftun_dns_message_t *message, const ftun_dns_query_t *query,
   ftun_dns_transport_t transport, const ftun_endpoint_t *source,
@@ -429,7 +424,7 @@ ftun_status_t ftun_dns_message_matches(
   *out_matches = (message->flags & 0x8000u) != 0u &&
                  message->id == query->id &&
                  query->transport == transport &&
-                 ftun_dns_endpoint_equal(&query->upstream, source) &&
+                 ftun_endpoint_equal(&query->upstream, source) &&
                  message->question.type == query->question.type &&
                  message->question.class_code == query->question.class_code &&
                  ftun_dns_name_equal(message->question.name,

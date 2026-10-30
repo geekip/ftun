@@ -82,7 +82,7 @@ def main():
     return fail("lock schema, review status or offline policy is invalid")
   dependencies = lock.get("dependencies")
   if not isinstance(dependencies, list) or {item.get("name") for item in dependencies} != {
-      "musl IP text codecs", "cJSON", "heiher/lwIP", "wolfSSL"}:
+      "musl IP text codecs", "cJSON", "heiher/lwIP", "wolfSSL", "wepoll", "Wintun API"}:
     return fail("dependency set is incomplete or contains an unreviewed entry")
   for dependency in dependencies:
     vendor = root / dependency.get("path", "")

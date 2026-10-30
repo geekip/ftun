@@ -18,51 +18,7 @@ typedef struct {
 static ftun_error_t ftun_system_resolver_error(ftun_status_t status,
                                                 uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
-}
-
-static int ftun_system_resolver_domain_valid(ftun_string_t domain)
-{
-  size_t effective;
-  size_t start = 0u;
-  size_t index;
-  size_t dots = 0u;
-  int only_digits_and_dots = 1;
-  if (domain.data == NULL || domain.length == 0u ||
-      domain.length > FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
-      memchr(domain.data, '\0', domain.length) != NULL) return 0;
-  effective = domain.length;
-  if (domain.data[effective - 1u] == '.') effective--;
-  if (effective == 0u || effective > 253u) return 0;
-  for (index = 0u; index < effective; index++) {
-    unsigned char byte = (unsigned char)domain.data[index];
-    if (byte == '.') dots++;
-    else if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
-      only_digits_and_dots = 0;
-    }
-  }
-  if (only_digits_and_dots && dots == 3u) return 0;
-  for (index = 0u; index <= effective; index++) {
-    if (index == effective || domain.data[index] == '.') {
-      size_t label_length = index - start;
-      size_t label_index;
-      if (label_length == 0u || label_length > 63u ||
-          domain.data[start] == '-' || domain.data[index - 1u] == '-') return 0;
-      for (label_index = start; label_index < index; label_index++) {
-        unsigned char byte = (unsigned char)domain.data[label_index];
-        if (!((byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
-              (byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
-              (byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
-              byte == (unsigned char)'-')) return 0;
-      }
-      start = index + 1u;
-    }
-  }
-  return 1;
+  return (ftun_error_t){status, stage, 0};
 }
 
 static int ftun_system_resolver_device_valid(ftun_string_t device)
@@ -84,7 +40,7 @@ static int ftun_system_resolver_request_valid(
 {
   return request != NULL && request->worker != NULL &&
          request->budget != NULL &&
-         ftun_system_resolver_domain_valid(request->domain) &&
+         ftun_domain_span(request->domain.data, request->domain.length) &&
          ftun_system_resolver_device_valid(
            request->protection.interface_name) &&
          (request->protection.mark != 0u ||

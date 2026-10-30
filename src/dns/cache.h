@@ -3,7 +3,8 @@
 #include "core/limits.h"
 #include "libs/resolver/dnswire.h"
 
-typedef uint64_t (*ftun_dns_cache_now_fn)(void *user);
+/* 时钟失败如实返回，输出仅在OK时有效。 */
+typedef ftun_status_t (*ftun_dns_cache_now_fn)(void *user, uint64_t *out);
 
 typedef struct {
   ftun_budget_t *budget;

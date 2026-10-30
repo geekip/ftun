@@ -1,9 +1,6 @@
 #include "util/endpoint.h"
 #include "proxy/dns/resolver_adapter.h"
 
-#if defined(FTUN_HAVE_MODULE_DNS)
-#endif
-
 #include <string.h>
 
 static int ftun_resolver_backend_valid(const ftun_resolver_backend_t *backend)
@@ -35,46 +32,6 @@ static int ftun_resolver_name_valid(ftun_string_t name)
   return 1;
 }
 
-static int ftun_resolver_domain_valid(ftun_string_t domain)
-{
-  size_t effective;
-  size_t start = 0u;
-  size_t index;
-  size_t dots = 0u;
-  int only_digits_and_dots = 1;
-  if (domain.data == NULL || domain.length == 0u ||
-      domain.length > FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
-      memchr(domain.data, '\0', domain.length) != NULL) return 0;
-  effective = domain.length;
-  if (domain.data[effective - 1u] == '.') effective--;
-  if (effective == 0u || effective > 253u) return 0;
-  for (index = 0u; index < effective; index++) {
-    unsigned char byte = (unsigned char)domain.data[index];
-    if (byte == '.') dots++;
-    else if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
-      only_digits_and_dots = 0;
-    }
-  }
-  if (only_digits_and_dots && dots == 3u) return 0;
-  for (index = 0u; index <= effective; index++) {
-    if (index == effective || domain.data[index] == '.') {
-      size_t label_length = index - start;
-      size_t label_index;
-      if (label_length == 0u || label_length > 63u ||
-          domain.data[start] == '-' || domain.data[index - 1u] == '-') return 0;
-      for (label_index = start; label_index < index; label_index++) {
-        unsigned char byte = (unsigned char)domain.data[label_index];
-        if (!((byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
-              (byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
-              (byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
-              byte == (unsigned char)'-')) return 0;
-      }
-      start = index + 1u;
-    }
-  }
-  return 1;
-}
-
 static ftun_status_t ftun_resolver_validate(
   const ftun_resolve_request_t *request)
 {
@@ -84,7 +41,7 @@ static ftun_status_t ftun_resolver_validate(
   ftun_status_t status;
   if (request == NULL || request->session == NULL ||
       request->query.budget == NULL || request->query.completion == NULL ||
-      !ftun_resolver_domain_valid(request->query.domain) ||
+      !ftun_domain_span(request->query.domain.data, request->query.domain.length) ||
       !ftun_resolver_name_valid(request->default_server)) {
     return FTUN_E_INVALID;
   }

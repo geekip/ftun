@@ -86,9 +86,6 @@ ftun_status_t ftun_recovery_report_failure(
   ftun_recovery_scheduler_t *scheduler, ftun_recovery_id_t id,
   uint64_t now_ms, ftun_recovery_fault_t fault);
 /* 实体在尝试之外自行恢复（例如外部重新打开了监听）。 */
-ftun_status_t ftun_recovery_report_success(
-  ftun_recovery_scheduler_t *scheduler, ftun_recovery_id_t id,
-  uint64_t now_ms);
 /* 结束一次尝试。fault 仅在 status 非 OK 时使用。期限已到的尝试无论结果
  * 如何都按失败处理。 */
 ftun_status_t ftun_recovery_attempt_finish(

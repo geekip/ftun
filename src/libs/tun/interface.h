@@ -14,6 +14,7 @@ typedef struct {
   uint32_t rule_priority;
   bool strict_route;
   ftun_budget_t *budget;
+  uint32_t mtu;
 } ftun_interface_spec_t;
 
 typedef struct {
@@ -77,5 +78,6 @@ typedef struct {
   ftun_status_t (*withdraw)(void *context, void **state);
   void *context;
   ftun_interface_async_ops_t async;
+  bool configure_when_manual;
 } ftun_interface_ops_t;
 #endif

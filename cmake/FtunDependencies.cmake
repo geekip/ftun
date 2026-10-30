@@ -34,12 +34,19 @@ set(WOLFSSL_CRYPT_TESTS no CACHE STRING "Disable wolfSSL crypt tests" FORCE)
 set(WOLFSSL_INSTALL no CACHE STRING "Disable wolfSSL install rules" FORCE)
 set(WOLFSSL_IP_ALT_NAME yes CACHE STRING "Verify numeric IPv4/IPv6 certificate identities" FORCE)
 set(WOLFSSL_OPENSSLEXTRA no CACHE STRING "Disable unused OpenSSL compatibility layer" FORCE)
+set(WOLFSSL_SNI yes CACHE STRING "Enable required TLS server name indication" FORCE)
 set(WOLFSSL_TLS13 yes CACHE STRING "Enable wolfSSL TLS 1.3" FORCE)
 set(WOLFSSL_DTLS no CACHE STRING "Disable unused wolfSSL DTLS" FORCE)
 set(WOLFSSL_OLD_TLS no CACHE STRING "Disable obsolete TLS versions" FORCE)
+# TLS上下文只接受配置的CA文件/内存证书，不使用上游系统证书仓库。
+set(WOLFSSL_SYS_CA_CERTS no CACHE STRING "Disable unused system trust store loader" FORCE)
 add_subdirectory(third_party/wolfssl EXCLUDE_FROM_ALL)
 # IP SAN校验回调也必须在证书链验证成功时执行。
 target_compile_definitions(wolfssl PUBLIC WOLFSSL_ALWAYS_VERIFY_CB)
+if(CMAKE_C_BYTE_ORDER STREQUAL "BIG_ENDIAN")
+  # 上游CMake未把端序检测写入config/options头；库与调用方必须一致。
+  target_compile_definitions(wolfssl PUBLIC BIG_ENDIAN_ORDER)
+endif()
 if(FTUN_HARDENING)
   target_compile_options(wolfssl PRIVATE ${ftun_hardening_codegen_options})
   target_compile_definitions(wolfssl PRIVATE

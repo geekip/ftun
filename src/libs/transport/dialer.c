@@ -25,11 +25,7 @@ typedef struct {
 
 static ftun_error_t ftun_dial_error(ftun_status_t status, uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
+  return (ftun_error_t){status, stage, 0};
 }
 
 static int ftun_dial_transport_valid(ftun_dial_transport_t transport)
@@ -47,12 +43,6 @@ static int ftun_dial_domain_valid(ftun_dial_domain_t domain)
 {
   return domain >= FTUN_DIAL_DOMAIN_AUTO &&
          domain <= FTUN_DIAL_DOMAIN_OVERLAY;
-}
-
-static int ftun_dial_endpoint_equal(const ftun_endpoint_t *left,
-                                    const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
 }
 
 static int ftun_dial_allowed_valid(const ftun_dial_request_t *request)
@@ -73,7 +63,7 @@ static int ftun_dial_endpoint_allowed(const ftun_dial_request_t *request)
   size_t index;
   if (request->allowed_count == 0u) return 1;
   for (index = 0u; index < request->allowed_count; index++) {
-    if (ftun_dial_endpoint_equal(&request->allowed[index],
+    if (ftun_endpoint_equal(&request->allowed[index],
                                  &request->endpoint)) return 1;
   }
   return 0;

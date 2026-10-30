@@ -296,10 +296,12 @@
         },
         "auto-route": {
           "type": "boolean",
+          "description": "Linux 自动路由；Windows Wintun 要求 false，地址/MTU 与手动路由步骤见平台构建说明。",
           "default": false
         },
         "strict-route": {
           "type": "boolean",
+          "description": "Linux 自动路由保护；Windows 不支持。",
           "default": false
         },
         "route-table": {
@@ -737,7 +739,7 @@
       "properties": {
         "address": {
           "$ref": "#/$defs/IPv6CIDR",
-          "description": "可选设备 IPv6 地址及前缀；配置后安装 IPv6 路由，MTU 至少 1280。"
+          "description": "可选设备 IPv6 地址及前缀；MTU 至少 1280。Windows 配置地址及直连路由，其他前缀由用户手动管理。"
         }
       },
       "additionalProperties": false,

@@ -25,7 +25,7 @@ static void completed(ftun_operation_t *operation, ftun_error_t error, void *use
 {
   fixture_t *state = user;
   ftun_endpoint_t endpoints[2] = {{0}};
-  ftun_system_resolve_result_t result;
+  ftun_system_resolve_result_t result = {0};
   if (state->in_start) error.status = FTUN_E_STATE_CORRUPT;
   endpoints[0].kind = endpoints[1].kind = FTUN_ADDRESS_IPV4;
   endpoints[0].address[0] = 192u; endpoints[0].address[3] = 1u;

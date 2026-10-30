@@ -51,7 +51,6 @@ typedef struct ftun_network_view ftun_network_view_t;
 typedef struct ftun_operation_queue ftun_operation_queue_t;
 typedef struct ftun_packet_port ftun_packet_port_t;
 typedef struct ftun_packet ftun_packet_t;
-typedef struct ftun_probe_request ftun_probe_request_t;
 typedef struct ftun_proxy_spec ftun_proxy_spec_t;
 typedef struct ftun_reservation ftun_reservation_t;
 typedef struct ftun_resolve_request ftun_resolve_request_t;

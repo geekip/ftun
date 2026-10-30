@@ -48,6 +48,15 @@ function(ftun_generate_notices)
       endforeach()
     endif()
   endforeach()
+  string(JSON toolchain_type ERROR_VARIABLE toolchain_error TYPE
+    "${ftun_notice_lock}" distribution_toolchain)
+  if(NOT toolchain_error)
+    foreach(field name version source notice)
+      ftun_notice_string(toolchain_${field} distribution_toolchain ${field})
+    endforeach()
+    string(APPEND ftun_notice_text
+      "\n## Optional distribution toolchain: ${toolchain_name} ${toolchain_version}\n\nSource: ${toolchain_source}\n\n${toolchain_notice}\n\nZig-built packages include LICENSE-Zig and the applicable LICENSE-musl-libc or LICENSE-MinGW-w64.\n")
+  endif()
   # 校验完整份输入后再写入，失败不覆盖已有告知；内容不变时保持时间戳。
   if(EXISTS "${FTUN_NOTICES_OUTPUT}")
     file(READ "${FTUN_NOTICES_OUTPUT}" previous_notice)

@@ -1,5 +1,6 @@
 #include "proxy/slot_pool.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -51,14 +52,14 @@ struct ftun_proxy_slot_pool {
 
 static int ftun_proxy_slot_add(size_t left, size_t right, size_t *out)
 {
-  if (out == NULL || left > SIZE_MAX - right) return 0;
+  if (left > SIZE_MAX - right) return 0;
   *out = left + right;
   return 1;
 }
 
 static int ftun_proxy_slot_mul(size_t left, size_t right, size_t *out)
 {
-  if (out == NULL || (left != 0u && right > SIZE_MAX / left)) return 0;
+  if (left != 0u && right > SIZE_MAX / left) return 0;
   *out = left * right;
   return 1;
 }
@@ -93,13 +94,13 @@ static void ftun_proxy_slot_available_remove(ftun_proxy_slot_pool_t *pool,
   link = &pool->available_head;
   while (*link != FTUN_PROXY_SLOT_NONE) {
     ftun_proxy_slot_slab_t *current = pool->slabs[*link];
+    assert(current != NULL);
     if (current == slab) {
       *link = slab->next_available;
       slab->next_available = FTUN_PROXY_SLOT_NONE;
       slab->available = false;
       return;
     }
-    if (current == NULL) return;
     link = &current->next_available;
   }
 }
@@ -161,7 +162,8 @@ static ftun_status_t ftun_proxy_slot_slab_destroy(
   }
   ftun_proxy_slot_available_remove(pool, slab);
   pool->slabs[slab->index] = NULL;
-  if (pool->resident_slabs != 0u) pool->resident_slabs--;
+  assert(pool->resident_slabs != 0u);
+  pool->resident_slabs--;
   reservation = slab->reservation;
   slab->reservation = (ftun_reservation_t){0};
   free(slab);
@@ -364,7 +366,8 @@ ftun_status_t ftun_proxy_slot_pool_release(
       pool->resident_slabs > pool->retained_idle_slabs) {
     pool->trim_needed = true;
   }
-  if (pool->active != 0u) pool->active--;
+  assert(pool->active != 0u);
+  pool->active--;
   if (pool->releases != UINT64_MAX) pool->releases++;
   *object = NULL;
   return FTUN_OK;

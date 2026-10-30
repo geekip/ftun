@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - dev
 
 permissions:
   contents: read
@@ -17,17 +18,8 @@ env:
   DEBIAN_FRONTEND: noninteractive
 
 jobs:
-  macos-common:
-    runs-on: macos-14
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - name: Compile common layers with the macOS SDK
-        run: |
-          cmake -S . -B build/macos-platform -DBUILD_TESTING=OFF -DFTUN_PLATFORM_COMPILE_CHECK=ON
-          cmake --build build/macos-platform --target ftun_compile_check --parallel
+  platforms:
+    uses: ./.github/workflows/platforms.yml
 
   # Debug 构建：全部单元、契约、产品和模块矩阵测试；随后以 root 运行需要私有
   # 网络/挂载命名空间的恢复契约场景（非 root 时这些场景以 77 跳过）。

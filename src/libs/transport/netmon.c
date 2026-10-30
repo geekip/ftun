@@ -145,12 +145,3 @@ ftun_status_t ftun_netmon_take(ftun_netmon_t *netmon, uint64_t now_ms,
   if (netmon->pending.mask != 0u) ftun_netmon_arm(netmon);
   return FTUN_OK;
 }
-
-ftun_status_t ftun_netmon_get_stats(const ftun_netmon_t *netmon,
-                                    ftun_netmon_stats_t *out)
-{
-  if (out != NULL) memset(out, 0, sizeof(*out));
-  if (netmon == NULL || out == NULL) return FTUN_E_INVALID;
-  *out = netmon->stats;
-  return FTUN_OK;
-}

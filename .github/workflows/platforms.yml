@@ -1,0 +1,89 @@
+name: Platform builds
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      wintun_driver:
+        description: 'Run privileged isolated Wintun driver test on Windows runners'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: darwin-amd64, runner: macos-15-intel, emulator: '[]'}
+          - {platform: darwin-arm64, runner: macos-15, emulator: '[]'}
+          - {platform: windows-amd64, runner: windows-2025, emulator: '[]'}
+          - {platform: windows-arm64, runner: windows-11-arm, emulator: '[]'}
+          - {platform: linux-amd64-musl, runner: ubuntu-24.04, emulator: '[]'}
+          - {platform: linux-arm64-musl, runner: ubuntu-24.04, emulator: '["qemu-aarch64"]'}
+          - {platform: linux-armv7-musl, runner: ubuntu-24.04, emulator: '["qemu-arm"]'}
+          - {platform: linux-mips-musl, runner: ubuntu-24.04, emulator: '["qemu-mips"]'}
+          - {platform: linux-mipsel-musl, runner: ubuntu-24.04, emulator: '["qemu-mipsel"]'}
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        with:
+          version: '0.15.2'
+          cache-key: ${{ matrix.platform }}
+      - name: Install Ninja
+        run: python -m pip install ninja
+      - name: Install QEMU
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install --no-install-recommends -y qemu-user
+      - name: Prepare official signed Wintun runtime
+        if: runner.os == 'Windows'
+        run: python tools/fetch_wintun.py
+      - name: Build native application and platform contracts
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          cmake --preset "${PLATFORM}" -DFTUN_PORTABLE_TESTS=ON
+          cmake --build --preset "${PLATFORM}" --parallel 3
+      - name: Verify executable architecture and hardening
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: python tests/portable/artifact.py "${PLATFORM}"
+      - name: Exercise native services and real protocols
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          EMULATOR: ${{ matrix.emulator }}
+        run: python tests/portable/product.py "build/${PLATFORM}" --runner "${EMULATOR}"
+      - name: Exercise native Wintun driver on an isolated adapter
+        if: runner.os == 'Windows' && inputs.wintun_driver == true
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          "build/${PLATFORM}/ftun-wintun-driver-test.exe" --driver
+      - name: Package application
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
+            python tools/package.py "${PLATFORM}" --output dist --tag "${GITHUB_REF_NAME}"
+          else
+            python tools/package.py "${PLATFORM}" --output dist
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ftun-${{ matrix.platform }}
+          path: dist/*
+          if-no-files-found: error

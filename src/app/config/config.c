@@ -146,7 +146,7 @@ static ftun_status_t ftun_config_resolve_path(ftun_config_t *config, const char 
   if (directory == NULL || value == NULL || value[0] == '\0' || out == NULL) {
     return FTUN_E_INVALID;
   }
-  if (value[0] == '/') {
+  if (ftun_file_path_root_length(value) != 0u) {
     resolved = ftun_config_copy_span(config, value, strlen(value));
   } else if (value[0] != '~') {
     resolved = ftun_config_join(config, directory, value);
@@ -177,6 +177,7 @@ static ftun_status_t ftun_config_resolve_path(ftun_config_t *config, const char 
     ftun_config_free_bytes(config, buffer, capacity);
   }
   if (resolved == NULL) return FTUN_E_LIMIT;
+  ftun_file_path_normalize(resolved);
   *out = resolved;
   return FTUN_OK;
 }

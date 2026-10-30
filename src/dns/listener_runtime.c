@@ -263,7 +263,7 @@ ftun_status_t ftun_dns_runtime_recovery_create(ftun_dns_runtime_t *dns,
   const ftun_config_t *config)
 {
   ftun_recovery_policy_t policy;
-  uint64_t now_ms = ftun_dns_runtime_now(NULL);
+  uint64_t now_ms;
   size_t capacity = ftun_config_dns(config)->listener_count;
   size_t index;
   for (index = 0u; index < ftun_config_dns(config)->server_count; index++) {
@@ -271,6 +271,8 @@ ftun_status_t ftun_dns_runtime_recovery_create(ftun_dns_runtime_t *dns,
     if (count > 1u) capacity += count > FTUN_UPSTREAM_SET_MAX ? FTUN_UPSTREAM_SET_MAX : count;
   }
   if (capacity == 0u) return FTUN_OK;
+  ftun_status_t status = ftun_dns_runtime_now(NULL, &now_ms);
+  if (status != FTUN_OK) return status;
   memset(&policy, 0, sizeof(policy));
   policy.initial_ms = FTUN_DNS_RUNTIME_LISTENER_RETRY_INITIAL_MS;
   policy.maximum_ms = FTUN_DNS_RUNTIME_LISTENER_RETRY_MAXIMUM_MS;
@@ -285,10 +287,12 @@ ftun_status_t ftun_dns_runtime_recovery_create(ftun_dns_runtime_t *dns,
 /* 每个监听槽注册为恢复实体；启动时地址未就绪的槽立即进入等待。 */
 ftun_status_t ftun_dns_runtime_recovery_open(ftun_dns_runtime_t *dns)
 {
-  uint64_t now_ms = ftun_dns_runtime_now(NULL);
+  uint64_t now_ms;
   size_t index;
   ftun_status_t status = FTUN_OK;
   if (dns->listener_count == 0u) return FTUN_OK;
+  status = ftun_dns_runtime_now(NULL, &now_ms);
+  if (status != FTUN_OK) return status;
   for (index = 0u; status == FTUN_OK && index < dns->listener_count; index++) {
     ftun_dns_runtime_listener_slot_t *slot = &dns->listeners[index];
     ftun_recovery_spec_t spec;
@@ -875,7 +879,7 @@ ftun_status_t ftun_dns_runtime_tcp_accept(
 {
   uint64_t now_ms;
   size_t accepted = 0u;
-  ftun_status_t status = ftun_monotonic_now(&now_ms);
+  ftun_status_t status = ftun_dns_runtime_now(NULL, &now_ms);
   if (out_accepted != NULL) *out_accepted = 0u;
   if (dns == NULL || listener == NULL || quota == 0u ||
       out_accepted == NULL) return FTUN_E_INVALID;
@@ -1207,12 +1211,14 @@ ftun_status_t ftun_dns_runtime_slot_close(
 ftun_status_t ftun_dns_runtime_slot_fail(
   ftun_dns_runtime_t *dns, ftun_dns_runtime_listener_slot_t *slot)
 {
-  ftun_status_t status = ftun_dns_runtime_slot_close(slot);
+  uint64_t now;
+  ftun_status_t status = ftun_dns_runtime_now(NULL, &now);
+  if (status == FTUN_OK) status = ftun_dns_runtime_slot_close(slot);
   if (status != FTUN_OK) return status;
   slot->waiting = true;
   dns->object_faults++;
   return ftun_recovery_report_failure(dns->recovery, slot->recovery,
-    ftun_dns_runtime_now(NULL), FTUN_RECOVERY_FAULT_NETWORK);
+    now, FTUN_RECOVERY_FAULT_NETWORK);
 }
 
 /* A0 的尝试：按原地址重新 bind 并注册事件源。同步结束。 */
@@ -1223,7 +1229,10 @@ ftun_status_t ftun_dns_runtime_slot_recover(void *user,
   ftun_dns_runtime_t *dns = slot->dns;
   size_t index = (size_t)(slot - dns->listeners);
   ftun_socket_bind_issue_t error_code = FTUN_SOCKET_BIND_OTHER;
-  ftun_status_t status = ftun_dns_runtime_socket_open(
+  uint64_t now;
+  ftun_status_t status = ftun_dns_runtime_now(NULL, &now);
+  if (status != FTUN_OK) return status;
+  status = ftun_dns_runtime_socket_open(
     ftun_config_dns(dns->config)->listeners[index].listen, FTUN_DIAL_UDP, &slot->descriptor,
     &error_code);
   if (status == FTUN_OK) {
@@ -1239,7 +1248,7 @@ ftun_status_t ftun_dns_runtime_slot_recover(void *user,
     slot->waiting = false;
   }
   (void)ftun_recovery_attempt_finish(dns->recovery, id,
-    ftun_dns_runtime_now(NULL), status,
+    now, status,
     error_code == FTUN_SOCKET_BIND_PERMISSION
       ? FTUN_RECOVERY_FAULT_CONFIG : FTUN_RECOVERY_FAULT_NETWORK);
   return FTUN_OK;
@@ -1335,7 +1344,9 @@ ftun_status_t ftun_dns_runtime_step_tcp(ftun_dns_runtime_t *dns,
    * STATE_CORRUPT 是共享状态损坏，照常升级。 */
   if (status != FTUN_OK && status != FTUN_E_STATE_CORRUPT) {
     ftun_dns_runtime_tcp_t *connection = &dns->tcp[index];
-    uint64_t now_ms = ftun_dns_runtime_now(NULL);
+    uint64_t now_ms;
+    ftun_status_t clock_status = ftun_dns_runtime_now(NULL, &now_ms);
+    if (clock_status != FTUN_OK) return clock_status;
     if (connection->quarantine_retry_ms == 0u) dns->quarantined_tcp++;
     connection->quarantine_retry_ms = now_ms > UINT64_MAX - FTUN_DNS_RUNTIME_QUARANTINE_RETRY_MS
       ? UINT64_MAX : now_ms + FTUN_DNS_RUNTIME_QUARANTINE_RETRY_MS;
@@ -1355,14 +1366,16 @@ ftun_status_t ftun_dns_runtime_run_slice(ftun_dns_runtime_t *dns,
     dns->pending_status = FTUN_OK;
     return status;
   }
+  uint64_t now_ms;
+  ftun_status_t clock_status = ftun_dns_runtime_now(NULL, &now_ms);
+  if (clock_status != FTUN_OK) return clock_status;
   if (dns->recovery != NULL) {
     size_t recovery_work = 0u;
     ftun_status_t status = ftun_recovery_run(dns->recovery,
-      ftun_dns_runtime_now(NULL), 4u, &recovery_work);
+      now_ms, 4u, &recovery_work);
     if (status != FTUN_OK) return status;
   }
   if (dns->quarantined_tcp != 0u) {
-    uint64_t now_ms = ftun_dns_runtime_now(NULL);
     size_t index;
     for (index = 0u; index < FTUN_DNS_RUNTIME_MAX_TCP_CONNECTIONS; index++) {
       ftun_dns_runtime_tcp_t *connection = &dns->tcp[index];
@@ -1374,7 +1387,8 @@ ftun_status_t ftun_dns_runtime_run_slice(ftun_dns_runtime_t *dns,
     }
   }
   while (work < quota) {
-    uint64_t now_ms = ftun_dns_runtime_now(NULL);
+    clock_status = ftun_dns_runtime_now(NULL, &now_ms);
+    if (clock_status != FTUN_OK) return clock_status;
     bool did_work = false;
     size_t attempt;
     ftun_status_t status;
@@ -1494,7 +1508,7 @@ size_t ftun_dns_runtime_take_object_faults(ftun_dns_runtime_t *dns)
   return faults;
 }
 
-bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns)
+bool ftun_dns_runtime_has_ready(ftun_dns_runtime_t *dns)
 {
   uint64_t deadline = 0u;
   bool present = false;
@@ -1507,8 +1521,14 @@ bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns)
         dns->listeners[index].tcp_events != 0u) return true;
   }
   if (dns->tcp_ready_mask != 0u) return true;
-  if (ftun_dns_runtime_next_deadline(dns, &deadline, &present) == FTUN_OK &&
-      present && ftun_dns_runtime_now(NULL) >= deadline) return true;
+  ftun_status_t status = ftun_dns_runtime_next_deadline(dns, &deadline, &present);
+  uint64_t now;
+  if (status == FTUN_OK && present) status = ftun_dns_runtime_now(NULL, &now);
+  if (status != FTUN_OK) {
+    ftun_dns_runtime_record(dns, status);
+    return true;
+  }
+  if (present && now >= deadline) return true;
   return false;
 }
 
@@ -1578,7 +1598,10 @@ ftun_status_t ftun_dns_runtime_stop_slice(ftun_dns_runtime_t *dns,
   if (result != FTUN_OK) return result;
   /* 先轮转拥有链，再交付回调；回调可取消其他请求，不能保留其 next 指针。 */
   while (dns->request_head != NULL && work < FTUN_DNS_RUNTIME_STOP_QUOTA) {
-    if (ftun_dns_runtime_now(NULL) >= deadline_ms) return FTUN_E_TIMEOUT;
+    uint64_t now;
+    result = ftun_dns_runtime_now(NULL, &now);
+    if (result != FTUN_OK) return result;
+    if (now >= deadline_ms) return FTUN_E_TIMEOUT;
     request = dns->request_head;
     if (request->next != NULL) {
       dns->request_head = request->next;
@@ -1649,7 +1672,7 @@ ftun_status_t ftun_dns_runtime_destroy(ftun_dns_runtime_t **dns_ptr)
   }
   /* 上游集合借用调度器，必须先于它销毁。 */
   for (index = 0u; index < FTUN_DNS_RUNTIME_MAX_SERVERS; index++) {
-    (void)ftun_upstream_set_destroy(&dns->upstream_sets[index]);
+    ftun_upstream_set_destroy(&dns->upstream_sets[index]);
   }
   ftun_recovery_scheduler_stop(dns->recovery);
   if (ftun_recovery_scheduler_destroy(&dns->recovery) != FTUN_OK) return FTUN_E_AGAIN;

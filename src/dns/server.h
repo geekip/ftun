@@ -39,10 +39,11 @@ typedef struct {
   void *context;
   /* 仅供成功结果校验使用的接收时刻；缺省仍使用 server.now。
    * 新查询与 TCP fallback 的准入必须继续检查真实当前期限。 */
-  uint64_t (*response_now)(void *context);
+  ftun_status_t (*response_now)(void *context, uint64_t *out);
 } ftun_dns_query_transport_t;
 
-typedef uint64_t (*ftun_dns_server_now_fn)(void *user);
+/* 时钟失败如实返回，输出仅在OK时有效。 */
+typedef ftun_status_t (*ftun_dns_server_now_fn)(void *user, uint64_t *out);
 
 typedef struct {
   ftun_budget_t *budget;

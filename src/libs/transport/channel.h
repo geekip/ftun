@@ -25,7 +25,6 @@ ftun_status_t ftun_channel_write_ref(ftun_channel_t *channel,
 ftun_status_t ftun_channel_write_ref_with_completion(ftun_channel_t *channel,
   const ftun_buffer_slice_t *slice, ftun_completion_fn completion, void *user,
   size_t *accepted, ftun_operation_t **out);
-ftun_status_t ftun_channel_shutdown_write(ftun_channel_t *channel);
 ftun_status_t ftun_channel_send(ftun_channel_t *channel,
   const ftun_endpoint_t *target, ftun_packet_t *packet);
 /* 协议后端交付完整报文；source/packet 仅同步借用。 */

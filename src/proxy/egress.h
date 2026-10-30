@@ -3,7 +3,8 @@
 #include "libs/transport/egress.h"
 
 /* 快照复制出站字段、成员及Bootstrap；不借用配置存储。
- * prepare只复制/校验配置，不执行网络I/O；owner首次open异步解析域名。
+ * prepare只复制/校验配置，不执行网络I/O；owner首次open异步解析域名，同节点共享在途请求，TTL到期按需刷新；
+ * 解析失败由core/recovery退避，等待者分别持有自己的期限和取消权。
  * bind 仅在交给owner前调用一次，设置代次和组选择回调。 */
 typedef ftun_status_t (*ftun_proxy_egress_select_fn)(void *context,
   uint64_t generation, uint32_t group, uint32_t *member);

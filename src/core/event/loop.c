@@ -340,15 +340,15 @@ ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t 
 {
   ftun_event_source_t *source;
   ftun_status_t status;
-  uint32_t allowed = FTUN_EVENT_READ | FTUN_EVENT_WRITE | FTUN_EVENT_ERROR;
+  uint32_t allowed = FTUN_EVENT_READ | FTUN_EVENT_WRITE | FTUN_EVENT_ERROR | FTUN_EVENT_WAITABLE;
   if (out != NULL) *out = NULL;
-  if (out == NULL || interests == 0u || (interests & ~allowed) != 0u) {
+  if (out == NULL || (interests & ~FTUN_EVENT_WAITABLE) == 0u || (interests & ~allowed) != 0u) {
     return FTUN_E_INVALID;
   }
   status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_IO, callback, user, &source);
   if (status != FTUN_OK) return status;
   source->socket = socket;
-  source->interests = interests;
+  source->interests = interests & ~FTUN_EVENT_WAITABLE;
   if (loop->backend != NULL) {
     status = loop->backend->io_start(loop->backend_context, source, socket, interests);
     if (status != FTUN_OK) {

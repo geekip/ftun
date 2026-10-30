@@ -1,6 +1,8 @@
 #include "libs/tun/internal.h"
 
 #include <limits.h>
+#include "platform/clock.h"
+#include "platform/socket.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -88,6 +90,27 @@ static void ftun_tun_service_ready(ftun_event_source_t *source,
   }
 }
 
+/* Wintun 没有写就绪事件。仅队列背压时保留一个 1ms 定时器，停止先取消。 */
+static void ftun_tun_service_write_ready(ftun_event_source_t *source,
+  uint32_t events, void *user)
+{
+  ftun_tun_service_t *service = user;
+  (void)source; (void)events;
+  (void)ftun_event_source_cancel(&service->write_timer);
+  service->events |= FTUN_EVENT_WRITE;
+}
+
+ftun_status_t ftun_tun_service_cancel_io(ftun_tun_service_t *service)
+{
+  ftun_status_t status = ftun_event_source_cancel(&service->write_timer);
+  return status == FTUN_OK ? ftun_event_source_cancel(&service->source) : status;
+}
+
+static uint32_t ftun_tun_service_watch_kind(const ftun_tun_service_t *service)
+{
+  return (service->info.flags & FTUN_PACKET_PORT_WAITABLE) ? FTUN_EVENT_WAITABLE : 0u;
+}
+
 ftun_status_t ftun_tun_service_interests(ftun_tun_service_t *service)
 {
   uint32_t interests = FTUN_EVENT_ERROR;
@@ -95,7 +118,18 @@ ftun_status_t ftun_tun_service_interests(ftun_tun_service_t *service)
   if (service->accepting && service->active_leases != 0u) {
     interests |= FTUN_EVENT_READ;
   }
-  if (service->queued_outputs != 0u) interests |= FTUN_EVENT_WRITE;
+  if (service->info.flags & FTUN_PACKET_PORT_WRITE_TIMER) {
+    if (service->queued_outputs != 0u && service->write_timer == NULL) {
+      uint64_t now;
+      ftun_status_t status = ftun_monotonic_now(&now);
+      if (status == FTUN_OK) status = ftun_event_timer_start(service->loop, now + 1u,
+        ftun_tun_service_write_ready, service, &service->write_timer);
+      if (status != FTUN_OK) return status;
+    } else if (service->queued_outputs == 0u) {
+      ftun_status_t status = ftun_event_source_cancel(&service->write_timer);
+      if (status != FTUN_OK) return status;
+    }
+  } else if (service->queued_outputs != 0u) interests |= FTUN_EVENT_WRITE;
   return ftun_event_io_update(service->source, interests);
 }
 
@@ -198,7 +232,7 @@ static ftun_status_t ftun_tun_service_network_withdraw(ftun_tun_service_t *servi
 
 static ftun_status_t ftun_tun_service_device_close(ftun_tun_service_t *service)
 {
-  ftun_status_t status = ftun_event_source_cancel(&service->source);
+  ftun_status_t status = ftun_tun_service_cancel_io(service);
   if (status != FTUN_OK) return status;
   status = ftun_tun_service_network_withdraw(service);
   if (status != FTUN_OK) return status;
@@ -229,7 +263,7 @@ static ftun_status_t ftun_tun_service_port_open(
   }
   if (status == FTUN_OK &&
       (service->info.mtu != service->mtu ||
-       service->info.native_socket > (ftun_native_socket_t)INT32_MAX)) {
+       service->info.native_socket == FTUN_INVALID_SOCKET)) {
     status = FTUN_E_STATE_CORRUPT;
   }
   return status;
@@ -249,7 +283,7 @@ static ftun_status_t ftun_tun_service_device_open(
   }
   if (status == FTUN_OK) {
     status = ftun_event_io_start(
-      service->loop, service->info.native_socket, interests,
+      service->loop, service->info.native_socket, interests | ftun_tun_service_watch_kind(service),
       ftun_tun_service_ready, service, &service->source);
   }
   if (status != FTUN_OK) {
@@ -492,7 +526,7 @@ ftun_status_t ftun_tun_service_rebuild(ftun_tun_service_t *service)
   }
   service->rebuilding = true;
   service->accepting = false;
-  status = ftun_event_source_cancel(&service->source);
+  status = ftun_tun_service_cancel_io(service);
   if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
   if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   if (status == FTUN_OK) status = ftun_tun_service_device_close(service);
@@ -530,7 +564,7 @@ ftun_status_t ftun_tun_service_refresh_network(
   }
   service->rebuilding = true;
   service->accepting = false;
-  status = ftun_event_source_cancel(&service->source);
+  status = ftun_tun_service_cancel_io(service);
   if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
   if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   if (status == FTUN_OK) status = ftun_tun_service_network_withdraw(service);
@@ -542,7 +576,7 @@ ftun_status_t ftun_tun_service_refresh_network(
     uint32_t interests = FTUN_EVENT_ERROR;
     if (service->active_leases != 0u) interests |= FTUN_EVENT_READ;
     status = ftun_event_io_start(service->loop, service->info.native_socket,
-      interests, ftun_tun_service_ready, service, &service->source);
+      interests | ftun_tun_service_watch_kind(service), ftun_tun_service_ready, service, &service->source);
   }
   service->events = 0u;
   if (status == FTUN_OK) {
@@ -572,7 +606,7 @@ static ftun_status_t ftun_tun_service_change_pause(
   service->rebuild_paused = rebuild;
   service->rebuild_port_ready = false;
   service->accepting = false;
-  status = ftun_event_source_cancel(&service->source);
+  status = ftun_tun_service_cancel_io(service);
   if (status == FTUN_OK) ftun_tun_service_all_outputs_clear(service);
   if (status == FTUN_OK) ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;
@@ -638,7 +672,7 @@ ftun_status_t ftun_tun_service_network_finish(
     }
     if (service->active_leases != 0u) interests |= FTUN_EVENT_READ;
     status = ftun_event_io_start(service->loop, service->info.native_socket,
-      interests, ftun_tun_service_ready, service, &service->source);
+      interests | ftun_tun_service_watch_kind(service), ftun_tun_service_ready, service, &service->source);
     if (status == FTUN_OK) {
       service->network_generation++;
       service->accepting = true;
@@ -664,7 +698,7 @@ ftun_status_t ftun_tun_service_quiesce_io(ftun_tun_service_t *service)
   was_quiesced = service->quiesced;
   service->quiesced = true;
   service->accepting = false;
-  result = ftun_event_source_cancel(&service->source);
+  result = ftun_tun_service_cancel_io(service);
   ftun_tun_service_all_outputs_clear(service);
   ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;
@@ -684,7 +718,7 @@ ftun_status_t ftun_tun_service_quiesce(ftun_tun_service_t *service)
       service->queued_inputs == 0u && service->queued_outputs == 0u) return FTUN_OK;
   service->quiesced = true;
   service->accepting = false;
-  result = ftun_event_source_cancel(&service->source);
+  result = ftun_tun_service_cancel_io(service);
   ftun_tun_service_all_outputs_clear(service);
   ftun_tun_service_all_inputs_clear(service);
   service->events = 0u;

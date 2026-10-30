@@ -229,7 +229,7 @@ static int health_scratch(void)
   const char text[] = "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false},"
     "\"outbounds\":[{\"name\":\"A\",\"type\":\"socks5\",\"server\":\"127.0.0.1:9\"},"
     "{\"name\":\"G\",\"type\":\"url-test\",\"outbounds\":[\"A\"],\"default\":\"A\","
-    "\"url\":\"http://127.0.0.1:9/\"}],\"rules\":[\"MATCH,G\"]}";
+    "\"url\":\"https://127.0.0.1:9/\"}],\"rules\":[\"MATCH,G\"]}";
   ftun_proxy_runtime_t engine = {0};
   ftun_config_t *config = NULL;
   ftun_runtime_t *candidate = NULL;
@@ -298,6 +298,19 @@ static int health_scratch(void)
     CHECK(slot->operation == NULL);
     CHECK(ftun_proxy_runtime_next_deadline(&engine, &deadline, &present) == FTUN_OK &&
       present && deadline == slot->schedule.next_due_ms);
+    /* 使用生产HTTP完成入口验证HTTPS样本，不能仅凭204判定成功。 */
+    {
+      ftun_proxy_runtime_http_result_t response = {0};
+      response.status = 204u;
+      error.status = FTUN_OK;
+      for (unsigned int verified = 0u; verified < 2u; verified++) {
+        response.tls_verified = (uint8_t)verified;
+        slot->operation = (ftun_operation_t *)&engine;
+        ftun_proxy_runtime_health_completed(slot->operation, error,
+          (ftun_bytes_t){(const uint8_t *)&response, sizeof(response)}, slot);
+        CHECK(slot->sample.success == (verified != 0u));
+      }
+    }
     engine.generation++;
     slot->schedule.next_due_ms = 1u;
     CHECK(ftun_proxy_runtime_next_deadline(&engine, &deadline, &present) == FTUN_OK &&

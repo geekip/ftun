@@ -19,6 +19,14 @@ static ftun_status_t ftun_socket_option(int descriptor, int level, int name,
   return FTUN_OK;
 }
 
+bool ftun_socket_has_user_timeout(void)
+{
+#if defined(TCP_USER_TIMEOUT)
+  return true;
+#else
+  return false;
+#endif
+}
 ftun_status_t ftun_socket_apply_liveness(ftun_handle_t descriptor,
   const ftun_socket_liveness_t *liveness)
 {
@@ -29,6 +37,9 @@ ftun_status_t ftun_socket_apply_liveness(ftun_handle_t descriptor,
 #if defined(TCP_KEEPIDLE)
     if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
       TCP_KEEPIDLE, (int)liveness->idle_s);
+#elif defined(TCP_KEEPALIVE)
+    if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
+      TCP_KEEPALIVE, (int)liveness->idle_s);
 #endif
 #if defined(TCP_KEEPINTVL)
     if (status == FTUN_OK) status = ftun_socket_option((int)descriptor, IPPROTO_TCP,
@@ -44,6 +55,8 @@ ftun_status_t ftun_socket_apply_liveness(ftun_handle_t descriptor,
     status = ftun_socket_option((int)descriptor, IPPROTO_TCP, TCP_USER_TIMEOUT,
                                 (int)liveness->user_timeout_ms);
   }
+#else
+  if (status == FTUN_OK && liveness->user_timeout_ms != 0u) status = FTUN_E_UNSUPPORTED;
 #endif
   return status;
 }

@@ -77,7 +77,7 @@ size_t ftun_dns_runtime_listeners_waiting(const ftun_dns_runtime_t *dns);
 size_t ftun_dns_runtime_take_object_faults(ftun_dns_runtime_t *dns);
 ftun_status_t ftun_dns_runtime_run_once(ftun_dns_runtime_t *dns, size_t quota,
                                        size_t *out_work);
-bool ftun_dns_runtime_has_ready(const ftun_dns_runtime_t *dns);
+bool ftun_dns_runtime_has_ready(ftun_dns_runtime_t *dns);
 /* 网络变化：把等待中的监听和上游地址的恢复提前到 now_ms。 */
 void ftun_dns_runtime_network_changed(ftun_dns_runtime_t *dns, uint64_t now_ms);
 ftun_status_t ftun_dns_runtime_next_deadline(

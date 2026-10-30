@@ -42,6 +42,8 @@ bool ftun_decimal_parse(const char *text, size_t length, uint32_t maximum,
 bool ftun_port_parse(const char *text, size_t length, uint16_t *out);
 /* 严格点分十进制 IPv4。 */
 bool ftun_ipv4_parse(const char *text, size_t length, uint8_t out[4]);
+/* DNS域名文本：允许末尾点，拒绝空标签、非法字符及IPv4样式数字文本。 */
+int ftun_domain_span(const char *value, size_t length);
 /* IPv4 或 IPv6 字面量。 */
 bool ftun_ip_parse(const char *text, size_t length, ftun_ip_t *out);
 bool ftun_host_port_split(const char *text, size_t length,

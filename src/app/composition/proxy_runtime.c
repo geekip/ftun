@@ -604,7 +604,7 @@ static ftun_status_t ftun_proxy_support_publish_job(
     return status == FTUN_OK ? FTUN_E_INVALID : status;
   }
   path_length = strlen(path);
-  if (path_length > UINT32_MAX || body.length > UINT64_MAX ||
+  if (path_length > UINT32_MAX ||
       path_length > SIZE_MAX - sizeof(*work) - 1u ||
       body.length > SIZE_MAX - sizeof(*work) - path_length - 1u) {
     return FTUN_E_LIMIT;

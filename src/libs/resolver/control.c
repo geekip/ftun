@@ -327,7 +327,7 @@ static void ftun_control_resolution_completed(ftun_operation_t *operation,
   ftun_error_t error, void *user)
 {
   ftun_control_resolution_t *state = user;
-  ftun_system_resolve_result_t result = {{state->domain, state->domain_length}, &state->endpoint, 1u};
+  ftun_system_resolve_result_t result = {{state->domain, state->domain_length}, &state->endpoint, 1u, 0u};
   ftun_reservation_t reservation = state->reservation;
   (void)ftun_event_source_cancel(&state->task);
   state->completion(operation, error, error.status == FTUN_OK ? &result : NULL, state->user);

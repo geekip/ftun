@@ -204,31 +204,3 @@ ftun_status_t ftun_socks5_client_input(ftun_socks5_client_t *client,
   client->phase = FTUN_SOCKS5_CLIENT_FAILED;
   return status;
 }
-
-ftun_status_t ftun_socks5_client_run(ftun_socks5_client_t *client,
-  const ftun_socks5_client_io_t *io, ftun_socks5_client_result_t *result)
-{
-  uint8_t frame[FTUN_SOCKS5_CLIENT_FRAME_BYTES];
-  if (client == NULL || io == NULL || io->write_all == NULL ||
-      io->read_exact == NULL || result == NULL) return FTUN_E_INVALID;
-  for (;;) {
-    ftun_status_t status;
-    size_t length = 0u;
-    if (ftun_socks5_client_wants_output(client)) {
-      status = ftun_socks5_client_output(client, frame, sizeof(frame), &length);
-      if (status == FTUN_OK) status = io->write_all(io->context, frame, length);
-      if (status == FTUN_OK) status = ftun_socks5_client_output_done(client);
-      if (status != FTUN_OK) return status;
-    } else {
-      size_t needed = ftun_socks5_client_needed(client);
-      size_t consumed = 0u;
-      if (needed == 0u || needed > sizeof(frame)) return FTUN_E_STATE_CORRUPT;
-      status = io->read_exact(io->context, frame, needed);
-      if (status != FTUN_OK) return status;
-      status = ftun_socks5_client_input(client, (ftun_bytes_t){frame, needed},
-                                        &consumed, result);
-      if (status == FTUN_OK) return FTUN_OK;
-      if (status != FTUN_E_AGAIN) return status;
-    }
-  }
-}

@@ -1,5 +1,6 @@
 #include "libs/tun/config/validate.h"
 #include "platform/route.h"
+#include "platform/tun.h"
 #include "core/config/syntax.h"
 #include <string.h>
 
@@ -15,6 +16,10 @@ ftun_status_t ftun_config_validate_tun_device(
       strlen(tun->interface_name) > 15u) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
                                   "TUN interface name is invalid");
+  }
+  if (tun->auto_route && !ftun_platform_tun_auto_route_supported()) {
+    return ftun_config_diagnostic(out, FTUN_E_UNSUPPORTED, "/tun/auto-route",
+      "TUN auto-route is unavailable on this platform; use manual routes");
   }
   route_error = ftun_platform_route_config_error(
     (ftun_route_settings_t){tun->route_table, tun->rule_priority});

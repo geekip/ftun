@@ -71,51 +71,6 @@ int ftun_path_valid(const char *value)
   return 1;
 }
 
-int ftun_ipv4_span(const char *value, size_t length, uint32_t *out)
-{
-  uint8_t bytes[4];
-  if (!ftun_ipv4_parse(value, length, bytes)) return 0;
-  if (out != NULL) *out = ftun_ipv4_value(bytes);
-  return 1;
-}
-
-int ftun_domain_span(const char *value, size_t length)
-{
-  size_t effective = length;
-  size_t start = 0u;
-  size_t index;
-  size_t dots = 0u;
-  int only_digits_and_dots = 1;
-  if (value == NULL || length == 0u) return 0;
-  if (value[length - 1u] == '.') effective--;
-  if (effective == 0u || effective > 253u) return 0;
-  for (index = 0u; index < effective; index++) {
-    unsigned char byte = (unsigned char)value[index];
-    if (byte == '.') {
-      dots++;
-    } else if (byte < '0' || byte > '9') {
-      only_digits_and_dots = 0;
-    }
-  }
-  if (only_digits_and_dots && dots == 3u) return 0;
-  for (index = 0u; index <= effective; index++) {
-    if (index == effective || value[index] == '.') {
-      size_t label_length = index - start;
-      size_t label_index;
-      if (label_length == 0u || label_length > 63u ||
-          value[start] == '-' || value[index - 1u] == '-') return 0;
-      for (label_index = start; label_index < index; label_index++) {
-        unsigned char byte = (unsigned char)value[label_index];
-        if (!((byte >= 'A' && byte <= 'Z') ||
-              (byte >= 'a' && byte <= 'z') ||
-              (byte >= '0' && byte <= '9') || byte == '-')) return 0;
-      }
-      start = index + 1u;
-    }
-  }
-  return 1;
-}
-
 int ftun_host_span(const char *value, size_t length, ftun_ip_t *ip, int *is_ip)
 {
   ftun_ip_t address;

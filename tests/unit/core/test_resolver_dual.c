@@ -18,6 +18,7 @@ typedef struct {
   ftun_status_t admission;
   size_t cancels;
   bool invalid;
+  uint64_t expires;
   char domain[64];
 } child_t;
 typedef struct {
@@ -29,6 +30,7 @@ typedef struct {
 typedef struct {
   size_t calls, count;
   ftun_status_t status;
+  uint64_t expires;
   ftun_endpoint_t addresses[2];
 } result_t;
 
@@ -42,7 +44,7 @@ static void child_done(ftun_operation_t *operation, ftun_error_t error, void *us
 {
   child_t *child = user;
   ftun_endpoint_t endpoint = {0};
-  ftun_system_resolve_result_t result = {{child->domain, strlen(child->domain)}, &endpoint, 1u};
+  ftun_system_resolve_result_t result = {{child->domain, strlen(child->domain)}, &endpoint, 1u, child->expires};
   if (child->invalid) result.addresses = NULL;
   endpoint.kind = child->type == 28u ? FTUN_ADDRESS_IPV6 : FTUN_ADDRESS_IPV4;
   endpoint.address[child->type == 28u ? 15u : 3u] = 1u;
@@ -78,6 +80,7 @@ static void done(ftun_operation_t *operation, ftun_error_t error,
   result->status = error.status;
   if (error.status == FTUN_OK && answer != NULL && answer->address_count <= 2u) {
     result->count = answer->address_count;
+    result->expires = answer->expires_at_ms;
     memcpy(result->addresses, answer->addresses, answer->address_count * sizeof(*answer->addresses));
     if (answer->domain.length != 9u || memcmp(answer->domain.data, "dual.test", 9u)) result->status = FTUN_E_STATE_CORRUPT;
   }
@@ -104,6 +107,8 @@ static int run_case(unsigned int scenario)
   CHECK(ftun_event_loop_create(core, &loop) == FTUN_OK);
   CHECK(ftun_operation_queue_create(budget, 8u, &queue) == FTUN_OK);
   backend.queue = queue;
+  backend.children[0].expires = 2000u;
+  backend.children[1].expires = 1000u;
   CHECK(ftun_monotonic_now(&backend.deadline) == FTUN_OK);
   backend.deadline += 5000u;
   spec.budget = budget; spec.generation = 1u;
@@ -144,6 +149,7 @@ static int run_case(unsigned int scenario)
     CHECK(ftun_operation_dispatch(queue, 8u, &dispatched) == FTUN_OK);
     CHECK(result.calls == 1u);
     CHECK(result.status == (scenario == 2u ? FTUN_E_IO : scenario == 3u ? FTUN_E_CANCELLED : scenario == 4u ? FTUN_E_LIMIT : scenario == 6u ? FTUN_E_STATE_CORRUPT : FTUN_OK));
+    if (scenario == 0u || scenario == 1u) CHECK(result.expires == 1000u);
     if (scenario == 0u) CHECK(result.count == 2u && result.addresses[0].kind == FTUN_ADDRESS_IPV4 && result.addresses[1].kind == FTUN_ADDRESS_IPV6 && result.addresses[1].address[15] == 1u);
     if (scenario == 1u) CHECK(result.count == 1u && result.addresses[0].kind == FTUN_ADDRESS_IPV6);
   }

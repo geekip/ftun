@@ -3,32 +3,6 @@
 #include "proxy/outbound_id.h"
 #include <string.h>
 
-static ftun_status_t ftun_http_outbound_id(const ftun_config_t *config,
-                                            const char *name,
-                                            uint32_t *out)
-{
-  size_t index;
-  if (config == NULL || name == NULL || out == NULL) return FTUN_E_INVALID;
-  if (strcmp(name, "DIRECT") == 0) {
-    *out = FTUN_OUTBOUND_ID_DIRECT;
-    return FTUN_OK;
-  }
-  if (strcmp(name, "REJECT") == 0) {
-    *out = FTUN_OUTBOUND_ID_REJECT;
-    return FTUN_OK;
-  }
-  for (index = 0u; index < ftun_config_outbound_count(config); index++) {
-    if (strcmp(name, ftun_config_outbounds(config)[index].name) == 0) {
-      if (index > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) {
-        return FTUN_E_LIMIT;
-      }
-      *out = (uint32_t)index + FTUN_OUTBOUND_ID_NAMED_BASE;
-      return FTUN_OK;
-    }
-  }
-  return FTUN_E_REJECTED;
-}
-
 ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
                                     const ftun_runtime_t *runtime,
                                     const char *outbound_name,
@@ -47,7 +21,7 @@ ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
     spec->generation = info.generation;
   }
   spec->egress_id = FTUN_EGRESS_DIRECT;
-  status = ftun_http_outbound_id(config, outbound_name, &current);
+  status = ftun_proxy_outbound_id(config, outbound_name, &current);
   for (depth = 0u; status == FTUN_OK && depth <= ftun_config_outbound_count(config);
        depth++) {
     const ftun_config_outbound_t *item;
@@ -75,7 +49,7 @@ ftun_status_t ftun_http_fetch_route(const ftun_config_t *config,
       if (status == FTUN_OK && !is_group) status = FTUN_E_STATE_CORRUPT;
       if (status == FTUN_OK) current = selected;
     } else {
-      status = ftun_http_outbound_id(config, item->default_member, &current);
+      status = ftun_proxy_outbound_id(config, item->default_member, &current);
     }
   }
   return status == FTUN_OK ? FTUN_E_STATE_CORRUPT : status;

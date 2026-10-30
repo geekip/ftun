@@ -1,0 +1,5 @@
+set(CMAKE_SYSTEM_NAME Linux)
+set(CMAKE_SYSTEM_PROCESSOR armv7)
+set(FTUN_ZIG_TARGET "arm-linux-musleabihf")
+set(CMAKE_C_FLAGS_INIT "-mcpu=cortex_a7")
+include("${CMAKE_CURRENT_LIST_DIR}/zig.cmake")

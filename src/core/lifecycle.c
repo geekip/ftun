@@ -208,13 +208,6 @@ bool ftun_core_service_run_fatal(ftun_status_t status,
   return status == FTUN_E_STATE_CORRUPT || (usage != NULL && usage->fatal);
 }
 
-bool ftun_core_service_can_pause(const ftun_core_service_t *service)
-{
-  return service != NULL && service->descriptor != NULL &&
-         service->descriptor->maintain_once != NULL &&
-         service->implementation != NULL && service->prepared;
-}
-
 ftun_status_t ftun_core_service_maintain_once(
   ftun_core_service_t *service, uint64_t now_ms, size_t quota,
   ftun_core_service_run_usage_t *out_usage)

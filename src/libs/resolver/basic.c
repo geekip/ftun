@@ -4,6 +4,7 @@
 #include "libs/resolver/basic.h"
 
 #include <limits.h>
+#include "platform/clock.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -44,7 +45,7 @@ typedef struct {
   uint8_t response_wire[FTUN_BOOTSTRAP_MAX_RESPONSE_BYTES];
   ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
-  uint64_t deadline_ms;
+  uint64_t deadline_ms, expires_at_ms;
   uint16_t query_id, query_type;
   ftun_native_socket_t socket;
   ftun_system_resolve_completion_fn completion;
@@ -61,51 +62,7 @@ typedef struct {
 
 static ftun_error_t ftun_bootstrap_error(ftun_status_t status, uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
-}
-
-static int ftun_bootstrap_domain_valid(ftun_string_t domain)
-{
-  size_t effective;
-  size_t start = 0u;
-  size_t index;
-  size_t dots = 0u;
-  int only_digits_and_dots = 1;
-  if (domain.data == NULL || domain.length == 0u ||
-      domain.length > FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES ||
-      memchr(domain.data, '\0', domain.length) != NULL) return 0;
-  effective = domain.length;
-  if (domain.data[effective - 1u] == '.') effective--;
-  if (effective == 0u || effective > 253u) return 0;
-  for (index = 0u; index < effective; index++) {
-    unsigned char byte = (unsigned char)domain.data[index];
-    if (byte == '.') dots++;
-    else if (byte < (unsigned char)'0' || byte > (unsigned char)'9') {
-      only_digits_and_dots = 0;
-    }
-  }
-  if (only_digits_and_dots && dots == 3u) return 0;
-  for (index = 0u; index <= effective; index++) {
-    if (index == effective || domain.data[index] == '.') {
-      size_t label_length = index - start;
-      size_t label_index;
-      if (label_length == 0u || label_length > 63u ||
-          domain.data[start] == '-' || domain.data[index - 1u] == '-') return 0;
-      for (label_index = start; label_index < index; label_index++) {
-        unsigned char byte = (unsigned char)domain.data[label_index];
-        if (!((byte >= (unsigned char)'A' && byte <= (unsigned char)'Z') ||
-              (byte >= (unsigned char)'a' && byte <= (unsigned char)'z') ||
-              (byte >= (unsigned char)'0' && byte <= (unsigned char)'9') ||
-              byte == (unsigned char)'-')) return 0;
-      }
-      start = index + 1u;
-    }
-  }
-  return 1;
+  return (ftun_error_t){status, stage, 0};
 }
 
 static int ftun_bootstrap_device_valid(ftun_string_t device)
@@ -122,11 +79,6 @@ static int ftun_bootstrap_device_valid(ftun_string_t device)
   return 1;
 }
 
-static int ftun_bootstrap_endpoint_equal(const ftun_endpoint_t *left, const ftun_endpoint_t *right)
-{
-  return ftun_endpoint_equal(left, right);
-}
-
 static ftun_status_t ftun_bootstrap_servers_validate(
   const ftun_bootstrap_request_t *request)
 {
@@ -141,7 +93,7 @@ static ftun_status_t ftun_bootstrap_servers_validate(
     if (!ftun_endpoint_is_ip(server) || server->port == 0u ||
         server->domain.length != 0u) return FTUN_E_INVALID;
     for (previous = 0u; previous < index; previous++) {
-      if (ftun_bootstrap_endpoint_equal(server, &request->servers[previous])) {
+      if (ftun_endpoint_equal(server, &request->servers[previous])) {
         return FTUN_E_INVALID;
       }
     }
@@ -155,7 +107,7 @@ static ftun_status_t ftun_bootstrap_request_validate(
   ftun_status_t status;
   if (request == NULL || request->budget == NULL ||
       request->completion == NULL ||
-      !ftun_bootstrap_domain_valid(request->domain) ||
+      !ftun_domain_span(request->domain.data, request->domain.length) ||
       !ftun_bootstrap_device_valid(request->protection.interface_name)) {
     return FTUN_E_INVALID;
   }
@@ -256,6 +208,7 @@ static void ftun_bootstrap_completed(ftun_operation_t *operation,
   if (error.status == FTUN_OK) {
     result.addresses = context->addresses;
     result.address_count = context->address_count;
+    result.expires_at_ms = context->expires_at_ms;
   }
   context->operation = NULL;
   context->completion(operation, error, &result, context->completion_user);
@@ -370,14 +323,22 @@ static ftun_status_t ftun_bootstrap_collect_answers(
   ftun_bootstrap_context_t *context, const ftun_dns_message_t *message)
 {
   size_t index;
+  uint32_t ttl = INT32_MAX;
+  uint64_t now;
   context->address_count = 0u;
   size_t bytes = context->query_type == 28u ? 16u : 4u;
   for (index = 0u; index < message->record_count; index++) {
     const ftun_dns_record_t *record = &message->records[index];
     ftun_endpoint_t *endpoint;
     if (record->section != FTUN_DNS_SECTION_ANSWER ||
-        record->kind != FTUN_DNS_RECORD_ORDINARY || record->type != context->query_type ||
-        record->class_code != 1u || record->rdata.length != bytes) continue;
+        record->kind != FTUN_DNS_RECORD_ORDINARY || record->class_code != 1u) continue;
+    /* CNAME链及地址RR共同限制缓存期限；重复地址也不能延长TTL。 */
+    if (record->type == 5u ||
+        (record->type == context->query_type && record->rdata.length == bytes)) {
+      uint32_t seconds = record->ttl > INT32_MAX ? 0u : record->ttl;
+      if (seconds < ttl) ttl = seconds;
+    }
+    if (record->type != context->query_type || record->rdata.length != bytes) continue;
     if (ftun_bootstrap_address_contains(context, record->rdata.data)) continue;
     if (context->address_count >= FTUN_SYSTEM_RESOLVER_MAX_RESULTS) {
       return FTUN_E_LIMIT;
@@ -387,7 +348,12 @@ static ftun_status_t ftun_bootstrap_collect_answers(
     endpoint->kind = context->query_type == 28u ? FTUN_ADDRESS_IPV6 : FTUN_ADDRESS_IPV4;
     memcpy(endpoint->address, record->rdata.data, bytes);
   }
-  return context->address_count == 0u ? FTUN_E_RESOLVE : FTUN_OK;
+  if (context->address_count == 0u) return FTUN_E_RESOLVE;
+  ftun_status_t status = ftun_monotonic_now(&now);
+  if (status != FTUN_OK) return status;
+  uint64_t lifetime = (uint64_t)ttl * 1000u;
+  context->expires_at_ms = lifetime > UINT64_MAX - now ? UINT64_MAX : now + lifetime;
+  return FTUN_OK;
 }
 
 static ftun_status_t ftun_bootstrap_process_response(
@@ -399,7 +365,7 @@ static ftun_status_t ftun_bootstrap_process_response(
   bool matches = false;
   ftun_status_t status;
   *out_matched = 0;
-  if (!ftun_bootstrap_endpoint_equal(
+  if (!ftun_endpoint_equal(
         source, &context->servers[context->current_server])) return FTUN_OK;
   status = ftun_dns_message_parse_with_budget(context->budget,
     (ftun_bytes_t){context->response_wire, received}, &message);
@@ -544,7 +510,7 @@ static void ftun_bootstrap_child_completed(
   if (result == NULL || result->socket == FTUN_INVALID_SOCKET ||
       result->transport != FTUN_DIAL_UDP ||
       result->purpose != FTUN_DIAL_PURPOSE_BOOTSTRAP ||
-      !ftun_bootstrap_endpoint_equal(
+      !ftun_endpoint_equal(
         &result->endpoint, &context->servers[context->current_server])) {
     if (result != NULL) context->socket = result->socket;
     (void)ftun_bootstrap_finish(

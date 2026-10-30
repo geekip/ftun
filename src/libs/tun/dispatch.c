@@ -416,7 +416,7 @@ ftun_status_t ftun_tun_service_run(
     status = FTUN_OK;
     if (service->device_lost && !service->rebuilding && service->source != NULL) {
       service->accepting = false;
-      status = ftun_event_source_cancel(&service->source);
+      status = ftun_tun_service_cancel_io(service);
     }
     if (status != FTUN_OK) {
       ftun_tun_service_broadcast(service, FTUN_TUN_SERVICE_FAILED, status);

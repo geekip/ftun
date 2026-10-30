@@ -132,10 +132,33 @@ static int test_ipv4_helpers(void)
   return 0;
 }
 
+/* 文本规则下沉后，各解析入口共用同一标签/长度语义。 */
+static int test_domain(void)
+{
+  char name[255];
+  CHECK(ftun_domain_span(TEXT("api.example")));
+  CHECK(ftun_domain_span(TEXT("API.example.")));
+  CHECK(!ftun_domain_span(TEXT("")) && !ftun_domain_span(NULL, 1u));
+  CHECK(!ftun_domain_span(TEXT(".example")) && !ftun_domain_span(TEXT("a..b")));
+  CHECK(!ftun_domain_span(TEXT("-a.test")) && !ftun_domain_span(TEXT("a-.test")));
+  CHECK(!ftun_domain_span(TEXT("127.0.0.1")));
+  CHECK(!ftun_domain_span("a\0b", 3u));
+  memset(name, 'a', sizeof(name));
+  name[63] = name[127] = name[191] = '.';
+  CHECK(ftun_domain_span(name, 253u));
+  name[253] = '.';
+  CHECK(ftun_domain_span(name, 254u));
+  CHECK(!ftun_domain_span(name, 255u));
+  name[63] = 'a';
+  CHECK(!ftun_domain_span(name, 253u));
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_decimal_and_port() == 0);
   CHECK(test_ip() == 0);
+  CHECK(test_domain() == 0);
   CHECK(test_host_port() == 0);
   CHECK(test_cidr() == 0);
   CHECK(test_ipv4_helpers() == 0);

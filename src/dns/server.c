@@ -4,6 +4,7 @@
 #include "core/context.h"
 #include "platform/clock.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -60,19 +61,13 @@ typedef struct {
 static ftun_error_t ftun_dns_server_error(ftun_status_t status,
                                           uint32_t stage)
 {
-  ftun_error_t error;
-  memset(&error, 0, sizeof(error));
-  error.status = status;
-  error.stage = stage;
-  return error;
+  return (ftun_error_t){status, stage, 0};
 }
 
-static uint64_t ftun_dns_server_default_now(void *user)
+static ftun_status_t ftun_dns_server_default_now(void *user, uint64_t *out)
 {
-  uint64_t now = 0u;
   (void)user;
-  (void)ftun_monotonic_now(&now);
-  return now;
+  return ftun_monotonic_now(out);
 }
 
 static int ftun_dns_server_endpoint_valid(const ftun_endpoint_t *endpoint)
@@ -181,8 +176,9 @@ static ftun_status_t ftun_dns_server_submit(
   ftun_dns_exchange_context_t *context, ftun_dns_transport_t transport)
 {
   ftun_dns_server_t *server = context->server;
-  uint64_t now = server->now(server->now_user);
-  ftun_status_t status;
+  uint64_t now;
+  ftun_status_t status = server->now(server->now_user, &now);
+  if (status != FTUN_OK) return ftun_dns_server_finish(context, status, FTUN_DNS_SERVER_STAGE_TRANSPORT);
   if (now >= context->query.deadline_ms) {
     return ftun_dns_server_finish(context, FTUN_E_TIMEOUT,
                                   FTUN_DNS_SERVER_STAGE_TIMEOUT);
@@ -256,9 +252,15 @@ static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context)
   ftun_dns_server_t *server = context->server;
   size_t next = 0u;
   if (server->upstream_set == NULL) return false;
-  ftun_upstream_set_report_failure(server->upstream_set, context->upstream_index);
+  uint64_t now;
+  ftun_status_t status = server->now(server->now_user, &now);
+  if (status == FTUN_OK) status = ftun_upstream_set_report_failure(server->upstream_set, context->upstream_index);
+  if (status != FTUN_OK) {
+    (void)ftun_dns_server_finish(context, status, FTUN_DNS_SERVER_STAGE_TRANSPORT);
+    return true;
+  }
   if ((!context->probing && context->failed_over) ||
-      server->now(server->now_user) >= context->query.deadline_ms ||
+      now >= context->query.deadline_ms ||
       ftun_upstream_set_pick(server->upstream_set, context->upstream_index,
                              &next, &(bool){false}) != FTUN_OK) return false;
   if (!context->probing) context->failed_over = true;
@@ -280,7 +282,7 @@ static void ftun_dns_server_transport_completed(
   ftun_dns_message_t *message = NULL;
   bool matches = false;
   uint64_t now;
-  if (context == NULL || context->server == NULL) return;
+  assert(context != NULL && context->server != NULL);
   server = context->server;
   if (context->cancelling) context->completed_during_cancel = true;
   context->transport_request = NULL;
@@ -293,9 +295,13 @@ static void ftun_dns_server_transport_completed(
                                  FTUN_DNS_SERVER_STAGE_TRANSPORT);
     return;
   }
-  now = server->query_transport.response_now == NULL
-    ? server->now(server->now_user)
-    : server->query_transport.response_now(server->query_transport.context);
+  status = server->query_transport.response_now == NULL
+    ? server->now(server->now_user, &now)
+    : server->query_transport.response_now(server->query_transport.context, &now);
+  if (status != FTUN_OK) {
+    (void)ftun_dns_server_finish(context, status, FTUN_DNS_SERVER_STAGE_RESPONSE);
+    return;
+  }
   if (now >= context->query.deadline_ms) {
     (void)ftun_dns_server_finish(context, FTUN_E_TIMEOUT,
                                  FTUN_DNS_SERVER_STAGE_TIMEOUT);
@@ -427,7 +433,10 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
   (void)core_budget;
   status = ftun_dns_server_query_validate(server->budget, query);
   if (status != FTUN_OK) return status;
-  if (server->now(server->now_user) >= query->deadline_ms) {
+  uint64_t now;
+  status = server->now(server->now_user, &now);
+  if (status != FTUN_OK) return status;
+  if (now >= query->deadline_ms) {
     return FTUN_E_TIMEOUT;
   }
   if (server->cache != NULL) {

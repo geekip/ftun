@@ -168,6 +168,9 @@ static void ftun_linux_ifreq_name(struct ifreq *request, const char *name)
   memcpy(request->ifr_name, name, strlen(name) + 1u);
 }
 
+bool ftun_platform_tun_auto_route_supported(void) { return true; }
+void ftun_platform_tun_resources(size_t *bytes, size_t *handles, size_t *temporary)
+{ *bytes = 0u; *handles = 1u; *temporary = 1u; }
 const ftun_platform_tun_io_t *ftun_platform_tun_default_io(void) { return &ftun_system_io; }
 bool ftun_platform_tun_spec_valid(const ftun_tun_spec_t *spec, const ftun_platform_tun_io_t *io)
 {
@@ -302,4 +305,5 @@ void ftun_platform_tun_get_info(const ftun_platform_tun_t *port, ftun_packet_por
   memcpy(out->name, port->name, sizeof(out->name));
   out->mtu = port->mtu;
   out->native_socket = (ftun_native_socket_t)(unsigned int)port->descriptor;
+  out->flags = 0u;
 }

@@ -568,31 +568,6 @@ ftun_status_t ftun_proxy_runtime_fakeip_reserve_runtime(
 #endif
 
 /* 记下监听地址与名字；不创建 socket。 */
-ftun_status_t ftun_proxy_runtime_config_outbound_id(
-  const ftun_config_t *config, const char *name, uint32_t *out)
-{
-  size_t index;
-  if (config == NULL || name == NULL || out == NULL) return FTUN_E_INVALID;
-  if (strcmp(name, "DIRECT") == 0) {
-    *out = FTUN_OUTBOUND_ID_DIRECT;
-    return FTUN_OK;
-  }
-  if (strcmp(name, "REJECT") == 0) {
-    *out = FTUN_OUTBOUND_ID_REJECT;
-    return FTUN_OK;
-  }
-  for (index = 0u; index < ftun_config_outbound_count(config); index++) {
-    if (strcmp(name, ftun_config_outbounds(config)[index].name) == 0) {
-      if (index > UINT32_MAX - FTUN_OUTBOUND_ID_NAMED_BASE) {
-        return FTUN_E_LIMIT;
-      }
-      *out = (uint32_t)index + FTUN_OUTBOUND_ID_NAMED_BASE;
-      return FTUN_OK;
-    }
-  }
-  return FTUN_E_REJECTED;
-}
-
 int ftun_proxy_runtime_string_equal(const char *left, const char *right)
 {
   if (left == NULL || right == NULL) return left == right;
@@ -766,7 +741,7 @@ ftun_status_t ftun_proxy_runtime_health_prepare(
       slot->generation = generation;
       slot->schedule.consumers = group->consumed ? 1u : 0u;
       slot->schedule.next_due_ms = group->consumed ? now_ms : 0u;
-      status = ftun_proxy_runtime_config_outbound_id(config,
+      status = ftun_proxy_outbound_id(config,
         item->members.items[member], &slot->member_id);
       if (status != FTUN_OK) break;
       slot->sample.member_id = slot->member_id;
@@ -904,7 +879,7 @@ ftun_status_t ftun_proxy_runtime_health_publish(
     ? UINT64_MAX : group->interval_ms * 2u;
   spec.minimum_hold_ms = group->interval_ms;
   spec.tolerance_ms = item->tolerance_ms;
-  status = ftun_proxy_runtime_config_outbound_id(config, item->default_member,
+  status = ftun_proxy_outbound_id(config, item->default_member,
                                            &spec.default_member_id);
   if (status == FTUN_OK) status = ftun_url_test_choose(&spec, &snapshot,
                                                        &choice);

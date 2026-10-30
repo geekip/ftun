@@ -3,6 +3,8 @@
 #include "util/types.h"
 #if defined(__unix__) || defined(__APPLE__)
 #include "platform/posix/thread_types.h"
+#elif defined(_WIN32)
+#include "platform/windows/thread_types.h"
 #else
 #error "Synchronization storage is not implemented for this platform"
 #endif

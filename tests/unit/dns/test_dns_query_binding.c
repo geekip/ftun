@@ -82,6 +82,13 @@ typedef struct {
   size_t fd_baseline;
 } fixture_t;
 
+static uint64_t test_now(void)
+{
+  uint64_t now;
+  if (ftun_dns_runtime_now(NULL, &now) != FTUN_OK) abort();
+  return now;
+}
+
 static size_t open_fd_count(void)
 {
   DIR *directory = opendir("/proc/self/fd");
@@ -391,13 +398,13 @@ static int query_start(fixture_t *fixture, uint16_t id,
   completion_t *completion, ftun_operation_t **operation)
 {
   return query_start_until(fixture, id, completion, operation,
-                            ftun_dns_runtime_now(NULL) + 3000u);
+                            test_now() + 3000u);
 }
 
 static int wait_udp(fixture_t *fixture, size_t proxy, unsigned int count)
 {
-  uint64_t deadline = ftun_dns_runtime_now(NULL) + 2000u;
-  while (fixture->proxies[proxy].udp_queries < count && ftun_dns_runtime_now(NULL) < deadline) {
+  uint64_t deadline = test_now() + 2000u;
+  while (fixture->proxies[proxy].udp_queries < count && test_now() < deadline) {
     CHECK(pump(fixture) == 0);
   }
   CHECK(fixture->proxies[proxy].udp_queries == count);
@@ -406,8 +413,8 @@ static int wait_udp(fixture_t *fixture, size_t proxy, unsigned int count)
 
 static int wait_completion(fixture_t *fixture, completion_t *completion)
 {
-  uint64_t deadline = ftun_dns_runtime_now(NULL) + 3000u;
-  while (completion->calls == 0u && ftun_dns_runtime_now(NULL) < deadline) CHECK(pump(fixture) == 0);
+  uint64_t deadline = test_now() + 3000u;
+  while (completion->calls == 0u && test_now() < deadline) CHECK(pump(fixture) == 0);
   CHECK(completion->calls == 1u && completion->status == FTUN_OK && completion->length == 27u);
   return 0;
 }
@@ -485,9 +492,9 @@ static int generation_case(int variant)
     CHECK(reload(&fixture, variant) == 0);
     CHECK(ftun_dns_runtime_reap(&fixture.retired) == FTUN_E_AGAIN);
     {
-      uint32_t member = UINT32_MAX;
-      CHECK(ftun_proxy_dns_select_member(&fixture.selector.proxy, old->config, 2u, &member) == FTUN_E_STALE);
-      CHECK(member == 0u);
+      ftun_egress_info_t info = {0};
+      CHECK(fixture.dns->egress->query(fixture.dns->egress->context,
+        2u, old->generation, &info) == FTUN_E_STALE);
     }
   } else if (variant == 5) {
     CHECK(ftun_runtime_select_names(fixture.core, (ftun_string_t){"G",1u},
@@ -500,9 +507,9 @@ static int generation_case(int variant)
   }
   fixture.proxies[0].release_tc = true;
   {
-    uint64_t deadline = ftun_dns_runtime_now(NULL) + 2000u;
+    uint64_t deadline = test_now() + 2000u;
     ftun_dns_runtime_transport_request_t *tcp = NULL;
-    while (tcp == NULL && ftun_dns_runtime_now(NULL) < deadline) {
+    while (tcp == NULL && test_now() < deadline) {
       ftun_dns_runtime_transport_request_t *request;
       for (request = old->request_head; request != NULL; request = request->next) {
         if (request->transport == FTUN_DNS_TRANSPORT_TCP && request->waiter_head != NULL) {
@@ -561,7 +568,7 @@ static int invalid_binding_case(void)
     else changed.root_id = 4u;
     CHECK(ftun_dns_runtime_transport_submit(fixture.dns, &changed, 1u, 1u,
       &upstream, FTUN_DNS_TRANSPORT_UDP, (ftun_bytes_t){wire,sizeof(wire)},
-      ftun_dns_runtime_now(NULL) + 1000u, unexpected_completion, NULL, &request) ==
+      test_now() + 1000u, unexpected_completion, NULL, &request) ==
       (index == 4u ? FTUN_E_STALE : FTUN_E_REJECTED));
     CHECK(request == NULL && fixture.dns->request_count == 0u);
     CHECK(((ftun_proxy_egress_t *)fixture.dns->egress->context)->nodes[1].resolved);
@@ -630,14 +637,14 @@ static int retired_termination_case(bool timeout)
   size_t count;
   CHECK(fixture_init(&fixture, 0) == 0);
   fixture.proxies[0].withhold_tcp = true;
-  deadline = ftun_dns_runtime_now(NULL) + 1000u;
+  deadline = test_now() + 1000u;
   CHECK(query_start_until(&fixture, 31u, &completion, &operation, deadline) == 0);
   CHECK(wait_udp(&fixture, 0u, 1u) == 0);
   CHECK(reload(&fixture, 1) == 0);
   CHECK(ftun_dns_runtime_reap(&fixture.retired) == FTUN_E_AGAIN);
   fixture.proxies[0].release_tc = true;
   while (fixture.proxies[0].tcp_queries == 0u &&
-         ftun_dns_runtime_now(NULL) < deadline) CHECK(pump(&fixture) == 0);
+         test_now() < deadline) CHECK(pump(&fixture) == 0);
   CHECK(fixture.proxies[0].tcp_queries == 1u && completion.calls == 0u);
   {
     ftun_dns_runtime_transport_request_t *request = fixture.retired->request_head;
@@ -649,7 +656,7 @@ static int retired_termination_case(bool timeout)
   }
   CHECK(ftun_dns_runtime_reap(&fixture.retired) == FTUN_E_AGAIN);
   if (timeout) {
-    while (completion.calls == 0u && ftun_dns_runtime_now(NULL) < deadline + 1000u) {
+    while (completion.calls == 0u && test_now() < deadline + 1000u) {
       CHECK(pump(&fixture) == 0);
       CHECK(poll(NULL, 0u, 1) == 0);
     }

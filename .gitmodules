@@ -4,3 +4,9 @@
 [submodule "third_party/lwip"]
 	path = third_party/lwip
 	url = https://github.com/heiher/lwip.git
+[submodule "third_party/wepoll"]
+	path = third_party/wepoll
+	url = https://github.com/piscisaureus/wepoll.git
+[submodule "third_party/wintun"]
+	path = third_party/wintun
+	url = https://git.zx2c4.com/wintun

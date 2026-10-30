@@ -6,6 +6,7 @@
 #include "core/operation.h"
 #include "core/worker.h"
 #include "libs/resolver/basic.h"
+#include "platform/clock.h"
 
 #include <stdint.h>
 #include <stdio.h>
@@ -63,6 +64,7 @@ typedef struct {
   char domain[FTUN_SYSTEM_RESOLVER_MAX_DOMAIN_BYTES + 1u];
   ftun_endpoint_t addresses[FTUN_SYSTEM_RESOLVER_MAX_RESULTS];
   size_t address_count;
+  uint64_t expires;
 } completion_state_t;
 
 typedef struct {
@@ -318,6 +320,7 @@ static void completed(ftun_operation_t *operation, ftun_error_t error,
   memcpy(state->domain, result->domain.data, result->domain.length);
   state->domain[result->domain.length] = '\0';
   state->address_count = result->address_count;
+  state->expires = result->expires_at_ms;
   for (index = 0u; index < result->address_count; index++) {
     state->addresses[index] = result->addresses[index];
   }
@@ -715,8 +718,54 @@ static int test_system_branch(void)
 }
 
 /* 显式 DIRECT 源与 SystemResolver 分支。 */
+static int ttl_case(unsigned int scenario)
+{
+  fixture_t fixture;
+  ftun_operation_t *operation = NULL;
+  uint8_t wire[512];
+  size_t length = sizeof(response_ok);
+  uint64_t before, after;
+  uint32_t ttl = scenario == 0u ? 5u : scenario == 3u ? 1u : 0u;
+  memcpy(wire, response_ok, length);
+  if (scenario == 3u) {
+    static const uint8_t records[] = {
+      0xc0,0x0c,0,5,0,1,0,0,0,1,0,12,
+      5,'a','l','i','a','s',4,'t','e','s','t',0,
+      0xc0,0x29,0,1,0,1,0,0,0,120,0,4,1,2,3,4
+    };
+    length = 29u + sizeof(records);
+    memcpy(wire + 29u, records, sizeof(records));
+  } else {
+    ftun_dns_message_t *message = NULL;
+    CHECK(ftun_dns_message_parse((ftun_bytes_t){wire, length}, &message) == FTUN_OK);
+    size_t offset = (size_t)(message->records[1].rdata.data - message->wire);
+    ftun_dns_message_release(&message);
+    uint32_t value = scenario == 2u ? UINT32_C(0x80000001) : ttl;
+    wire[offset - 6u] = (uint8_t)(value >> 24u);
+    wire[offset - 5u] = (uint8_t)(value >> 16u);
+    wire[offset - 4u] = (uint8_t)(value >> 8u);
+    wire[offset - 3u] = (uint8_t)value;
+    /* 重复地址的较短TTL同样约束有效期限。 */
+    memcpy(wire + offset, (uint8_t[]){1,2,3,4}, 4u);
+  }
+  CHECK(fixture_start(&fixture, 8u) == 0);
+  CHECK(ftun_bootstrap_resolve_with_io(NULL, &fixture.request,
+    &fixture.dial_io, &fixture.io, &operation) == FTUN_OK);
+  CHECK(dispatch_operations(&fixture, 1u));
+  CHECK(ftun_monotonic_now(&before) == FTUN_OK);
+  CHECK(deliver(&fixture, wire, length, &fixture.sockets.endpoints[0]));
+  CHECK(dispatch_operations(&fixture, 1u));
+  CHECK(ftun_monotonic_now(&after) == FTUN_OK);
+  CHECK(fixture.completion.calls == 1 && fixture.completion.error.status == FTUN_OK);
+  CHECK(fixture.completion.expires >= before + (uint64_t)ttl * 1000u &&
+        fixture.completion.expires <= after + (uint64_t)ttl * 1000u);
+  CHECK(fixture_stop(&fixture) == 0);
+  return 0;
+}
+
 int main(void)
 {
+  for (unsigned int scenario = 0u; scenario < 4u; scenario++) CHECK(ttl_case(scenario) == 0);
   CHECK(test_explicit_success_and_copy() == 0);
   CHECK(test_source_filter_and_retry() == 0);
   CHECK(test_tc_timeout_and_cancel() == 0);

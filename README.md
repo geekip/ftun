@@ -2,7 +2,7 @@
 
 FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明代理和嵌入式宿主集成。它提供独立命令行程序和稳定的 C API，通过规则、DNS、FakeIP、FRS 规则集合与代理组处理 TCP/UDP 流量。
 
-当前版本为 **1.0.5**，正式支持 Linux x86_64 IPv4/IPv6 双栈。项目采用 C99 和 CMake，可生成 musl x86_64 全静态程序；功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
+当前版本为 **1.0.5**，采用 C99 和 CMake，支持 IPv4/IPv6 双栈。提供 Linux amd64/arm64/armv7/mips/mipsel 的 musl 全静态构建，以及 Darwin 和 Windows 的 amd64/arm64 用户态程序构建。Windows 通过 Wintun 提供手动路由模式的 TUN，Darwin 暂不含 TUN；平台 ABI、能力与验证边界见[平台构建说明](docs/building.md)。功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
 
 ## 主要能力
 
@@ -44,7 +44,7 @@ ftun reload PID
 ftun fakeip init -c CONFIG
 ```
 
-TUN 与自动路由需要 root 或相应网络能力。只使用 SOCKS5/Mixed 入站时，普通用户只需具备监听端口、配置文件和状态文件权限。系统无法建立必需的出口保护时，FTUN 会在启动阶段失败并报告原因。
+Linux TUN 与自动路由需要 root 或相应网络能力。Windows Wintun 需要管理员权限，使用手动路由，详见[Windows TUN 说明](docs/building.md#windows-wintun)。只使用 SOCKS5/Mixed 入站时，普通用户只需具备监听端口、配置文件和状态文件权限。系统无法建立必需的出口保护时，FTUN 会在启动阶段失败并报告原因。
 
 ## 配置与集成
 
@@ -63,7 +63,7 @@ target_link_libraries(my_host PRIVATE FTUN::Runtime)
 - [实现符合度矩阵](docs/conformance.md)：各项能力实现到什么程度、有哪些测试佐证
 - [变更记录](CHANGELOG.md)
 
-默认预设（`CMakePresets.json`）内置 DNS、FakeIP、TUN 和 FRS；不使用预设直接配置 CMake 时这四个模块默认关闭。可通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 依赖 DNS。构建生成的 `ftun-build-modules.txt` 记录实际模块组合。
+Linux 常用预设（`CMakePresets.json`）内置 DNS、FakeIP、TUN 和 FRS，Windows 发行预设内置 Wintun TUN，Darwin 发行预设关闭 TUN；不使用预设直接配置 CMake 时这四个模块默认关闭。可通过 `FTUN_MODULE_DNS`、`FTUN_MODULE_FAKEIP`、`FTUN_MODULE_TUN`、`FTUN_MODULE_FRS` 选择 `OFF` 或 `BUILTIN`；FakeIP 依赖 DNS。构建生成的 `ftun-build-modules.txt` 记录实际模块组合。
 
 完整样例包含需要替换的测试地址、端点和探测 URL。运行前先阅读 [样例说明](examples/README.md)，再准备网络权限、CA、FRS 文件和 FakeIP 状态。
 

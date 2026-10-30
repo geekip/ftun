@@ -27,6 +27,13 @@
 } while (0)
 
 enum { SEND_REAL, SEND_PIPE, SEND_RESET, SEND_ZERO, SEND_SHORT, SEND_AGAIN };
+static uint64_t test_now(void)
+{
+  uint64_t now;
+  if (ftun_dns_runtime_now(NULL, &now) != FTUN_OK) abort();
+  return now;
+}
+
 static int watched_fd = -1;
 static int send_fault;
 static int recv_fault;
@@ -923,7 +930,7 @@ static int listener_recovery(void)
   CHECK(slot->descriptor >= 0 && slot->tcp_descriptor >= 0 && !slot->waiting);
   CHECK(getsockname((int)slot->tcp_descriptor, (struct sockaddr *)&address, &length) == 0);
   slot->events |= FTUN_EVENT_ERROR;
-  CHECK(ftun_dns_runtime_step_listener(dns, ftun_dns_runtime_now(NULL), &work) == FTUN_OK);
+  CHECK(ftun_dns_runtime_step_listener(dns, test_now(), &work) == FTUN_OK);
   CHECK(work && slot->waiting && slot->descriptor == -1 && slot->tcp_descriptor == -1);
   CHECK(slot->source == NULL && slot->tcp_source == NULL);
   CHECK(ftun_dns_runtime_listeners_waiting(dns) == 1u &&
