@@ -69,4 +69,4 @@ Linux 常用预设（`CMakePresets.json`）内置 DNS、FakeIP、TUN 和 FRS，W
 
 ## 许可
 
-FTUN 使用 [GNU GPL v3](LICENSE)。依赖版本、第三方许可选择与修改说明统一见 [third_party/LOCK.json](third_party/LOCK.json)。构建自动生成第三方告知，安装目录为 `share/doc/ftun/THIRD_PARTY_NOTICES.md`，发布包中位于 `docs/`，并附所用组件的许可原文。wolfSSL 当前按 GPLv3 开放源码许可组合分发；商业闭源分发需要另行取得合适许可并复核整体许可义务。
+FTUN 使用 [GNU GPL v3](LICENSE)。依赖用途、版本、仓库和许可归属见[第三方依赖说明](third_party/README.md)，精确提交与校验值统一见 [third_party/LOCK.json](third_party/LOCK.json)。构建自动生成第三方告知，安装目录为 `share/doc/ftun/THIRD_PARTY_NOTICES.md`，发布包中位于 `docs/`，并附所用组件的许可原文。wolfSSL 当前按 GPLv3 开放源码许可组合分发；商业闭源分发需要另行取得合适许可并复核整体许可义务。

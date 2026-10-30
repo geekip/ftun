@@ -8,25 +8,23 @@
       "name": "cJSON",
       "version": "1.7.19",
       "revision": "c859b25da02955fef659d658b8f324b5cde87be3",
-      "source": "https://github.com/DaveGamble/cJSON/archive/refs/tags/v1.7.19.tar.gz",
-      "archive_sha256": "7fa616e3046edfa7a28a32d5f9eacfd23f92900fe1f8ccd988c1662f30454562",
+      "source": "https://github.com/DaveGamble/cJSON.git",
       "path": "third_party/cjson",
-      "metadata": "third_party/cjson/FTUN-UPSTREAM.json",
       "license": "MIT",
       "license_file": "third_party/cjson/LICENSE",
       "license_sha256": "a36dda207c36db5818729c54e7ad4e8b0c6fba847491ba64f372c1a2037b6d5c",
       "local_patches": [],
       "build_boundary": "cJSON.c only; nesting limit 32",
       "selected_license": "MIT",
-      "notice": "FTUN vendors the unmodified upstream parser source and header under the MIT license."
+      "notice": "FTUN uses unmodified cJSON 1.7.19 as a pinned Git submodule under the MIT license; only cJSON.c is compiled with CJSON_NESTING_LIMIT=32.",
+      "source_form": "git-submodule",
+      "tag": "v1.7.19"
     },
     {
       "name": "heiher/lwIP",
       "revision": "150d2b1a2658612741b4ac002578d440e7874540",
       "source": "https://github.com/heiher/lwip.git",
-      "archive_sha256": "bab562a52da5ccad9e66ec3af98e559249c0da2cb21ef68a399bc91cae31a416",
       "path": "third_party/lwip",
-      "metadata": "third_party/lwip.UPSTREAM.json",
       "license": "BSD-3-Clause",
       "license_file": "third_party/lwip/LICENSE",
       "license_sha256": "ef4aac92e05e87cd1cdc140870ed52206ba03d4a7fe46c1e11d7ffa6c87d252b",
@@ -34,7 +32,8 @@
       "build_boundary": "static raw IPv4/IPv6 core; no socket, app, netif or OS-port sources",
       "selected_license": "BSD-3-Clause",
       "notice": "FTUN uses the unmodified upstream commit as a Git submodule under the three-clause BSD license.",
-      "source_form": "git-submodule"
+      "source_form": "git-submodule",
+      "version": "2.2.1.8-3-g150d2b1"
     },
     {
       "name": "wolfSSL",
@@ -51,23 +50,6 @@
       "build_boundary": "static client library; TLS 1.3 and SNI; no DTLS, obsolete TLS, examples, tests or install",
       "selected_license": "GPL-3.0-only",
       "notice": "FTUN includes the unmodified upstream source as a pinned Git submodule. This repository uses GPLv3 terms unless a distributor has obtained a suitable commercial license. wolfSSL offers commercial licensing separately."
-    },
-    {
-      "name": "musl IP text codecs",
-      "version": "snapshot-2026-10-29",
-      "source": "https://git.musl-libc.org/cgit/musl/tree/src/network/",
-      "path": "third_party/musl",
-      "license": "MIT",
-      "selected_license": "MIT",
-      "license_file": "third_party/musl/COPYRIGHT",
-      "license_sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
-      "local_patches": [],
-      "source_files": {
-        "inet_pton.c": "32a7094a7dc9eea10d067f5fcafbcf2651b86c459ff89cd3cd3f7b7f16e58bbe",
-        "inet_ntop.c": "3e5ebbbb8f4bbd2e113c3eb23d6cbb1c5b7f0d9036c1aa5d182322cc9a5b68f7"
-      },
-      "build_boundary": "pure IPv6 text codecs adapted in src/util/ip.c; no musl OS code is compiled",
-      "notice": "IPv6 text conversion is adapted from musl inet_pton and inet_ntop. Copyright \u00a9 2005-2020 Rich Felker, et al.; MIT license retained with original source snapshots. FTUN removes the socket address-family API and errno dependency."
     },
     {
       "name": "wepoll",
@@ -93,14 +75,11 @@
       "source_form": "git-submodule",
       "license": "GPL-2.0 OR MIT (API header); GPL-2.0 (unused driver sources)",
       "selected_license": "MIT (API header)",
-      "license_file": "third_party/wintun-api-LICENSE",
-      "license_sha256": "a9ac182713a3a69fee867dfa483330f22e8a001909f4b92b72cca8b86739de7d",
+      "license_file": "third_party/wintun/api/wintun.h",
+      "license_sha256": "1c484d46851582c6800b1c3e608cee231ad4690df3e45d6959d4fb8468b8cf69",
       "local_patches": [],
       "build_boundary": "Windows only; public api/wintun.h declarations; no upstream driver or API implementation is compiled; official signed DLL loaded at runtime via the public API",
-      "notice": "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved. FTUN uses the API header under its MIT alternative. The unmodified official wintun.dll is a separate runtime component distributed under the Wintun Prebuilt Binaries License (LICENSE-Wintun-binaries), including the permission to accompany software using only its public API. Driver sources in this submodule are not compiled or distributed in FTUN binary packages.",
-      "source_files": {
-        "api/wintun.h": "1c484d46851582c6800b1c3e608cee231ad4690df3e45d6959d4fb8468b8cf69"
-      }
+      "notice": "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved. FTUN uses the API header under its MIT alternative. The unmodified official wintun.dll is a separate runtime component distributed under the Wintun Prebuilt Binaries License (LICENSE-Wintun-binaries), including the permission to accompany software using only its public API. Driver sources in this submodule are not compiled or distributed in FTUN binary packages."
     }
   ],
   "distribution_targets": [
@@ -141,5 +120,6 @@
         "sha256": "f7ba89005544be9d85231a9e0d5f23b2d15b3311667e2dad0debd344918a3f80"
       }
     }
-  }
+  },
+  "attribution_notice": "The IPv6 text codecs adapted in src/util/ip.c originate from musl commit\n947b4574fa7998f027d3906e1f53acb9a7553c61 (inet_pton.c and inet_ntop.c).\nCopyright © 2005-2020 Rich Felker, et al.\n\nThe Wintun API header is used under its MIT alternative.\nCopyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.\n\nThe following MIT terms apply separately to both items:\n\nPermission is hereby granted, free of charge, to any person obtaining a copy\nof this software and associated documentation files (the \"Software\"), to deal\nin the Software without restriction, including without limitation the rights\nto use, copy, modify, merge, publish, distribute, sublicense, and/or sell\ncopies of the Software, and to permit persons to whom the Software is\nfurnished to do so, subject to the following conditions:\n\nThe above copyright notice and this permission notice shall be included in all\ncopies or substantial portions of the Software.\n\nTHE SOFTWARE IS PROVIDED \"AS IS\", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR\nIMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,\nFITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE\nAUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER\nLIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,\nOUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE\nSOFTWARE."
 }

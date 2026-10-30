@@ -30,8 +30,6 @@ if(WIN32 AND FTUN_MODULE_TUN STREQUAL "BUILTIN")
   configure_file("${ftun_wintun_dll}" "${CMAKE_BINARY_DIR}/wintun.dll" COPYONLY)
   configure_file("${ftun_wintun_license}" "${CMAKE_BINARY_DIR}/LICENSE-Wintun-binaries" COPYONLY)
   install(FILES "${ftun_wintun_dll}" DESTINATION ${CMAKE_INSTALL_BINDIR})
-  install(FILES third_party/wintun-api-LICENSE
-    DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-Wintun-API)
   install(FILES "${ftun_wintun_license}" third_party/wintun/api/wintun.h
     DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 endif()

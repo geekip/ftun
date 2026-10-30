@@ -42,7 +42,8 @@ def main():
     for path in ('LICENSE', 'third_party/LOCK.json'):
         files['docs/' + Path(path).name] = (root / path).read_bytes()
     files['docs/THIRD_PARTY_NOTICES.md'] = (build / 'THIRD_PARTY_NOTICES.md').read_bytes()
-    for component, source in [('cJSON', 'cjson/LICENSE'), ('wolfSSL', 'wolfssl/COPYING'), ('musl', 'musl/COPYRIGHT')]:
+    files['docs/README-third-party.md'] = (root / 'third_party/README.md').read_bytes()
+    for component, source in [('cJSON', 'cjson/LICENSE'), ('wolfSSL', 'wolfssl/COPYING')]:
         files['docs/LICENSE-' + component] = (root / 'third_party' / source).read_bytes()
     if args.platform.startswith('windows-'):
         files['docs/LICENSE-wepoll'] = (root / 'third_party/wepoll/LICENSE').read_bytes()
@@ -58,7 +59,6 @@ def main():
             raise SystemExit('Wintun runtime or license differs from lock')
         files['wintun.dll'] = dll
         files['docs/LICENSE-Wintun-binaries'] = license
-        files['docs/LICENSE-Wintun-API'] = (root / 'third_party/wintun-api-LICENSE').read_bytes()
         files['docs/wintun.h'] = (root / 'third_party/wintun/api/wintun.h').read_bytes()
     epoch = int(subprocess.check_output(['git', 'show', '-s', '--format=%ct', 'HEAD'], cwd=root, text=True))
     name = f'ftun-{tag}-{args.platform}'

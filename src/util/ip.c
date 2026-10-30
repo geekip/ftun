@@ -5,7 +5,7 @@
 
 /* IPv6 文本算法改编自 musl inet_pton/inet_ntop（MIT）。
  * Copyright © 2005-2020 Rich Felker, et al.
- * 许可原文及原始源码见 third_party/musl。 */
+ * 借鉴来源见 third_party/README.md；版权和许可全文见 third_party/LOCK.json。 */
 static int hexval(unsigned c)
 {
   if (c-'0'<10) return (int)(c-'0');

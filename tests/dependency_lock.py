@@ -53,6 +53,10 @@ def check_notices(root, lock, cmake):
     updated = subprocess.run(command, capture_output=True, text=True)
     if updated.returncode or modified["dependencies"][0]["notice"] not in output.read_text(encoding="utf-8"):
       return fail("notice generation did not preserve changed lock text")
+    if lock["attribution_notice"] not in notices:
+      return fail("generated notices omit the complete attribution license")
+    if "README-third-party.md" not in notices:
+      return fail("generated notices omit borrowed-code attribution")
     expected = output.read_bytes()
     for field in ("selected_license", "notice"):
       invalid = json.loads(json.dumps(modified))
@@ -61,6 +65,12 @@ def check_notices(root, lock, cmake):
       rejected = subprocess.run(command, capture_output=True, text=True)
       if rejected.returncode == 0 or output.read_bytes() != expected:
         return fail("invalid notice metadata was accepted or replaced the last valid output")
+    invalid = json.loads(json.dumps(modified))
+    del invalid["attribution_notice"]
+    source.write_text(json.dumps(invalid), encoding="utf-8")
+    rejected = subprocess.run(command, capture_output=True, text=True)
+    if rejected.returncode == 0 or output.read_bytes() != expected:
+      return fail("missing attribution license was accepted or replaced valid notices")
   return 0
 
 
@@ -82,7 +92,7 @@ def main():
     return fail("lock schema, review status or offline policy is invalid")
   dependencies = lock.get("dependencies")
   if not isinstance(dependencies, list) or {item.get("name") for item in dependencies} != {
-      "musl IP text codecs", "cJSON", "heiher/lwIP", "wolfSSL", "wepoll", "Wintun API"}:
+      "cJSON", "heiher/lwIP", "wolfSSL", "wepoll", "Wintun API"}:
     return fail("dependency set is incomplete or contains an unreviewed entry")
   for dependency in dependencies:
     vendor = root / dependency.get("path", "")
@@ -94,32 +104,37 @@ def main():
     if any(not isinstance(dependency.get(field), str) or not dependency[field].strip()
            for field in ("license", "selected_license", "build_boundary", "notice")):
       return fail(f"{dependency.get('name')} review metadata is incomplete")
-    for patch in dependency.get("local_patches", []):
-      if not isinstance(patch.get("description"), str) or not patch["description"].strip():
-        return fail(f"{dependency.get('name')} patch description is missing")
-      patch_path = root / patch.get("path", "")
-      if not patch_path.is_file() or sha256(patch_path) != patch.get("sha256"):
-        return fail(f"{dependency.get('name')} local patch differs")
-    for name, expected in dependency.get("source_files", {}).items():
-      if sha256(vendor / name) != expected:
-        return fail(f"{dependency['name']} source snapshot differs: {name}")
-    metadata_path = dependency.get("metadata")
-    if metadata_path:
-      metadata = json.loads((root / metadata_path).read_text(encoding="utf-8"))
-      if dependency.get("revision") is not None and (
-          dependency["revision"] != metadata.get("revision")):
-        return fail(f"{dependency.get('name')} revision disagrees with metadata")
-      if dependency.get("version") is not None and (
-          dependency["version"] != metadata.get("version")):
-        return fail(f"{dependency.get('name')} version disagrees with metadata")
-      if dependency.get("archive_sha256") != metadata.get("sha256"):
-        return fail(f"{dependency.get('name')} archive digest disagrees with metadata")
-      if dependency.get("vendored_tree_sha256") is not None and (
-          dependency["vendored_tree_sha256"] !=
-          metadata.get("vendored_tree_sha256")):
-        return fail(f"{dependency.get('name')} tree digest disagrees with metadata")
+    if dependency.get("source_form") != "git-submodule" or dependency.get("local_patches") != []:
+      return fail(f"{dependency['name']} must be an unmodified Git submodule")
+  expected_entries = {"LOCK.json", "README.md"} | {Path(item["path"]).name for item in dependencies}
+  if {path.name for path in (root / "third_party").iterdir()} != expected_entries:
+    return fail("third_party must contain only LOCK.json, README.md and declared submodules")
+  readme = (root / "third_party/README.md").read_text(encoding="utf-8")
+  entries = {}
+  labels = ("开源协议：", "使用版本：", "仓库地址：", "集成能力：")
+  for section in readme.split("\n## ")[1:]:
+    name, _, body = section.partition("\n")
+    lines = [line for line in body.splitlines() if line.strip()]
+    if name in entries or len(lines) != 4 or any(
+        not line.startswith(label) or not line[len(label):].strip()
+        for line, label in zip(lines, labels)):
+      return fail("README sections must contain exactly the four requested fields")
+    entries[name] = [line[len(label):] for line, label in zip(lines, labels)]
+  for dependency in dependencies:
+    fields = entries.get(dependency["name"])
+    if fields is None or any(value not in field for value, field in zip((
+        dependency["selected_license"], dependency["version"], dependency["source"]), fields)):
+      return fail(f"{dependency['name']} README license, version or source differs from lock")
+  # README 仅保留简介和字段；完整版权与许可由锁清单传递到分发告知。
+  attribution = lock["attribution_notice"]
+  permission = "Permission is hereby granted"
+  mit = permission + (root / "third_party/cjson/LICENSE").read_text().split(permission, 1)[1]
+  if " ".join(mit.split()) not in " ".join(attribution.split()) or any(notice not in attribution for notice in (
+      "Copyright © 2005-2020 Rich Felker, et al.",
+      "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.", "src/util/ip.c")):
+    return fail("lock omits borrowed-code/API attribution or complete MIT terms")
   modules = (root / ".gitmodules").read_text(encoding="utf-8")
-  submodules = [item for item in dependencies if item.get("source_form") == "git-submodule"]
+  submodules = dependencies
   if modules.count("path = ") != len(submodules) or any(
       f"path = {item['path']}" not in modules for item in submodules):
     return fail("submodules differ from the public lock")

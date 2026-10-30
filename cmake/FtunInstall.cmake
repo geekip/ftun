@@ -29,7 +29,8 @@ install(DIRECTORY docs DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun
 configure_file(cmake/uninstall.cmake.in uninstall.cmake @ONLY)
 add_custom_target(uninstall COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake)
 
-install(FILES third_party/musl/COPYRIGHT DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-musl)
+install(FILES third_party/README.md
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME README-third-party.md)
 
 set_target_properties(ftun_runtime PROPERTIES EXPORT_NAME Runtime)
 include(CMakePackageConfigHelpers)

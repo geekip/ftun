@@ -10,3 +10,6 @@
 [submodule "third_party/wintun"]
 	path = third_party/wintun
 	url = https://git.zx2c4.com/wintun
+[submodule "third_party/cjson"]
+	path = third_party/cjson
+	url = https://github.com/DaveGamble/cJSON.git
