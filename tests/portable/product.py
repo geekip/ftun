@@ -71,6 +71,7 @@ def main():
     assert 'FTUN 1.0.5' in version and 'proxy,dns,fakeip' in version, version
     subprocess.run(runner + [host_binary], check=True, timeout=60)
     if suffix:
+        subprocess.run(runner + [str(build / 'ftun-wepoll-test.exe'), '--creation-failures'], check=True, timeout=60)
         subprocess.run(runner + [str(build / 'ftun-wepoll-test.exe')], check=True, timeout=60)
         if (build / 'ftun-wintun-test.exe').exists():
             subprocess.run(runner + [str(build / 'ftun-wintun-test.exe')], check=True, timeout=60)

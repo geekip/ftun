@@ -37,14 +37,8 @@ static ftun_mutex_t start_mutex = FTUN_MUTEX_INITIALIZER;
 static ftun_condition_t start_condition;
 static size_t owners_ready;
 static bool owners_go;
-static void *parallel_owner(void *context)
+static void poller_lifetime(ledger_t *ledger)
 {
-  ledger_t *ledger = context;
-  ftun_mutex_lock(&start_mutex);
-  owners_ready++;
-  ftun_condition_broadcast(&start_condition);
-  while (!owners_go) ftun_condition_wait(&start_condition, &start_mutex);
-  ftun_mutex_unlock(&start_mutex);
   ftun_poller_t poller = {0};
   ftun_poller_event_t events[FTUN_POLLER_CAPACITY];
   size_t count;
@@ -53,9 +47,18 @@ static void *parallel_owner(void *context)
   CHECK(ftun_poller_wait(&poller, 1000, events, &count) == FTUN_OK && count == 0u);
   ftun_poller_destroy(&poller);
   CHECK(ledger->live == 0u);
+}
+static void *parallel_owner(void *context)
+{
+  ftun_mutex_lock(&start_mutex);
+  owners_ready++;
+  ftun_condition_broadcast(&start_condition);
+  while (!owners_go) ftun_condition_wait(&start_condition, &start_mutex);
+  ftun_mutex_unlock(&start_mutex);
+  poller_lifetime(context);
   return NULL;
 }
-static void creation_failures(void)
+static void initialization_race(void)
 {
   /* 首次全局初始化可由不同owner并发进入，分配上下文必须保持隔离。 */
   ledger_t ledgers[4] = {0};
@@ -70,7 +73,12 @@ static void creation_failures(void)
   for (size_t i = 0u; i < 4u; i++) CHECK(ftun_thread_join(&owners[i]) == FTUN_OK);
   ftun_condition_destroy(&start_condition);
   ftun_mutex_destroy(&start_mutex);
-  /* Winsock和wepoll的一次性初始化完成后，逐个注入三处构造分配失败。 */
+}
+static void creation_failures(void)
+{
+  /* 独立进程内预热，避免并发初始化测试的线程/系统延迟清理干扰句柄基线。 */
+  ledger_t warmup = {0};
+  poller_lifetime(&warmup);
   DWORD handles, after;
   CHECK(GetProcessHandleCount(GetCurrentProcess(), &handles));
   for (size_t fail_at = 1u; fail_at <= 3u; fail_at++) {
@@ -78,7 +86,9 @@ static void creation_failures(void)
     ftun_poller_t poller = {0};
     CHECK(ftun_poller_create(&poller, memory(&ledger)) == FTUN_E_LIMIT);
     CHECK(ledger.live == 0u);
-    CHECK(GetProcessHandleCount(GetCurrentProcess(), &after) && after == handles);
+    CHECK(GetProcessHandleCount(GetCurrentProcess(), &after));
+    if (after != handles) fprintf(stderr, "wepoll allocation %zu: handles before=%lu after=%lu\n", fail_at, (unsigned long)handles, (unsigned long)after);
+    CHECK(after == handles);
   }
 }
 static void ready(ftun_event_source_t *source, uint32_t events, void *context)
@@ -306,9 +316,11 @@ static void waitable_budget_contract(void)
   CHECK(CloseHandle(event));
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-  creation_failures(); waitable_contract(); waitable_budget_contract(); descriptor_failure(); budget_lifetime(); registration_capacity();
+  if (argc == 2 && strcmp(argv[1], "--creation-failures") == 0) { creation_failures(); return 0; }
+  CHECK(argc == 1);
+  initialization_race(); waitable_contract(); waitable_budget_contract(); descriptor_failure(); budget_lifetime(); registration_capacity();
   puts("wepoll: concurrent owners, allocation/descriptor failures, deferred release and cancellation passed");
   return 0;
 }

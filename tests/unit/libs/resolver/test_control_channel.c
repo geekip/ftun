@@ -1,7 +1,6 @@
 #include "libs/resolver/control_channel.h"
 #include "platform/clock.h"
 
-#include <fcntl.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/resource.h>
@@ -148,16 +147,12 @@ static int descriptor_exhaustion(void)
   ftun_control_channel_t *channel = NULL;
   ftun_status_t status;
   uint64_t now;
-  int highest = 2;
-  int descriptor;
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 128u, &budget) == FTUN_OK);
   CHECK(ftun_monotonic_now(&now) == FTUN_OK);
-  for (descriptor = 3; descriptor < 1024; descriptor++) {
-    if (fcntl(descriptor, F_GETFD) != -1) highest = descriptor;
-  }
   CHECK(getrlimit(RLIMIT_NOFILE, &original) == 0);
   limited = original;
-  limited.rlim_cur = (rlim_t)highest + 1u;
+  /* 已打开的描述符保持有效；禁止分配任何新编号，不依赖继承描述符中的空洞。 */
+  limited.rlim_cur = 0u;
   alarm(15u);
   CHECK(setrlimit(RLIMIT_NOFILE, &limited) == 0);
   status = ftun_control_channel_create(budget, 7u, now + 1000u, &channel);

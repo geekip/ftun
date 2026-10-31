@@ -614,7 +614,7 @@ static int test_admission_and_boundaries(void)
   return 0;
 }
 
-/* 仅由隔离网络命名空间显式调用，不加入普通 CTest。 */
+/* 普通用户可执行的真实回环；出口 mark 由 socket-protect 和隔离网络测试覆盖。 */
 static int test_real_loopback(void)
 {
   ftun_budget_t *budget = NULL;
@@ -658,7 +658,6 @@ static int test_real_loopback(void)
   request.endpoint.kind = FTUN_ADDRESS_IPV4;
   memcpy(request.endpoint.address, &address.sin_addr.s_addr, 4u);
   request.endpoint.port = ntohs(address.sin_port);
-  request.protection.mark = 77u;
   request.protection.liveness.keepalive_enabled = true;
   request.protection.liveness.idle_s = 20u;
   request.protection.liveness.interval_s = 5u;

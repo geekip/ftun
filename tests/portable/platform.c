@@ -5,6 +5,7 @@
 #include "platform/process.h"
 #include "platform/random.h"
 #include "platform/socket.h"
+#include "util/endpoint.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -130,6 +131,14 @@ static void datagrams(ftun_address_kind_t family)
   CHECK(ftun_monotonic_now(&now) == FTUN_OK);
   CHECK(ftun_blocking_socket_wait(socket, FTUN_POLLER_READ, now + 5000u));
   CHECK(ftun_socket_receive_from(socket, buffer, sizeof(buffer), &source, &status) == 0 && status == FTUN_OK);
+  /* 短包和恰好填满缓冲区都不是截断；随后超长包必须拒绝。 */
+  for (size_t size = 3u; size <= sizeof(buffer); size++) {
+    CHECK(ftun_socket_send_to(socket, "full", size, &address, &status) == (ptrdiff_t)size && status == FTUN_OK);
+    CHECK(ftun_monotonic_now(&now) == FTUN_OK);
+    CHECK(ftun_blocking_socket_wait(socket, FTUN_POLLER_READ, now + 5000u));
+    CHECK(ftun_socket_datagram_receive(NULL, (ftun_native_socket_t)socket, buffer, sizeof(buffer), &length, &source) == FTUN_OK);
+    CHECK(length == size && memcmp(buffer, "full", size) == 0 && ftun_endpoint_equal(&source, &address));
+  }
   CHECK(ftun_socket_send_to(socket, "truncated", 9u, &address, &status) == 9 && status == FTUN_OK);
   CHECK(ftun_blocking_socket_wait(socket, FTUN_POLLER_READ, now + 5000u));
   CHECK(ftun_socket_datagram_receive(NULL, (ftun_native_socket_t)socket, buffer, sizeof(buffer), &length, &source) == FTUN_E_LIMIT);

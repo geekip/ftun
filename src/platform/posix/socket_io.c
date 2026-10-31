@@ -232,7 +232,8 @@ ftun_status_t ftun_socket_datagram_receive(
   message.msg_iov = &vector;
   message.msg_iovlen = 1u;
   do {
-    result = recvmsg(descriptor, &message, MSG_TRUNC);
+    /* MSG_TRUNC 是输出标志；Darwin 会保留传入位，导致完整报文也被误判为截断。 */
+    result = recvmsg(descriptor, &message, 0);
   } while (result < 0 && errno == EINTR);
   if (result < 0) return ftun_bootstrap_errno_status(errno);
   if (result == 0) return FTUN_E_IO;

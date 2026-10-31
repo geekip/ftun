@@ -11,8 +11,7 @@
 #if defined(FTUN_HAVE_MODULE_FRS)
 #include "frs_fixture.h"
 #include "proxy/frs/frs.h"
-#include <errno.h>
-#include <sys/mman.h>
+#include "platform/file.h"
 #include <unistd.h>
 #endif
 
@@ -156,13 +155,14 @@ void *__wrap_calloc(size_t count, size_t size)
   }
   return __real_calloc(count, size);
 }
-int __real_munmap(void *address, size_t length);
-int __wrap_munmap(void *address, size_t length)
+ftun_status_t __real_ftun_file_unmap(const void *address, size_t length);
+ftun_status_t __wrap_ftun_file_unmap(const void *address, size_t length)
 {
-  if (fail_unmap) { failed_unmaps++; errno = EIO; return -1; }
+  /* 只注入业务映射的释放，不能阻断 musl 分配器内部的 munmap。 */
+  if (fail_unmap) { failed_unmaps++; return FTUN_E_IO; }
   {
-    int result = __real_munmap(address, length);
-    if (result == 0) released_maps++;
+    ftun_status_t result = __real_ftun_file_unmap(address, length);
+    if (result == FTUN_OK) released_maps++;
     return result;
   }
 }
