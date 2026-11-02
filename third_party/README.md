@@ -80,4 +80,4 @@ FTUN 使用的第三方库、运行库及借鉴实现，精确提交与校验信
 
 仓库地址：https://github.com/skeeto/optparse
 
-集成能力：可重入 CLI 参数解析、长短选项与位置参数重排，仅在 args.c 编译单头文件实现。
+集成能力：Git submodule 固定提交；可重入 CLI 参数解析、长短选项与位置参数重排，仅在 args.c 编译单头文件实现。

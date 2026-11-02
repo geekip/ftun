@@ -106,11 +106,11 @@ def main():
       return fail(f"{dependency.get('name')} review metadata is incomplete")
     if dependency.get("local_patches") != []:
       return fail(f"{dependency['name']} must be unmodified")
+    if dependency.get("source_form") != "git-submodule":
+      return fail(f"{dependency['name']} must be an unmodified Git submodule")
     if dependency['name'] == 'optparse':
-      if dependency.get('source_form') != 'single-header' or set(dependency.get('files', {})) != {'optparse.h', 'UNLICENSE'}:
+      if set(dependency.get('files', {})) != {'optparse.h', 'UNLICENSE'}:
         return fail('optparse must retain its original header and license')
-      if {path.name for path in vendor.iterdir()} != set(dependency['files']):
-        return fail('optparse contains unexpected files')
       for name, digest in dependency['files'].items():
         if sha256(vendor / name) != digest:
           return fail(f'optparse upstream file differs: {name}')
@@ -119,8 +119,6 @@ def main():
                          if '#define OPTPARSE_IMPLEMENTATION' in path.read_text()]
       if implementations != ['src/app/cli/args.c']:
         return fail('optparse must have exactly one implementation unit')
-    elif dependency.get("source_form") != "git-submodule":
-      return fail(f"{dependency['name']} must be an unmodified Git submodule")
   expected_entries = {"LOCK.json", "README.md"} | {Path(item["path"]).name for item in dependencies}
   if {path.name for path in (root / "third_party").iterdir()} != expected_entries:
     return fail("third_party must contain only LOCK.json, README.md and declared dependencies")

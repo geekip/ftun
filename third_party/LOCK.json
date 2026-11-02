@@ -87,7 +87,7 @@
       "revision": "a86877ed301d89a4eb64feb08f23af395aede2ed",
       "source": "https://github.com/skeeto/optparse",
       "path": "third_party/optparse",
-      "source_form": "single-header",
+      "source_form": "git-submodule",
       "license": "Unlicense",
       "selected_license": "Unlicense",
       "license_file": "third_party/optparse/UNLICENSE",
@@ -98,7 +98,7 @@
       },
       "local_patches": [],
       "build_boundary": "Unmodified optparse.h; implementation defined only in app/cli/args.c",
-      "notice": "FTUN embeds the unmodified optparse single-header library at the pinned upstream commit under the Unlicense. No runtime dependency is added."
+      "notice": "FTUN uses the unmodified optparse Git submodule at the pinned upstream commit under the Unlicense. Only the single header is compiled; no runtime dependency is added."
     }
   ],
   "distribution_targets": [

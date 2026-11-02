@@ -13,3 +13,6 @@
 [submodule "third_party/cjson"]
 	path = third_party/cjson
 	url = https://github.com/DaveGamble/cJSON.git
+[submodule "third_party/optparse"]
+	path = third_party/optparse
+	url = https://github.com/skeeto/optparse.git
