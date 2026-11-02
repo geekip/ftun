@@ -68,9 +68,9 @@ FTUN 使用的第三方库、运行库及借鉴实现，精确提交与校验信
 
 使用版本：参考提交 947b4574fa7998f027d3906e1f53acb9a7553c61
 
-仓库地址：https://git.musl-libc.org/git/musl
+仓库地址：[inet_pton](https://git.musl-libc.org/cgit/musl/tree/src/network/inet_pton.c?id=947b4574fa7998f027d3906e1f53acb9a7553c61) / [inet_ntop](https://git.musl-libc.org/cgit/musl/tree/src/network/inet_ntop.c?id=947b4574fa7998f027d3906e1f53acb9a7553c61)
 
-集成能力：src/util/ip.c 借鉴 inet_pton/inet_ntop 实现 IPv6 文本解析与格式化，不引入整库或源码快照。
+集成能力：src/util/ip.c 借鉴 inet_pton/inet_ntop 算法实现 IPv6 文本解析与格式化，未引入整库或源码快照。
 
 ## optparse
 
