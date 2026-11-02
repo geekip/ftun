@@ -73,6 +73,10 @@ typedef enum {
   FTUN_LIFECYCLE_REASON_RELOAD_PREPARE,
   FTUN_LIFECYCLE_REASON_RELOAD_COMMIT,
   FTUN_LIFECYCLE_REASON_RELOAD_ABORT,
+  /* 21/22保留既有生产者编号；FRS已使用22。 */
+  FTUN_LIFECYCLE_REASON_NETWORK_CHANGED = 23,
+  FTUN_LIFECYCLE_REASON_NETWORK_OVERFLOW,
+  FTUN_LIFECYCLE_REASON_NETWORK_STORM,
   FTUN_LIFECYCLE_REASON_COUNT = 64
 } ftun_lifecycle_reason_t;
 
@@ -104,6 +108,7 @@ typedef struct {
   bool has_error;
   ftun_lifecycle_event_t last;
   ftun_lifecycle_event_t last_error;
+  ftun_lifecycle_event_t first_error; /* 本次run首错，回滚/清理不能覆盖。 */
   uint64_t diagnostics;
   uint64_t diagnostic_suppressed;
   bool has_diagnostic;

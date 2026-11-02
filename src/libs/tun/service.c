@@ -3,6 +3,7 @@
 #include <limits.h>
 #include "platform/clock.h"
 #include "platform/socket.h"
+#include "core/context.h"
 #include <assert.h>
 #include <stdlib.h>
 #include <string.h>
@@ -811,6 +812,11 @@ ftun_status_t ftun_tun_service_destroy(ftun_tun_service_t **service)
   ftun_tun_service_all_inputs_clear(owned);
   status = ftun_tun_service_device_close(owned);
   if (status != FTUN_OK) return status;
+  if (owned->log_faulted) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK)
+      (void)ftun_log_retire(owned->core, FTUN_LOG_TUN, owned->log_entity, now);
+  }
   reservation = owned->reservation;
   owned->reservation = (ftun_reservation_t){0};
   free(owned->input);

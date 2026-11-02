@@ -5,7 +5,7 @@
  * 分配归 owner，部分失败由宿主析构处理，不启动任何业务或网络工作。 */
 ftun_status_t ftun_config_parse_frs(const cJSON *item, ftun_config_t *owner,
   ftun_config_frs_t *frs);
-ftun_status_t ftun_config_parse_sniff(const cJSON *item, ftun_config_sniff_t *sniff);
+ftun_status_t ftun_config_parse_sniff(const cJSON *item, ftun_config_t *owner, ftun_config_sniff_t *sniff);
 ftun_status_t ftun_config_parse_inbounds(const cJSON *array, ftun_config_t *owner,
   ftun_config_inbound_t **items, size_t *item_count);
 ftun_status_t ftun_config_parse_outbounds(const cJSON *array, ftun_config_t *owner,

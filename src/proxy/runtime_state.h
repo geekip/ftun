@@ -1,8 +1,26 @@
 #ifndef FTUN_PROXY_RUNTIME_STATE_H
 #define FTUN_PROXY_RUNTIME_STATE_H
 #include "core/context.h"
+#include "core/config/error.h"
 #include "proxy/outbound/group/url_test.h"
 #include "util/types.h"
+
+typedef struct {
+  uint64_t active, connections;
+  uint64_t failures[FTUN_E_STATE_CORRUPT + 1u];
+} ftun_outbound_stats_t;
+
+/* owner计数写入Session所持代；active查询合并仍存活旧代，回收时归并累计值。 */
+ftun_status_t ftun_runtime_outbound_stats(const ftun_runtime_t *runtime,
+  uint32_t outbound_id, ftun_outbound_stats_t *out);
+void ftun_runtime_outbound_started(ftun_runtime_t *runtime, uint32_t outbound_id);
+void ftun_runtime_outbound_finished(ftun_runtime_t *runtime, uint32_t outbound_id,
+  ftun_status_t result);
+/* owner的真实拨号结果；实体属于所持快照，退场时汇总并释放聚合键。 */
+void ftun_runtime_outbound_log_failure(ftun_runtime_t *runtime, uint32_t id,
+  const ftun_log_record_t *record, uint64_t now_ms);
+void ftun_runtime_outbound_log_recovery(ftun_runtime_t *runtime, uint32_t id,
+  const ftun_log_event_t *failure, const ftun_log_record_t *record, uint64_t now_ms);
 
 typedef enum {
   FTUN_RUNTIME_CANDIDATE = 1,
@@ -71,6 +89,8 @@ ftun_status_t ftun_runtime_manager_clear(ftun_core_t *core);
  * 输入同步借用；成功后 candidate 保留 config，调用者用 commit 转移或 abort 回滚。
  */
 ftun_status_t ftun_runtime_prepare(ftun_core_t *core, const ftun_config_t *config, ftun_runtime_t **out);
+ftun_status_t ftun_runtime_prepare_error(ftun_core_t *core, const ftun_config_t *config,
+  ftun_runtime_t **out, ftun_config_error_t *error, size_t *frs_sets);
 /* FRS 本地文件缺失且开启自动更新时的启动：不阻塞下载，FRS 规则处于 NOT_READY，
  * 命中它们的新连接被拒绝，直到后台下载成功并发布新快照。 */
 ftun_status_t ftun_runtime_prepare_frs_pending(ftun_core_t *core, const ftun_config_t *config, ftun_runtime_t **out);
@@ -88,6 +108,8 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
  * 独立未绑定配置仍在 attach 时准入。清理失败保留候选和额度供重试。 */
 ftun_status_t ftun_runtime_prepare_detached(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
+ftun_status_t ftun_runtime_prepare_detached_error(const ftun_config_t *config,
+  ftun_frs_view_t *view, ftun_runtime_t **out, ftun_config_error_t *error);
 ftun_status_t ftun_runtime_prepare_detached_frs(
   const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out);
 ftun_status_t ftun_runtime_attach_prepared(ftun_core_t *core,

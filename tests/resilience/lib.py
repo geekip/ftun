@@ -236,7 +236,7 @@ class Lab:
                      'timeouts': {'connect': '2s', 'handshake': '3s',
                                   'tcp-keepalive': {'idle': '2s', 'interval': '1s', 'count': 2},
                                   'write-progress': os.environ.get('FTUN_R8_WRITE_PROGRESS', '10s')}},
-            'log': {'level': 'info', 'file': str(self.log)},
+            'log': {'output': 'file', 'level': 'info', 'file': str(self.log)},
             'frs': {'path': str(self.root / 'rules.frs'), 'url': 'http://frs.lab.test/rules',
                     'auto-update': True, 'update-interval': '2s'},
             'dns': {'enable': True, 'cache': False, 'fake-ip': {'enable': False},
@@ -260,7 +260,7 @@ class Lab:
     def start(self, config=None, prefix=None, quiet=False):
         if config is not None:
             self.write_config(config)
-        argv = (prefix or []) + [self.ftun, 'run', '-c', str(self.config_path)]
+        argv = (prefix or []) + [self.ftun, 'run', '-c', str(self.config_path), '-p', str(self.config_path) + '.pid']
         self.process = subprocess.Popen(argv, stdout=open(self.output, 'ab'),
                                         stderr=subprocess.STDOUT)
         return self.process

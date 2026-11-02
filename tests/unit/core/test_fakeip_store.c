@@ -158,7 +158,7 @@ static int test_durable_reservation_and_recovery(void)
   identity.end_address_exclusive = UINT32_C(0xc6120010);
   CHECK(mkdtemp(directory) != NULL && rmdir(directory) == 0);
   CHECK(ftun_fakeip_store_initialize(directory, &identity) == FTUN_OK);
-  CHECK(ftun_fakeip_store_initialize(directory, &identity) == FTUN_E_INVALID);
+  CHECK(ftun_fakeip_store_initialize(directory, &identity) == FTUN_E_STALE);
   CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_worker_create(budget, 4u, &worker) == FTUN_OK);
   options.directory = directory;
@@ -258,11 +258,11 @@ static int test_cancel_halts_new_issuance(void)
 static int test_bounded_resources(void)
 {
   char directory[] = "/tmp/ftun-fakeip-budget.XXXXXX";
-  const size_t limits[] = {0u, 1u, 3u};
+  const size_t limits[] = {0u, 1u, 2u, 3u};
   ftun_fakeip_store_identity_t identity = {{7u}, 100u, 200u};
   size_t round;
   CHECK(mkdtemp(directory) != NULL && rmdir(directory) == 0);
-  for (round = 0u; round < 3u; round++) {
+  for (round = 0u; round < 4u; round++) {
     ftun_budget_options_t options = {{1024u * 1024u, 0u, 64u}, {0}, {0}};
     ftun_budget_usage_t usage, before;
     ftun_reservation_t hold = (ftun_reservation_t){0};
@@ -278,7 +278,7 @@ static int test_bounded_resources(void)
     options.limit.descriptors = limits[round];
     CHECK(ftun_budget_create_resources(NULL, &options, &observed_budget) == FTUN_OK);
     observed_count = observed_opens = 0u;
-    if (round < 2u) {
+    if (round < 3u) {
       CHECK(ftun_fakeip_store_initialize_budget(observed_budget, directory, &identity) == FTUN_E_LIMIT);
       CHECK(access(directory, F_OK) != 0 && observed_count == 0u);
       CHECK(ftun_budget_get_usage(observed_budget, &usage) == FTUN_OK &&

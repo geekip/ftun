@@ -1,10 +1,11 @@
+#define _GNU_SOURCE 1
+#define _DARWIN_C_SOURCE 1
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
 #include "platform/file.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
-#include <pwd.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <stdio.h>
@@ -13,6 +14,10 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include "platform/linux/uapi.h"
+#endif
 
 static ftun_status_t ftun_file_errno(int value)
 {
@@ -41,7 +46,7 @@ ftun_status_t ftun_platform_file_parent(const char *path, ftun_string_t *out)
 ftun_status_t ftun_platform_file_lock_acquire(const char *path,
   ftun_platform_file_lock_t *out)
 {
-  int descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+  int descriptor = open(path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
   ftun_status_t status;
   if (descriptor < 0) return ftun_file_errno(errno);
   if (flock(descriptor, LOCK_EX | LOCK_NB) != 0) {
@@ -62,7 +67,7 @@ ftun_status_t ftun_platform_file_lock_release(ftun_platform_file_lock_t *lock)
 
 ftun_status_t ftun_platform_file_replace(const char *temporary,
   const char *destination, const char *parent, ftun_file_stage_hook_fn hook,
-  void *hook_user, bool *published)
+  void *hook_user, bool replace_existing, bool *published)
 {
   struct stat temporary_stat, parent_stat;
   int temporary_fd = -1, parent_fd = -1;
@@ -86,8 +91,18 @@ ftun_status_t ftun_platform_file_replace(const char *temporary,
     status = hook(FTUN_FILE_STAGE_TEMP_SYNCED, hook_user);
     if (status != FTUN_OK) goto done;
   }
-  if (rename(temporary, destination) != 0) { status = ftun_file_errno(errno); goto done; }
-  *published = true;
+  if (replace_existing) {
+    if (rename(temporary, destination) != 0) { status = ftun_file_errno(errno); goto done; }
+    *published = true;
+  } else {
+    /* link原子拒绝已有目录项，包括悬空符号链接。 */
+    if (link(temporary, destination) != 0) {
+      status = errno == EEXIST ? FTUN_E_STALE : ftun_file_errno(errno);
+      goto done;
+    }
+    *published = true;
+    if (unlink(temporary) != 0) { status = ftun_file_errno(errno); goto done; }
+  }
   if (hook != NULL) {
     status = hook(FTUN_FILE_STAGE_RENAMED, hook_user);
     if (status != FTUN_OK) goto done;
@@ -96,6 +111,57 @@ ftun_status_t ftun_platform_file_replace(const char *temporary,
   status = hook == NULL ? FTUN_OK : hook(FTUN_FILE_STAGE_DIRECTORY_SYNCED, hook_user);
 done:
   if (close(temporary_fd) != 0 && status == FTUN_OK) status = FTUN_E_IO;
+  if (parent_fd >= 0 && close(parent_fd) != 0 && status == FTUN_OK) status = FTUN_E_IO;
+  return status;
+}
+
+ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created)
+{
+  *created = false;
+  if (mkdtemp(temporary) == NULL) return ftun_file_errno(errno);
+  *created = true;
+  return chmod(temporary, 0700) == 0 ? FTUN_OK : ftun_file_errno(errno);
+}
+
+ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
+  const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published)
+{
+  struct stat source, folder;
+  int directory = -1, parent_fd = -1, moved;
+  ftun_status_t status;
+  *published = false;
+  directory = open(temporary, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory < 0) return ftun_file_errno(errno);
+  parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_fd < 0) { status = ftun_file_errno(errno); goto done; }
+  if (fstat(directory, &source) != 0 || fstat(parent_fd, &folder) != 0) {
+    status = FTUN_E_IO;
+    goto done;
+  }
+  if (source.st_dev != folder.st_dev) { status = FTUN_E_INVALID; goto done; }
+  if (fsync(directory) != 0) { status = ftun_file_errno(errno); goto done; }
+  status = hook == NULL ? FTUN_OK : hook(FTUN_FILE_STAGE_TEMP_SYNCED, user);
+  if (status != FTUN_OK) goto done;
+#if defined(__linux__)
+  moved = (int)syscall(SYS_renameat2, AT_FDCWD, temporary,
+    AT_FDCWD, destination, FTUN_RENAME_NOREPLACE);
+#elif defined(__APPLE__)
+  moved = renamex_np(temporary, destination, RENAME_EXCL);
+#else
+#error Unsupported POSIX directory publication platform
+#endif
+  if (moved != 0) {
+    status = errno == EEXIST ? FTUN_E_STALE : errno == ENOSYS || errno == EOPNOTSUPP ?
+      FTUN_E_UNSUPPORTED : ftun_file_errno(errno);
+    goto done;
+  }
+  *published = true;
+  status = hook == NULL ? FTUN_OK : hook(FTUN_FILE_STAGE_RENAMED, user);
+  if (status != FTUN_OK) goto done;
+  if (fsync(parent_fd) != 0) { status = ftun_file_errno(errno); goto done; }
+  if (hook != NULL) status = hook(FTUN_FILE_STAGE_DIRECTORY_SYNCED, user);
+done:
+  if (close(directory) != 0 && status == FTUN_OK) status = FTUN_E_IO;
   if (parent_fd >= 0 && close(parent_fd) != 0 && status == FTUN_OK) status = FTUN_E_IO;
   return status;
 }
@@ -153,15 +219,23 @@ ftun_status_t ftun_platform_file_close(ftun_file_handle_t *file)
 ftun_status_t ftun_platform_file_write(ftun_file_handle_t *file,
   ftun_bytes_t contents, size_t *written)
 {
+  return ftun_platform_file_write_error(file, contents, written).status;
+}
+ftun_error_t ftun_platform_file_write_error(ftun_file_handle_t *file,
+  ftun_bytes_t contents, size_t *written)
+{
   *written = 0u;
   while (*written < contents.length) {
     ssize_t count = write((int)file->descriptor, contents.data + *written, contents.length - *written);
     if (count < 0 && errno == EINTR) continue;
-    if (count < 0) return ftun_file_errno(errno);
-    if (count == 0) return FTUN_E_IO;
+    if (count < 0) {
+      int code = errno;
+      return (ftun_error_t){ftun_file_errno(code), 0u, code};
+    }
+    if (count == 0) return (ftun_error_t){FTUN_E_IO, 0u, 0};
     *written += (size_t)count;
   }
-  return FTUN_OK;
+  return (ftun_error_t){FTUN_OK, 0u, 0};
 }
 ftun_status_t ftun_platform_file_rename_if_exists(const char *from, const char *to)
 {
@@ -198,6 +272,11 @@ static ftun_status_t ftun_file_describe(const struct stat *info, ftun_file_info_
   out->size = (uint64_t)info->st_size;
   out->regular = S_ISREG(info->st_mode);
   out->directory = S_ISDIR(info->st_mode);
+#if defined(__APPLE__)
+  out->modified_unix_ms = (int64_t)info->st_mtimespec.tv_sec * 1000 + info->st_mtimespec.tv_nsec / 1000000;
+#else
+  out->modified_unix_ms = (int64_t)info->st_mtim.tv_sec * 1000 + info->st_mtim.tv_nsec / 1000000;
+#endif
   return FTUN_OK;
 }
 
@@ -212,6 +291,13 @@ ftun_status_t ftun_file_inspect_path(const char *path, ftun_file_info_t *out)
 {
   struct stat info;
   if (stat(path, &info) != 0) return errno == ENOENT ? FTUN_E_EOF : FTUN_E_IO;
+  return ftun_file_describe(&info, out);
+}
+
+ftun_status_t ftun_file_inspect_path_nofollow(const char *path, ftun_file_info_t *out)
+{
+  struct stat info;
+  if (lstat(path, &info) != 0) return errno == ENOENT ? FTUN_E_EOF : FTUN_E_IO;
   return ftun_file_describe(&info, out);
 }
 
@@ -285,12 +371,13 @@ ftun_status_t ftun_file_real_path(const char *path, char *out, size_t capacity)
 
 ftun_status_t ftun_user_home(char *storage, size_t capacity, ftun_string_t *home)
 {
-  struct passwd record;
-  struct passwd *user = NULL;
-  int error = getpwuid_r(geteuid(), &record, storage, capacity, &user);
-  if (error == ERANGE) return FTUN_E_AGAIN;
-  if (error != 0 || user == NULL || user->pw_dir == NULL || user->pw_dir[0] == '\0') return FTUN_E_IO;
-  *home = (ftun_string_t){user->pw_dir, strlen(user->pw_dir)};
+  const char *configured = getenv("HOME");
+  size_t length;
+  if (configured == NULL || configured[0] == '\0') return FTUN_E_IO;
+  length = strlen(configured);
+  if (length >= capacity) return FTUN_E_AGAIN;
+  memcpy(storage, configured, length + 1u);
+  *home = (ftun_string_t){storage, length};
   return FTUN_OK;
 }
 
@@ -330,4 +417,14 @@ const char *ftun_file_system_ca(void)
     if (ftun_file_inspect_path(candidates[i], &info) == FTUN_OK && info.regular) return candidates[i];
   }
   return NULL;
+}
+
+bool ftun_file_is_terminal(ftun_handle_t descriptor)
+{
+  return isatty((int)descriptor) != 0;
+}
+
+bool ftun_file_enable_ansi(ftun_handle_t descriptor)
+{
+  return ftun_file_is_terminal(descriptor);
 }

@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+from ctl_server_product import wait
 
 
 def free_port():
@@ -59,16 +60,16 @@ def run_case(binary, fixture, with_file):
         config = {
             'base': {'state-cache': False, 'cache-file': str(root / 'ftun.cache')},
             'dns': {'enable': False},
-            'log': {'level': 'info', 'file': str(root / 'ftun.log')},
+            'log': {'output': 'file', 'level': 'info', 'file': str(root / 'ftun.log')},
             # 下载地址不可达（连接被拒绝）：没有网络时服务必须照常运行。
             'frs': {'path': str(rules), 'url': 'http://127.0.0.1:9/rules.frs',
-                    'auto-update': True, 'update-interval': '1s'},
+                    'auto-update': True, 'update-interval': '1s', 'update-outbound': 'DIRECT'},
             'inbounds': [{'name': 'in', 'type': 'socks5', 'listen': f'127.0.0.1:{port}'}],
             'rules': ['frs-ip,CN,REJECT', 'MATCH,DIRECT'],
         }
         path = root / 'config.json'
         path.write_text(json.dumps(config))
-        process = subprocess.Popen([binary, 'run', '-c', str(path)],
+        process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + 10
@@ -85,13 +86,18 @@ def run_case(binary, fixture, with_file):
             assert process.poll() is None, f'download failure stopped the service: {process.returncode}'
             local = socks_connect(port, '127.0.0.1', sink_port)
             listed = socks_connect(port, '10.1.2.3', 80)
+            if not with_file:
+                wait(lambda: 'frs-not-ready' in (root / 'ftun.log').read_text(), lambda: (root / 'ftun.log').read_text())
             log = (root / 'ftun.log').read_text()
+            assert log.count('[frs   ][WARN ] download failed (first):') == 1, log
+            assert 'phase=download' in log and 'err=rejected' in log, log
             if with_file:
                 # 本地文件立即生效：CN 集合内的地址被规则拒绝，其余直连成功。
                 assert local == 0, local
                 assert listed != 0, listed
                 assert 'NOT_READY' not in log, log
                 assert rules.read_bytes() == before
+                assert '[frs   ][INFO ] rule set loaded:' in log, log
             else:
                 # NOT_READY：第一条 FRS 规则对任何目标都拒绝新连接，下载失败不留下文件。
                 assert local != 0, local
@@ -100,6 +106,10 @@ def run_case(binary, fixture, with_file):
                 assert not rules.exists()
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=15) == 0
+            final = (root / 'ftun.log').read_text()
+            if not with_file:
+                assert final.count('connection rejected: frs-not-ready (first):') == 1, final
+                assert any('connection rejected: frs-not-ready:' in line and 'count=2' in line for line in final.splitlines()), final
         finally:
             if process.poll() is None:
                 process.kill()

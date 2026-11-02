@@ -48,7 +48,7 @@
 | `dns.enable` | 布尔 | `true` |  | false 时停用 FTUN DNS 入口、缓存、Hijack 与 FakeIP；必要本地解析使用系统解析器。 |
 | `dns.fake-ip` | 对象 |  |  | 所有 fake-ip server 共用域名身份池；不自动复用，满池拒绝新映射。 |
 | `dns.fake-ip.enable` | 布尔 | `true` |  | 是否允许合成 FakeIP；dns.enable=false 时本开关不生效。 |
-| `dns.fake-ip.persist` | 布尔 | `true` |  | 先耐久预留地址，再批量保存映射；首次显式初始化，缺失/损坏不自动重建。池范围与持久化模式更改需要重启。 |
+| `dns.fake-ip.persist` | 布尔 | `true` |  | 先耐久预留地址，再批量保存映射；首次run仅在状态目录不存在时自动创建身份，已有目录缺文件或损坏时拒绝启动。实际池范围与持久化模式更改需要重启。 |
 | `dns.fake-ip.range` | 字符串 | `198.18.0.0/15` | 格式见 Schema | IPv4 地址/前缀，前缀 0–32；网络地址规范化、地址冲突及用途检查由运行时执行。 |
 | `dns.listeners` | 数组 | `[]` |  |  |
 | `dns.listeners[]` | 对象 |  |  |  |
@@ -107,9 +107,10 @@
 |---|---|---|---|---|
 | `log` | 对象 |  |  |  |
 | `log.file` | 字符串 | `~/.ftun/ftun.log` | 最短 1；格式见 Schema | 本地路径；~ 展开当前用户目录，相对路径以配置文件目录为基准。Schema 不检查文件存在性或权限。 |
-| `log.level` | 字符串 | `warn` | 取值：`silent`、`error`、`warn`、`info`、`debug`、`trace` | silent 关闭日志格式化及输出。 |
+| `log.level` | 字符串 | `info` | 取值：`silent`、`error`、`warn`、`info`、`debug`、`trace` | silent 关闭日志格式化及输出。 |
 | `log.max-files` | 整数 | `3` | 最小 1；最大 32 | 保留的日志文件总数（含当前文件）：ftun.log、ftun.log.1…；为 1 时超限直接截断重写。收到 SIGUSR1 会重新打开日志文件，配合外部 logrotate。 |
 | `log.max-size` | 整数 | `10485760` | 最小 0；最大 4294967295 | 单个日志文件的大小上限（字节）；写入会超过时轮转。0 表示不轮转；非 0 时至少 65536。 |
+| `log.output` | 字符串 | `stderr` | 取值：`stderr`、`file`、`both` | 运行诊断输出目标；文件路径独立于输出选择。后台运行将stderr改写为文件。 |
 
 ## `outbounds`
 

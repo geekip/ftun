@@ -60,7 +60,7 @@ def main():
             path.write_text(json.dumps(config))
             reserved.close()
             with (root / 'run.log').open('w+') as log:
-                process = subprocess.Popen([str(args.binary.resolve()), 'run', '-c', str(path)], stdout=log, stderr=log)
+                process = subprocess.Popen([str(args.binary.resolve()), 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=log, stderr=log)
                 clients = []
                 try:
                     deadline = time.monotonic() + 5

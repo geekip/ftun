@@ -50,6 +50,7 @@ struct ftun_platform_route_async {
   ftun_status_t repair_result;
   size_t repair_runs;
   size_t repairs;
+  size_t protection_missing;
   size_t repair_failures;
   bool system_io;
   /* 同一路由表号的实例互斥锁；与 operation 同生命周期。 */
@@ -339,6 +340,9 @@ static void ftun_route_async_reply(
         ftun_route_async_applied(operation);
       }
     } else {
+      ftun_route_resource_kind_t kind = operation->resources[operation->cursor].kind;
+      if (operation->repairing && (kind == FTUN_LINUX_ROUTE_MARK_RULE || kind == FTUN_LINUX_ROUTE_PROTECT_RULE))
+        operation->protection_missing++;
       operation->step = FTUN_ROUTE_ASYNC_CHANGE;
       operation->kernel.runnable = true;
     }
@@ -872,6 +876,7 @@ ftun_status_t ftun_platform_route_async_get_info(
   out->repair_result = operation->repair_result;
   out->repair_runs = operation->repair_runs;
   out->repairs = operation->repairs;
+  out->protection_missing = operation->protection_missing;
   out->repair_failures = operation->repair_failures;
   out->strays_removed = operation->strays_removed;
   return FTUN_OK;

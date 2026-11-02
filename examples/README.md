@@ -8,6 +8,8 @@
 - [dns-proxy/full.json](dns-proxy/full.json)：顶层物理 TUN、三类入站、真实/假DNS、固定/策略入口、两种组、顺序规则与本地 FRS；192.0.2.0/24 与 example.invalid 是待替换占位地址，不能直接联网运行。
 - [proxy-only/frs.json](proxy-only/frs.json)：单个多集合 `.frs` 文件、大小写不敏感的 FRS 规则类型、大小写敏感的 label/出口名称以及 HTTP(S) 自动更新。示例 URL 和文件均为占位符。
 
-完整示例使用 persist=true，首次运行必须先显式初始化 FakeIP 状态；状态路径相对该配置文件目录。只要规则引用 FRS 集合，启动就会校验 `.frs` 文件及所有引用集合；文件损坏、集合缺失、类型错误或空集合都会阻止完整 Runtime 就绪。作为 LAN 网关使用时还需配置系统转发与受管路由，不把 Socket allow-lan 当作 TUN 网关开关。运行前替换真实端点、探测 URL，准备权限和 CA。
+完整示例使用 persist=true，状态目录不存在时首次 run 自动创建 FakeIP 身份；已有目录缺文件或损坏时拒绝启动。状态路径相对配置文件目录。只要规则引用 FRS 集合，启动就会校验 `.frs` 文件及所有引用集合；文件损坏、集合缺失、类型错误或空集合都会阻止完整 Runtime 就绪。作为 LAN 网关使用时还需配置系统转发与受管路由，不把 Socket allow-lan 当作 TUN 网关开关。运行前替换真实端点、探测 URL，准备权限和 CA。
+
+先执行 `ftun check -c FILE` 检查配置，再运行 `ftun run -c FILE -p PIDFILE`；用相同 `-p` 执行 status/reload/stop。check 不创建身份或测试端点可达性。服务管理样例见 [systemd](../packaging/systemd/ftun.service)、[OpenWrt procd](../packaging/openwrt/ftun.procd) 和 [Padavan](../packaging/padavan/ftun.sh)。
 
 物理设备身份使用顶层 `tun` 配置，`inbounds[].type=tun` 只描述 Proxy 消费者。设备字段（`interface`、`ipv4`、`auto-route`、`strict-route`）只能写在顶层 `tun` 下，写在 TUN inbound 下会被拒绝。

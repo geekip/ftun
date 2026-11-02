@@ -311,7 +311,7 @@ static int write_config(const char *path, const char *level, const char *log)
   CHECK(fprintf(file, "{\"base\":{\"state-cache\":false},"
     "\"tun\":{\"interface\":\"ftun-unused0\",\"mtu\":1400,"
     "\"ipv4\":{\"address\":\"10.88.0.1/30\"},\"auto-route\":false},"
-    "\"dns\":{\"enable\":false},\"log\":{\"level\":\"%s\",\"file\":\"%s\"}}",
+    "\"dns\":{\"enable\":false},\"log\":{\"output\":\"file\",\"level\":\"%s\",\"file\":\"%s\"}}",
     level, log) > 0);
   CHECK(fclose(file) == 0);
   return 0;
@@ -416,6 +416,11 @@ static int scenario(bool blocked)
   CHECK(strstr(buffer, "silent marker") == NULL);
   if (!blocked) CHECK(strstr(buffer, "after reject marker") != NULL);
   CHECK(unlink(first) == 0 && unlink(second) == 0);
+  {
+    char lock_path[300];
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", first) > 0 && unlink(lock_path) == 0);
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", second) > 0 && unlink(lock_path) == 0);
+  }
   for (index = 0u; index < 4u; index++) CHECK(unlink(test.paths[index]) == 0);
   CHECK(rmdir(directory) == 0 && descriptors() == baseline);
   return 0;
@@ -461,6 +466,11 @@ static int limited_scenario(void)
     strstr(buffer, "new sink after budget recovery") != NULL);
   CHECK(unlink(first) == 0 && unlink(second) == 0 &&
     unlink(test.paths[0]) == 0 && unlink(test.paths[1]) == 0);
+  {
+    char lock_path[300];
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", first) > 0 && unlink(lock_path) == 0);
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", second) > 0 && unlink(lock_path) == 0);
+  }
   CHECK(rmdir(directory) == 0 && descriptors() == baseline);
   return 0;
 }

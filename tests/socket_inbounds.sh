@@ -75,13 +75,14 @@ done
 ordinary_user=0
 if [ "$(id -u)" -eq 0 ] && command -v setpriv >/dev/null 2>&1; then
   ordinary_user=1
+  chown nobody:nogroup "$temporary"
   setpriv --reuid=nobody --regid=nogroup --clear-groups --no-new-privs \
-    sh -c 'ulimit -n 48; exec "$1" run -c "$2"' sh \
-    "$ftun_binary" "$config_file" \
+    sh -c 'ulimit -n 48; exec "$1" run -c "$2" -p "$3"' sh \
+    "$ftun_binary" "$config_file" "$temporary/ftun.pid" \
     >"$temporary/ftun.log" 2>&1 &
 else
-  sh -c 'ulimit -n 48; exec "$1" run -c "$2"' sh \
-    "$ftun_binary" "$config_file" \
+  sh -c 'ulimit -n 48; exec "$1" run -c "$2" -p "$3"' sh \
+    "$ftun_binary" "$config_file" "$temporary/ftun.pid" \
     >"$temporary/ftun.log" 2>&1 &
 fi
 ftun_pid=$!
@@ -126,7 +127,7 @@ ftun_pid=
 if [ "$ordinary_user" -eq 1 ]; then
   set +e
   timeout 5 setpriv --reuid=nobody --regid=nogroup --clear-groups \
-    --no-new-privs "$ftun_binary" run -c "$tun_config_file" \
+    --no-new-privs "$ftun_binary" run -c "$tun_config_file" -p "$temporary/tun.pid" \
     >>"$temporary/ftun.log" 2>&1
   tun_status=$?
   set -e

@@ -463,6 +463,11 @@ int main(void)
   CHECK(unlink(cache_path) == 0);
   CHECK(unlink(stuck_path) == 0);
   CHECK(unlink(stuck_cache_path) == 0);
+  {
+    char lock_path[300];
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", cache_path) > 0 && unlink(lock_path) == 0);
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", stuck_cache_path) > 0 && unlink(lock_path) == 0);
+  }
   CHECK(rmdir(directory) == 0);
   return 0;
 }

@@ -4,10 +4,11 @@
 #include "core/limits.h"
 #include "core/operation.h"
 #include "dns/cache.h"
+#include "dns/stats.h"
 #include "dns/upstream_set.h"
 
 typedef void (*ftun_dns_transport_completion_fn)(
-  void *user, ftun_status_t status, ftun_dns_transport_t transport,
+  void *user, ftun_error_t error, ftun_dns_transport_t transport,
   const ftun_endpoint_t *source, ftun_bytes_t response);
 
 typedef struct {
@@ -48,6 +49,7 @@ typedef ftun_status_t (*ftun_dns_server_now_fn)(void *user, uint64_t *out);
 typedef struct {
   ftun_budget_t *budget;
   ftun_operation_queue_t *operations;
+  const char *name; /* 可选的已校验配置名称；构造时复制。 */
   ftun_endpoint_t upstream;
   /* 可选，被借用：同一服务器的多个上游地址（配置顺序即优先级）及其被动健康。
    * 提供时 upstream 必须等于集合的第一个地址；网络类失败（超时、不可达）
@@ -72,6 +74,11 @@ typedef struct {
   ftun_dns_transport_t transport;
   bool tcp_fallback;
   bool fakeip;
+  ftun_dns_query_stats_t queries;
+  ftun_endpoint_t upstream;
+  uint64_t upstream_success, upstream_failures, latency_ms;
+  ftun_status_t last_failure;
+  bool latency_valid, unhealthy;
 } ftun_dns_server_info_t;
 
 ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
@@ -92,4 +99,6 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
 /* 有在途请求时返回 AGAIN。cache/queue/transport 均由调用者拥有。 */
 ftun_status_t ftun_dns_server_destroy(ftun_dns_server_t **server);
 
+/* owner归并已排空旧代的同身份计数，不改变健康状态。 */
+void ftun_dns_server_add_counts(ftun_dns_server_t *server, uint64_t success, uint64_t failures);
 #endif

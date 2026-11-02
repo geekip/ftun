@@ -129,21 +129,46 @@ static ftun_status_t ftun_system_connect_socket(
   return ftun_dial_errno_status(errno);
 }
 
-static ftun_status_t ftun_system_get_socket_error(void *context,
-                                                   ftun_native_socket_t socket)
+ftun_error_t ftun_socket_connect_error(ftun_native_socket_t socket)
 {
   socklen_t length;
   int descriptor;
   int error_code = 0;
-  (void)context;
-  if (socket > (ftun_native_socket_t)INT_MAX) return FTUN_E_INVALID;
+  if (socket > (ftun_native_socket_t)INT_MAX) return (ftun_error_t){FTUN_E_INVALID, 0u, 0};
   descriptor = (int)socket;
   length = (socklen_t)sizeof(error_code);
   if (getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error_code, &length) < 0) {
-    return ftun_dial_errno_status(errno);
+    error_code = errno;
+    return (ftun_error_t){ftun_dial_errno_status(error_code), 0u, error_code};
   }
-  if (length != (socklen_t)sizeof(error_code)) return FTUN_E_IO;
-  return ftun_dial_errno_status(error_code);
+  if (length != (socklen_t)sizeof(error_code)) return (ftun_error_t){FTUN_E_IO, 0u, 0};
+  return (ftun_error_t){ftun_dial_errno_status(error_code), 0u, error_code};
+}
+
+static ftun_status_t ftun_system_get_socket_error(void *context,
+  ftun_native_socket_t socket)
+{
+  (void)context;
+  return ftun_socket_connect_error(socket).status;
+}
+
+const char *ftun_socket_error_name(int code)
+{
+  switch (code) {
+#define SOCKET_ERROR_NAME(name) case name: return #name
+    SOCKET_ERROR_NAME(EACCES); SOCKET_ERROR_NAME(EPERM);
+    SOCKET_ERROR_NAME(EADDRINUSE); SOCKET_ERROR_NAME(EADDRNOTAVAIL);
+    SOCKET_ERROR_NAME(EMFILE); SOCKET_ERROR_NAME(ENFILE);
+    SOCKET_ERROR_NAME(ENOMEM); SOCKET_ERROR_NAME(ENOBUFS);
+    SOCKET_ERROR_NAME(ENETUNREACH); SOCKET_ERROR_NAME(EHOSTUNREACH);
+    SOCKET_ERROR_NAME(ECONNREFUSED); SOCKET_ERROR_NAME(ECONNRESET);
+    SOCKET_ERROR_NAME(EPIPE); SOCKET_ERROR_NAME(ETIMEDOUT);
+    SOCKET_ERROR_NAME(EINVAL); SOCKET_ERROR_NAME(ENOTSOCK); SOCKET_ERROR_NAME(EBADF);
+    SOCKET_ERROR_NAME(EALREADY); SOCKET_ERROR_NAME(EINPROGRESS);
+    SOCKET_ERROR_NAME(EAGAIN); SOCKET_ERROR_NAME(EINTR);
+#undef SOCKET_ERROR_NAME
+    default: return "unknown";
+  }
 }
 
 static ftun_status_t ftun_system_close_socket(void *context,

@@ -151,7 +151,7 @@ def main() -> None:
         config_path = Path(directory) / "dns-only.json"
         config = {
                     "base": {"state-cache": False},
-                    "log": {"level": "error", "file": str(Path(directory) / "ftun.log")},
+                    "log": {'output': 'file', "level": "error", "file": str(Path(directory) / "ftun.log")},
                     "dns": {
                         "enable": True,
                         "cache": False,
@@ -175,7 +175,7 @@ def main() -> None:
                 }
         config_path.write_text(json.dumps(config), encoding="utf-8")
         checked = subprocess.run(
-            [str(executable), "check", str(config_path)],
+            [str(executable), "check", "-c", str(config_path)],
             text=True,
             capture_output=True,
             timeout=10,
@@ -184,7 +184,7 @@ def main() -> None:
         if checked.returncode != 0:
             fail(f"configuration check failed: {checked.stderr.strip()}")
         process = subprocess.Popen(
-            [str(executable), "run", str(config_path)],
+            [str(executable), "run", "-c", str(config_path), "-p", str(config_path) + ".pid"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -193,6 +193,20 @@ def main() -> None:
             response = dns_query(listener_port)
             if socket.inet_aton("203.0.113.7") not in response:
                 fail("listener response did not contain the fixture address")
+            # 同一真实DNS-only实例的宿主与业务查询，不链接Proxy也不能伪装其状态。
+            for command in (["status"], ["dns", "status"]):
+                queried = subprocess.run([str(executable), *command, "-p", str(config_path) + ".pid", "--json"],
+                                         capture_output=True, text=True, timeout=5)
+                assert queried.returncode == 0 and not queried.stderr, queried
+                snapshot = json.loads(queried.stdout)
+                assert snapshot["result"] == "ok", snapshot
+                if command[0] == "dns":
+                    assert snapshot["queries"]["success"] >= 1, snapshot
+                else:
+                    assert {item["name"] for item in snapshot["services"]} == {"core", "dns"}, snapshot
+            absent = subprocess.run([str(executable), "proxy", "status", "--json"],
+                                    capture_output=True, text=True, timeout=5)
+            assert absent.returncode == 1 and "not built" in json.loads(absent.stdout)["message"], absent
             old_result: list[bytes | BaseException] = []
             old_thread = threading.Thread(
                 target=dns_query_once,

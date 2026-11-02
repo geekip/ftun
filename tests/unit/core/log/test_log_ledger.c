@@ -2,11 +2,14 @@
 #include "core/log/log.h"
 #include "platform/clock.h"
 #include "core/limits.h"
+#include "platform/file.h"
 
 #include <errno.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
 
 #define CHECK(x) do { if (!(x)) { \
   fprintf(stderr, "log ledger failed at %d: %s\n", __LINE__, #x); \
@@ -15,6 +18,14 @@
 
 /* 仅在 logger writer join 后注入 close 返回错误，真实关闭仍执行一次。 */
 static bool fail_close;
+static char full_path[256];
+ftun_status_t __real_ftun_platform_file_open_append(const char *, bool, ftun_file_handle_t *, uint64_t *);
+ftun_status_t __wrap_ftun_platform_file_open_append(const char *path, bool truncate,
+  ftun_file_handle_t *out, uint64_t *size)
+{
+  return __real_ftun_platform_file_open_append(
+    strcmp(path, full_path) == 0 ? "/dev/full" : path, truncate, out, size);
+}
 int __real_close(int descriptor);
 int __wrap_close(int descriptor)
 {
@@ -118,7 +129,7 @@ static int test_retirement(void)
   options.writer = NULL;
   options.path = "/no/such/directory/log-ledger";
   CHECK(ftun_logger_create(&options, &failed) == FTUN_E_IO && failed == NULL);
-  options.path = "/dev/full";
+  options.path = full_path;
   CHECK(ftun_logger_create(&options, &failed) == FTUN_OK);
   CHECK(ftun_logger_write(failed, FTUN_LOG_ERROR, &diagnostic) == FTUN_OK);
   CHECK(ftun_logger_flush(failed) == FTUN_OK);
@@ -148,28 +159,34 @@ static int test_admission(void)
   ftun_log_totals_t totals;
   ftun_reservation_t hold = (ftun_reservation_t){0};
   size_t logger_bytes;
-  limits.limit = (ftun_budget_resources_t){65536u, 1u, 4u};
+  char directory[] = "/tmp/ftun-ledger-admission-XXXXXX", path[256], lock_path[300];
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(snprintf(path, sizeof(path), "%s/log", directory) > 0);
+  CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", path) > 0);
+  limits.limit = (ftun_budget_resources_t){65536u, 3u, 4u};
   CHECK(ftun_budget_create_resources(NULL, &limits, &budget) == FTUN_OK);
   CHECK(ftun_log_ledger_create(budget, &ledger) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &base) == FTUN_OK);
   options.level = FTUN_LOG_ERROR;
   options.queue_capacity = 2u;
   options.line_capacity = 128u;
-  options.path = "/dev/null";
+  options.path = path;
   options.ledger = ledger;
   CHECK(ftun_logger_create(&options, &first) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes > base.used_resources.memory_bytes &&
-    usage.used_resources.descriptors == 1u && usage.used_resources.queue_slots == 2u);
+    usage.used_resources.descriptors == 3u && usage.used_resources.queue_slots == 2u);
   logger_bytes = usage.used_resources.memory_bytes - base.used_resources.memory_bytes;
   /* 文件 FD 达限，在 open/线程创建之前拒绝候选，旧 sink 仍存活。 */
   CHECK(ftun_logger_create(&options, &second) == FTUN_E_LIMIT && second == NULL);
   CHECK(ftun_log_ledger_get_usage(ledger, &totals) == FTUN_OK && totals.created == 1u && totals.instances == 1u);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == base.used_resources.memory_bytes + logger_bytes &&
-    usage.used_resources.descriptors == 1u && usage.used_resources.queue_slots == 2u);
+    usage.used_resources.descriptors == 3u && usage.used_resources.queue_slots == 2u);
   CHECK(ftun_logger_destroy(&first) == FTUN_OK);
   options.path = NULL;
   options.writer = failed_write;
   CHECK(ftun_logger_create(&options, &first) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
+  logger_bytes = usage.used_resources.memory_bytes - base.used_resources.memory_bytes;
   options.queue_capacity = 3u;
   CHECK(ftun_logger_create(&options, &second) == FTUN_E_LIMIT && second == NULL);
   options.queue_capacity = 2u;
@@ -191,12 +208,18 @@ static int test_admission(void)
   CHECK(ftun_log_ledger_destroy(&ledger) == FTUN_OK);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK && usage.used_resources.memory_bytes == 0u);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(unlink(path) == 0 && unlink(lock_path) == 0 && rmdir(directory) == 0);
   return 0;
 }
 
 int main(void)
 {
+  char directory[] = "/tmp/ftun-ledger-device-XXXXXX", lock_path[300];
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(snprintf(full_path, sizeof(full_path), "%s/full", directory) > 0);
+  CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", full_path) > 0);
   CHECK(test_retirement() == 0);
+  CHECK(unlink(lock_path) == 0 && rmdir(directory) == 0);
   CHECK(test_admission() == 0);
   puts("log ledger: pending writes, retirement, drop, filter, write and close failures passed");
   return 0;

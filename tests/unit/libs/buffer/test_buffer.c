@@ -13,12 +13,18 @@
   } \
 } while (0)
 
-static size_t fail_calloc_after;
+static size_t fail_allocation_after;
 void *__real_calloc(size_t count, size_t size);
 void *__wrap_calloc(size_t count, size_t size)
 {
-  if (fail_calloc_after != 0u && --fail_calloc_after == 0u) return NULL;
+  if (fail_allocation_after != 0u && --fail_allocation_after == 0u) return NULL;
   return __real_calloc(count, size);
+}
+void *__real_malloc(size_t size);
+void *__wrap_malloc(size_t size)
+{
+  if (fail_allocation_after != 0u && --fail_allocation_after == 0u) return NULL;
+  return __real_malloc(size);
 }
 
 typedef struct {
@@ -103,6 +109,8 @@ static int test_class_boundaries(void)
   CHECK(ftun_buffer_class(SIZE_MAX, &capacity) == FTUN_E_LIMIT);
   CHECK(ftun_budget_create(NULL, 8192u, 0u, &budget) == FTUN_OK);
   CHECK(ftun_buffer_pool_create_waitable(budget, 0u, 0u, 2u, 1u, &pool) == FTUN_OK);
+  stale = (ftun_buffer_wait_token_t){pool, 1u, 1u};
+  CHECK(ftun_buffer_pool_wait_cancel(&stale) == FTUN_E_STALE);
   CHECK(ftun_budget_get_usage(budget, &usage) == FTUN_OK);
   CHECK(ftun_budget_reserve(budget, usage.normal_available_resources.memory_bytes, &hold) == FTUN_OK);
   pool->next_waiter_generation = UINT64_MAX - 1u;
@@ -138,9 +146,9 @@ static int test_waiter_budget(void)
   CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_E_LIMIT && pool == NULL);
   ftun_reservation_release(&queue_pressure);
   for (allocation = 1u; allocation <= 2u; allocation++) {
-    fail_calloc_after = allocation;
+    fail_allocation_after = allocation;
     CHECK(ftun_buffer_pool_create_waitable(child, 0u, 0u, 2u, 1u, &pool) == FTUN_E_LIMIT && pool == NULL);
-    CHECK(fail_calloc_after == 0u);
+    CHECK(fail_allocation_after == 0u);
     CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK &&
       usage.used_resources.memory_bytes == 0u && usage.used_resources.queue_slots == 0u);
   }

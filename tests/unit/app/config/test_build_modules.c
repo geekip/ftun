@@ -25,18 +25,18 @@ static int has_name(const ftun_build_capabilities_t *capabilities, const char *n
 static int check_module(const ftun_build_capabilities_t *capabilities,
                         uint32_t module, const char *name, int expected)
 {
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   ftun_status_t status = ftun_build_require_modules(module, &diagnostic);
   CHECK(((capabilities->builtins & module) != 0u) == expected);
   CHECK(has_name(capabilities, name) == expected);
   if (expected) {
     CHECK(status == FTUN_OK);
     CHECK(diagnostic.error.status == FTUN_OK);
-    CHECK(diagnostic.message.data == NULL && diagnostic.message.length == 0u);
+    CHECK(diagnostic.message[0] == '\0' && strlen(diagnostic.message) == 0u);
   } else {
     CHECK(status == FTUN_E_UNSUPPORTED);
     CHECK(diagnostic.error.status == FTUN_E_UNSUPPORTED);
-    CHECK(diagnostic.message.data != NULL && diagnostic.message.length > 0u);
+    CHECK(diagnostic.message[0] != '\0' && strlen(diagnostic.message) > 0u);
   }
   return 0;
 }
@@ -46,7 +46,7 @@ static int check_config_capability(const char *text, int expected)
   ftun_bytes_t bytes;
   ftun_config_t *config = NULL;
   ftun_feature_plan_t *plan = NULL;
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   ftun_status_t status;
   bytes.data = (const uint8_t *)text;
   bytes.length = strlen(text);
@@ -54,14 +54,14 @@ static int check_config_capability(const char *text, int expected)
   status = ftun_config_validate(config, &diagnostic);
   if (expected) {
     CHECK(status == FTUN_OK);
-    CHECK(diagnostic.message.data == NULL && diagnostic.path.data == NULL);
+    CHECK(diagnostic.message[0] == '\0' && diagnostic.pointer[0] == '\0');
     CHECK(ftun_config_compile(config, &plan) == FTUN_OK && plan != NULL);
     CHECK((plan->modules.required_modules & ~plan->modules.built_modules) == 0u);
     CHECK(ftun_feature_plan_destroy(&plan) == FTUN_OK && plan == NULL);
   } else {
     CHECK(status == FTUN_E_UNSUPPORTED);
     CHECK(diagnostic.error.status == FTUN_E_UNSUPPORTED);
-    CHECK(diagnostic.message.data != NULL && diagnostic.path.data != NULL);
+    CHECK(diagnostic.message[0] != '\0' && diagnostic.pointer[0] != '\0');
     CHECK(ftun_config_compile(config, &plan) == FTUN_E_UNSUPPORTED && plan == NULL);
   }
   CHECK(ftun_config_destroy(&config) == FTUN_OK && config == NULL);
@@ -86,7 +86,7 @@ static int check_required_modules(const char *text, uint32_t expected)
 int main(void)
 {
   const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   size_t left, right;
   int expect_proxy = 0;
   int expect_dns = 0;
@@ -130,7 +130,7 @@ int main(void)
   CHECK(ftun_build_require_modules(FTUN_BUILD_MODULE_CORE, &diagnostic) == FTUN_OK);
   CHECK(ftun_build_require_modules(1u << 31, &diagnostic) == FTUN_E_INVALID);
   CHECK(diagnostic.error.status == FTUN_E_INVALID);
-  CHECK(diagnostic.message.data != NULL && diagnostic.message.length > 0u);
+  CHECK(diagnostic.message[0] != '\0' && strlen(diagnostic.message) > 0u);
   CHECK(check_config_capability("{\"dns\":{\"enable\":false}}", 1) == 0);
   CHECK(check_config_capability("{}", expect_dns) == 0);
   CHECK(check_config_capability(

@@ -92,7 +92,7 @@ def main():
     return fail("lock schema, review status or offline policy is invalid")
   dependencies = lock.get("dependencies")
   if not isinstance(dependencies, list) or {item.get("name") for item in dependencies} != {
-      "cJSON", "heiher/lwIP", "wolfSSL", "wepoll", "Wintun API"}:
+      "cJSON", "heiher/lwIP", "wolfSSL", "wepoll", "Wintun API", "optparse"}:
     return fail("dependency set is incomplete or contains an unreviewed entry")
   for dependency in dependencies:
     vendor = root / dependency.get("path", "")
@@ -104,11 +104,26 @@ def main():
     if any(not isinstance(dependency.get(field), str) or not dependency[field].strip()
            for field in ("license", "selected_license", "build_boundary", "notice")):
       return fail(f"{dependency.get('name')} review metadata is incomplete")
-    if dependency.get("source_form") != "git-submodule" or dependency.get("local_patches") != []:
+    if dependency.get("local_patches") != []:
+      return fail(f"{dependency['name']} must be unmodified")
+    if dependency['name'] == 'optparse':
+      if dependency.get('source_form') != 'single-header' or set(dependency.get('files', {})) != {'optparse.h', 'UNLICENSE'}:
+        return fail('optparse must retain its original header and license')
+      if {path.name for path in vendor.iterdir()} != set(dependency['files']):
+        return fail('optparse contains unexpected files')
+      for name, digest in dependency['files'].items():
+        if sha256(vendor / name) != digest:
+          return fail(f'optparse upstream file differs: {name}')
+      implementations = [path.relative_to(root).as_posix()
+                         for path in (root / 'src').rglob('*.c')
+                         if '#define OPTPARSE_IMPLEMENTATION' in path.read_text()]
+      if implementations != ['src/app/cli/args.c']:
+        return fail('optparse must have exactly one implementation unit')
+    elif dependency.get("source_form") != "git-submodule":
       return fail(f"{dependency['name']} must be an unmodified Git submodule")
   expected_entries = {"LOCK.json", "README.md"} | {Path(item["path"]).name for item in dependencies}
   if {path.name for path in (root / "third_party").iterdir()} != expected_entries:
-    return fail("third_party must contain only LOCK.json, README.md and declared submodules")
+    return fail("third_party must contain only LOCK.json, README.md and declared dependencies")
   readme = (root / "third_party/README.md").read_text(encoding="utf-8")
   entries = {}
   labels = ("开源协议：", "使用版本：", "仓库地址：", "集成能力：")
@@ -134,7 +149,7 @@ def main():
       "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved.", "src/util/ip.c")):
     return fail("lock omits borrowed-code/API attribution or complete MIT terms")
   modules = (root / ".gitmodules").read_text(encoding="utf-8")
-  submodules = dependencies
+  submodules = [item for item in dependencies if item['source_form'] == 'git-submodule']
   if modules.count("path = ") != len(submodules) or any(
       f"path = {item['path']}" not in modules for item in submodules):
     return fail("submodules differ from the public lock")

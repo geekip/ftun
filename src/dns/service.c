@@ -422,7 +422,9 @@ void ftun_dns_runtime_waiter_finish(
   }
   dns->delivering = true;
   dns->delivering_request = request;
-  completion(completion_user, status, transport, &upstream, response);
+  ftun_error_t error = request->io_error.status == status
+    ? request->io_error : (ftun_error_t){status, 0u, 0};
+  completion(completion_user, error, transport, &upstream, response);
   dns->delivering = previous_delivery;
   dns->delivery_now_ms = previous_time;
   dns->delivering_request = previous_request;
@@ -472,8 +474,9 @@ void ftun_dns_runtime_path_notify(ftun_path_t *path, uint32_t events,
 {
   ftun_dns_runtime_transport_request_t *request = user;
   (void)path;
-  if ((events & FTUN_PATH_ERROR) != 0u && request->io_status == FTUN_OK) {
-    request->io_status = error.status == FTUN_OK ? FTUN_E_IO : error.status;
+  if ((events & FTUN_PATH_ERROR) != 0u && request->io_error.status == FTUN_OK) {
+    request->io_error = error;
+    request->io_error.status = error.status == FTUN_OK ? FTUN_E_IO : error.status;
   }
   ftun_dns_runtime_request_ready_enqueue(request);
 }
@@ -486,7 +489,7 @@ void ftun_dns_runtime_write_done(ftun_operation_t *operation,
   request->writing = NULL;
   request->write_pending = false;
   if (error.status == FTUN_OK) request->buffer_offset += request->writing_bytes;
-  else request->io_status = error.status;
+  else request->io_error = error;
   request->writing_bytes = 0u;
   ftun_dns_runtime_request_ready_enqueue(request);
 }
@@ -509,7 +512,7 @@ ftun_status_t ftun_dns_runtime_packet_receive(ftun_datagram_t *channel,
   if (!ftun_endpoint_equal(source, &request->peer)) return FTUN_OK;
   status = ftun_packet_clone(packet, &request->received);
   if (status == FTUN_OK) request->received_present = true;
-  else request->io_status = status;
+  else request->io_error.status = status;
   ftun_dns_runtime_request_ready_enqueue(request);
   return FTUN_OK;
 }
@@ -521,13 +524,13 @@ void ftun_dns_runtime_path_opened(ftun_operation_t *operation,
   (void)operation;
   request->opening = NULL;
   request->path = path;
-  if (error.status != FTUN_OK) request->io_status = error.status;
-  else if (request->io_status != FTUN_OK) {
+  if (error.status != FTUN_OK) request->io_error = error;
+  else if (request->io_error.status != FTUN_OK) {
     /* 保留在结果交付前到达的驱动错误，拥有权仍由请求负责回收。 */
   } else if (request->transport == FTUN_DNS_TRANSPORT_TCP) {
-    request->io_status = ftun_path_channel(path, &request->stream);
+    request->io_error.status = ftun_path_channel(path, &request->stream);
   } else {
-    request->io_status = ftun_path_channel(path, &request->datagram);
+    request->io_error.status = ftun_path_channel(path, &request->datagram);
   }
   ftun_dns_runtime_request_ready_enqueue(request);
 }
@@ -581,7 +584,7 @@ ftun_status_t ftun_dns_runtime_request_connected(
 {
   *connected = false;
   if (request->opening != NULL) return FTUN_E_AGAIN;
-  if (request->io_status != FTUN_OK) return request->io_status;
+  if (request->io_error.status != FTUN_OK) return request->io_error.status;
   *connected = true;
   return FTUN_OK;
 }
@@ -597,7 +600,7 @@ ftun_status_t ftun_dns_runtime_request_send(
   size_t accepted = 0u;
   size_t length = request->buffer_length - request->buffer_offset;
   ftun_status_t status;
-  if (request->io_status != FTUN_OK) return request->io_status;
+  if (request->io_error.status != FTUN_OK) return request->io_error.status;
   if (request->write_pending) return FTUN_E_AGAIN;
   if (length == 0u) return FTUN_OK;
   status = ftun_buffer_acquire(request->dns->budget, length, &buffer);
@@ -628,7 +631,7 @@ ftun_status_t ftun_dns_runtime_request_send(
   ftun_buffer_release(&buffer);
   if (status != FTUN_OK) return status;
   if (request->write_pending) return FTUN_E_AGAIN;
-  return request->io_status;
+  return request->io_error.status;
 }
 
 ftun_status_t ftun_dns_runtime_request_receive(
@@ -712,7 +715,7 @@ ftun_status_t ftun_dns_runtime_request_drive(
   size_t steps;
   for (steps = 0u; steps < 16u; steps++) {
     ftun_status_t status;
-    if (request->io_status != FTUN_OK) return request->io_status;
+    if (request->io_error.status != FTUN_OK) return request->io_error.status;
     uint64_t now;
     status = ftun_dns_runtime_now(NULL, &now);
     if (status != FTUN_OK) return status;

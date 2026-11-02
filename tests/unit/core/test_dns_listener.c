@@ -87,7 +87,7 @@ static void transport_deliver(transport_t *transport, ftun_bytes_t response)
   void *user = transport->user;
   transport->pending = 0;
   transport->completion = NULL;
-  completion(user, FTUN_OK, transport->protocol, &transport->source, response);
+  completion(user, (ftun_error_t){0}, transport->protocol, &transport->source, response);
 }
 
 static void reply(ftun_dns_transport_t transport, uint64_t peer,
@@ -265,11 +265,13 @@ int main(void)
   CHECK(ftun_dns_listener_receive_udp(listener, 101u,
     (ftun_bytes_t){request, sizeof(request)}, &operation) == FTUN_OK && transport.pending);
   transport.pending = 0;
-  transport.completion(transport.user, FTUN_E_RESOLVE, transport.protocol,
+  transport.completion(transport.user, (ftun_error_t){FTUN_E_RESOLVE, 0u, 0}, transport.protocol,
     &transport.source, (ftun_bytes_t){NULL, 0u});
   CHECK(dispatch(operations) && result.calls == 4u && result.status == FTUN_OK &&
         result.length == 27u && result.response[0] == 0x22u && result.response[1] == 0x33u &&
         result.response[2] == 0x81u && result.response[3] == 0x82u);
+  CHECK(ftun_dns_listener_get_info(listener, &info) == FTUN_OK &&
+        info.queries.success == 3u && info.queries.failures[FTUN_E_RESOLVE] == 1u);
   CHECK(ftun_dns_connection_close(&connection) == FTUN_OK);
   CHECK(ftun_dns_listener_stop(listener) == FTUN_OK);
   CHECK(ftun_dns_listener_tcp_open(listener, 300u, &connection) ==

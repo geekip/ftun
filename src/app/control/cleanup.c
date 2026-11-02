@@ -199,6 +199,10 @@ ftun_status_t ftun_core_cleanup_step(void *context, bool may_wait,
       if (status == FTUN_OK) {
         status = ftun_config_destroy(&control->startup_config);
         ftun_app_cleanup_record(&cleanup, status);
+        status = ftun_file_lock_release(&control->startup_state_lock);
+        ftun_app_cleanup_record(&cleanup, status);
+        status = ftun_file_lock_release(&control->state_lock);
+        ftun_app_cleanup_record(&cleanup, status);
       }
       status = ftun_core_owned_path_destroy(&control->startup_path);
       ftun_app_cleanup_record(&cleanup, status);
@@ -220,6 +224,8 @@ ftun_status_t ftun_core_cleanup_step(void *context, bool may_wait,
           event.generation = ftun_core_generation_now(control);
           event.status = control->first_error != FTUN_OK ? control->first_error : control->cleanup_error;
           event.reason = FTUN_LIFECYCLE_REASON_LOG_DRAINING;
+          ftun_ctl_server_runtime_stopped(control->ctl_server,
+            (ftun_error_t){event.status, FTUN_STAGE_CONTROL, 0}, event.generation);
           (void)ftun_core_context_finish_logging(control->core, &event);
         } else (void)ftun_core_context_finish_logging(control->core, NULL);
         status = ftun_logger_destroy_until(&control->startup_logger,
@@ -237,7 +243,8 @@ ftun_status_t ftun_core_cleanup_step(void *context, bool may_wait,
     control->startup_config == NULL && control->startup_candidate == NULL &&
     control->startup_path.value == NULL && (control->startup_path.reservation).budget == NULL &&
     control->startup_logger == NULL && control->logger == NULL &&
-    control->retired_logger == NULL;
+    control->retired_logger == NULL && control->startup_state_lock == NULL &&
+    control->state_lock == NULL;
   return FTUN_OK;
 }
 

@@ -3,6 +3,7 @@
 
 #include "core/limits.h"
 #include "util/types.h"
+#include "core/log/aggregate.h"
 #include "core/log/event_log.h"
 
 /* Core 上下文只保存通用 owner-loop 资源和一个类型擦除的业务扩展。
@@ -49,6 +50,11 @@ ftun_status_t ftun_core_context_set_logger(ftun_core_t *core,
  * 不在底层 context_create 分配，独立使用 Core 的宿主可不启用。 */
 ftun_status_t ftun_core_context_set_event_log(ftun_core_t *core,
                                               ftun_event_log_t *log);
+/* 聚合器由宿主拥有；只在生产者开始前发布，loop撤销后清除。
+ * acquire也允许logger为NULL，保持发布锁直到logger_release；表只由owner修改。 */
+ftun_status_t ftun_core_context_set_aggregate(ftun_core_t *core, ftun_log_aggregate_t *aggregate);
+ftun_status_t ftun_core_context_aggregate_acquire(ftun_core_t *core,
+  ftun_log_aggregate_t **aggregate, ftun_logger_t **logger);
 /* 配置 sink 和事件过滤在同一个发布锁中切换。首次输出早期 FIFO，之后
  * 向旧 sink 汇总。输出失败仍发布新 sink，并通过返回值/计数报告；
  * 已关闭事件记录器返回 STALE，不修改槽。silent 可使用 NULL logger。 */

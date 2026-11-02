@@ -1,4 +1,5 @@
 #include "core/context_internal.h"
+#include "platform/clock.h"
 
 #include <stdlib.h>
 
@@ -23,6 +24,7 @@ ftun_status_t ftun_core_context_create(ftun_budget_t *budget,
     return FTUN_E_IO;
   }
   ftun_atomic_init(&core->generation, 0u);
+  ftun_atomic_init(&core->log_level, FTUN_LOG_SILENT);
   core->context_magic = FTUN_CORE_CONTEXT_MAGIC;
   core->budget = budget;
   core->reservation = reservation;
@@ -151,6 +153,19 @@ ftun_status_t ftun_core_context_set_budget(ftun_core_t *core,
   return FTUN_OK;
 }
 
+static void ftun_core_log_gate(ftun_core_t *core, const ftun_logger_t *logger)
+{
+  ftun_log_level_t level = FTUN_LOG_TRACE;
+  while (level > FTUN_LOG_SILENT && !ftun_logger_enabled(logger, level)) level--;
+  ftun_atomic_store_explicit(&core->log_level, (size_t)level, FTUN_MEMORY_RELAXED);
+}
+
+bool ftun_log_enabled(const ftun_core_t *core, ftun_log_level_t level)
+{
+  return core != NULL && level >= FTUN_LOG_ERROR && level <= FTUN_LOG_TRACE &&
+    (size_t)level <= ftun_atomic_load_explicit(&core->log_level, FTUN_MEMORY_RELAXED);
+}
+
 ftun_status_t ftun_core_context_set_logger(ftun_core_t *core,
                                            ftun_logger_t *logger)
 {
@@ -160,6 +175,7 @@ ftun_status_t ftun_core_context_set_logger(ftun_core_t *core,
   }
   ftun_mutex_lock(&core->logger_mutex);
   core->logger = logger;
+  ftun_core_log_gate(core, logger);
   ftun_mutex_unlock(&core->logger_mutex);
   return FTUN_OK;
 }
@@ -191,6 +207,33 @@ ftun_status_t ftun_core_context_set_event_log(ftun_core_t *core,
   return status;
 }
 
+ftun_status_t ftun_core_context_set_aggregate(ftun_core_t *core, ftun_log_aggregate_t *aggregate)
+{
+  ftun_status_t status = FTUN_OK;
+  if (!ftun_core_context_valid(core)) return FTUN_E_INVALID;
+  ftun_mutex_lock(&core->logger_mutex);
+  if (core->aggregate != NULL && aggregate != NULL && core->aggregate != aggregate) status = FTUN_E_STALE;
+  else core->aggregate = aggregate;
+  ftun_mutex_unlock(&core->logger_mutex);
+  return status;
+}
+
+ftun_status_t ftun_core_context_aggregate_acquire(ftun_core_t *core,
+  ftun_log_aggregate_t **aggregate, ftun_logger_t **logger)
+{
+  *aggregate = NULL;
+  *logger = NULL;
+  if (!ftun_core_context_valid(core)) return FTUN_E_INVALID;
+  ftun_mutex_lock(&core->logger_mutex);
+  if (core->aggregate == NULL) {
+    ftun_mutex_unlock(&core->logger_mutex);
+    return FTUN_E_AGAIN;
+  }
+  *aggregate = core->aggregate;
+  *logger = core->logger;
+  return FTUN_OK;
+}
+
 ftun_status_t ftun_core_context_publish_logger(ftun_core_t *core,
   ftun_logger_t *logger, bool silent)
 {
@@ -209,7 +252,14 @@ ftun_status_t ftun_core_context_publish_logger(ftun_core_t *core,
       ftun_event_log_reconfigure(core->events, core->logger, silent) :
       ftun_event_log_publish(core->events, logger, silent);
   }
+  if (core->aggregate != NULL) {
+    uint64_t now_ms;
+    ftun_status_t aggregate_status = ftun_monotonic_now(&now_ms);
+    if (aggregate_status == FTUN_OK) aggregate_status = ftun_log_aggregate_flush(core->aggregate, core->logger, now_ms);
+    if (status == FTUN_OK) status = aggregate_status;
+  }
   core->logger = logger;
+  ftun_core_log_gate(core, silent ? NULL : logger);
   ftun_mutex_unlock(&core->logger_mutex);
   return status;
 }
@@ -237,8 +287,19 @@ ftun_status_t ftun_core_context_finish_logging(ftun_core_t *core,
   ftun_status_t status = FTUN_OK;
   if (core == NULL || core->context_magic != FTUN_CORE_CONTEXT_MAGIC) return FTUN_E_INVALID;
   ftun_mutex_lock(&core->logger_mutex);
-  if (core->events != NULL) status = ftun_event_log_finish_with(core->events, core->logger, terminal);
-  if (status != FTUN_E_INVALID) core->logger = NULL;
+  if (core->aggregate != NULL) {
+    uint64_t now_ms;
+    status = ftun_monotonic_now(&now_ms);
+    if (status == FTUN_OK) status = ftun_log_aggregate_flush(core->aggregate, core->logger, now_ms);
+  }
+  if (core->events != NULL) {
+    ftun_status_t finished = ftun_event_log_finish_with(core->events, core->logger, terminal);
+    if (status == FTUN_OK) status = finished;
+  }
+  if (status != FTUN_E_INVALID) {
+    core->logger = NULL;
+    ftun_core_log_gate(core, NULL);
+  }
   ftun_mutex_unlock(&core->logger_mutex);
   return status;
 }
@@ -276,7 +337,7 @@ ftun_status_t ftun_core_context_destroy(ftun_core_t **core)
   owned = *core;
   if (owned == NULL) return FTUN_OK;
   if (!ftun_core_context_valid(owned)) return FTUN_E_INVALID;
-  if (owned->extension != NULL || owned->logger != NULL || owned->events != NULL ||
+  if (owned->extension != NULL || owned->logger != NULL || owned->events != NULL || owned->aggregate != NULL ||
       owned->control != NULL) return FTUN_E_AGAIN;
   ftun_mutex_destroy(&owned->logger_mutex);
   reservation = owned->reservation;

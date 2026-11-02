@@ -14,6 +14,7 @@
 #include "libs/tun/interface_backend.h"
 #include "libs/tun/routes.h"
 #include "platform/clock.h"
+#include "core/log/aggregate.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -697,6 +698,18 @@ static int test_network_changed_repair(ftun_core_t *core, ftun_budget_t *budget,
   }
   CHECK(host->resource_count == installed && host->applies == applies + 1u &&
         host->removes == removes);
+  /* 保护规则被外部删除时，必须先报告缺失，再在补回后报告恢复。 */
+  for (round = 0u; round < host->resource_count; round++) {
+    if (host->resources[round].kind == FTUN_LINUX_ROUTE_MARK_RULE ||
+        host->resources[round].kind == FTUN_LINUX_ROUTE_PROTECT_RULE) break;
+  }
+  CHECK(round < host->resource_count);
+  host->resources[round] = host->resources[--host->resource_count];
+  ftun_tun_owner_service.network_changed(owner, &change, now_ms);
+  for (round = 0u; round < 64u; round++) {
+    CHECK(ftun_tun_owner_service.run_once(owner, false, &run) == FTUN_OK);
+  }
+  CHECK(host->resource_count == installed && host->applies == applies + 2u);
   /* 对账出错（添加被拒）：不撤销现有资源，退避后重试。 */
   host->resources[1] = host->resources[--host->resource_count];
   host->fail_apply_at = host->apply_attempts + 1u;
@@ -1171,6 +1184,9 @@ int main(void)
   ftun_core_module_runtime_t *runtime = NULL;
   ftun_core_module_reload_plan_t *reload_plan = NULL;
   ftun_core_t *core = NULL;
+  ftun_logger_t *logger = NULL;
+  ftun_log_aggregate_t *aggregate = NULL;
+  char log_path[128], log_text[65536];
   ftun_budget_t *budget = NULL;
   ftun_operation_queue_t *operations = NULL;
   ftun_event_loop_t *loop = NULL;
@@ -1205,6 +1221,12 @@ int main(void)
   CHECK(ftun_budget_create(NULL, 8u * 1024u * 1024u, 4096u, &budget) ==
         FTUN_OK);
   CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  (void)snprintf(log_path, sizeof(log_path), "/tmp/ftun-tun-events-%ld.log", (long)getpid());
+  CHECK(ftun_logger_create(&(ftun_logger_options_t){.level = FTUN_LOG_INFO,
+    .path = log_path, .queue_capacity = 512u, .line_capacity = 1024u}, &logger) == FTUN_OK);
+  CHECK(ftun_core_context_set_logger(core, logger) == FTUN_OK);
+  CHECK(ftun_log_aggregate_create(budget, &aggregate) == FTUN_OK);
+  CHECK(ftun_core_context_set_aggregate(core, aggregate) == FTUN_OK);
   CHECK(ftun_operation_queue_create(budget, 8u, &operations) == FTUN_OK);
   CHECK(ftun_event_loop_create_with_capacity(core, 16u, &loop) == FTUN_OK);
   owner_binding.provider = &provider;
@@ -1378,6 +1400,26 @@ int main(void)
   CHECK(ftun_event_loop_destroy(&loop) == FTUN_OK);
   CHECK(ftun_operation_queue_stop(operations) == FTUN_OK);
   CHECK(ftun_operation_queue_destroy(&operations) == FTUN_OK);
+  CHECK(ftun_core_context_set_logger(core, NULL) == FTUN_OK);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  {
+    FILE *log = fopen(log_path, "rb");
+    CHECK(log != NULL);
+    size_t length = fread(log_text, 1u, sizeof(log_text) - 1u, log);
+    log_text[length] = '\0';
+    CHECK(fclose(log) == 0);
+    CHECK(strstr(log_text, "device up:") != NULL);
+    CHECK(strstr(log_text, "device recreated:") != NULL);
+    CHECK(strstr(log_text, "route reconciled:") != NULL);
+    CHECK(strstr(log_text, "protect rule missing (first):") != NULL);
+    CHECK(strstr(log_text, "protection restored:") != NULL);
+    CHECK(unlink(log_path) == 0);
+    char lock_path[sizeof(log_path) + 6u];
+    (void)snprintf(lock_path, sizeof(lock_path), "%s.lock", log_path);
+    CHECK(unlink(lock_path) == 0);
+  }
+  CHECK(ftun_core_context_set_aggregate(core, NULL) == FTUN_OK);
+  ftun_log_aggregate_destroy(&aggregate);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
   return 0;

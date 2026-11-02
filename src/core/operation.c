@@ -43,6 +43,7 @@ struct ftun_operation_queue {
   ftun_operation_waiter_t *waiter_head;
   ftun_operation_waiter_t *waiter_tail;
   size_t capacity;
+  size_t initialized;
   size_t inflight;
   ftun_atomic_size_t ready_count;
   size_t control_reserve;
@@ -126,7 +127,6 @@ ftun_status_t ftun_operation_queue_create_reserved(
   ftun_operation_queue_t *queue;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_status_t status;
-  size_t index;
   size_t charge;
   if (out != NULL) *out = NULL;
   if (budget == NULL || out == NULL || capacity == 0u ||
@@ -140,8 +140,7 @@ ftun_status_t ftun_operation_queue_create_reserved(
   if (status != FTUN_OK) return status;
   queue = (ftun_operation_queue_t *)calloc(1u, sizeof(*queue));
   if (queue != NULL) {
-    queue->storage = (ftun_operation_t *)calloc(capacity,
-                                                sizeof(*queue->storage));
+    queue->storage = (ftun_operation_t *)malloc(capacity * sizeof(*queue->storage));
   }
   if (queue == NULL || queue->storage == NULL) {
     if (queue != NULL) free(queue->storage);
@@ -155,10 +154,6 @@ ftun_status_t ftun_operation_queue_create_reserved(
   queue->control_reserve = control_reserve;
   ftun_atomic_init(&queue->ready_count, 0u);
   queue->accepting = 1;
-  for (index = 0u; index < capacity; index++) {
-    queue->storage[index].free_next = queue->free_head;
-    queue->free_head = &queue->storage[index];
-  }
   if (ftun_mutex_init(&queue->mutex) != FTUN_OK) {
     free(queue->storage);
     queue->storage = NULL;
@@ -200,11 +195,15 @@ static ftun_status_t ftun_operation_accept_kind(
     return FTUN_E_LIMIT;
   }
   operation = queue->free_head;
-  if (operation == NULL) {
+  if (operation != NULL) {
+    queue->free_head = operation->free_next;
+  } else if (queue->initialized < queue->capacity) {
+    /* 槽位已整体准入并分配，首次接纳时才触碰对应对象。 */
+    operation = &queue->storage[queue->initialized++];
+  } else {
     ftun_mutex_unlock(&queue->mutex);
     return FTUN_E_STATE_CORRUPT;
   }
-  queue->free_head = operation->free_next;
   memset(operation, 0, sizeof(*operation));
   queue->next_generation++;
   if (queue->next_generation == 0u) queue->next_generation++;
@@ -262,6 +261,10 @@ static ftun_status_t ftun_operation_complete_kind(
   if (completion.slot >= queue->capacity) {
     ftun_mutex_unlock(&queue->mutex);
     return FTUN_E_INVALID;
+  }
+  if (completion.slot >= queue->initialized) {
+    ftun_mutex_unlock(&queue->mutex);
+    return FTUN_E_STALE;
   }
   operation = &queue->storage[completion.slot];
   if (operation->queue != queue ||
@@ -579,7 +582,7 @@ static ftun_status_t ftun_operation_queue_stop_kind(
   if (restart) queue->stop_cursor = 0u;
   /* 稳定槽位游标把扫描工作也计入配额。停止后不再接纳新项，允许在
    * 两次 step 之间 dispatch/recycle；下一轮完整扫描会重试失败 hook。 */
-  while (visited < max_slots && queue->stop_cursor < queue->capacity &&
+  while (visited < max_slots && queue->stop_cursor < queue->initialized &&
          queue->inflight != 0u) {
     ftun_operation_t *operation = &queue->storage[queue->stop_cursor++];
     ftun_status_t status;
@@ -594,7 +597,7 @@ static ftun_status_t ftun_operation_queue_stop_kind(
     ftun_mutex_lock(&queue->mutex);
   }
   *out_visited = visited;
-  *out_more = queue->inflight != 0u && queue->stop_cursor < queue->capacity;
+  *out_more = queue->inflight != 0u && queue->stop_cursor < queue->initialized;
   if (!*out_more) queue->stop_cursor = 0u;
   queue->stop_running = 0;
   ftun_mutex_unlock(&queue->mutex);

@@ -273,6 +273,7 @@ ftun_status_t ftun_proxy_runtime_tun_prepare(
   engine->tun_listener.kind = FTUN_CONFIG_INBOUND_TUN;
   engine->tun_listener.tcp_idle_ms = inbound->tcp_idle_ms;
   engine->tun_listener.inbound_id = inbound_id;
+  engine->tun_listener.log_entity = ftun_correlation_next();
   engine->tun_info.mtu = inbound->mtu;
   engine->tun_auto_route = inbound->auto_route;
   status = ftun_monotonic_now(&engine->now_ms);

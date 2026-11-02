@@ -2216,10 +2216,17 @@ static int dns_client_main(const char *address_text, const char *port_text,
   do {
     length = recv(descriptor, response, sizeof(response), 0);
   } while (length < 0 && errno == EINTR);
+  int received_error = length < 0 ? errno : 0;
   (void)close(descriptor);
-  return length >= 43 && response[0] == 0x44u && response[1] == 0x55u &&
+  if (length >= 43 && response[0] == 0x44u && response[1] == 0x55u &&
     (response[2] & 0x80u) != 0u && response[7] == 1u &&
-    memcmp(response + length - 4, expected, 4u) == 0 ? 0 : 1;
+    memcmp(response + length - 4, expected, 4u) == 0) return 0;
+  fprintf(stderr, "dns-client failed: server=%s:%lu expected=%s bytes=%zd errno=%d rcode=%d answers=%d\n",
+    address_text, port, expected_text, length, received_error,
+    length >= 4 ? (int)(response[3] & 15u) : -1, length >= 8 ? response[7] : -1);
+  if (length >= 43) fprintf(stderr, "dns-client response tail: %u.%u.%u.%u\n",
+    response[length - 4], response[length - 3], response[length - 2], response[length - 1]);
+  return 1;
 }
 
 static int dns_fakeip_sequence_main(const char *address_text,

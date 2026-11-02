@@ -20,6 +20,7 @@ ftun_status_t ftun_wolfssl_client_write(ftun_tls_client_t *client,
                                         size_t *written);
 ftun_status_t ftun_wolfssl_client_info(const ftun_tls_client_t *client,
                                        ftun_tls_info_t *out);
+void ftun_wolfssl_error_text(int code, char out[FTUN_TLS_ERROR_BYTES]);
 ftun_status_t ftun_wolfssl_client_destroy(ftun_tls_client_t **client);
 ftun_status_t ftun_wolfssl_context_destroy(ftun_tls_context_t **context);
 #endif

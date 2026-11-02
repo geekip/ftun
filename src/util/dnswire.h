@@ -62,6 +62,7 @@ typedef enum {
 } ftun_dns_entry_t;
 
 struct ftun_dns_query {
+  uint64_t sid, generation; /* 接纳时分配，缓存、fallback与应答沿用同一关联。 */
   uint16_t id;
   uint16_t flags; /* 不含 ID 的客户端请求标志；缓存按完整值隔离。 */
   ftun_dns_transport_t transport;

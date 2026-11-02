@@ -49,6 +49,7 @@ struct ftun_buffer_pool {
   size_t pressure_trimmed_buffers;
   ftun_buffer_waiter_t *waiters;
   size_t waiter_capacity;
+  size_t waiter_initialized;
   size_t free_waiter;
   ftun_buffer_class_queue_t *classes;
   size_t waiting_classes;
@@ -385,8 +386,7 @@ ftun_status_t ftun_buffer_pool_create_waitable(
   if (status != FTUN_OK) return status;
   pool = (ftun_buffer_pool_t *)calloc(1u, pool_bytes);
   if (pool != NULL && waiter_capacity != 0u) {
-    pool->waiters = (ftun_buffer_waiter_t *)calloc(
-      waiter_capacity, sizeof(*pool->waiters));
+    pool->waiters = (ftun_buffer_waiter_t *)malloc(waiter_capacity * sizeof(*pool->waiters));
   }
   if (pool == NULL || (waiter_capacity != 0u && pool->waiters == NULL)) {
     if (pool != NULL) free(pool->waiters);
@@ -407,13 +407,7 @@ ftun_status_t ftun_buffer_pool_create_waitable(
   pool->idle_limit_buffers = idle_limit_buffers;
   pool->waiter_capacity = waiter_capacity;
   pool->wake_quota = wake_quota;
-  pool->free_waiter = waiter_capacity == 0u
-    ? FTUN_BUFFER_WAITER_NONE : 0u;
-  for (index = 0u; index < waiter_capacity; index++) {
-    pool->waiters[index].previous = FTUN_BUFFER_WAITER_NONE;
-    pool->waiters[index].next = index + 1u < waiter_capacity
-      ? index + 1u : FTUN_BUFFER_WAITER_NONE;
-  }
+  pool->free_waiter = FTUN_BUFFER_WAITER_NONE;
   *out = pool;
   return FTUN_OK;
 }
@@ -517,17 +511,19 @@ ftun_status_t ftun_buffer_pool_wait(
     ftun_buffer_pool_notify(pool);
     return FTUN_E_AGAIN;
   }
-  if (pool->free_waiter == FTUN_BUFFER_WAITER_NONE ||
+  if ((pool->free_waiter == FTUN_BUFFER_WAITER_NONE &&
+       pool->waiter_initialized == pool->waiter_capacity) ||
       pool->next_waiter_generation == UINT64_MAX) {
     if (pool->rejected_waiters != SIZE_MAX) pool->rejected_waiters++;
     ftun_buffer_pool_notify(pool);
     return FTUN_E_LIMIT;
   }
   slot = pool->free_waiter;
+  if (slot == FTUN_BUFFER_WAITER_NONE) slot = pool->waiter_initialized++;
+  else pool->free_waiter = pool->waiters[slot].next;
   category = ftun_buffer_class_index(buffer_class);
   queue = &pool->classes[category];
   waiter = &pool->waiters[slot];
-  pool->free_waiter = waiter->next;
   pool->next_waiter_generation++;
   memset(waiter, 0, sizeof(*waiter));
   waiter->previous = queue->wait_tail;
@@ -560,6 +556,7 @@ ftun_status_t ftun_buffer_pool_wait_cancel(ftun_buffer_wait_token_t *token)
   pool = token->pool;
   if (pool == NULL || token->generation == 0u ||
       token->slot >= pool->waiter_capacity) return FTUN_E_INVALID;
+  if (token->slot >= pool->waiter_initialized) return FTUN_E_STALE;
   waiter = &pool->waiters[token->slot];
   if (!waiter->pending || waiter->generation != token->generation) {
     return FTUN_E_STALE;

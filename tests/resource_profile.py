@@ -73,7 +73,7 @@ def main():
       config.write_text(template.replace("@CACHE@", str(cache)),
                         encoding="utf-8")
       process = subprocess.Popen(
-        [str(binary), "run", "-c", str(config)], stdout=subprocess.DEVNULL,
+        [str(binary), "run", "-c", str(config), "-p", str(config) + ".pid"], stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE, text=True)
       try:
         time.sleep(0.20)

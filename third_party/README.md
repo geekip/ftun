@@ -71,3 +71,13 @@ FTUN 使用的第三方库、运行库及借鉴实现，精确提交与校验信
 仓库地址：https://git.musl-libc.org/git/musl
 
 集成能力：src/util/ip.c 借鉴 inet_pton/inet_ntop 实现 IPv6 文本解析与格式化，不引入整库或源码快照。
+
+## optparse
+
+开源协议：Unlicense
+
+使用版本：a86877ed301d
+
+仓库地址：https://github.com/skeeto/optparse
+
+集成能力：可重入 CLI 参数解析、长短选项与位置参数重排，仅在 args.c 编译单头文件实现。

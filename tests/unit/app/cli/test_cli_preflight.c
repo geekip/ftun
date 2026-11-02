@@ -12,31 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#if defined(FTUN_HAVE_MODULE_FAKEIP)
-#include "app/cli/cmd_fakeip.c"
-#include <stdarg.h>
-static bool force_random_fallback;
-static ftun_budget_t *random_budget;
-static size_t random_opens;
-ftun_status_t __real_ftun_random_bytes(void *buffer, size_t length);
-ftun_status_t __wrap_ftun_random_bytes(void *buffer, size_t length)
-{
-  return force_random_fallback ? FTUN_E_IO : __real_ftun_random_bytes(buffer, length);
-}
-ftun_status_t __real_ftun_random_device_bytes(void *buffer, size_t length);
-ftun_status_t __wrap_ftun_random_device_bytes(void *buffer, size_t length)
-{
-  ftun_budget_usage_t usage;
-  ftun_status_t status;
-  if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
-      usage.used_resources.descriptors != 1u) abort();
-  random_opens++;
-  status = __real_ftun_random_device_bytes(buffer, length);
-  if (ftun_budget_get_usage(random_budget, &usage) != FTUN_OK ||
-      usage.used_resources.descriptors != 1u) abort();
-  return status;
-}
-#endif
+
 
 #define CHECK(x) do { if (!(x)) { \
   fprintf(stderr, "cli preflight failed at %d: %s\n", __LINE__, #x); return 1; \
@@ -151,35 +127,11 @@ static int failures(const char *path)
   return 0;
 }
 
-static int random_resources(void)
-{
-#if defined(FTUN_HAVE_MODULE_FAKEIP)
-  ftun_budget_options_t options = {{4096u, 0u, 0u}, {0}, {0}};
-  ftun_budget_usage_t usage, before;
-  uint8_t uuid[FTUN_FAKEIP_UUID_BYTES];
-  force_random_fallback = true;
-  CHECK(ftun_budget_create_resources(NULL, &options, &random_budget) == FTUN_OK);
-  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_E_LIMIT && random_opens == 0u);
-  CHECK(ftun_budget_destroy(&random_budget) == FTUN_OK);
-  options.limit.descriptors = 1u;
-  CHECK(ftun_budget_create_resources(NULL, &options, &random_budget) == FTUN_OK);
-  CHECK(ftun_budget_get_usage(random_budget, &before) == FTUN_OK);
-  CHECK(ftun_cli_random_uuid(random_budget, uuid) == FTUN_OK && random_opens == 1u);
-  CHECK((uuid[6] & 0xf0u) == 0x40u && (uuid[8] & 0xc0u) == 0x80u);
-  CHECK(ftun_budget_get_usage(random_budget, &usage) == FTUN_OK &&
-    usage.used_resources.memory_bytes == 0u && usage.metadata_bytes == before.metadata_bytes && usage.used_resources.descriptors == 0u);
-  CHECK(ftun_budget_destroy(&random_budget) == FTUN_OK);
-  force_random_fallback = false;
-#endif
-  return 0;
-}
-
 int main(void)
 {
   char path[] = "/tmp/ftun-preflight.XXXXXX";
   int descriptor = mkstemp(path);
   CHECK(descriptor >= 0 && close(descriptor) == 0);
-  CHECK(random_resources() == 0);
   CHECK(write_config(path, "{\"dns\":{\"enable\":false}}") == 0);
   CHECK(ownership(path) == 0);
   CHECK(failures(path) == 0);

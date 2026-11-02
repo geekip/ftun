@@ -41,7 +41,9 @@ int main(void)
   size_t written;
   bool created, published;
   struct stat info;
+  ftun_file_info_t observed;
   int descriptor;
+  ftun_error_t error;
   CHECK(mkdtemp(directory) != NULL);
   CHECK(snprintf(path, sizeof(path), "%s/value", directory) > 0);
   CHECK(snprintf(temporary, sizeof(temporary), "%s%s", directory, FTUN_FILE_TEMPORARY_SUFFIX) > 0);
@@ -52,13 +54,15 @@ int main(void)
   CHECK(ftun_platform_file_parent("value/", &parent) == FTUN_E_INVALID);
   CHECK(ftun_platform_file_open_append(path, false, &file, &size) == FTUN_OK && size == 0u);
   fail_write = true;
-  CHECK(ftun_platform_file_write(&file, (ftun_bytes_t){(const uint8_t *)"abcdef", 6u}, &written) == FTUN_E_LIMIT);
-  CHECK(written == 3u);
+  error = ftun_platform_file_write_error(&file, (ftun_bytes_t){(const uint8_t *)"abcdef", 6u}, &written);
+  CHECK(error.status == FTUN_E_LIMIT && error.native_code == ENOSPC && written == 3u);
   fail_write = false;
-  CHECK(ftun_platform_file_write(&file, (ftun_bytes_t){(const uint8_t *)"def", 3u}, &written) == FTUN_OK && written == 3u);
+  error = ftun_platform_file_write_error(&file, (ftun_bytes_t){(const uint8_t *)"def", 3u}, &written);
+  CHECK(error.status == FTUN_OK && error.native_code == 0 && written == 3u);
   CHECK(ftun_platform_file_close(&file) == FTUN_OK && !ftun_platform_file_is_open(&file));
   descriptor = open(path, O_RDONLY);
   CHECK(descriptor >= 0 && read(descriptor, value, 6u) == 6 && memcmp(value, "abcdef", 6u) == 0);
+  CHECK(!ftun_file_is_terminal(descriptor) && !ftun_file_enable_ansi(descriptor));
   CHECK(close(descriptor) == 0);
   CHECK(ftun_platform_file_lock_acquire(path, &lock) == FTUN_OK);
   CHECK(ftun_platform_file_lock_acquire(path, &contender) == FTUN_E_AGAIN);
@@ -66,7 +70,10 @@ int main(void)
   CHECK(ftun_platform_file_write_temporary(temporary,
     (ftun_bytes_t){(const uint8_t *)"new", 3u}, 0640u, &created) == FTUN_OK && created);
   CHECK(stat(temporary, &info) == 0 && (info.st_mode & 0777) == 0640);
-  CHECK(ftun_platform_file_replace(temporary, path, directory, after_rename, &published, &published) == FTUN_E_IO);
+  CHECK(ftun_file_inspect_path(temporary, &observed) == FTUN_OK);
+  CHECK(observed.modified_unix_ms >= (int64_t)info.st_mtime * 1000 &&
+        observed.modified_unix_ms < ((int64_t)info.st_mtime + 1) * 1000);
+  CHECK(ftun_platform_file_replace(temporary, path, directory, after_rename, &published, true, &published) == FTUN_E_IO);
   CHECK(published && access(temporary, F_OK) != 0);
   CHECK(ftun_platform_file_rename_if_exists(temporary, path) == FTUN_OK);
   CHECK(unlink(path) == 0 && rmdir(directory) == 0);

@@ -66,6 +66,8 @@ ftun_status_t ftun_dns_runtime_commit_reload(ftun_dns_runtime_t **active,
                                              ftun_dns_runtime_t **retired);
 /* Quiesced old generations finish accepted work before their resources are
  * reclaimed. AGAIN means the bounded retired slot is still in use. */
+/* owner只读查询；仍有在途工作返回AGAIN。 */
+ftun_status_t ftun_dns_runtime_idle(const ftun_dns_runtime_t *dns);
 ftun_status_t ftun_dns_runtime_reap(ftun_dns_runtime_t **retired);
 ftun_status_t ftun_dns_runtime_activate(ftun_dns_runtime_t *dns);
 /* 每单元至多推进一次有界传输并交付一个 waiter；未交付响应保留原接收

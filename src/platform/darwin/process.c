@@ -4,9 +4,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/resource.h>
+#include <sys/proc.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <unistd.h>
+
+ftun_status_t ftun_process_exited(uint32_t pid, bool *exited)
+{
+  struct kinfo_proc info;
+  size_t size = sizeof(info);
+  int query[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid};
+  *exited = false;
+  if (sysctl(query, 4u, &info, &size, NULL, 0u) != 0) return FTUN_E_IO;
+  *exited = size == 0u || (size == sizeof(info) && info.kp_proc.p_stat == SZOMB);
+  return size == 0u || size == sizeof(info) ? FTUN_OK : FTUN_E_IO;
+}
 
 uint64_t ftun_process_boot_token(void)
 {

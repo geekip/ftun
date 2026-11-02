@@ -40,7 +40,7 @@ def live(listener):
 
 def config(directory, name, level, upstream, proxy, listener, proxy_port=None):
     value = {'base': {'state-cache': False},
-             'log': {'file': str(directory / (name + '.log'))},
+             'log': {'output': 'file', 'file': str(directory / (name + '.log'))},
              'dns': {'enable': True, 'cache': False, 'fake-ip': {'enable': False},
                      'default-server': 'direct',
                      'servers': [{'name': 'direct', 'type': 'udp',
@@ -55,6 +55,16 @@ def config(directory, name, level, upstream, proxy, listener, proxy_port=None):
                               'listen': f'127.0.0.1:{proxy_port}', 'udp': False}]
         value['rules'] = ['MATCH,DIRECT']
     return value
+
+
+def event_line(text, phrase, **fields):
+    for line in text.splitlines():
+        if not re.search(r'\] ' + re.escape(phrase) + r':(?: |$)', line):
+            continue
+        actual = dict(re.findall(r'\b([a-z_]+)=([^ ]+)', line))
+        if all(actual.get(key) == str(value) for key, value in fields.items()):
+            return line
+    return ''
 
 
 def ordered(text, markers):
@@ -88,21 +98,21 @@ def run_reserved_case(binary, directory, level, upstream, proxy, reservations):
     with stderr.open('wb') as errors:
         for sock in reservations:
             sock.close()
-        process = subprocess.Popen([str(binary), 'run', '-c', str(path)],
+        process = subprocess.Popen([str(binary), 'run', '-c', str(path), '-p', str(path) + '.pid'],
                                    stdout=subprocess.DEVNULL, stderr=errors)
         try:
             wait_for(process, lambda: live(listener))
-            if level == 'info':
-                wait_for(process, lambda: 'event=running ' in read(log))
-                ordered(read(log), ['event=starting ', 'event=config.read ',
-                                    'event=config.parsed ', 'event=config.validated ',
-                                    'event=config.compiled ', 'event=module.selected ',
-                                    'event=module.preparing ', 'event=module.prepared ',
-                                    'event=module.active ', 'event=running '])
+            if level in (None, 'info'):
+                wait_for(process, lambda: ' ready: ' in read(log))
+                ordered(read(log), [' starting: ', ' configuration read: ',
+                                    ' configuration parsed: ', ' configuration validated: ',
+                                    ' configuration compiled: ', ' module selected: ',
+                                    ' module preparing: ', ' module prepared: ',
+                                    ' module active: ', ' ready: '])
                 if proxy:
-                    assert 'event=module.selected module=proxy generation=1 reason=required' in read(log)
+                    assert event_line(read(log), 'module selected', service='proxy', gen=1, reason='required')
                 else:
-                    assert 'event=module.disabled module=proxy generation=1 reason=not-built' in read(log)
+                    assert event_line(read(log), 'module disabled', service='proxy', gen=1, reason='not-built')
                 initial = read(log)
                 for ident in range(20, 40):
                     dns_query(listener, ident)
@@ -116,21 +126,27 @@ def run_reserved_case(binary, directory, level, upstream, proxy, reservations):
             wait_for(process, lambda: 'ftun: reload rejected' in read(stderr))
             assert live(listener), 'rejected reload stopped existing listener'
             if level != 'silent':
-                wait_for(process, lambda: 'event=reload.rejected ' in read(log))
-                assert 'event=config.failed module=app generation=2 reason=parse' in read(log)
-                assert 'event=running module=app generation=2 ' not in read(log)
+                wait_for(process, lambda: event_line(read(log), 'configuration rejected', gen=1, reason='none'))
+                assert event_line(read(log), 'configuration rejected', service='app', gen=2, reason='parse')
+                if level in (None, 'info'):
+                    text = read(log)
+                    request = event_line(text, 'reload requested', source='signal', signal='SIGHUP')
+                    result = event_line(text, 'result', source='signal', signal='SIGHUP', result='rejected')
+                    assert request and result, text
+                    assert re.search(r'\bop=(\d+)', request)[1] == re.search(r'\bop=(\d+)', result)[1], text
+                assert not event_line(read(log), 'ready', service='app', gen=2)
             else:
                 assert not log.exists(), 'silent created a log file'
 
-            if level == 'info':
+            if level in (None, 'info'):
                 path.unlink()
                 process.send_signal(signal.SIGHUP)
                 wait_for(process, lambda: read(stderr).count('ftun: reload rejected') == 2)
-                wait_for(process, lambda: 'event=config.failed module=app generation=2 reason=read ' in read(log))
+                wait_for(process, lambda: event_line(read(log), 'configuration rejected', service='app', gen=2, reason='read'))
                 text = read(log)
-                read_line = next(line for line in text.splitlines() if 'event=config.read ' in line)
+                read_line = next(line for line in text.splitlines() if ' configuration read: ' in line)
                 failed_line = next(line for line in text.splitlines()
-                                   if 'event=config.failed ' in line and 'reason=read ' in line)
+                                   if ' configuration rejected: ' in line and 'reason=read ' in line)
                 assert re.search(r'stage=([0-9]+)', read_line).group(1) == \
                     re.search(r'stage=([0-9]+)', failed_line).group(1), failed_line
                 assert live(listener)
@@ -146,17 +162,17 @@ def run_reserved_case(binary, directory, level, upstream, proxy, reservations):
                 path.write_text(json.dumps(value))
                 process.send_signal(signal.SIGHUP)
                 wait_for(process, lambda: read(stderr).count('ftun: reload committed') == 2)
-                wait_for(process, lambda: 'event=reload.committed module=app generation=3 ' in read(replacement))
+                wait_for(process, lambda: event_line(read(replacement), 'configuration committed', service='app', gen=3))
                 assert read(log) == previous, 'retired sink received new events'
                 log = replacement
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=10) == 0, read(stderr)
-            if level == 'info':
-                ordered(read(log), ['event=reload.committed ', 'event=stopping ',
-                                    'event=module.quiesced ', 'event=module.drained ',
-                                    'event=module.stopped ', 'event=runtime.stopped '])
-                assert 'event=module.stopped module=dns generation=3 ' in read(log)
-                assert 'event=runtime.stopped module=app generation=3 reason=log-draining' in read(log).splitlines()[-1]
+            if level in (None, 'info'):
+                ordered(read(log), [' configuration committed: ', ' stopping: ',
+                                    ' module quiesced: ', ' module drained: ',
+                                    ' module stopped: ', ' runtime stopped: '])
+                assert event_line(read(log), 'module stopped', service='dns', gen=3)
+                assert event_line(read(log).splitlines()[-1], 'runtime stopped', service='app', gen=3, reason='log-draining')
             assert 'configuration OK' not in read(stderr)
         except BaseException:
             print(json.dumps({'level': name, 'exit': process.poll(),
@@ -171,23 +187,23 @@ def run_reserved_case(binary, directory, level, upstream, proxy, reservations):
 
 def failure_cases(binary, directory, upstream, proxy):
     for phase, body in [('parse', '{'), ('validate', '{"log":{"level":"bad"}}'),
-                        ('paths', '{"dns":{"enable":false},"log":{"file":"~someone/x"}}')]:
+                        ('paths', '{"dns":{"enable":false},"log":{"output":"file","file":"~someone/x"}}')]:
         path = directory / ('bad-' + phase + '.json')
         path.write_text(body)
-        completed = subprocess.run([str(binary), 'run', '-c', str(path)], capture_output=True, timeout=8)
+        completed = subprocess.run([str(binary), 'run', '-c', str(path), '-p', str(path) + '.pid'], capture_output=True, timeout=8)
         assert completed.returncode != 0
-        assert ('ftun: configuration ' + phase + ': invalid').encode() in completed.stderr, completed.stderr
+        assert ('ftun: run: configuration ' + phase + ': ').encode() in completed.stderr and b'(invalid)' in completed.stderr, completed.stderr
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as occupied:
         occupied.bind(('127.0.0.1', 0))
         value = config(directory, 'occupied', 'info', upstream, proxy, occupied.getsockname()[1])
         path = directory / 'occupied.json'
         path.write_text(json.dumps(value))
-        completed = subprocess.run([str(binary), 'run', '-c', str(path)], capture_output=True, timeout=10)
+        completed = subprocess.run([str(binary), 'run', '-c', str(path), '-p', str(path) + '.pid'], capture_output=True, timeout=10)
         assert completed.returncode != 0, 'occupied listener unexpectedly started'
         text = read(directory / 'occupied.log')
-        assert 'event=module.failed module=dns ' in text, text
-        assert 'event=rollback ' in text and 'event=running ' not in text, text
-        assert 'event=module.active module=dns ' not in text, text
+        assert event_line(text, 'module failed', service='dns'), text
+        assert ' rollback: ' in text and ' ready: ' not in text, text
+        assert not event_line(text, 'module active', service='dns'), text
 
 
 def main():

@@ -1,10 +1,12 @@
 #include "core/log/event_log.h"
 #include "core/context.h"
 #include "platform/clock.h"
+#include "platform/process.h"
 
 #include <inttypes.h>
 #include "platform/thread.h"
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -38,28 +40,53 @@ typedef struct {
 struct ftun_event_log {
   ftun_mutex_t mutex;
   ftun_reservation_t reservation;
-  ftun_early_event_t early[FTUN_EVENT_LOG_EARLY_CAPACITY];
-  ftun_event_rate_t rates[FTUN_LIFECYCLE_COUNT][FTUN_EVENT_MODULES];
+  bool rate_initialized[FTUN_LIFECYCLE_COUNT][FTUN_EVENT_MODULES];
   char module_names[FTUN_EVENT_MODULES][FTUN_EVENT_MODULE_NAME_BYTES];
   char reason_names[FTUN_LIFECYCLE_REASON_COUNT][FTUN_EVENT_MODULE_NAME_BYTES];
   ftun_diagnostic_rate_t diagnostics[FTUN_DIAGNOSTIC_COUNT];
   ftun_event_log_usage_t usage;
   bool silent;
+  ftun_early_event_t early[FTUN_EVENT_LOG_EARLY_CAPACITY];
+  ftun_event_rate_t rates[FTUN_LIFECYCLE_COUNT][FTUN_EVENT_MODULES];
 };
 
-static const char *const ftun_event_names[FTUN_LIFECYCLE_COUNT] = {
-  "invalid", "starting", "config.read", "config.parsed", "config.validated",
-  "config.compiled", "config.failed", "module.selected", "module.disabled",
-  "module.preparing", "module.prepared", "module.active", "module.quiesced",
-  "module.drained", "module.stopped", "module.failed", "rollback", "running",
-  "reload.requested", "reload.committed", "reload.rejected", "stopping",
-  "runtime.stopped", "stop.failed", "reload.cancelled", "config.published",
-  "network.changed"
+/* 生命周期目录只含Core通用阶段；业务事件在所属层定义。 */
+static const ftun_log_event_t ftun_event_catalog[FTUN_LIFECYCLE_COUNT] = {
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "invalid", "invalid"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "starting", "starting"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.read", "configuration read"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.parsed", "configuration parsed"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.validated", "configuration validated"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.compiled", "configuration compiled"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.failed", "configuration rejected"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.selected", "module selected"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.disabled", "module disabled"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.preparing", "module preparing"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.prepared", "module prepared"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.active", "module active"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.quiesced", "module quiesced"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.drained", "module drained"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.stopped", "module stopped"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "module.failed", "module failed"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "rollback", "rollback"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "running", "ready"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "reload.requested", "reload requested"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "reload.committed", "configuration committed"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "reload.rejected", "configuration rejected"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "stopping", "stopping"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "runtime.stopped", "runtime stopped"},
+  {FTUN_LOG_APP, FTUN_LOG_INFO, "stop.failed", "stop failed"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "reload.cancelled", "reload cancelled"},
+  {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.published", "configuration published"},
+  {FTUN_LOG_NET, FTUN_LOG_INFO, "network.changed", "network changed"},
 };
 static const char *const ftun_event_reasons[] = {
   "none", "required", "dependency", "optional", "not-selected", "not-built", "not-registered",
   "read", "parse", "paths", "validate", "compile", "log-draining", "admission",
-  "run", "quiesce", "drain", "destroy", "reload-prepare", "reload-commit", "reload-abort"
+  "run", "quiesce", "drain", "destroy", "reload-prepare", "reload-commit", "reload-abort",
+  [FTUN_LIFECYCLE_REASON_NETWORK_CHANGED] = "changed",
+  [FTUN_LIFECYCLE_REASON_NETWORK_OVERFLOW] = "overflow",
+  [FTUN_LIFECYCLE_REASON_NETWORK_STORM] = "storm"
 };
 
 static void ftun_event_count(uint64_t *counter, uint64_t amount)
@@ -85,13 +112,15 @@ static bool ftun_event_valid(const ftun_lifecycle_event_t *event)
 static ftun_status_t ftun_event_forward(ftun_event_log_t *log,
   ftun_logger_t *logger, const ftun_lifecycle_event_t *event, uint64_t suppressed)
 {
-  ftun_diagnostic_t diagnostic;
-  char message[256];
-  int length;
-  char module_id[11], reason_id[11];
+  ftun_log_event_t descriptor = ftun_event_catalog[event->kind];
+  ftun_log_record_t record = {0};
+  ftun_log_field_t fields[5];
+  size_t field_count = 3u;
+  char module_id[11], reason_id[11], boot[17];
   const char *reason_name = log->reason_names[event->reason];
   const char *module_name = log->module_names[ftun_event_module(event->module)];
   ftun_status_t status;
+
   if (log->silent) {
     ftun_event_count(&log->usage.filtered_without_sink, 1u);
     return FTUN_OK;
@@ -100,35 +129,57 @@ static ftun_status_t ftun_event_forward(ftun_event_log_t *log,
     ftun_event_count(&log->usage.unavailable, 1u);
     return FTUN_E_AGAIN;
   }
+  descriptor.level = event->status == FTUN_OK || event->status == FTUN_E_CANCELLED ||
+    event->status == FTUN_E_RESTART_REQUIRED ? FTUN_LOG_INFO : FTUN_LOG_ERROR;
+  if (event->kind == FTUN_LIFECYCLE_NETWORK_CHANGED && event->status == FTUN_E_LIMIT)
+    { descriptor.level = FTUN_LOG_WARN; descriptor.phrase = "change storm"; }
+  if (event->status == FTUN_E_RESTART_REQUIRED) descriptor.phrase = "restart required";
+  record.event = &descriptor;
+  if (!ftun_logger_enabled(logger, descriptor.level)) goto write_record;
   if (module_name[0] == '\0') {
     (void)snprintf(module_id, sizeof(module_id), "0x%08" PRIx32, event->module);
     module_name = module_id;
   }
   if (reason_name[0] == '\0') {
-    if ((size_t)event->reason < sizeof(ftun_event_reasons) / sizeof(ftun_event_reasons[0])) {
+    if ((size_t)event->reason < sizeof(ftun_event_reasons) / sizeof(ftun_event_reasons[0]) && ftun_event_reasons[event->reason] != NULL) {
       reason_name = ftun_event_reasons[event->reason];
     } else {
       (void)snprintf(reason_id, sizeof(reason_id), "0x%08x", (unsigned int)event->reason);
       reason_name = reason_id;
     }
   }
-  length = snprintf(message, sizeof(message),
-    "event=%s module=%s generation=%" PRIu64 " reason=%s suppressed=%" PRIu64,
-    ftun_event_names[event->kind], module_name,
-    event->generation, reason_name, suppressed);
-  if (length < 0 || (size_t)length >= sizeof(message)) return FTUN_E_LIMIT;
-  memset(&diagnostic, 0, sizeof(diagnostic));
-  diagnostic.correlation = event->correlation;
-  diagnostic.error.status = event->status;
-  diagnostic.error.stage = (event->kind == FTUN_LIFECYCLE_CONFIG_READ ||
-    (event->kind == FTUN_LIFECYCLE_CONFIG_FAILED &&
-     event->reason == FTUN_LIFECYCLE_REASON_CONFIG_READ)) ?
-    FTUN_STAGE_CONFIG_READ :
-    (event->kind >= FTUN_LIFECYCLE_CONFIG_PARSED && event->kind <= FTUN_LIFECYCLE_CONFIG_FAILED ?
-      FTUN_STAGE_CONFIG_PREPARE : FTUN_STAGE_CONTROL);
-  diagnostic.message = (ftun_string_t){message, (size_t)length};
-  status = ftun_logger_write(logger, event->status == FTUN_OK ? FTUN_LOG_INFO : FTUN_LOG_ERROR,
-    &diagnostic);
+  if (descriptor.module == FTUN_LOG_APP) {
+    static const struct { const char *name; ftun_log_module_t module; } modules[] = {
+      {"dns", FTUN_LOG_DNS}, {"proxy", FTUN_LOG_PROXY}, {"frs", FTUN_LOG_FRS},
+      {"fakeip", FTUN_LOG_FAKEIP}, {"tun", FTUN_LOG_TUN}
+    };
+    size_t index;
+    for (index = 0u; index < sizeof(modules) / sizeof(modules[0]); ++index)
+      if (strcmp(module_name, modules[index].name) == 0) descriptor.module = modules[index].module;
+  }
+  fields[0] = (ftun_log_field_t){.key = "service", .kind = FTUN_LOG_TEXT,
+    .value.text = {module_name, strlen(module_name)}};
+  fields[1] = (ftun_log_field_t){.key = "reason", .kind = FTUN_LOG_TEXT,
+    .value.text = {reason_name, strlen(reason_name)}};
+  fields[2] = (ftun_log_field_t){.key = "suppressed", .kind = FTUN_LOG_U64, .value.u64 = suppressed};
+  if (event->kind == FTUN_LIFECYCLE_STARTING) {
+    (void)snprintf(boot, sizeof(boot), "%016" PRIx64, ftun_log_boot_id());
+    fields[field_count++] = (ftun_log_field_t){.key = "pid", .kind = FTUN_LOG_U64, .value.u64 = ftun_process_id()};
+    fields[field_count++] = (ftun_log_field_t){.key = "boot", .kind = FTUN_LOG_TEXT, .value.text = {boot, 16u}};
+  }
+  record.event = &descriptor;
+  record.operation = event->correlation;
+  record.generation = event->generation;
+  record.error.status = event->status;
+  record.error.stage = (event->kind == FTUN_LIFECYCLE_CONFIG_READ ||
+    (event->kind == FTUN_LIFECYCLE_CONFIG_FAILED && event->reason == FTUN_LIFECYCLE_REASON_CONFIG_READ))
+    ? FTUN_STAGE_CONFIG_READ :
+    (event->kind >= FTUN_LIFECYCLE_CONFIG_PARSED && event->kind <= FTUN_LIFECYCLE_CONFIG_FAILED
+      ? FTUN_STAGE_CONFIG_PREPARE : FTUN_STAGE_CONTROL);
+  record.fields = fields;
+  record.field_count = field_count;
+write_record:
+  status = ftun_logger_record(logger, &record);
   if (status == FTUN_OK) ftun_event_count(&log->usage.forwarded, 1u);
   else ftun_event_count(&log->usage.unavailable, 1u);
   return status;
@@ -160,6 +211,8 @@ static ftun_status_t ftun_diagnostic_forward(ftun_event_log_t *log,
     return FTUN_E_AGAIN;
   }
   diagnostic.error = event->error;
+  if (!ftun_logger_enabled(logger, (event->error.status == FTUN_OK || event->error.status == FTUN_E_CANCELLED) ? FTUN_LOG_INFO : FTUN_LOG_ERROR))
+    goto write_diagnostic;
   if (suppressed != 0u) {
     int length = snprintf(summary, sizeof(summary),
       "diagnostic=%u generation=%" PRIu64 " suppressed=%" PRIu64 " %s",
@@ -167,7 +220,8 @@ static ftun_status_t ftun_diagnostic_forward(ftun_event_log_t *log,
     if (length < 0 || (size_t)length >= sizeof(summary)) return FTUN_E_LIMIT;
     diagnostic.message = (ftun_string_t){summary, (size_t)length};
   } else diagnostic.message = (ftun_string_t){event->message, strlen(event->message)};
-  status = ftun_logger_write(logger, event->error.status == FTUN_OK ? FTUN_LOG_INFO : FTUN_LOG_ERROR,
+write_diagnostic:
+  status = ftun_logger_write(logger, (event->error.status == FTUN_OK || event->error.status == FTUN_E_CANCELLED) ? FTUN_LOG_INFO : FTUN_LOG_ERROR,
     &diagnostic);
   if (status == FTUN_OK) ftun_event_count(&log->usage.forwarded, 1u);
   else ftun_event_count(&log->usage.unavailable, 1u);
@@ -192,6 +246,7 @@ static ftun_status_t ftun_event_summaries(ftun_event_log_t *log,
   size_t kind, module;
   for (kind = 1u; kind < FTUN_LIFECYCLE_COUNT; kind++) {
     for (module = 0u; module < FTUN_EVENT_MODULES; module++) {
+      if (!log->rate_initialized[kind][module]) continue;
       ftun_status_t status = ftun_event_summary(log, logger, &log->rates[kind][module]);
       if (first == FTUN_OK) first = status;
     }
@@ -213,11 +268,12 @@ ftun_status_t ftun_event_log_create(ftun_budget_t *budget, ftun_event_log_t **ou
   if (budget == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_budget_reserve_resources(budget, resources, &reservation);
   if (status != FTUN_OK) return status;
-  log = calloc(1u, sizeof(*log));
+  log = malloc(sizeof(*log));
   if (log == NULL) {
     ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
+  memset(log, 0, offsetof(ftun_event_log_t, early));
   if (ftun_mutex_init(&log->mutex) != FTUN_OK) {
     free(log);
     ftun_reservation_release(&reservation);
@@ -271,6 +327,7 @@ ftun_status_t ftun_event_log_record(ftun_event_log_t *log,
 {
   ftun_status_t status = FTUN_OK;
   ftun_event_rate_t *rate;
+  bool *initialized;
   if (log == NULL || !ftun_event_valid(event)) return FTUN_E_INVALID;
   ftun_mutex_lock(&log->mutex);
   if (log->usage.closed) { status = FTUN_E_CANCELLED; goto done; }
@@ -278,6 +335,7 @@ ftun_status_t ftun_event_log_record(ftun_event_log_t *log,
   log->usage.has_last = true;
   log->usage.last = *event;
   if (event->status != FTUN_OK) {
+    if (!log->usage.has_error) log->usage.first_error = *event;
     log->usage.has_error = true;
     log->usage.last_error = *event;
   }
@@ -292,15 +350,21 @@ ftun_status_t ftun_event_log_record(ftun_event_log_t *log,
     goto done;
   }
   rate = &log->rates[event->kind][ftun_event_module(event->module)];
-  if (rate->emitted != 0u && (event->status == FTUN_OK ||
+  initialized = &log->rate_initialized[event->kind][ftun_event_module(event->module)];
+  if (*initialized && (event->status == FTUN_OK ||
       rate->event.status != event->status || rate->event.generation != event->generation ||
       rate->event.reason != event->reason ||
       now_ms < rate->started_ms || now_ms - rate->started_ms >= FTUN_EVENT_WINDOW_MS)) {
     (void)ftun_event_summary(log, logger, rate);
-    memset(rate, 0, sizeof(*rate));
+    *initialized = false;
   }
   if (event->status != FTUN_OK) {
-    if (rate->emitted == 0u) { rate->started_ms = now_ms; rate->event = *event; }
+    if (!*initialized) {
+      memset(rate, 0, sizeof(*rate));
+      *initialized = true;
+      rate->started_ms = now_ms;
+      rate->event = *event;
+    }
     if (rate->emitted == FTUN_EVENT_BURST) {
       ftun_event_count(&rate->suppressed, 1u);
       ftun_event_count(&log->usage.suppressed, 1u);
@@ -402,7 +466,7 @@ ftun_status_t ftun_event_log_reconfigure(ftun_event_log_t *log,
   if (log->usage.closed || !log->usage.configured) status = FTUN_E_STALE;
   else {
     status = ftun_event_summaries(log, old_logger);
-    memset(log->rates, 0, sizeof(log->rates));
+    memset(log->rate_initialized, 0, sizeof(log->rate_initialized));
     memset(log->diagnostics, 0, sizeof(log->diagnostics));
     log->silent = silent;
   }
@@ -469,7 +533,8 @@ ftun_status_t ftun_event_log_begin(ftun_event_log_t *log)
   log->usage.has_error = false;
   memset(&log->usage.last, 0, sizeof(log->usage.last));
   memset(&log->usage.last_error, 0, sizeof(log->usage.last_error));
-  memset(log->rates, 0, sizeof(log->rates));
+  memset(&log->usage.first_error, 0, sizeof(log->usage.first_error));
+  memset(log->rate_initialized, 0, sizeof(log->rate_initialized));
   memset(log->diagnostics, 0, sizeof(log->diagnostics));
   log->usage.has_diagnostic = false;
   memset(&log->usage.last_diagnostic, 0, sizeof(log->usage.last_diagnostic));

@@ -46,6 +46,7 @@ typedef struct ftun_health_snapshot ftun_health_snapshot_t;
 typedef struct ftun_inbound_spec ftun_inbound_spec_t;
 typedef struct ftun_index ftun_index_t;
 typedef struct ftun_lwip ftun_lwip_t;
+typedef struct ftun_l3_provider ftun_l3_provider_t;
 typedef struct ftun_logger ftun_logger_t;
 typedef struct ftun_network_view ftun_network_view_t;
 typedef struct ftun_operation_queue ftun_operation_queue_t;

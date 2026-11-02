@@ -80,6 +80,25 @@
       "local_patches": [],
       "build_boundary": "Windows only; public api/wintun.h declarations; no upstream driver or API implementation is compiled; official signed DLL loaded at runtime via the public API",
       "notice": "Copyright (C) 2018-2021 WireGuard LLC. All Rights Reserved. FTUN uses the API header under its MIT alternative. The unmodified official wintun.dll is a separate runtime component distributed under the Wintun Prebuilt Binaries License (LICENSE-Wintun-binaries), including the permission to accompany software using only its public API. Driver sources in this submodule are not compiled or distributed in FTUN binary packages."
+    },
+    {
+      "name": "optparse",
+      "version": "a86877ed301d",
+      "revision": "a86877ed301d89a4eb64feb08f23af395aede2ed",
+      "source": "https://github.com/skeeto/optparse",
+      "path": "third_party/optparse",
+      "source_form": "single-header",
+      "license": "Unlicense",
+      "selected_license": "Unlicense",
+      "license_file": "third_party/optparse/UNLICENSE",
+      "license_sha256": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c",
+      "files": {
+        "optparse.h": "6fed5a3d637bacc8fe183c697201a075d2fe5ca5601d35512cdaebe1fea3debe",
+        "UNLICENSE": "7e12e5df4bae12cb21581ba157ced20e1986a0508dd10d0e8a4ab9a4cf94e85c"
+      },
+      "local_patches": [],
+      "build_boundary": "Unmodified optparse.h; implementation defined only in app/cli/args.c",
+      "notice": "FTUN embeds the unmodified optparse single-header library at the pinned upstream commit under the Unlicense. No runtime dependency is added."
     }
   ],
   "distribution_targets": [

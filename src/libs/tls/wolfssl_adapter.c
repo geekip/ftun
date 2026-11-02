@@ -42,6 +42,7 @@ struct ftun_tls_client {
   size_t maximum_plaintext;
   bool handshake_complete;
   bool peer_verified;
+  int native_error;
   ftun_ip_t identity_ip;
   bool wants_read;
   bool wants_write;
@@ -359,6 +360,7 @@ static ftun_status_t ftun_wolfssl_result(ftun_tls_client_t *client,
     return FTUN_E_AGAIN;
   }
   if (error == WOLFSSL_ERROR_ZERO_RETURN) return FTUN_E_EOF;
+  client->native_error = error;
   return FTUN_E_REJECTED;
 }
 
@@ -419,7 +421,13 @@ ftun_status_t ftun_wolfssl_client_info(const ftun_tls_client_t *client,
   out->peer_verified = client->peer_verified;
   out->wants_read = client->wants_read;
   out->wants_write = client->wants_write;
+  out->native_error = client->native_error;
   return FTUN_OK;
+}
+
+void ftun_wolfssl_error_text(int code, char out[FTUN_TLS_ERROR_BYTES])
+{
+  wolfSSL_ERR_error_string_n((unsigned long)code, out, FTUN_TLS_ERROR_BYTES);
 }
 
 ftun_status_t ftun_wolfssl_client_destroy(ftun_tls_client_t **client)

@@ -165,8 +165,8 @@ static size_t ftun_event_backend_deliver(ftun_event_backend_adapter_t *adapter)
   return work;
 }
 
-static ftun_status_t ftun_event_backend_watcher_create(ftun_event_backend_adapter_t *adapter,
-  ftun_event_backend_group_t *group, ftun_event_backend_watcher_t **out)
+static ftun_status_t ftun_event_backend_watcher_create(ftun_event_backend_group_t *group,
+  ftun_budget_t *budget, ftun_event_backend_watcher_t **out)
 {
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_event_backend_watcher_t *watcher;
@@ -177,8 +177,8 @@ static ftun_status_t ftun_event_backend_watcher_create(ftun_event_backend_adapte
     *out = &group->first;
     return FTUN_OK;
   }
-  if (adapter->budget != NULL) {
-    status = ftun_budget_reserve(adapter->budget, sizeof(*watcher), &reservation);
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, sizeof(*watcher), &reservation);
     if (status != FTUN_OK) return status;
   }
   watcher = calloc(1u, sizeof(*watcher));
@@ -254,14 +254,15 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
   ftun_event_backend_watcher_t *watcher;
   ftun_event_backend_group_t *group;
   ftun_status_t status;
+  ftun_budget_t *budget = ftun_event_source_budget(source);
   if (socket == (ftun_native_socket_t)UINTPTR_MAX) return FTUN_E_INVALID;
   uint32_t kind = (interests & FTUN_EVENT_WAITABLE) != 0u ? FTUN_POLLER_WAITABLE : 0u;
   interests &= ~FTUN_EVENT_WAITABLE;
   group = ftun_event_backend_group_find(adapter, socket, kind);
   if (group == NULL) {
     ftun_reservation_t reservation = (ftun_reservation_t){0};
-    if (adapter->budget != NULL) {
-      status = ftun_budget_reserve(adapter->budget, sizeof(*group), &reservation);
+    if (budget != NULL) {
+      status = ftun_budget_reserve(budget, sizeof(*group), &reservation);
       if (status != FTUN_OK) return status;
     }
     group = calloc(1u, sizeof(*group));
@@ -275,7 +276,7 @@ static ftun_status_t ftun_event_backend_io_start(void *context, ftun_event_sourc
     group->io.kind = kind;
     ftun_event_backend_group_insert(group);
   }
-  status = ftun_event_backend_watcher_create(adapter, group, &watcher);
+  status = ftun_event_backend_watcher_create(group, budget, &watcher);
   if (status != FTUN_OK) {
     if (group->watchers == NULL) ftun_event_backend_group_free(group);
     return status;

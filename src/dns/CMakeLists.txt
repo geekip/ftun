@@ -6,6 +6,7 @@ set(ftun_sources_dns
   module.c
   plan.c
   server.c
+  status.c
   service.c
   upstream.c
   upstream_set.c

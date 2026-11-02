@@ -2,20 +2,13 @@
 #include "util/ip.h"
 #include <string.h>
 
-ftun_status_t ftun_config_diagnostic(ftun_diagnostic_t *out,
+ftun_status_t ftun_config_diagnostic(ftun_config_error_t *out,
                                             ftun_status_t status,
                                             const char *path,
                                             const char *message)
 {
-  if (out != NULL) {
-    memset(out, 0, sizeof(*out));
-    out->error.status = status;
-    out->path.data = path;
-    out->path.length = strlen(path);
-    out->message.data = message;
-    out->message.length = strlen(message);
-  }
-  return status;
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
+  return ftun_config_error_set(out, status, path, message);
 }
 
 int ftun_span_equal(const char *data, size_t length, const char *value)

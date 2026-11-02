@@ -10,6 +10,7 @@
 #include "app/config/parser.h"
 #include "app/config/model.h"
 #include "dns/service.c"
+#include "dns/status.h"
 #include "libs/transport/socket_path.h"
 #include "app/config/validate.h"
 #include "core/context.h"
@@ -631,6 +632,8 @@ static int reset_read_case(bool body)
 static int half_close_case(bool reload, bool hijack)
 {
   fixture_t fixture;
+  ftun_dns_service_slot_t slot = {0};
+  ftun_dns_status_t snapshot;
   ftun_dns_runtime_tcp_t *connection = NULL;
   ftun_dns_runtime_t *retired = NULL;
   ftun_dns_runtime_t *owner;
@@ -653,6 +656,10 @@ static int half_close_case(bool reload, bool hijack)
     CHECK(reload_start(&fixture, &retired) == 0);
     CHECK(ftun_dns_runtime_reap(&retired) == FTUN_E_AGAIN && retired == owner);
     CHECK(pump(&fixture, owner) == 0);
+    slot.active = fixture.dns;
+    slot.retired = owner;
+    CHECK(ftun_dns_service_status_fill(&slot, &snapshot) == FTUN_OK);
+    CHECK(snapshot.queries.queries == 1u && snapshot.queries.success == 0u);
   }
   CHECK(finish_request(&fixture, 0u) == 0);
   CHECK(connection_ready(connection) && connection->response_count == 1u);
@@ -679,7 +686,16 @@ static int half_close_case(bool reload, bool hijack)
   CHECK(memcmp(actual, expected, sizeof(actual)) == 0);
   watched_fd = -1;
   CHECK(close(client) == 0);
-  if (reload) CHECK(ftun_dns_runtime_reap(&retired) == FTUN_OK && retired == NULL);
+  if (reload) {
+    CHECK(ftun_dns_service_status_fill(&slot, &snapshot) == FTUN_OK);
+    CHECK(snapshot.queries.queries == 1u && snapshot.queries.success == 1u);
+    CHECK(ftun_dns_runtime_idle(retired) == FTUN_OK);
+    CHECK(ftun_dns_status_archive(retired, fixture.dns, &slot.history) == FTUN_OK);
+    slot.retired = NULL;
+    CHECK(ftun_dns_runtime_reap(&retired) == FTUN_OK && retired == NULL);
+    CHECK(ftun_dns_service_status_fill(&slot, &snapshot) == FTUN_OK);
+    CHECK(snapshot.queries.queries == 1u && snapshot.queries.success == 1u);
+  }
   CHECK(fixture_destroy(&fixture) == 0);
   printf("half close reload=%u hijack=%u passed\n", reload, hijack);
   return 0;
@@ -932,6 +948,12 @@ static int listener_recovery(void)
   slot->events |= FTUN_EVENT_ERROR;
   CHECK(ftun_dns_runtime_step_listener(dns, test_now(), &work) == FTUN_OK);
   CHECK(work && slot->waiting && slot->descriptor == -1 && slot->tcp_descriptor == -1);
+  {
+    ftun_dns_status_t snapshot;
+    CHECK(ftun_dns_status_fill(dns, &snapshot) == FTUN_OK);
+    CHECK(snapshot.listeners_count == 1u && snapshot.listeners[0].status.state == FTUN_SERVICE_WAITING);
+    CHECK(snapshot.listeners[0].status.reason == FTUN_E_IO && snapshot.listeners[0].status.retry_at_ms != 0u);
+  }
   CHECK(slot->source == NULL && slot->tcp_source == NULL);
   CHECK(ftun_dns_runtime_listeners_waiting(dns) == 1u &&
         ftun_dns_runtime_take_object_faults(dns) == 1u);
@@ -947,6 +969,11 @@ static int listener_recovery(void)
   CHECK(!slot->waiting && slot->descriptor >= 0 && slot->tcp_descriptor >= 0);
   CHECK(slot->source != NULL && slot->tcp_source != NULL);
   CHECK(ftun_dns_runtime_listeners_waiting(dns) == 0u);
+  {
+    ftun_dns_status_t snapshot;
+    CHECK(ftun_dns_status_fill(dns, &snapshot) == FTUN_OK);
+    CHECK(snapshot.status.state == FTUN_SERVICE_ACTIVE && snapshot.listeners[0].status.state == FTUN_SERVICE_ACTIVE);
+  }
   CHECK(ftun_recovery_query(dns->recovery, slot->recovery.slot, &info) == FTUN_OK &&
         info.state == FTUN_RECOVERY_AVAILABLE);
   {

@@ -56,6 +56,8 @@ typedef struct {
 
 struct ftun_tun_service {
   ftun_core_t *core;
+  uint64_t log_entity;
+  bool log_faulted;
   ftun_budget_t *budget;
   ftun_reservation_t reservation;
   ftun_event_loop_t *loop;

@@ -258,7 +258,7 @@ def main():
       proxy_port = pick_port()
       write_config(config, proxy_port)
       with stderr_path.open("w+") as stderr_file:
-        process = subprocess.Popen([str(binary), "run", "-c", str(config)],
+        process = subprocess.Popen([str(binary), "run", "-c", str(config), "-p", str(config) + ".pid"],
                                    stdout=subprocess.DEVNULL,
                                    stderr=stderr_file)
         wait_ready(process, proxy_port, stderr_path)

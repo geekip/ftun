@@ -62,6 +62,7 @@ ftun_status_t __wrap_ftun_logger_create(const ftun_logger_options_t *options,
   ftun_logger_options_t copy = *options;
   /* 仅替换外部 writer；保留生产容量、level 和共享 ledger 绑定。 */
   copy.path = NULL;
+  copy.stderr_output = false;
   copy.max_size = 0u;
   copy.max_files = 0u;
   copy.writer = write_line;
@@ -229,7 +230,7 @@ static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
     CHECK(status == FTUN_E_AGAIN && now_ms() - started < 5000u);
   }
   if (!fail) {
-    const char *terminal = strstr(test.text, "event=runtime.stopped ");
+    const char *terminal = strstr(test.text, "runtime stopped: ");
     CHECK(terminal != NULL);
     if (!fail_prepare) CHECK(strchr(terminal, '\n') == test.text + test.length - 1u);
   }
@@ -237,9 +238,9 @@ static int scenario(const char *path, bool slow, bool fail, bool fail_prepare,
     /* worker poll 的非 STATE_CORRUPT 错误只记录，不停机：服务照常运行。 */
     CHECK(test.rounds >= 1u && strstr(test.text, "production data plane failed") == NULL);
     if (fail_poll_at == 1u) {
-      CHECK(strstr(test.text, "message=reload worker failed\n") != NULL &&
+      CHECK(strstr(test.text, "message=\"reload worker failed\"\n") != NULL &&
         strstr(test.text, "state worker failed") == NULL);
-    } else CHECK(strstr(test.text, "message=state worker failed\n") != NULL &&
+    } else CHECK(strstr(test.text, "message=\"state worker failed\"\n") != NULL &&
       strstr(test.text, "reload worker failed") == NULL);
   }
   CHECK(pthread_cond_destroy(&test.condition) == 0);
@@ -257,7 +258,7 @@ int main(void)
   file = fopen(path, "w");
   CHECK(file != NULL);
   CHECK(fprintf(file, "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false},"
-    "\"log\":{\"level\":\"info\",\"file\":\"%s/output.log\"}}", directory) > 0);
+    "\"log\":{\"output\":\"file\",\"level\":\"info\",\"file\":\"%s/output.log\"}}", directory) > 0);
   CHECK(fclose(file) == 0);
   CHECK(scenario(path, false, false, false, 0u) == 0);
   CHECK(scenario(path, true, false, false, 0u) == 0);

@@ -1,4 +1,6 @@
 #include "libs/tun/internal.h"
+#include "core/context.h"
+#include "platform/clock.h"
 
 #include <string.h>
 
@@ -367,6 +369,39 @@ void ftun_tun_service_broadcast(ftun_tun_service_t *service,
                                 ftun_status_t status)
 {
   size_t index;
+  if (service->core != NULL && status != FTUN_E_CANCELLED &&
+      (status != FTUN_OK || ((event == FTUN_TUN_SERVICE_REBUILT || event == FTUN_TUN_SERVICE_NETWORK_UPDATED) &&
+        ftun_log_enabled(service->core, FTUN_LOG_INFO)))) {
+    static const ftun_log_event_t failed = {FTUN_LOG_TUN, FTUN_LOG_WARN, "tun.operation-failed", "TUN operation failed"};
+    static const ftun_log_event_t recovered = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.operation-recovered", "TUN operation recovered"};
+    static const ftun_log_event_t recreated = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.device-recreated", "device recreated"};
+    static const ftun_log_event_t reconciled = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.route-reconciled", "route reconciled"};
+    uint64_t generation = 0u, now = 0u;
+    (void)ftun_core_context_generation(service->core, &generation);
+    (void)ftun_monotonic_now(&now);
+    ftun_log_field_t fields[] = {
+      {.key = "device", .kind = FTUN_LOG_TEXT, .value.text = {service->device_name, strlen(service->device_name)}},
+      {.key = "device_gen", .kind = FTUN_LOG_U64, .value.u64 = service->device_generation},
+      {.key = "network_gen", .kind = FTUN_LOG_U64, .value.u64 = service->network_generation}
+    };
+    ftun_log_record_t record = {.generation = generation, .fields = fields, .field_count = 3u};
+    if (status != FTUN_OK) {
+      if (service->log_entity == 0u) service->log_entity = ftun_correlation_next();
+      record.event = &failed;
+      record.error = (ftun_error_t){status, FTUN_STAGE_CONTROL, 0};
+      (void)ftun_log_failure(service->core, &record, service->log_entity,
+        (ftun_string_t){service->device_name, strlen(service->device_name)}, now);
+      service->log_faulted = true;
+    } else {
+      if (service->log_faulted) {
+        record.event = &recovered;
+        (void)ftun_log_recovery(service->core, &failed, service->log_entity, &record, now);
+        service->log_faulted = false;
+      }
+      record.event = event == FTUN_TUN_SERVICE_REBUILT ? &recreated : &reconciled;
+      (void)ftun_log_record(service->core, &record);
+    }
+  }
   for (index = 0u; index < service->consumer_capacity; index++) {
     ftun_tun_service_consumer_t *consumer = &service->consumers[index];
     ftun_tun_lease_t lease = consumer->lease;

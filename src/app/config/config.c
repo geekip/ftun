@@ -215,7 +215,7 @@ static ftun_status_t ftun_config_default_frs_path(ftun_config_t *config, char **
 }
 
 static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
-                                               const char *source_path)
+                                               const char *source_path, ftun_config_error_t *error)
 {
   ftun_status_t status;
   if (config == NULL || source_path == NULL) return FTUN_E_INVALID;
@@ -225,8 +225,10 @@ static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
   if (config->base_directory == NULL) return FTUN_E_LIMIT;
   status = ftun_config_resolve_one(config, config->base_directory,
                                    &config->base.proxy.cache_file);
+  if (status != FTUN_OK) return ftun_config_error_set(error, status, "/base/cache-file", "cannot resolve cache path");
   if (status == FTUN_OK) {
     status = ftun_config_resolve_one(config, config->base_directory, &config->log.file);
+    if (status != FTUN_OK) return ftun_config_error_set(error, status, "/log/file", "cannot resolve log path");
   }
   if (status == FTUN_OK && config->frs.active) {
     if (config->frs.path == NULL) {
@@ -236,6 +238,7 @@ static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
                                        &config->frs.path);
     }
   }
+  if (status != FTUN_OK) return ftun_config_error_set(error, status, "/frs/path", "cannot resolve FRS path");
   return status;
 }
 
@@ -252,7 +255,8 @@ ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   size_t length = 0u;
   ftun_status_t status = FTUN_E_INVALID;
   ftun_config_step_t step = FTUN_CONFIG_STEP_READ;
-  ftun_config_trace_t result = {FTUN_CONFIG_STEP_NONE, FTUN_CONFIG_STEP_NONE, FTUN_OK};
+  ftun_config_trace_t result = {0};
+  ftun_config_error_begin(&result.error, FTUN_CONFIG_STEP_READ);
   if (out != NULL) *out = NULL;
   if (path == NULL || path[0] == '\0' || out == NULL) goto done;
   status = ftun_file_real_path(path, source_path, sizeof(source_path));
@@ -267,21 +271,23 @@ ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   step = FTUN_CONFIG_STEP_PARSE;
   bytes.data = data;
   bytes.length = length;
-  status = ftun_config_parse_budget(budget, bytes, &config);
+  status = ftun_config_parse_budget_error(budget, bytes, &config, &result.error);
   free(data);
   data = NULL;
   ftun_reservation_release(&input_reservation);
   if (status != FTUN_OK) goto done;
   result.completed = FTUN_CONFIG_STEP_PARSE;
   step = FTUN_CONFIG_STEP_PATHS;
-  status = ftun_config_resolve_paths(config, source_path);
+  ftun_config_error_begin(&result.error, step);
+  status = ftun_config_resolve_paths(config, source_path, &result.error);
   if (status != FTUN_OK) goto done;
   result.completed = FTUN_CONFIG_STEP_PATHS;
   step = FTUN_CONFIG_STEP_VALIDATE;
-  status = ftun_config_validate(config, NULL);
+  status = ftun_config_validate(config, &result.error);
   if (status != FTUN_OK) goto done;
   result.completed = FTUN_CONFIG_STEP_VALIDATE;
   step = FTUN_CONFIG_STEP_COMPILE;
+  ftun_config_error_begin(&result.error, step);
   status = ftun_config_compile(config, &plan);
   if (status != FTUN_OK) goto done;
   result.completed = FTUN_CONFIG_STEP_COMPILE;
@@ -295,7 +301,13 @@ done:
   (void)ftun_feature_plan_destroy(&plan);
   (void)ftun_config_destroy(&config);
   result.status = status;
-  if (status != FTUN_OK) result.failed = step;
+  if (status != FTUN_OK) {
+    result.failed = step;
+    (void)ftun_config_error_set(&result.error, status, "",
+      step == FTUN_CONFIG_STEP_READ ? "cannot read configuration file" :
+      step == FTUN_CONFIG_STEP_PATHS ? "cannot resolve configuration directory" :
+      step == FTUN_CONFIG_STEP_COMPILE ? "cannot compile configuration plan" : "invalid configuration");
+  }
   if (trace != NULL) *trace = result;
   return status;
 }
@@ -317,12 +329,6 @@ ftun_status_t ftun_config_load(ftun_core_t *core, const char *path,
     if (status != FTUN_OK) return status;
   }
   return ftun_config_load_budget_traced(budget, path, out, NULL);
-}
-
-const char *ftun_config_step_name(ftun_config_step_t step)
-{
-  static const char *const names[] = {"none", "read", "parse", "paths", "validate", "compile"};
-  return step >= FTUN_CONFIG_STEP_NONE && step <= FTUN_CONFIG_STEP_COMPILE ? names[step] : "unknown";
 }
 
 void ftun_config_trace_emit(ftun_core_t *core, const ftun_config_trace_t *trace,
@@ -352,4 +358,22 @@ void ftun_config_trace_emit(ftun_core_t *core, const ftun_config_trace_t *trace,
     item.reason = reasons[trace->failed];
     (void)ftun_lifecycle_emit(core, &item);
   }
+}
+
+void ftun_config_error_log(ftun_core_t *core, const ftun_config_error_t *error,
+  uint64_t generation, uint64_t operation)
+{
+  static const ftun_log_event_t rejected = {FTUN_LOG_CONFIG, FTUN_LOG_ERROR, "config.rejected-detail", "configuration rejected"};
+  static const ftun_log_event_t restart = {FTUN_LOG_CONFIG, FTUN_LOG_INFO, "config.restart-required", "restart required"};
+  const ftun_log_event_t *event = error->error.status == FTUN_E_RESTART_REQUIRED ? &restart : &rejected;
+  if (error->error.status == FTUN_OK || error->error.status == FTUN_E_CANCELLED || !ftun_log_enabled(core, event->level)) return;
+  const char *phase = ftun_config_step_name(error->phase);
+  ftun_log_field_t fields[] = {
+    {.key = "field", .kind = FTUN_LOG_TEXT, .value.text = {error->field, strlen(error->field)}},
+    {.key = "pointer", .kind = FTUN_LOG_TEXT, .value.text = {error->pointer, strlen(error->pointer)}},
+    {.key = "phase", .kind = FTUN_LOG_TEXT, .value.text = {phase, strlen(phase)}},
+    {.key = "reason", .kind = FTUN_LOG_TEXT, .value.text = {error->message, strlen(error->message)}}
+  };
+  FTUN_CORE_LOG(core, event, .generation = generation, .operation = operation, .error = error->error,
+    .fields = fields, .field_count = 4u);
 }

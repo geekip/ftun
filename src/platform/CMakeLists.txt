@@ -8,14 +8,14 @@ if(NOT FTUN_POLLER_BACKEND STREQUAL "" AND
   message(FATAL_ERROR "Poller ${FTUN_POLLER_BACKEND} is unavailable on ${CMAKE_SYSTEM_NAME}")
 endif()
 if(WIN32)
-  set(ftun_sources_platform windows/clock.c windows/file.c windows/thread.c
+  set(ftun_sources_platform windows/clock.c windows/file.c windows/ipc.c windows/thread.c
     windows/socket.c windows/poller.c windows/process.c windows/random.c
     windows/sysresolve.c unsupported_network.c)
   if(FTUN_MODULE_TUN STREQUAL "BUILTIN")
     list(APPEND ftun_sources_platform windows/tun.c windows/tun_config.c)
   endif()
 else()
-  set(ftun_sources_platform posix/clock.c posix/error.c posix/file.c posix/process.c
+  set(ftun_sources_platform posix/clock.c posix/error.c posix/file.c posix/ipc.c posix/pidfile.c posix/process.c
     posix/socket_io.c posix/socket.c posix/sysresolve.c posix/sockopt.c posix/thread.c)
   if(APPLE)
     list(APPEND ftun_sources_platform bsd/poller_kqueue.c darwin/random.c
@@ -28,6 +28,7 @@ else()
     message(FATAL_ERROR "Native platform services are not implemented for ${CMAKE_SYSTEM_NAME}")
   endif()
 endif()
+list(APPEND ftun_sources_platform pidfile.c)
 ftun_add_layer(platform ftun_util Threads::Threads)
 if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   target_compile_definitions(ftun_platform PRIVATE _DARWIN_C_SOURCE=1)

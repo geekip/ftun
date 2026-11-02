@@ -97,6 +97,21 @@ ftun_status_t ftun_process_signal(uint32_t pid, uint32_t signal, int *native_err
   return FTUN_E_INVALID;
 }
 uint32_t ftun_process_id(void) { return GetCurrentProcessId(); }
+ftun_status_t ftun_process_exited(uint32_t pid, bool *exited)
+{
+  HANDLE process = OpenProcess(SYNCHRONIZE, FALSE, pid);
+  DWORD result;
+  *exited = false;
+  if (process == NULL) {
+    if (GetLastError() != ERROR_INVALID_PARAMETER) return FTUN_E_IO;
+    *exited = true;
+    return FTUN_OK;
+  }
+  result = WaitForSingleObject(process, 0u);
+  CloseHandle(process);
+  *exited = result == WAIT_OBJECT_0;
+  return result == WAIT_OBJECT_0 || result == WAIT_TIMEOUT ? FTUN_OK : FTUN_E_IO;
+}
 void ftun_process_exit(int code) { ExitProcess((UINT)code); }
 static void CALLBACK alarm_expired(void *context, BOOLEAN fired)
 {
@@ -148,3 +163,19 @@ ptrdiff_t ftun_process_executable(char *buffer, size_t capacity)
     buffer, (int)capacity, NULL, NULL);
   return bytes == 0 ? -1 : bytes;
 }
+
+ftun_status_t ftun_process_background_fork(ftun_handle_t *channel, bool *child, uint32_t *pid)
+{
+  *channel = -1; *child = false; *pid = 0u;
+  return FTUN_E_UNSUPPORTED;
+}
+ftun_status_t ftun_process_background_session(void) { return FTUN_E_UNSUPPORTED; }
+ftun_status_t ftun_process_pipe_read(ftun_handle_t channel, void *data, size_t length, uint64_t deadline_ms)
+{ (void)channel; (void)data; (void)length; (void)deadline_ms; return FTUN_E_UNSUPPORTED; }
+ftun_status_t ftun_process_pipe_write(ftun_handle_t channel, const void *data, size_t length, uint64_t deadline_ms)
+{ (void)channel; (void)data; (void)length; (void)deadline_ms; return FTUN_E_UNSUPPORTED; }
+ftun_status_t ftun_process_null_open(ftun_handle_t *out) { *out = -1; return FTUN_E_UNSUPPORTED; }
+ftun_status_t ftun_process_stdio_null(ftun_handle_t descriptor)
+{ (void)descriptor; return FTUN_E_UNSUPPORTED; }
+
+ftun_status_t ftun_process_standard_ensure(void) { return FTUN_E_UNSUPPORTED; }

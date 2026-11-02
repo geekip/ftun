@@ -20,7 +20,7 @@
 typedef struct {
   ftun_core_t *core;
   char paths[2][256];
-  unsigned int step, reload_done, stale_done, cancel_done;
+  unsigned int step, reload_done, stale_done, cancel_done, ready_count;
   bool select_supported, failed;
   uint64_t deadline;
   atomic_bool reader_stop;
@@ -28,6 +28,20 @@ typedef struct {
   ftun_app_control_snapshot_t saved;
 } control_test_t;
 static control_test_t test;
+
+#if defined(FTUN_TEST_CONTROL_PUBLICATION_GAP)
+ftun_status_t __real_ftun_core_generation_settle(ftun_core_t *core, uint64_t next);
+ftun_status_t __wrap_ftun_core_generation_settle(ftun_core_t *core, uint64_t next)
+{
+  ftun_status_t status = __real_ftun_core_generation_settle(core, next);
+  /* 放大发布代次到切换路径的窗口；正确实现让reader在同一发布锁上等待。 */
+  if (status == FTUN_OK) {
+    struct timespec delay = {0, 10000000L};
+    (void)nanosleep(&delay, NULL);
+  }
+  return status;
+}
+#endif
 
 static uint64_t now(void)
 {
@@ -58,6 +72,20 @@ static void completed(ftun_operation_t *operation, ftun_app_command_result_t res
     test.cancel_done++;
   }
 }
+static ftun_status_t ready(ftun_core_t *core, void *user)
+{
+  ftun_app_control_snapshot_t snapshot;
+  REQUIRE(core == test.core && user == &test);
+  REQUIRE(ftun_app_control_query(core, &snapshot) == FTUN_OK);
+  REQUIRE(snapshot.core.state == FTUN_CORE_RUNNING && snapshot.core.generation == 1u);
+  REQUIRE(!strcmp(snapshot.config_path, test.paths[0]));
+  REQUIRE(ftun_app_control_set_ready(core, NULL, NULL) == FTUN_E_STALE);
+  REQUIRE(ftun_app_control_set_verbosity(core, 1u) == FTUN_E_STALE);
+  REQUIRE(ftun_app_control_set_background(core, true) == FTUN_E_STALE);
+  test.ready_count++;
+  return FTUN_OK;
+}
+
 static ftun_status_t submit(ftun_app_command_kind_t kind, const char *first,
   const char *second, uint64_t generation, unsigned int tag, ftun_operation_t **out)
 {
@@ -193,11 +221,16 @@ static void *reader(void *unused)
   (void)unused;
   while (!atomic_load(&test.reader_stop)) {
     ftun_app_control_snapshot_t snapshot;
-    if (ftun_app_control_query(test.core, &snapshot) != FTUN_OK ||
+    ftun_status_t status = ftun_app_control_query(test.core, &snapshot);
+    if (status != FTUN_OK ||
         (snapshot.core.generation == 0u && snapshot.config_path[0] != '\0') ||
         (snapshot.core.generation == 1u && strcmp(snapshot.config_path, test.paths[0])) ||
         (snapshot.core.generation == 2u && strcmp(snapshot.config_path, test.paths[1])) ||
-        snapshot.core.generation > 2u) atomic_fetch_add(&test.reader_errors, 1u);
+        snapshot.core.generation > 2u) {
+      if (atomic_fetch_add(&test.reader_errors, 1u) == 0u)
+        fprintf(stderr, "incoherent snapshot: status=%s generation=%llu path=%s\n",
+          ftun_status_name(status), (unsigned long long)snapshot.core.generation, snapshot.config_path);
+    }
     atomic_fetch_add(&test.reader_queries, 1u);
     pause_once();
   }
@@ -230,6 +263,10 @@ int main(void)
   options.struct_size = sizeof(options);
   options.abi_version = FTUN_ABI_VERSION;
   CHECK(ftun_core_create_with_service(&options, &descriptor, &test.core) == FTUN_OK);
+  CHECK(ftun_app_control_set_ready(test.core, ready, &test) == FTUN_OK);
+  CHECK(ftun_app_control_set_verbosity(test.core, 3u) == FTUN_E_INVALID);
+  CHECK(ftun_app_control_set_verbosity(test.core, 0u) == FTUN_OK);
+  CHECK(ftun_app_control_set_background(test.core, false) == FTUN_OK);
   CHECK(ftun_app_control_query(test.core, &snapshot) == FTUN_OK);
   CHECK(snapshot.core.state == FTUN_CORE_CREATED && snapshot.core.generation == 0u && !snapshot.config_path[0]);
   CHECK(snapshot.build_modules == ftun_build_capabilities()->builtins);
@@ -246,8 +283,10 @@ int main(void)
   }
   atomic_store(&test.reader_stop, true);
   CHECK(pthread_join(thread, NULL) == 0);
+  CHECK(test.ready_count == 1u);
   CHECK(test.step == 3u && !test.failed && test.reload_done == 1u && test.cancel_done == 1u);
-  CHECK(atomic_load(&test.reader_errors) == 0u && atomic_load(&test.reader_queries) != 0u);
+  CHECK(atomic_load(&test.reader_queries) != 0u);
+  CHECK(atomic_load(&test.reader_errors) == 0u);
   CHECK(ftun_app_control_query(test.core, &snapshot) == FTUN_OK && snapshot.core.state == FTUN_CORE_STOPPED);
   CHECK(ftun_core_get_info(test.core, &public_info) == FTUN_OK && public_info.generation == snapshot.core.generation);
   CHECK(ftun_app_control_stop(test.core, now() + 1000u, guard, &result) == FTUN_OK && result.phase == FTUN_APP_COMMAND_COMPLETED);

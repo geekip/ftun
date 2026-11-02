@@ -5,15 +5,24 @@
 #include "platform/file.h"
 
 typedef struct ftun_file_lock ftun_file_lock_t;
-
-
-
+typedef struct ftun_file_lock_pool ftun_file_lock_pool_t;
 /* 锁文件由调用者选择，通常是 FakeIP identity 目录中的固定 lock 路径。
  * 成功后持有非阻塞独占锁，release 消费句柄。 */
 ftun_status_t ftun_file_lock_acquire(const char *path, ftun_file_lock_t **out);
 /* 自有锁对象和1 FD在打开前准入，直到release才归还。 */
 ftun_status_t ftun_file_lock_acquire_budget(ftun_budget_t *budget,
   const char *path, ftun_file_lock_t **out);
+/* pool 按实例和用途隔离；只在本 pool 内共享同一路径的锁。
+ * 对象、路径和每个唯一锁的1 FD先准入，数量受预算及调用方在途任务上限约束。
+ * native open/close 不持 pool mutex；创建/关闭中的同路径请求返回 AGAIN。
+ * acquire/retain/release 可并发；destroy 前终止新调用，有引用时返回 AGAIN。 */
+ftun_status_t ftun_file_lock_pool_create(ftun_budget_t *budget,
+  ftun_file_lock_pool_t **out);
+ftun_status_t ftun_file_lock_pool_acquire(ftun_file_lock_pool_t *pool,
+  const char *path, ftun_file_lock_t **out);
+ftun_status_t ftun_file_lock_pool_destroy(ftun_file_lock_pool_t **pool);
+/* 调用方已有有效拥有引用；复制给 Worker 后须等其 input_cleanup 才 release。 */
+void ftun_file_lock_retain(ftun_file_lock_t *lock);
 ftun_status_t ftun_file_lock_release(ftun_file_lock_t **lock);
 
 /* 持久文件替换。
@@ -38,5 +47,9 @@ ftun_status_t ftun_file_write_atomic_with_hook(
 ftun_status_t ftun_file_write_atomic_budget(ftun_budget_t *budget,
   const char *destination, ftun_bytes_t contents, unsigned int mode,
   ftun_file_stage_hook_fn hook, void *hook_user);
+
+/* 首次创建；已有目录项返回STALE，绝不替换。权限应用于完整写入的临时文件。 */
+ftun_status_t ftun_file_create_atomic_budget(ftun_budget_t *budget,
+  const char *destination, ftun_bytes_t contents, unsigned int mode);
 
 #endif

@@ -15,6 +15,21 @@ typedef struct ftun_upstream_set ftun_upstream_set_t;
 /* 时钟失败如实返回，输出仅在OK时有效。 */
 typedef ftun_status_t (*ftun_upstream_now_fn)(void *user, uint64_t *out);
 
+typedef struct {
+  ftun_endpoint_t address;
+  ftun_recovery_info_t recovery;
+  uint64_t success, failures, latency_ms;
+  ftun_status_t last_failure;
+  bool latency_valid;
+} ftun_upstream_info_t;
+
+/* owner只读快照；越过实际地址数返回EOF，不改变恢复状态。 */
+ftun_status_t ftun_upstream_set_get_info(const ftun_upstream_set_t *set,
+  size_t index, ftun_upstream_info_t *out);
+/* 记录真实传输结果，恢复调度仍只由既有report_failure驱动。 */
+void ftun_upstream_set_observe(ftun_upstream_set_t *set, size_t index,
+  ftun_status_t status, uint64_t latency_ms);
+
 /* endpoints 按优先级排列并被复制；scheduler 被借用，须晚于集合销毁。 */
 ftun_status_t ftun_upstream_set_create(ftun_budget_t *budget,
   ftun_recovery_scheduler_t *scheduler, const ftun_endpoint_t *endpoints,
@@ -31,4 +46,6 @@ ftun_status_t ftun_upstream_set_pick(ftun_upstream_set_t *set, size_t after,
   size_t *out_index, bool *out_recovering);
 /* 网络类失败（超时、不可达、连接中断）。上游自己返回的 SERVFAIL/REFUSED 不算。 */
 ftun_status_t ftun_upstream_set_report_failure(ftun_upstream_set_t *set, size_t index);
+/* owner归并已排空旧代的同身份计数，不改变健康状态。 */
+void ftun_upstream_set_add_counts(ftun_upstream_set_t *set, size_t index, uint64_t success, uint64_t failures);
 #endif

@@ -29,6 +29,7 @@ typedef struct {
   size_t length;
   char *etag;
   unsigned int status;
+  int tls_error; /* 失败仍保留原生TLS码；正文及ETag继续按原契约释放。 */
   bool tls_verified;
   /* 正文与ETag分别拥有实际分配额度，release统一消费。 */
   ftun_reservation_t reservation;

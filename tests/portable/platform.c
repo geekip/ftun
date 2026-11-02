@@ -1,6 +1,7 @@
 #include "app/cli/cli.h"
 #include "platform/clock.h"
 #include "platform/file.h"
+#include "platform/pidfile.h"
 #include "platform/poller.h"
 #include "platform/process.h"
 #include "platform/random.h"
@@ -9,6 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #if defined(_WIN32)
 #include <windows.h>
 #include <io.h>
@@ -159,6 +161,9 @@ static void files(void)
   size_t written;
   bool created, published;
   ftun_handle_t descriptor, duplicate;
+  ftun_file_info_t info;
+  int64_t before, after;
+  CHECK(ftun_wallclock_unix_ms(&before) == FTUN_OK);
   snprintf(directory, sizeof(directory), "ftun-platform-%lu", (unsigned long)ftun_process_id());
   snprintf(path, sizeof(path), "%s/\xe6\xb5\x8b\xe8\xaf\x95", directory);
   snprintf(temporary, sizeof(temporary), "%s%s", directory, FTUN_FILE_TEMPORARY_SUFFIX);
@@ -167,22 +172,108 @@ static void files(void)
   CHECK(ftun_platform_file_open_append(path, false, &file, &size) == FTUN_OK && size == 0u);
   CHECK(ftun_platform_file_write(&file, (ftun_bytes_t){(const uint8_t *)"old", 3u}, &written) == FTUN_OK && written == 3u);
   CHECK(ftun_platform_file_close(&file) == FTUN_OK);
+  CHECK(ftun_file_open(path, FTUN_FILE_READ, &file.descriptor) == FTUN_OK);
+  ftun_error_t error = ftun_platform_file_write_error(&file,
+    (ftun_bytes_t){(const uint8_t *)"denied", 6u}, &written);
+  CHECK(error.status != FTUN_OK && error.native_code != 0 && written == 0u);
+  CHECK(ftun_platform_file_close(&file) == FTUN_OK);
   CHECK(ftun_platform_file_lock_acquire(path, &lock) == FTUN_OK);
   CHECK(ftun_platform_file_lock_acquire(path, &contender) == FTUN_E_AGAIN);
   CHECK(ftun_platform_file_lock_release(&lock) == FTUN_OK);
   CHECK(ftun_platform_file_write_temporary(temporary, (ftun_bytes_t){(const uint8_t *)"new", 3u}, 0600u, &created) == FTUN_OK && created);
-  CHECK(ftun_platform_file_replace(temporary, path, directory, renamed, &published, &published) == FTUN_E_IO && published);
+  CHECK(ftun_platform_file_replace(temporary, path, directory, renamed, &published, true, &published) == FTUN_E_IO && published);
+  snprintf(temporary, sizeof(temporary), "%s%s", directory, FTUN_FILE_TEMPORARY_SUFFIX);
+  CHECK(ftun_platform_file_write_temporary(temporary, (ftun_bytes_t){(const uint8_t *)"ignored", 7u},
+    0600u, &created) == FTUN_OK && created);
+  CHECK(ftun_platform_file_replace(temporary, path, directory, NULL, NULL, false, &published) == FTUN_E_STALE && !published);
+  ftun_platform_file_remove_temporary(temporary);
   CHECK(ftun_file_real_path(path, canonical, sizeof(canonical)) == FTUN_OK);
   CHECK(ftun_file_open(path, FTUN_FILE_READ_NOFOLLOW, &descriptor) == FTUN_OK);
+  CHECK(!ftun_file_is_terminal(descriptor) && !ftun_file_enable_ansi(descriptor));
   CHECK(ftun_file_duplicate(descriptor, &duplicate) == FTUN_OK);
+  CHECK(ftun_file_inspect(descriptor, &info) == FTUN_OK);
+  CHECK(ftun_wallclock_unix_ms(&after) == FTUN_OK);
+  CHECK(info.modified_unix_ms >= before - 2000 && info.modified_unix_ms <= after);
   CHECK(ftun_file_read(duplicate, buffer, sizeof(buffer)) == 3 && memcmp(buffer, "new", 3u) == 0);
   const char *mapped = ftun_file_map_read(descriptor, 3u);
   CHECK(mapped != NULL && memcmp(mapped, "new", 3u) == 0);
   CHECK(ftun_file_unmap(mapped, 3u) == FTUN_OK);
   CHECK(ftun_file_close(duplicate) == FTUN_OK && ftun_file_close(descriptor) == FTUN_OK);
   ftun_platform_file_remove_temporary(path);
+  snprintf(temporary, sizeof(temporary), "%s%s", directory, FTUN_FILE_TEMPORARY_SUFFIX);
+  CHECK(ftun_platform_file_write_temporary(temporary, (ftun_bytes_t){(const uint8_t *)"created", 7u},
+    0600u, &created) == FTUN_OK && created);
+  CHECK(ftun_platform_file_replace(temporary, path, directory, NULL, NULL, false, &published) == FTUN_OK && published);
+  CHECK(ftun_file_open(path, FTUN_FILE_READ_NOFOLLOW, &descriptor) == FTUN_OK);
+  CHECK(ftun_file_read(descriptor, buffer, sizeof(buffer)) == 7 && memcmp(buffer, "created", 7u) == 0);
+  CHECK(ftun_file_close(descriptor) == FTUN_OK);
+  ftun_platform_file_remove_temporary(path);
+  {
+    char source[128], target[128], child[160];
+    snprintf(source, sizeof(source), "%s/state.XXXXXX", directory);
+    snprintf(target, sizeof(target), "%s/state", directory);
+    CHECK(ftun_directory_create_temporary(source, &created) == FTUN_OK && created);
+    snprintf(child, sizeof(child), "%s/value", source);
+    CHECK(ftun_platform_file_open_append(child, false, &file, &size) == FTUN_OK);
+    CHECK(ftun_platform_file_write(&file, (ftun_bytes_t){(const uint8_t *)"state", 5u}, &written) == FTUN_OK && written == 5u);
+    CHECK(ftun_file_sync(file.descriptor, false) == FTUN_OK);
+    CHECK(ftun_platform_file_close(&file) == FTUN_OK);
+    CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_OK && published);
+    CHECK(ftun_file_inspect_path_nofollow(source, &info) == FTUN_E_EOF);
+    CHECK(ftun_file_inspect_path_nofollow(target, &info) == FTUN_OK && info.directory);
+    snprintf(child, sizeof(child), "%s/value", target);
+    CHECK(ftun_file_open(child, FTUN_FILE_READ_NOFOLLOW, &descriptor) == FTUN_OK);
+    CHECK(ftun_file_read(descriptor, buffer, sizeof(buffer)) == 5 && memcmp(buffer, "state", 5u) == 0);
+    CHECK(ftun_file_close(descriptor) == FTUN_OK);
+    snprintf(source, sizeof(source), "%s/state.XXXXXX", directory);
+    CHECK(ftun_directory_create_temporary(source, &created) == FTUN_OK && created);
+    CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_E_STALE && !published);
+    ftun_platform_file_remove_temporary(child);
+    CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_E_STALE && !published);
+    ftun_directory_remove(target);
+    CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_OK && published);
+    ftun_directory_remove(target);
+  }
   ftun_directory_remove(directory);
 }
+static void pidfiles(void)
+{
+  char directory[128], path[256], contents[32], expected[32];
+  uint32_t pid;
+  ftun_handle_t descriptor;
+  ftun_pidfile_t first = FTUN_PIDFILE_INVALID, second = FTUN_PIDFILE_INVALID;
+  (void)snprintf(directory, sizeof(directory), "ftun-pidfile-%u", ftun_process_id());
+  (void)snprintf(path, sizeof(path), "%s/实例.pid", directory);
+  CHECK(ftun_directory_create(directory, 0700u) == FTUN_OK);
+  CHECK(ftun_pidfile_probe(path, &pid) == FTUN_E_EOF && pid == 0u);
+  CHECK(ftun_pidfile_acquire(path, &first, &pid) == FTUN_OK);
+  CHECK(ftun_pidfile_probe(path, &pid) == FTUN_OK && pid == ftun_process_id());
+  CHECK(ftun_pidfile_acquire(path, &second, &pid) == FTUN_E_AGAIN && pid == ftun_process_id());
+  CHECK(!ftun_platform_file_is_open(&second.file));
+  CHECK(ftun_file_open(path, FTUN_FILE_READ_NOFOLLOW, &descriptor) == FTUN_OK);
+  int length = snprintf(expected, sizeof(expected), "%u\n", ftun_process_id());
+  CHECK(ftun_file_read(descriptor, contents, sizeof(contents)) == length);
+  CHECK(memcmp(contents, expected, (size_t)length) == 0);
+  CHECK(ftun_file_close(descriptor) == FTUN_OK);
+  CHECK(ftun_pidfile_rewrite(&first) == FTUN_OK);
+  CHECK(ftun_pidfile_release(&first) == FTUN_OK);
+  CHECK(ftun_file_open(path, FTUN_FILE_READ, &descriptor) != FTUN_OK);
+  CHECK(ftun_pidfile_acquire(path, &second, &pid) == FTUN_OK);
+  CHECK(ftun_pidfile_release(&second) == FTUN_OK);
+  ftun_directory_remove(directory);
+#if defined(_WIN32)
+  {
+    char storage[4096], expanded[4096], wanted[4096];
+    ftun_string_t home;
+    CHECK(ftun_user_home(storage, sizeof(storage), &home) == FTUN_OK);
+    (void)snprintf(wanted, sizeof(wanted), "%.*s/instance.pid", (int)home.length, home.data);
+    ftun_file_path_normalize(wanted);
+    CHECK(ftun_pidfile_path("~\\instance.pid", expanded, sizeof(expanded)) == FTUN_OK);
+    CHECK(strcmp(wanted, expanded) == 0);
+  }
+#endif
+}
+
 static void *wait_signal(void *argument)
 {
   uint32_t received;
@@ -199,6 +290,34 @@ static void process(void)
   ftun_thread_t thread;
   bool received = false;
   int error;
+  int64_t wall;
+  bool exited;
+  {
+    ftun_local_time_t local;
+    CHECK(ftun_wallclock_local(&local) == FTUN_OK);
+    CHECK(local.calendar.year >= 2024 && local.calendar.month >= 1 && local.calendar.month <= 12);
+    CHECK(local.calendar.millisecond < 1000u && abs(local.offset_minutes) < 24 * 60);
+#if defined(_WIN32)
+    {
+      struct tm calendar = {0};
+      int64_t before_local, after_local, reconstructed;
+      calendar.tm_year = local.calendar.year - 1900;
+      calendar.tm_mon = local.calendar.month - 1;
+      calendar.tm_mday = local.calendar.day;
+      calendar.tm_hour = local.calendar.hour;
+      calendar.tm_min = local.calendar.minute;
+      calendar.tm_sec = local.calendar.second;
+      CHECK(ftun_wallclock_unix_ms(&before_local) == FTUN_OK);
+      reconstructed = (int64_t)_mkgmtime64(&calendar) * 1000 + local.calendar.millisecond -
+        (int64_t)local.offset_minutes * 60000;
+      CHECK(ftun_wallclock_unix_ms(&after_local) == FTUN_OK);
+      CHECK(reconstructed >= before_local - 2000 && reconstructed <= after_local);
+    }
+#endif
+  }
+  CHECK(ftun_wallclock_unix_ms(&wall) == FTUN_OK);
+  CHECK(llabs(wall - (int64_t)time(NULL) * 1000) < 2000);
+  CHECK(ftun_process_exited(ftun_process_id(), &exited) == FTUN_OK && !exited);
   CHECK(ftun_random_bytes(random, sizeof(random)) == FTUN_OK);
   CHECK(ftun_platform_boot_identity(identity, sizeof(identity), &length) == FTUN_OK && length != 0u);
   CHECK(ftun_process_boot_token() != 0u);
@@ -235,11 +354,38 @@ static int full_pipe(void)
   CHECK(false);
   return 1;
 }
+/* Wine继承的Unix管道不是Win32命名管道；用CreatePipe验证真实CLI有界写入。 */
+static int cli_pipe(int argc, char **argv)
+{
+  HANDLE reader, writer;
+  char output[16384];
+  DWORD received;
+  size_t used = 0u;
+  CHECK(argc > 2 && strcmp(argv[2], "check") == 0);
+  CHECK(CreatePipe(&reader, &writer, NULL, 65536u));
+  int saved = _dup(1), saved_error = _dup(2);
+  int descriptor = _open_osfhandle((intptr_t)writer, _O_WRONLY | _O_BINARY);
+  CHECK(saved >= 0 && saved_error >= 0 && descriptor >= 0 &&
+    _dup2(descriptor, 1) == 0 && _dup2(descriptor, 2) == 0);
+  CHECK(_close(descriptor) == 0);
+  int result = ftun_cli_main(argc - 1, argv + 1);
+  CHECK(_dup2(saved, 1) == 0 && _close(saved) == 0 &&
+    _dup2(saved_error, 2) == 0 && _close(saved_error) == 0);
+  while (ReadFile(reader, output + used, (DWORD)(sizeof(output) - used), &received, NULL)) {
+    used += received;
+    CHECK(used < sizeof(output));
+  }
+  CHECK(GetLastError() == ERROR_BROKEN_PIPE && CloseHandle(reader));
+  CHECK(used != 0u && fwrite(output, 1u, used, stdout) == used);
+  return result;
+}
+
 #endif
 int main(int argc, char **argv)
 {
 #if defined(_WIN32)
   if (argc == 2 && strcmp(argv[1], "pipe") == 0) return full_pipe();
+  if (argc > 2 && strcmp(argv[1], "cli-pipe") == 0) return cli_pipe(argc, argv);
 #endif
   /* 测试宿主暴露原生PID，外部驱动直接调用真实CLI的重载/停止路径。 */
   if (argc > 1) {
@@ -247,7 +393,7 @@ int main(int argc, char **argv)
     fflush(stdout);
     return ftun_cli_main(argc, argv);
   }
-  threads(); polling(); datagrams(FTUN_ADDRESS_IPV4); datagrams(FTUN_ADDRESS_IPV6); files(); process();
+  threads(); polling(); datagrams(FTUN_ADDRESS_IPV4); datagrams(FTUN_ADDRESS_IPV6); files(); pidfiles(); process();
   puts("portable platform contracts: passed");
   return 0;
 }

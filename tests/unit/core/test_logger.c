@@ -3,7 +3,10 @@
 #include "core/limits.h"
 #include "core/context.h"
 #include "core/log/log.h"
+#include "core/io/file.h"
 #include "platform/clock.h"
+#include "platform/file.h"
+#include "platform/atomic.h"
 
 #include <pthread.h>
 #include <errno.h>
@@ -16,6 +19,15 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
+
+static ftun_atomic_u64_t notice_clock_offset;
+ftun_status_t __real_ftun_monotonic_now(uint64_t *out);
+ftun_status_t __wrap_ftun_monotonic_now(uint64_t *out)
+{
+  ftun_status_t status = __real_ftun_monotonic_now(out);
+  if (status == FTUN_OK) *out += ftun_atomic_load(&notice_clock_offset);
+  return status;
+}
 #include <unistd.h>
 
 #define CHECK(x) do { \
@@ -190,7 +202,8 @@ static int test_basic(void)
         level == FTUN_LOG_TRACE);
   CHECK(ftun_log_level_parse("TRACE", &level) == FTUN_E_INVALID);
   CHECK(ftun_logger_create(&(ftun_logger_options_t){
-          FTUN_LOG_INFO, "/no/such/directory/ftun.log", 1u, 128u, NULL, NULL, NULL, false, 0u, 0u},
+          .level = FTUN_LOG_INFO, .path = "/no/such/directory/ftun.log",
+          .queue_capacity = 1u, .line_capacity = 128u},
         &logger) == FTUN_E_IO && logger == NULL);
   CHECK(pthread_cond_destroy(&writer.condition) == 0);
   CHECK(pthread_mutex_destroy(&writer.mutex) == 0);
@@ -226,7 +239,7 @@ static int record_valid(const writer_t *writer)
   size_t index;
   if (writer->calls != 1u || writer->length == 0u ||
       writer->output[writer->length - 1u] != '\n' ||
-      !contains(writer->output, writer->length, " message=")) return 0;
+      !contains(writer->output, writer->length, "[log   ][ERROR] ")) return 0;
   for (index = 0u; index + 1u < writer->length; index++) {
     unsigned char byte = (unsigned char)writer->output[index];
     if (byte < 0x20u || byte == 0x7fu) return 0;
@@ -234,32 +247,105 @@ static int record_valid(const writer_t *writer)
   return 1;
 }
 
-/* 带时间戳的前缀：ts 为 UTC 毫秒，seq 单调，boot 在进程内固定，id 仅在非零时出现。 */
+/* 文本只显示本地时间和op；序号与boot通过只读接口保持关联。 */
 static int stamped_line(writer_t *writer, uint64_t *seq, char *boot, bool *has_id,
   uint64_t *id, size_t *ts_ms)
 {
-  unsigned int year, month, day, hour, minute, second, millis;
-  unsigned long long sequence, correlation = 0u;
-  char hex[32];
-  const char *cursor = writer->output;
+  unsigned int year, month, day, hour, minute, second, millis, zone_hour, zone_minute;
+  unsigned long long correlation = 0u;
+  char sign;
   int consumed = 0;
-  if (sscanf(cursor, "ts=%4u-%2u-%2uT%2u:%2u:%2u.%3uZ seq=%llu boot=%16[0-9a-f] %n",
-             &year, &month, &day, &hour, &minute, &second, &millis, &sequence,
-             hex, &consumed) != 9 || consumed == 0 || strlen(hex) != 16u) return 0;
+  const char *op;
+  if (sscanf(writer->output, "[%4u-%2u-%2u %2u:%2u:%2u.%3u %c%2u%2u]%n",
+      &year, &month, &day, &hour, &minute, &second, &millis, &sign,
+      &zone_hour, &zone_minute, &consumed) != 10 || consumed == 0) return 0;
   if (year < 2024u || month < 1u || month > 12u || day < 1u || day > 31u ||
-      hour > 23u || minute > 59u || second > 60u || millis > 999u) return 0;
-  *has_id = sscanf(cursor + consumed, "id=%llu ", &correlation) == 1;
-  if (*has_id) {
-    char text[40];
-    int id_width = snprintf(text, sizeof(text), "id=%llu ", correlation);
-    consumed += id_width;
-  }
-  if (strncmp(cursor + consumed, "level=", 6u) != 0) return 0;
-  *seq = sequence;
+      hour > 23u || minute > 59u || second > 60u || millis > 999u ||
+      (sign != '+' && sign != '-') || zone_hour > 23u || zone_minute > 59u) return 0;
+  if (strncmp(writer->output + consumed, "[log   ][ERROR] diagnostic:", 26u) != 0 ||
+      strstr(writer->output, "seq=") != NULL || strstr(writer->output, "boot=") != NULL) return 0;
+  op = strstr(writer->output, " op=");
+  *has_id = op != NULL && sscanf(op, " op=%llu", &correlation) == 1;
+  *seq = ftun_log_last_sequence();
   *id = correlation;
   *ts_ms = ((size_t)hour * 3600u + (size_t)minute * 60u + second) * 1000u + millis;
-  memcpy(boot, hex, 17u);
+  (void)snprintf(boot, 17u, "%016llx", (unsigned long long)ftun_log_boot_id());
   return 1;
+}
+
+static int test_structured_record(void)
+{
+  const ftun_log_event_t answer = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "dns.answer", "answer"};
+  const ftun_log_event_t trace = {FTUN_LOG_DNS, FTUN_LOG_TRACE, "dns.query", "query"};
+  ftun_log_field_t fields[] = {
+    {.key = "name", .kind = FTUN_LOG_TEXT, .value.text = {"x=\"\n", 4u}},
+    {.key = "count", .kind = FTUN_LOG_U64, .value.u64 = UINT64_MAX},
+    {.key = "signed", .kind = FTUN_LOG_I64, .value.i64 = INT64_MIN}
+  };
+  ftun_log_record_t record = {.event = &answer, .generation = 3u, .sid = 8812u,
+    .operation = 42u, .fields = fields, .field_count = 3u};
+  ftun_logger_options_t options = {0};
+  ftun_logger_t *logger = NULL;
+  writer_t writer;
+  unsigned int evaluated = 0u;
+  CHECK(capture_init(&writer) == 0);
+  options.level = FTUN_LOG_DEBUG;
+  options.writer = write_line;
+  options.writer_user = &writer;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  CHECK(ftun_logger_enabled(logger, FTUN_LOG_DEBUG) && !ftun_logger_enabled(logger, FTUN_LOG_TRACE));
+  CHECK(ftun_logger_record(logger, &record) == FTUN_OK && ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(strcmp(writer.output, "[dns   ][DEBUG] answer: sid=8812 op=42 gen=3 name=\"x=\\\"\\n\" count=18446744073709551615 signed=-9223372036854775808\n") == 0);
+  FTUN_LOG(logger, &trace, .field_count = ++evaluated);
+  CHECK(evaluated == 0u);
+  record.event = &trace;
+  record.fields = (const ftun_log_field_t *)(uintptr_t)1u;
+  CHECK(ftun_logger_record(logger, &record) == FTUN_OK);
+  record.event = &answer;
+  record.fields = fields;
+  fields[0].key = "injected field";
+  CHECK(ftun_logger_record(logger, &record) == FTUN_E_INVALID);
+  record.field_count = FTUN_LOG_MAX_FIELDS + 1u;
+  CHECK(ftun_logger_record(logger, &record) == FTUN_E_INVALID);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(capture_destroy(&writer) == 0);
+  return 0;
+}
+
+static int test_priority_reserve(void)
+{
+  ftun_logger_options_t options = {0};
+  ftun_logger_t *logger = NULL;
+  ftun_logger_usage_t usage;
+  ftun_diagnostic_t item = diagnostic("/queue", "bounded queue");
+  writer_t writer;
+  size_t index;
+  CHECK(capture_init(&writer) == 0);
+  writer.blocked = 1;
+  options.level = FTUN_LOG_INFO;
+  options.queue_capacity = 16u;
+  options.writer = write_line;
+  options.writer_user = &writer;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  CHECK(ftun_logger_write(logger, FTUN_LOG_INFO, &item) == FTUN_OK);
+  CHECK(pthread_mutex_lock(&writer.mutex) == 0);
+  while (!writer.entered) CHECK(pthread_cond_wait(&writer.condition, &writer.mutex) == 0);
+  CHECK(pthread_mutex_unlock(&writer.mutex) == 0);
+  for (index = 0u; index < 14u; ++index)
+    CHECK(ftun_logger_write(logger, FTUN_LOG_INFO, &item) == FTUN_OK);
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_write(logger, FTUN_LOG_WARN, &item) == FTUN_OK);
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK);
+  CHECK(usage.queued == 16u && usage.emitted == 16u && usage.dropped == 2u);
+  CHECK(pthread_mutex_lock(&writer.mutex) == 0);
+  writer.blocked = 0;
+  CHECK(pthread_cond_broadcast(&writer.condition) == 0);
+  CHECK(pthread_mutex_unlock(&writer.mutex) == 0);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 16u);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(capture_destroy(&writer) == 0);
+  return 0;
 }
 
 static int test_stamp(void)
@@ -303,8 +389,8 @@ static int test_format_and_bound(void)
 {
   static const char path[] = {'/', 'x', '\n', '\r', '\t', '\\', 0, 1, 127};
   static const char expected[] =
-    "level=error status=io stage=7 native=28 "
-    "path=/x\\n\\r\\t\\\\\\0\\x01\\x7f message=a\\nb\\rc\\t\\\\\n";
+    "[log   ][ERROR] diagnostic: err=io stage=7 native=28 "
+    "path=\"/x\\n\\r\\t\\\\\\0\\x01\\x7f\" message=\"a\\nb\\rc\\t\\\\\"\n";
   writer_t writer;
   ftun_logger_t *logger = NULL;
   ftun_logger_options_t options;
@@ -331,10 +417,10 @@ static int test_format_and_bound(void)
   item = diagnostic("/plain", "ordinary failure");
   CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK);
-  CHECK(writer.length == strlen("level=error status=io stage=7 native=28 "
-    "path=/plain message=ordinary failure\n"));
-  CHECK(memcmp(writer.output, "level=error status=io stage=7 native=28 "
-    "path=/plain message=ordinary failure\n", writer.length) == 0);
+  CHECK(writer.length == strlen("[log   ][ERROR] diagnostic: err=io stage=7 native=28 "
+    "path=/plain message=\"ordinary failure\"\n"));
+  CHECK(memcmp(writer.output, "[log   ][ERROR] diagnostic: err=io stage=7 native=28 "
+    "path=/plain message=\"ordinary failure\"\n", writer.length) == 0);
   CHECK(capture_reset(&writer) == 0);
   item = diagnostic("", "a\nb\rc\t\\");
   item.path = (ftun_string_t){path, sizeof(path)};
@@ -391,7 +477,7 @@ static int test_format_and_bound(void)
     CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
     CHECK(ftun_logger_flush(logger) == FTUN_OK);
     CHECK(record_valid(&writer) && writer.length < index &&
-          contains(writer.output, writer.length, "...\n"));
+          contains(writer.output, writer.length, "...\"\n"));
     CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
           usage.truncated == 1u && usage.redacted == 0u);
     CHECK(capture_reset(&writer) == 0);
@@ -462,7 +548,7 @@ static void *produce_lines(void *user)
       break;
     }
     (void)pthread_mutex_unlock(&state->mutex);
-    status = ftun_log_emit(state->core, &item);
+    status = ftun_log_enabled(state->core, FTUN_LOG_ERROR) ? ftun_log_emit(state->core, &item) : FTUN_E_AGAIN;
     (void)pthread_mutex_lock(&state->mutex);
     if (status == FTUN_OK) state->accepted++;
     else if (status == FTUN_E_AGAIN) state->absent++;
@@ -689,14 +775,70 @@ static int test_guard_scope(void)
   return 0;
 }
 
+static int test_core_gate(void)
+{
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_logger_t *logger = NULL;
+  writer_t writer;
+  unsigned evaluated = 0u;
+  static const ftun_log_event_t event = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "test.query", "query"};
+  CHECK(capture_init(&writer) == 0);
+  CHECK(ftun_budget_create(NULL, 65536u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_core_context_create(budget, &core) == FTUN_OK);
+  CHECK(!ftun_log_enabled(core, FTUN_LOG_ERROR));
+  for (ftun_log_level_t level = FTUN_LOG_SILENT; level <= FTUN_LOG_TRACE; level++) {
+    ftun_logger_options_t options = {.level = level, .writer = write_line, .writer_user = &writer};
+    CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+    CHECK(ftun_core_context_publish_logger(core, logger, level == FTUN_LOG_SILENT) == FTUN_OK);
+    for (ftun_log_level_t wanted = FTUN_LOG_ERROR; wanted <= FTUN_LOG_TRACE; wanted++)
+      CHECK(ftun_log_enabled(core, wanted) == (wanted <= level));
+    unsigned before = evaluated;
+    FTUN_CORE_LOG(core, &event, .sid = ++evaluated);
+    CHECK(evaluated == before + (level >= FTUN_LOG_DEBUG ? 1u : 0u));
+    CHECK(ftun_core_context_finish_logging(core, NULL) == FTUN_OK);
+    CHECK(!ftun_log_enabled(core, FTUN_LOG_ERROR));
+    FTUN_CORE_LOG(core, &event, .sid = ++evaluated);
+    CHECK(evaluated == before + (level >= FTUN_LOG_DEBUG ? 1u : 0u));
+    CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  }
+  CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(capture_destroy(&writer) == 0);
+  return 0;
+}
+
+static const char *full_alias;
+static const char *fail_open_path;
+ftun_status_t __real_ftun_platform_file_open_append(const char *, bool, ftun_file_handle_t *, uint64_t *);
+ftun_status_t __wrap_ftun_platform_file_open_append(const char *path, bool truncate,
+  ftun_file_handle_t *out, uint64_t *size)
+{
+  if (fail_open_path != NULL && strcmp(path, fail_open_path) == 0) return FTUN_E_IO;
+  return __real_ftun_platform_file_open_append(
+    full_alias != NULL && strcmp(path, full_alias) == 0 ? "/dev/full" : path,
+    truncate, out, size);
+}
+
+static int remove_log_lock(const char *path)
+{
+  char lock_path[512];
+  CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", path) > 0);
+  CHECK(unlink(lock_path) == 0);
+  return 0;
+}
+
 static int test_real_sinks(void)
 {
   char directory[] = "/tmp/ftun-logger-XXXXXX";
   char path[256];
+  char full[256];
   char bytes[4096];
   ftun_logger_options_t options;
   ftun_logger_t *logger = NULL;
   ftun_logger_usage_t usage;
+  ftun_file_lock_t *contender = NULL;
+  char lock_path[300];
   ftun_diagnostic_t item = diagnostic("/sink", "write failed");
   ftun_budget_t *budget = NULL;
   ftun_core_t *core = NULL;
@@ -712,6 +854,7 @@ static int test_real_sinks(void)
   ssize_t count;
   CHECK(mkdtemp(directory) != NULL);
   CHECK(snprintf(path, sizeof(path), "%s/output", directory) > 0);
+  CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", path) > 0);
   memset(&options, 0, sizeof(options));
   options.level = FTUN_LOG_ERROR;
   options.queue_capacity = 2u;
@@ -730,17 +873,40 @@ static int test_real_sinks(void)
   CHECK(reader >= 0);
   count = read(reader, bytes, sizeof(bytes));
   CHECK(count > 7 && memcmp(bytes, "prefix\n", 7u) == 0 &&
-        contains(bytes + 7u, (size_t)count - 7u, "message=write failed\n"));
+        contains(bytes + 7u, (size_t)count - 7u, "message=\"write failed\"\n"));
   CHECK(close(reader) == 0 && unlink(path) == 0);
 
-  options.path = "/dev/full";
-  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
-  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
-  CHECK(ftun_logger_flush(logger) == FTUN_OK);
-  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
-        usage.emitted == 1u && usage.io_errors == 1u && usage.queued == 0u);
-  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(snprintf(full, sizeof(full), "%s/full", directory) > 0);
+  {
+    int errors[2], saved_error;
+    char notification[256];
+    ssize_t received;
+    CHECK(pipe(errors) == 0);
+    saved_error = dup(STDERR_FILENO);
+    CHECK(saved_error >= 0 && dup2(errors[1], STDERR_FILENO) == STDERR_FILENO);
+    CHECK(close(errors[1]) == 0);
+    full_alias = full;
+    options.path = full;
+    CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+    ftun_atomic_store(&notice_clock_offset, UINT64_C(60001));
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+    CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
+          usage.emitted == 3u && usage.io_errors == 3u && usage.queued == 0u);
+    CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+    ftun_atomic_store(&notice_clock_offset, 0u);
+    CHECK(dup2(saved_error, STDERR_FILENO) == STDERR_FILENO && close(saved_error) == 0);
+    received = read(errors[0], notification, sizeof(notification));
+    CHECK(received > 0 && contains(notification, (size_t)received, "[log   ][ERROR] write failed (first): count=1") &&
+      contains(notification, (size_t)received, "write failed: count=2") && contains(notification, (size_t)received, "err=io native=28"));
+    CHECK(close(errors[0]) == 0);
+  }
 
+  full_alias = NULL;
   options.path = path;
   CHECK(mkfifo(path, 0600) == 0);
   reader = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
@@ -780,6 +946,7 @@ static int test_real_sinks(void)
   CHECK(ftun_core_context_set_logger(core, NULL) == FTUN_OK);
   CHECK(ftun_logger_destroy_until(&logger, started) == FTUN_E_TIMEOUT &&
         logger != NULL);
+  CHECK(ftun_file_lock_acquire(lock_path, &contender) == FTUN_E_AGAIN);
   CHECK(ftun_monotonic_now(&now) == FTUN_OK && now - started < 1000u);
   CHECK(ftun_core_context_destroy(&core) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
@@ -809,7 +976,11 @@ static int test_real_sinks(void)
   CHECK(received == filled + 2u * (sizeof(bytes) - 1u) && newlines == 2u &&
         usage.io_errors == 0u && usage.emitted == 2u);
   CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
-  CHECK(close(reader) == 0 && unlink(path) == 0 && rmdir(directory) == 0);
+  CHECK(ftun_file_lock_acquire(lock_path, &contender) == FTUN_OK);
+  CHECK(ftun_file_lock_release(&contender) == FTUN_OK);
+  CHECK(close(reader) == 0 && unlink(path) == 0);
+  CHECK(remove_log_lock(path) == 0 && remove_log_lock(full) == 0);
+  CHECK(rmdir(directory) == 0);
   return 0;
 }
 
@@ -879,6 +1050,41 @@ static int test_rotation_and_reopen(void)
   CHECK(unlink(path) == 0 && unlink(older) == 0 && unlink(oldest) == 0 &&
         unlink(moved) == 0);
 
+  /* 改名失败保留旧FD；候选打开失败时，已移到.1的旧FD仍能交付本条日志。 */
+  options.max_files = 2u;
+  options.max_size = 1u;
+  CHECK(mkdir(older, 0700) == 0);
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  item = diagnostic("/before-rename", "first");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  item = diagnostic("/rename-failed", "retained");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(file_has(path, "/before-rename") && file_has(path, "/rename-failed"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
+    usage.io_errors == 0u && usage.rotate_errors == 1u);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK && rmdir(older) == 0 && unlink(path) == 0);
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  item = diagnostic("/before-open", "first");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  fail_open_path = path;
+  item = diagnostic("/open-failed", "retained");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(file_has(older, "/before-open") && file_has(older, "/open-failed"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
+    usage.io_errors == 0u && usage.rotate_errors == 1u);
+  CHECK(ftun_logger_reopen(logger) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  item = diagnostic("/reopen-failed", "retained");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK && file_has(older, "/reopen-failed"));
+  fail_open_path = NULL;
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK && unlink(older) == 0);
+  options.max_size = 600u;
+
   /* max_files 为 1：超限直接截断重写，不产生其他文件。 */
   options.max_files = 1u;
   CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
@@ -888,7 +1094,7 @@ static int test_rotation_and_reopen(void)
   }
   CHECK(file_size(path) <= 600u && file_size(older) == SIZE_MAX);
   CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
-  CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+  CHECK(unlink(path) == 0 && remove_log_lock(path) == 0 && rmdir(directory) == 0);
 
   /* 自定义 writer 不支持轮转与重新打开。 */
   {
@@ -912,10 +1118,13 @@ static int test_rotation_and_reopen(void)
 
 int main(void)
 {
+  CHECK(test_core_gate() == 0);
   CHECK(test_rotation_and_reopen() == 0);
   CHECK(test_basic() == 0);
   CHECK(test_format_and_bound() == 0);
   CHECK(test_stamp() == 0);
+  CHECK(test_structured_record() == 0);
+  CHECK(test_priority_reserve() == 0);
   CHECK(test_guard_scope() == 0);
   CHECK(test_real_sinks() == 0);
   CHECK(test_publish_concurrency() == 0);

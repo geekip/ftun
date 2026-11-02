@@ -115,7 +115,7 @@ def run_reserved_case(binary, directory, kind, proxy, upstream, echo_port, reser
     listener = reservations[0].getsockname()[1]
     proxy_port = reservations[2].getsockname()[1]
     config = {"base": {"state-cache": False},
-              "log": {"level": "warn" if kind == "file" else "silent",
+              "log": {'output': 'file', "level": "warn" if kind == "file" else "silent",
                       "file": str(directory / f"{kind}.log")},
               "dns": {"enable": True, "cache": False,
                       "fake-ip": {"enable": False},
@@ -161,7 +161,7 @@ def run_reserved_case(binary, directory, kind, proxy, upstream, echo_port, reser
     flags = fcntl.fcntl(writer, fcntl.F_GETFL)
     for sock in reservations:
         sock.close()
-    process = subprocess.Popen([str(binary), "run", "-c", str(path)],
+    process = subprocess.Popen([str(binary), "run", "-c", str(path), "-p", str(path) + ".pid"],
                                stdout=subprocess.DEVNULL, stderr=writer)
     stream = None
     captured = b""

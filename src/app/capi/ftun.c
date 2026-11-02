@@ -4,6 +4,7 @@
 #include "platform/file.h"
 #include "app/runtime_internal.h"
 #include "proxy/diagnostics.h"
+#include <stdio.h>
 
 
 ftun_app_cleanup_t ftun_core_cleanup(ftun_core_control_t *control)
@@ -158,9 +159,63 @@ ftun_status_t ftun_core_prepare_parent(const char *path)
   return FTUN_OK;
 }
 
+ftun_status_t ftun_app_control_set_no_color(ftun_core_t *core, bool no_color)
+{
+  ftun_core_control_t *control;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  ftun_mutex_lock(&control->mutex);
+  status = control->state == FTUN_CORE_CREATED ? FTUN_OK : FTUN_E_STALE;
+  if (status == FTUN_OK) control->log_no_color = no_color;
+  ftun_mutex_unlock(&control->mutex);
+  return status;
+}
+
+ftun_status_t ftun_app_control_set_verbosity(ftun_core_t *core, unsigned int verbosity)
+{
+  ftun_core_control_t *control;
+  if (verbosity > 2u) return FTUN_E_INVALID;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  ftun_mutex_lock(&control->mutex);
+  status = control->state == FTUN_CORE_CREATED ? FTUN_OK : FTUN_E_STALE;
+  if (status == FTUN_OK) control->log_level_override = verbosity == 0u ? FTUN_LOG_SILENT :
+    verbosity == 1u ? FTUN_LOG_DEBUG : FTUN_LOG_TRACE;
+  ftun_mutex_unlock(&control->mutex);
+  return status;
+}
+
+ftun_status_t ftun_app_control_set_background(ftun_core_t *core, bool background)
+{
+  ftun_core_control_t *control;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  ftun_mutex_lock(&control->mutex);
+  status = control->state == FTUN_CORE_CREATED ? FTUN_OK : FTUN_E_STALE;
+  if (status == FTUN_OK) control->log_file_only = background;
+  ftun_mutex_unlock(&control->mutex);
+  return status;
+}
+
+ftun_status_t ftun_app_control_set_ready(ftun_core_t *core,
+  ftun_app_ready_fn ready, void *user)
+{
+  ftun_core_control_t *control;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  ftun_mutex_lock(&control->mutex);
+  status = control->state == FTUN_CORE_CREATED ? FTUN_OK : FTUN_E_STALE;
+  if (status == FTUN_OK) {
+    control->ready = ready;
+    control->ready_user = user;
+  }
+  ftun_mutex_unlock(&control->mutex);
+  return status;
+}
+
 ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
-                                              ftun_log_ledger_t *ledger,
-                                              ftun_logger_t **out)
+                                              ftun_log_ledger_t *ledger, bool no_color, bool file_only, ftun_log_level_t level_override,
+                                              ftun_logger_t **out, char *file_error)
 {
   ftun_logger_options_t options;
   ftun_log_level_t level;
@@ -169,19 +224,33 @@ ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
   status = ftun_log_level_parse(config->log.level, &level);
   if (status != FTUN_OK) return status;
+  if (level_override != FTUN_LOG_SILENT) level = level_override;
   if (level == FTUN_LOG_SILENT) return FTUN_OK;
-  status = ftun_core_prepare_parent(config->log.file);
-  if (status != FTUN_OK) return status;
+  if (file_only || strcmp(config->log.output, "stderr") != 0) {
+    status = ftun_core_prepare_parent(config->log.file);
+    if (status != FTUN_OK) {
+      (void)snprintf(file_error, FTUN_APP_CONTROL_PATH_CAPACITY, "%s", config->log.file);
+      return status;
+    }
+  }
   memset(&options, 0, sizeof(options));
   options.level = level;
-  options.path = config->log.file;
-  options.max_size = config->log.max_size;
-  options.max_files = config->log.max_files;
+  options.no_color = no_color;
+  options.stderr_output = !file_only && strcmp(config->log.output, "file") != 0;
+  if (file_only || strcmp(config->log.output, "stderr") != 0) {
+    options.path = config->log.file;
+    options.max_size = config->log.max_size;
+    options.max_files = config->log.max_files;
+  }
   options.queue_capacity = 128u;
   options.stamp = true;
   options.line_capacity = 1024u;
   options.ledger = ledger;
-  return ftun_logger_create(&options, out);
+  status = ftun_logger_create(&options, out);
+  if (status != FTUN_OK && options.path != NULL) {
+    (void)snprintf(file_error, FTUN_APP_CONTROL_PATH_CAPACITY, "%s", options.path);
+  }
+  return status;
 }
 
 ftun_status_t ftun_core_logger_reap(ftun_core_control_t *control,
@@ -351,8 +420,7 @@ ftun_status_t ftun_core_create_with_service(
     status = FTUN_E_LIMIT;
     goto fail;
   }
-  control->tasks = (ftun_control_task_t **)calloc(
-    operation_capacity, sizeof(*control->tasks));
+  control->tasks = malloc(operation_capacity * sizeof(*control->tasks));
   if (control->tasks == NULL) {
     status = FTUN_E_LIMIT;
     goto fail;
@@ -399,7 +467,12 @@ ftun_status_t ftun_core_create_with_service(
   }
   if (status == FTUN_OK) status = ftun_event_log_reason_name(control->events,
     FTUN_LIFECYCLE_REASON_FRS_UPDATE, "frs-update");
+  if (status == FTUN_OK) status = ftun_log_aggregate_create(budget, &control->aggregate);
   if (status == FTUN_OK) status = ftun_log_ledger_create(budget, &control->log_ledger);
+  if (status == FTUN_OK && control->support != NULL) {
+    status = ftun_file_lock_pool_create(budget, &control->state_locks);
+  }
+  if (status == FTUN_OK) status = ftun_core_context_set_aggregate(core, control->aggregate);
   if (status == FTUN_OK) status = ftun_core_context_set_event_log(core, control->events);
   if (status != FTUN_OK) goto fail;
   status = ftun_core_context_set_control(core, control);
@@ -409,7 +482,11 @@ ftun_status_t ftun_core_create_with_service(
 
 fail:
   if (control != NULL) {
-    if (core != NULL) (void)ftun_core_context_set_event_log(core, NULL);
+    if (core != NULL) {
+      (void)ftun_core_context_set_event_log(core, NULL);
+      (void)ftun_core_context_set_aggregate(core, NULL);
+    }
+    ftun_log_aggregate_destroy(&control->aggregate);
     (void)ftun_event_log_destroy(&control->events);
     if (control->reload_worker != NULL) {
       (void)ftun_worker_stop(control->reload_worker);
@@ -422,6 +499,7 @@ fail:
       (void)ftun_worker_destroy(&control->state_worker);
     }
     (void)ftun_log_ledger_destroy(&control->log_ledger);
+    (void)ftun_file_lock_pool_destroy(&control->state_locks);
     (void)ftun_operation_queue_destroy(&control->operations);
     if (condition_initialized) {
       ftun_condition_destroy(&control->condition);
@@ -506,6 +584,10 @@ static void ftun_control_task_complete(ftun_operation_t *operation,
       (result.status == FTUN_E_CANCELLED ? FTUN_APP_COMMAND_CANCELLED : FTUN_APP_COMMAND_FAILED);
     value.error = result;
     value.generation = task->result_generation;
+    if (task->kind == FTUN_CONTROL_RELOAD) {
+      memcpy(value.file_error, task->file_error, sizeof(value.file_error));
+      value.config_error = task->config_error;
+    }
     if (value.generation == 0u) {
       ftun_mutex_lock(&control->mutex);
       value.generation = ftun_core_generation_now(control);
@@ -527,13 +609,13 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
                                       ftun_completion_fn completion, void *user,
                                       ftun_operation_t **out,
                                       const ftun_app_generation_guard_t *expected,
-                                      ftun_app_command_completion_fn command_completion)
+  ftun_app_command_completion_fn command_completion, uint32_t source_signal)
 {
   ftun_core_control_t *control = NULL;
   ftun_control_task_t *task = NULL;
   ftun_operation_t *operation = NULL;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
-  size_t charge = sizeof(*task);
+  size_t charge = sizeof(*task) + (kind == FTUN_CONTROL_RELOAD ? FTUN_APP_CONTROL_PATH_CAPACITY : 0u);
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (core == NULL || (completion == NULL && command_completion == NULL) || out == NULL ||
@@ -568,7 +650,8 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
     ? ftun_budget_reserve(control->budget, charge, &reservation)
     : ftun_budget_reserve_cleanup(control->budget, charge, &reservation);
   if (status != FTUN_OK) return status;
-  task = (ftun_control_task_t *)calloc(1u, sizeof(*task));
+  task = (ftun_control_task_t *)calloc(1u, sizeof(*task) +
+    (kind == FTUN_CONTROL_RELOAD ? FTUN_APP_CONTROL_PATH_CAPACITY : 0u));
   if (task == NULL) {
     ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
@@ -589,6 +672,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
     goto fail;
   }
   task->core = core;
+  task->source_signal = source_signal;
   task->completion = completion;
   task->command_completion = command_completion;
   if (expected != NULL) task->expected = *expected;
@@ -642,6 +726,7 @@ static ftun_status_t ftun_core_submit(ftun_core_t *core,
   if (kind == FTUN_CONTROL_RELOAD) {
     control->reload_pending = 1;
     ftun_core_event(control, FTUN_LIFECYCLE_RELOAD_REQUESTED, ftun_core_generation_now(control), FTUN_OK);
+    ftun_core_signal_reload_log(task, control, true, FTUN_OK);
   }
   if (control->service.implementation != NULL) {
     (void)ftun_core_service_wakeup(&control->service);
@@ -660,7 +745,7 @@ ftun_status_t ftun_core_post(ftun_core_t *core, ftun_completion_fn callback,
                              void *user, ftun_operation_t **out)
 {
   return ftun_core_submit(core, FTUN_CONTROL_POST, NULL, NULL,
-                          callback, user, out, NULL, NULL);
+                          callback, user, out, NULL, NULL, 0u);
 }
 
 static ftun_status_t ftun_core_reload_admission(ftun_core_t *core, ftun_status_t status)
@@ -674,6 +759,7 @@ static ftun_status_t ftun_core_reload_admission(ftun_core_t *core, ftun_status_t
     /* 接纳入口可跨线程；代次与发布在 control 锁内捕获。 */
     ftun_mutex_lock(&control->mutex);
     if (control->lifecycle_started) {
+      ftun_core_reload_observe_locked(control, status);
       event.generation = ftun_core_generation_now(control);
       (void)ftun_lifecycle_emit(core, &event);
     }
@@ -687,7 +773,7 @@ ftun_status_t ftun_core_reload(ftun_core_t *core, const char *path,
                                ftun_operation_t **out)
 {
   return ftun_core_reload_admission(core, ftun_core_submit(core, FTUN_CONTROL_RELOAD, path, NULL,
-                          callback, user, out, NULL, NULL));
+                          callback, user, out, NULL, NULL, 0u));
 }
 
 ftun_status_t ftun_core_select(ftun_core_t *core, const char *group_name,
@@ -696,7 +782,7 @@ ftun_status_t ftun_core_select(ftun_core_t *core, const char *group_name,
                                ftun_operation_t **out)
 {
   return ftun_core_submit(core, FTUN_CONTROL_SELECT, group_name, member_name,
-                          callback, user, out, NULL, NULL);
+                          callback, user, out, NULL, NULL, 0u);
 }
 
 ftun_status_t ftun_app_control_submit(ftun_core_t *core,
@@ -710,7 +796,7 @@ ftun_status_t ftun_app_control_submit(ftun_core_t *core,
       (command->kind == FTUN_APP_COMMAND_RELOAD && command->second != NULL)) return FTUN_E_INVALID;
   status = ftun_core_submit(core, command->kind == FTUN_APP_COMMAND_RELOAD ?
     FTUN_CONTROL_RELOAD : FTUN_CONTROL_SELECT, command->first, command->second,
-    NULL, user, out, &command->expected, completion);
+    NULL, user, out, &command->expected, completion, command->source_signal);
   return command->kind == FTUN_APP_COMMAND_RELOAD ? ftun_core_reload_admission(core, status) : status;
 }
 
@@ -926,6 +1012,18 @@ static ftun_status_t ftun_core_service_round(ftun_core_t *core,
   return FTUN_OK;
 }
 
+ftun_status_t ftun_app_control_bind_server(ftun_core_t *core, ftun_ctl_server_t *server)
+{
+  ftun_core_control_t *control;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  ftun_mutex_lock(&control->mutex);
+  if (control->state != FTUN_CORE_CREATED && !(server == NULL && control->run_returned)) status = FTUN_E_STALE;
+  else control->ctl_server = server;
+  ftun_mutex_unlock(&control->mutex);
+  return status;
+}
+
 ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
 {
   ftun_core_control_t *control = NULL;
@@ -941,6 +1039,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
     ftun_mutex_unlock(&control->mutex);
     return FTUN_E_STALE;
   }
+  (void)ftun_monotonic_now(&control->run_started_ms);
   control->state = FTUN_CORE_STARTING;
   control->owner_valid = 1;
   control->callbacks_enabled = true;
@@ -954,6 +1053,7 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   control->runtime_stopped = false;
   control->run_returned = false;
   control->run_result = FTUN_OK;
+  control->startup_error = (ftun_error_t){0};
   ftun_mutex_unlock(&control->mutex);
   (void)ftun_event_log_begin(control->events);
   ftun_core_event(control, FTUN_LIFECYCLE_STARTING, ftun_core_generation_now(control), FTUN_OK);
@@ -983,7 +1083,11 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   if (status == FTUN_OK) status = ftun_core_watchdog_open(control);
   if (status != FTUN_OK) {
     ftun_status_t cleanup_status;
+    ftun_config_error_log(core, &control->config_trace.error, ftun_core_generation_now(control), 0u);
     ftun_core_recovery_close(control);
+    ftun_mutex_lock(&control->mutex);
+    control->startup_error = (ftun_error_t){status, stage, 0};
+    ftun_mutex_unlock(&control->mutex);
     control->first_error = status;
     control->state_save_done = true;
     ftun_core_event(control, FTUN_LIFECYCLE_ROLLBACK, ftun_core_generation_now(control), status);
@@ -1014,7 +1118,17 @@ ftun_status_t ftun_core_run(ftun_core_t *core, const char *path)
   ftun_mutex_lock(&control->mutex);
   control->state = FTUN_CORE_RUNNING;
   ftun_core_event(control, FTUN_LIFECYCLE_RUNNING, ftun_core_generation_now(control), FTUN_OK);
-  ftun_watchdog_ready(control->watchdog);
+  {
+    bool announce = !control->stop_requested;
+    ftun_mutex_unlock(&control->mutex);
+    if (announce && control->ready != NULL) status = control->ready(core, control->ready_user);
+    if (announce && status == FTUN_OK) ftun_watchdog_ready(control->watchdog);
+    ftun_mutex_lock(&control->mutex);
+    if (status != FTUN_OK) {
+      control->startup_error = (ftun_error_t){status, FTUN_STAGE_CONTROL, 0};
+      control->stop_requested = 1;
+    }
+  }
   while (!control->stop_requested) {
     ftun_core_service_run_usage_t service_usage;
     ftun_control_task_t *task = NULL;
@@ -1285,9 +1399,12 @@ ftun_status_t ftun_app_control_query(ftun_core_t *core,
   out->runtime_stopped = control->runtime_stopped;
   out->run_returned = control->run_returned;
   out->run_result = control->run_result;
+  out->startup_error = control->startup_error;
   (void)ftun_log_ledger_get_usage(control->log_ledger, &out->log_totals);
+  (void)ftun_log_aggregate_query(core, &out->aggregation);
   out->config_trace = control->config_trace;
   out->config_trace_generation = control->config_trace_generation;
+  memcpy(out->file_error, control->file_error, sizeof(out->file_error));
   (void)ftun_event_log_get_usage(control->events, &out->events);
   {
     ftun_logger_t *logger = NULL;
@@ -1395,7 +1512,13 @@ ftun_status_t ftun_core_destroy(ftun_core_t **core)
   (void)ftun_core_context_set_event_log(owned, NULL);
   status = ftun_event_log_destroy(&control->events);
   if (status != FTUN_OK) return status;
+  (void)ftun_core_context_set_aggregate(owned, NULL);
+  ftun_log_aggregate_destroy(&control->aggregate);
   status = ftun_log_ledger_destroy(&control->log_ledger);
+  if (status != FTUN_OK) return status;
+  status = ftun_file_lock_release(&control->state_lock);
+  if (status != FTUN_OK) return status;
+  status = ftun_file_lock_pool_destroy(&control->state_locks);
   if (status != FTUN_OK) return status;
   status = ftun_budget_destroy(&control->data_budget);
   if (status != FTUN_OK) return status;

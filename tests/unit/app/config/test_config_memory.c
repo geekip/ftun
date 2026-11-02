@@ -245,6 +245,8 @@ static int loading(void)
   for (i = 1u; i <= attempts; i++) {
     fail_at = i; allocation_calls = 0u;
     CHECK(ftun_config_load_budget_traced(budget, path, &config, &trace) != FTUN_OK && config == NULL);
+    CHECK(trace.error.error.status == trace.status && trace.error.phase == trace.failed &&
+      trace.error.field[0] != '\0' && trace.error.message[0] != '\0');
     CHECK(live_bytes == 0u && check_usage(budget, 0u) == 0);
   }
   fail_at = 0u; tracking = false;

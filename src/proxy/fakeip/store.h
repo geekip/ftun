@@ -37,8 +37,10 @@ typedef struct {
   bool pending;
 } ftun_fakeip_store_info_t;
 
-/* 显式离线初始化。directory 必须不存在；成功时 identity、空 reservation
- * 日志和空 mappings 快照均已同步，run/open 从不隐式创建这些文件。 */
+/* 创建完整的新身份；directory已有任意目录项返回STALE。
+ * 同级0700临时目录内写入0600文件并取锁，文件/目录同步后整体无覆盖发布。
+ * 发布后失败保留完整身份并返回错误；发布前失败仅删除本次临时目录。
+ * open只校验，运行装配仅在nofollow查询返回EOF时调用初始化。 */
 ftun_status_t ftun_fakeip_store_initialize(
   const char *directory, const ftun_fakeip_store_identity_t *identity);
 ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,

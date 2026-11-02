@@ -46,14 +46,11 @@ static const ftun_build_capabilities_t ftun_capabilities = {
   sizeof(ftun_builtin_module_names) / sizeof(ftun_builtin_module_names[0])
 };
 
-static void ftun_build_diagnostic(ftun_diagnostic_t *out, ftun_status_t status,
+static void ftun_build_diagnostic(ftun_config_error_t *out, ftun_status_t status,
                                   const char *message)
 {
-  if (out == NULL) return;
-  memset(out, 0, sizeof(*out));
-  out->error.status = status;
-  out->message.data = message;
-  out->message.length = strlen(message);
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_COMPILE);
+  (void)ftun_config_error_set(out, status, "", message);
 }
 
 const ftun_build_capabilities_t *ftun_build_capabilities(void)
@@ -96,7 +93,7 @@ uint32_t ftun_config_required_modules(const ftun_config_t *config)
   return required;
 }
 
-ftun_status_t ftun_build_require_modules(uint32_t required, ftun_diagnostic_t *out)
+ftun_status_t ftun_build_require_modules(uint32_t required, ftun_config_error_t *out)
 {
   uint32_t missing;
   if ((required & ~(uint32_t)FTUN_BUILD_MODULE_ALL) != 0u) {
@@ -108,7 +105,7 @@ ftun_status_t ftun_build_require_modules(uint32_t required, ftun_diagnostic_t *o
     ftun_build_diagnostic(out, FTUN_E_UNSUPPORTED, "required build module is not built in");
     return FTUN_E_UNSUPPORTED;
   }
-  if (out != NULL) memset(out, 0, sizeof(*out));
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_COMPILE);
   return FTUN_OK;
 }
 

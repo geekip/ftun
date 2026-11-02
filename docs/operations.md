@@ -33,76 +33,98 @@ FTUN 自己的出站连接带 fwmark，TUN 自动路由用它把"FTUN 自己的�
 
 | 内容 | 默认位置 | 说明 |
 |---|---|---|
-| 状态缓存 | `base.cache-file`，默认 `~/.ftun/ftun.cache` | Group/Health 状态；`base.state-cache` 为 false 时不使用 |
-| FakeIP 状态目录 | `<base.cache-file>.fakeip` | `dns.fake-ip.persist` 为 true（默认）时，首次运行前必须先执行 `ftun fakeip init -c CONFIG`；缺失或损坏不会自动重建 |
-| FRS 规则文件 | 由 `frs` 配置 | 规则引用 FRS 集合时，启动会校验文件及所有引用的集合；本地文件损坏会阻止启动 |
-| 日志文件 | `log.file`，默认 `~/.ftun/ftun.log` | 见第 6 节 |
-| 实例锁 | `/run/ftun-net-<路由表号>.lock` | 仅 TUN 自动路由使用 |
+| 配置 | `~/.ftun/config.json` | 只有不带 `-c` 的 `run` 才在缺失时创建最小配置；新建目录 0700、文件 0600 |
+| PID 文件 | POSIX root：`/run/ftun/ftun.pid`；其他用户：`~/.ftun/ftun.pid` | `-p FILE` 可指定；进程持独占锁到实际退出，残留文件本身不表示实例存活 |
+| 本机控制端点 | PID 路径去掉末尾 `.pid` 后加 `.sock` | 例如 `/run/ftun/ftun.sock`；Unix 流套接字，权限 0600，仅相同 uid 或 root 可操作 |
+| 状态缓存 | `base.cache-file`，默认 `~/.ftun/ftun.cache` | Group/Health 快照；`base.state-cache=false` 时不使用；使用时持 `<cache-file>.lock` |
+| FakeIP 状态目录 | `<base.cache-file>.fakeip` | 持久模式只在整个目录不存在时自动创建；已有目录缺文件、损坏、池身份不符或锁冲突都拒绝启动 |
+| FRS 规则文件 | `frs.path` | 启动校验文件与被引用集合；不存在且配置自动更新时可先以未就绪状态启动 |
+| 日志文件 | `log.file`，默认 `~/.ftun/ftun.log` | file/both 或后台运行时使用，持 `<log.file>.lock`，防止不同实例混写 |
+| TUN 网络锁 | `/run/ftun-net-<路由表号>.lock` | 仅 TUN 自动路由使用 |
 
-FTUN 以运行用户的权限读写以上文件，目录权限请确保该用户可写（状态、日志）或可读（配置、FRS、CA）。
+配置中的相对文件路径以配置文件目录为基准。FTUN 以运行用户权限读写文件。多实例使用不同 PID、缓存、FakeIP、日志路径，并按第 2 节分配不同的网络标识。正常退出清理自身 PID 与控制端点；异常退出后可按锁状态接管残留路径。Unix 套接字路径受系统长度限制，实例目录应保持简短。
+
+FakeIP 初始化会生成 UUID、预留记录和空快照；身份建立成功前不分配映射。首次创建要求内核和文件系统支持原子、无覆盖的目录发布；Linux 使用 `renameat2(RENAME_NOREPLACE)`，无法使用时明确失败。重启沿用既有身份与映射，释放会话不会回收或跨域复用 FakeIP。备份应包含整个 `.fakeip` 目录；不能只删除其中某个文件来“修复”身份。变更持久化模式或实际地址池需要重启；同一 CIDR 的主机位别名会规范化为同一个池。
 
 ## 4. TLS 与 CA
 
-通过 HTTPS 下载 FRS 规则文件时，FTUN 总是校验服务端证书和主机名，没有关闭校验的选项。CA 证书包按下面的顺序取第一个存在的常规文件：
+HTTPS 下载总是校验证书链、有效期和主机名；数值 IPv4/IPv6 目标按 IP SAN 校验。可通过运行环境变量 `SSL_CERT_FILE` 指定 CA 文件；未指定时依次查询 `/etc/ssl/certs/ca-certificates.crt`、`/etc/pki/tls/certs/ca-bundle.crt`、`/etc/ssl/ca-bundle.pem`、`/etc/ssl/cert.pem`。没有可用 CA 时下载失败，已有规则继续使用。日志中的 `tls_code` 和 `tls_reason` 保留实际 TLS 库错误；没有关闭校验的选项。
 
-1. `/etc/ssl/certs/ca-certificates.crt`
-2. `/etc/pki/tls/certs/ca-bundle.crt`
-3. `/etc/ssl/ca-bundle.pem`
+## 5. 运行、查询与控制
 
-三个都不存在时下载被拒绝（精简系统请先安装 CA 证书包）。配置里目前没有自定义 CA 文件、证书固定或 IP SAN 校验的选项。
+```sh
+# 首次运行：缺失时创建默认配置，回环 SOCKS5 127.0.0.1:1080 + DIRECT
+ftun run
 
-## 5. 进程管理
+# 检查现有配置，不绑定端口、不创建持久身份
+ftun check -c /etc/ftun/config.json
+ftun check -c /etc/ftun/config.json --json
 
-### 信号与命令
+# 独立实例：后台启动在就绪后返回；服务管理器应使用前台方式
+ftun run -c /etc/ftun/config.json -p /run/ftun/edge.pid -b
+ftun status -p /run/ftun/edge.pid
+ftun dns status -p /run/ftun/edge.pid --json
+ftun proxy status -p /run/ftun/edge.pid --json
+ftun reload -p /run/ftun/edge.pid --timeout 30
+ftun stop -p /run/ftun/edge.pid --timeout 15
+```
 
-| 动作 | 命令 | 等价信号 |
-|---|---|---|
-| 停止 | `ftun stop PID` | `SIGTERM`（进程同样把 `SIGINT` 当作停止） |
-| 重载配置 | `ftun reload PID` | `SIGHUP` |
-| 重新打开日志文件 | `kill -USR1 PID` | `SIGUSR1` |
+`check` 的失败输出包含字段路径、阶段和原因；成功列出启用模块以及只在启动时才能验证的端口、权限、状态锁等条件。`check` 成功不保证网络可达。`run` 独立输出 `ready` 或 `ready (degraded: ...)`，即使日志设为 silent 也保留必要结果。`-b` 在 POSIX 上等待子进程完成就绪交接，启动期限为 60 秒；后台自动使用文件日志，输出实际文件位置。Windows 当前不支持 `-b` 和本机管理 IPC，直接前台运行；平台边界见[构建说明](building.md)。
 
-重载是事务性的：新配置整体通过校验与准备后才一起生效，失败时保持旧配置继续运行。`stop` 与 `reload` 只是对给定 PID 发送信号，不校验该 PID 是否是 FTUN 进程。
+省略定位参数时查询默认 PID 文件；`-p` 定位指定实例；数字 `PID` 与 `-p` 互斥。正常控制先检查 PID 文件锁，再核对控制端点的 PID/boot 身份。重载等待 `committed`、`rejected` 或 `restart-required`；准备失败保留旧配置，已建立连接保持旧代次。停止等待实际运行资源收尾。默认 stop 等待 15 秒、reload 等待 30 秒，`--timeout` 范围 1～3600 秒。
 
-### 退出码
+`--no-wait` 只取得接纳回执，不代表操作完成。命令带 `--json` 时 stdout 是单个 JSON 对象；操作的 `result`、`via`、`pid`、`op`、`generation`、`elapsed_ms` 等字段用于自动化。查询输出有数量和行数上限，超出标记 `truncated` 并保留总数；计数和模块状态来自同次 owner 快照。`status` 给出实例、配置代次、资源和日志账本；`dns status` 给出监听、上游、缓存与查询结果；`proxy status` 给出监听、组选择、出口计数及 FRS 状态。
 
-| 退出码 | 含义 | 是否应自动重启 |
-|---|---|---|
-| 0 | 正常停止 | 否 |
-| 1 | 配置或启动失败 | 视情况 |
-| 2 | 命令行用法错误 | 否 |
-| 3 | 运行时致命错误（内部状态损坏） | 是 |
-| 4 | 看门狗触发（主循环长时间无响应） | 是 |
+只有显式数字 PID 无法对应默认实例时，stop/reload 才可走原生信号方式。它不提供本机 IPC 的身份校验：stop 等待原生进程退出，reload 无法确认提交结果。信号提交后的结果未知返回 5，不能当作重载成功。`-p` 端点不可用时直接报告失败，不猜测进程。
 
-### 看门狗与服务管理器
+| 退出码 | 含义 |
+|---|---|
+| 0 | 查询/检查成功、已确认 committed/stopped；`--no-wait` 时仅表示 IPC 已接纳 |
+| 1 | 配置校验、启动预检或操作失败、拒绝、需要重启、找不到实例 |
+| 2 | 命令行用法错误 |
+| 3 | 运行时致命错误或模块启动失败 |
+| 4 | 看门狗触发 |
+| 5 | 等待超时或信号提交后拿不到真实终态；结果未知 |
 
-`base.watchdog` 默认 30 秒：主循环超过这个时长没有心跳，进程以退出码 4 停止，由服务管理器重启；设为 `null` 可以关闭。断网期间看门狗不会触发（恢复调度器不阻塞主循环）。
+### 服务管理器与信号
 
-在 systemd 下使用 `Type=notify`，FTUN 直接写 `NOTIFY_SOCKET`（不依赖 libsystemd），启动完成时发送 `READY=1`，并按 `WATCHDOG_USEC` 喂狗。`WatchdogSec` 必须大于 FTUN 自己的心跳间隔（约为 `base.watchdog` 的三分之一）。可直接使用的样例：
+前台模式支持 `SIGTERM`/`SIGINT` 停止、`SIGHUP` 重载、`SIGUSR1` 重开日志。信号处理器只通知安全控制通道；主循环处理配置和日志。
 
-- systemd：[packaging/systemd/ftun.service](../packaging/systemd/ftun.service)
-- OpenWrt procd：[packaging/openwrt/ftun.procd](../packaging/openwrt/ftun.procd)
+`base.watchdog` 默认 30 秒，主循环长时间没有心跳时退出 4；断网不应触发看门狗。systemd 使用 `Type=notify`，FTUN 直接写 `NOTIFY_SOCKET` 并按 `WATCHDOG_USEC` 喂狗，不依赖 libsystemd。服务管理器负责进程监督，FTUN 保持前台；不要同时使用 `-b`。
+
+- [systemd 样例](../packaging/systemd/ftun.service)：显式 PID 文件，reload/stop 使用可等待终态的 CLI。
+- [OpenWrt procd 样例](../packaging/openwrt/ftun.procd)：前台进程监督与 respawn。
+- [Padavan 启停样例](../packaging/padavan/ftun.sh)：通过 `-b` 启动，使用同一 PID 文件查询和控制。
 
 ## 6. 日志
 
-- `log.level`：`silent`、`error`、`warn`（默认）、`info`、`debug`、`trace`。
-- 文件日志按大小轮转：`log.max-size`（默认 10 MiB，0 不轮转，否则不小于 64 KiB）和 `log.max-files`（含当前文件，默认 3，范围 1～32）。超限时依次改名为 `<file>.1`、`<file>.2`……，超出保留数量的最旧文件被覆盖；`max-files` 为 1 时直接截断重写。
-- 配合外部 logrotate：它移走文件后向进程发送 `SIGUSR1`，之后的日志写入新建的文件。
-- 每行带时间戳、实例启动标识（`boot`）、序号（`seq`）和阶段，对端文本里的控制字符会被转义，不会伪造日志行。
-- 生命周期事件以 `event=` 字段记录，例如 `config.published`、`reload.committed`、`module.failed`、`network.changed`（网络监视器去抖后的变化批次）。
+`log.level` 可选 silent、error、warn、info（默认）、debug、trace；`log.output` 可选 stderr（默认）、file、both。`-v` 覆盖为 debug、`-vv` 覆盖为 trace，并在重载后保留。后台将 stderr/both 改为 file；silent 保持静默。终端 stderr 可给级别着色，`--no-color` 或 `NO_COLOR` 关闭颜色，文件永不带颜色码。
+
+```text
+[2026-11-02 10:00:00.123 +0800][proxy ][WARN ] dial failed (first): sid=42 gen=1 err=rejected entity=DIRECT errno=ECONNREFUSED
+[2026-11-02 10:01:00.123 +0800][proxy ][WARN ] dial failed: gen=1 err=rejected entity=DIRECT count=37 in=60s
+[2026-11-02 10:01:03.123 +0800][proxy ][INFO ] dial recovered: gen=1 entity=DIRECT count=40 duration_ms=63000
+```
+
+每行是本地毫秒时间、UTC 偏移、模块、级别和事件短语，随后是键值字段。`boot` 在启动行输出，序号由状态中的日志账本查询，不在每行重复；`sid` 关联 DNS 查询或代理会话，`op` 关联管理操作，`gen` 标识配置代次。对端文本经过控制字符转义和长度限制，密码不进入日志。
+
+info 记录生命周期、状态变化和故障恢复，正常转发不逐连接输出；debug 可见 DNS query/answer/cache hit 及 Proxy connect/rule matched/closed。详细日志可能因队列压力丢弃，应查看 `status --json` 中日志计数。重复故障按配置实体聚合：首次告警、60 秒窗口汇总、真实恢复后记录次数与持续时间；停止或实体退休时汇总未完成窗口，不伪报恢复。聚合表有固定容量，溢出使用模块计数，不按任意域名或客户端创建无限标签。
+
+文件轮转由 `log.max-size`（默认 10 MiB，0 不轮转，否则至少 64 KiB）和 `log.max-files`（含当前文件，默认 3，范围 1～32）控制。超限前依次移动到 `.1`、`.2` 等；只保留一个文件时截断重写。外部 logrotate 移走文件后发送 `SIGUSR1` 重开。writer 的丢弃、轮转和写入失败通过独立诊断报告，不递归入日志队列；计数仍可查询。文件写入的系统调用失败时，`native` 保留实际 POSIX errno 或 Windows 错误码，例如 Linux 的 `native=28` 表示 ENOSPC。日志写入成功不等同于文件已耐久落盘。
 
 ## 7. 断网、网络恢复与降级
 
-FTUN 的设计目标是"断网不退出，网络恢复后自动恢复服务"，具体行为：
+- 启动时没有网络：进程可降级运行。FRS 缺失但有自动更新配置时先未就绪，命中 FRS 规则的新连接被拒绝；本地 FRS 损坏仍拒绝启动。监听地址尚未配置时进入 waiting。
+- 运行中断网：连接按 TCP keepalive、写入进展和期限回收；DNS 多地址按健康状态切换。拨号、解析和下载故障聚合报告，其他入口继续工作。
+- 网络恢复：Linux 网络事件约 500 毫秒去抖后提前触发监听绑定、FRS 下载、URL-Test、UDP 出口及 TUN 对账。60 秒内超过 30 个变化批次形成风暴告警。
+- TUN：保护规则缺失会明确告警，对账补回后报告恢复；设备被删除后重建。关闭自动路由的平台仍需自行维护路由。
+- 内部状态损坏与看门狗可能结束实例；不能把一次超时直接理解为整个服务已停止。
 
-- **启动时没有网络**：进程正常启动。FRS 规则集合以未就绪状态启动，命中这些规则的新连接被拒绝，下载按退避重试；监听地址不存在时对应监听进入"等待恢复"，运行状态为降级。本地 FRS 文件损坏仍然会让启动失败，这与"没有网络"不同。
-- **运行中断网**：已有连接按各自的存活检测回收（TCP keepalive、`base.timeouts.write-progress`），服务继续运行；DNS 上游多地址时按被动健康检查切换，单个上游失败不会让进程退出。
-- **网络恢复**：内核网络事件（链路、地址、路由、策略规则）经约 500 毫秒去抖后，提前触发各恢复项（监听重新绑定、FRS 下载、url-test 重新探测、UDP 出口重试、TUN 对账），无需等待退避到期。事件风暴（60 秒内超过 30 批）会被计数并告警。
-- **TUN**：断网期间保护规则保留，不会把 FTUN 自己的流量卷入 TUN；恢复时先保证保护再恢复可达性。
-- **仍会导致进程退出的情况**：内部状态损坏（退出码 3）与看门狗触发（退出码 4）。其余故障按服务或对象隔离，不影响整个进程。
+## 8. 排错流程
 
-## 8. 排错线索
-
-- `ftun check -c CONFIG`：只做配置解析与校验，不启动服务。
-- `ftun version`：列出产物实际内置的模块。
-- 启动失败时错误信息给出失败阶段（`stage N`）；`event=` 行记录模块 `preparing/prepared/active/failed` 的顺序，可据此判断卡在哪个模块。
-- 断网期间"为什么某些连接被拒绝"：查日志里 FRS 是否仍未就绪（`frs-not-ready`）。
+1. 先执行 `ftun check -c CONFIG --json`，按 `field`、`stage`、`message` 修正配置；检查只读，不修复损坏状态。
+2. 执行 `ftun status -p PIDFILE --json`，核对 `boot`、配置路径、`generation`、各服务状态及资源拒绝/日志丢弃计数。
+3. DNS 故障查看 `dns status` 的监听、上游和缓存，结合 `upstream failures`、`response invalid`、`group switched` 与恢复事件判断。
+4. 代理故障查看 `proxy status` 的监听、出口和组选择；`frs-not-ready` 表示规则未就绪，`errno`/`tls_code`/`tls_reason` 给出实际底层原因。需要会话细节时用 `run -v`。
+5. reload 返回 `rejected` 或 `restart-required` 时活动代次保持原值；返回 5 时保留不确定结论，再查询状态和同一 `op` 的结果日志。
+6. 停止卡住时查看最后的 quiesced/drained/stopped 事件与剩余资源，不把信号已经发出视为资源已完成清理。

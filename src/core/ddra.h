@@ -99,4 +99,11 @@ ftun_status_t ftun_core_module_runtime_destroy_until(
 ftun_status_t ftun_core_module_runtime_get_info(
   const ftun_core_module_runtime_t *runtime, ftun_core_module_info_t *out);
 
+/* Composition在owner上借用已准备的服务；借用不得跨生命周期/重载调用。
+ * 未选择对应服务返回EOF，失败清空out；不遍历业务私有布局。 */
+ftun_status_t ftun_core_module_runtime_service(
+  const ftun_core_module_runtime_t *runtime,
+  const ftun_core_service_descriptor_t *descriptor,
+  const ftun_core_service_t **out);
+
 #endif

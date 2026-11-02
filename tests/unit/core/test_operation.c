@@ -394,6 +394,7 @@ static int test_waiters(void)
   memset(&c, 0, sizeof(c));
   CHECK(ftun_budget_create(NULL, 4096u, 256u, &budget) == FTUN_OK);
   CHECK(ftun_operation_queue_create(budget, 2u, &queue) == FTUN_OK);
+  CHECK(ftun_operation_complete((ftun_operation_token_t){queue, 1u, 1u}, success) == FTUN_E_STALE);
   /* 有额度时不排队。 */
   CHECK(ftun_operation_queue_wait(queue, &a, wake_ready, &wa) == FTUN_E_AGAIN);
   CHECK(ftun_operation_accept(queue, noop_completed, NULL, &first, &first_token) == FTUN_OK);

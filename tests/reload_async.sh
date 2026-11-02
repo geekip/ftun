@@ -129,16 +129,26 @@ while [ ! -f "$temporary/dns.ready" ] || [ ! -f "$temporary/echo.ready" ]; do
 done
 
 write_config "127.0.0.1:$dns_upstream_port"
-"$ftun_binary" run -c "$temporary/config.json" >"$temporary/ftun.log" 2>&1 &
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 sleep 0.1
 kill -0 "$ftun_pid"
 "$helper_binary" --socks-client "$socks_port" "127.0.0.1:$echo_port"
 
+# 数字PID只发送信号，退出5表示终态仍需由原有日志与数据面断言确认。
+reload_signal() {
+  if "$ftun_binary" reload "$ftun_pid"; then
+    echo "signal-only reload unexpectedly reported a terminal success" >&2
+    exit 1
+  else
+    test "$?" -eq 5
+  fi
+}
+
 # Resolving slow.example deliberately takes 700 ms in the bootstrap server.
 # Existing data-plane work must continue while the reload worker prepares it.
 write_config "slow.example:$dns_upstream_port"
-"$ftun_binary" reload "$ftun_pid"
+reload_signal
 sleep 0.05
 started=$(date +%s%3N)
 "$helper_binary" --socks-client "$socks_port" "127.0.0.1:$echo_port"
@@ -169,7 +179,7 @@ committed_before=$(grep -c 'reload committed' "$temporary/ftun.log" || true)
 dns_client_pid=$!
 sleep 0.1
 write_config "127.0.0.1:$dns_upstream_port"
-"$ftun_binary" reload "$ftun_pid"
+reload_signal
 attempt=0
 while [ "$(grep -c 'reload committed' "$temporary/ftun.log" || true)" \
         -le "$committed_before" ]; do
@@ -191,7 +201,7 @@ dns_client_pid=
 # A timed-out candidate is also prepared off-owner.  It must neither stall the
 # old data plane nor replace the committed DNS/Runtime generation.
 write_config "timeout.example:$dns_upstream_port"
-"$ftun_binary" reload "$ftun_pid"
+reload_signal
 sleep 0.05
 started=$(date +%s%3N)
 "$helper_binary" --socks-client "$socks_port" "127.0.0.1:$echo_port"
@@ -221,7 +231,7 @@ done
 rejected_before=$(grep -c 'reload rejected' "$temporary/ftun.log" || true)
 rm -f "$temporary/config.json"
 mkfifo "$temporary/config.json"
-"$ftun_binary" reload "$ftun_pid"
+reload_signal
 sleep 0.05
 started=$(date +%s%3N)
 "$helper_binary" --socks-client "$socks_port" "127.0.0.1:$echo_port"

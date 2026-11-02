@@ -238,88 +238,108 @@ static ftun_status_t ftun_json_preflight(ftun_bytes_t json, size_t *scratch_byte
   return in_string || escaped || depth != 0u ? FTUN_E_INVALID : FTUN_OK;
 }
 
-static ftun_status_t ftun_json_tree_check(const cJSON *item, size_t depth,
-                                          size_t *nodes)
+static ftun_status_t ftun_json_tree_check(const cJSON *root, const cJSON *item,
+  size_t depth, size_t *nodes, ftun_config_error_t *error)
 {
   const cJSON *child;
   size_t children = 0u;
-  if (item == NULL || nodes == NULL) return FTUN_E_INVALID;
   if (depth > FTUN_CONFIG_MAX_DEPTH || *nodes >= FTUN_CONFIG_MAX_NODES) {
-    return FTUN_E_LIMIT;
+    return ftun_config_error_node(error, FTUN_E_LIMIT, root, item, NULL, "JSON tree exceeds configuration limits");
   }
   (*nodes)++;
-  if (item->string != NULL &&
-      strlen(item->string) > FTUN_CONFIG_MAX_STRING_BYTES) return FTUN_E_LIMIT;
-  if (item->string != NULL &&
-      !ftun_utf8_valid((const unsigned char *)item->string)) return FTUN_E_INVALID;
-  if (cJSON_IsString(item) && item->valuestring == NULL) return FTUN_E_INVALID;
-  if (cJSON_IsString(item) &&
-      strlen(item->valuestring) > FTUN_CONFIG_MAX_STRING_BYTES) return FTUN_E_LIMIT;
-  if (cJSON_IsString(item) &&
-      !ftun_utf8_valid((const unsigned char *)item->valuestring)) return FTUN_E_INVALID;
-  if (cJSON_IsNumber(item) && !isfinite(item->valuedouble)) return FTUN_E_INVALID;
+  if (item->string != NULL && strlen(item->string) > FTUN_CONFIG_MAX_STRING_BYTES)
+    return ftun_config_error_node(error, FTUN_E_LIMIT, root, item, NULL, "JSON key is too long");
+  if (cJSON_IsString(item) && item->valuestring == NULL)
+    return ftun_config_error_node(error, FTUN_E_INVALID, root, item, NULL, "JSON string is missing");
+  if (cJSON_IsString(item) && strlen(item->valuestring) > FTUN_CONFIG_MAX_STRING_BYTES)
+    return ftun_config_error_node(error, FTUN_E_LIMIT, root, item, NULL, "JSON string is too long");
+  if (cJSON_IsNumber(item) && !isfinite(item->valuedouble))
+    return ftun_config_error_node(error, FTUN_E_INVALID, root, item, NULL, "JSON number is not finite");
   if (cJSON_IsObject(item)) {
     const cJSON *other;
     for (child = item->child; child != NULL; child = child->next) {
       children++;
       for (other = child->next; other != NULL; other = other->next) {
-        if (child->string != NULL && other->string != NULL &&
-            strcmp(child->string, other->string) == 0) return FTUN_E_INVALID;
+        if (child->string != NULL && other->string != NULL && strcmp(child->string, other->string) == 0)
+          return ftun_config_error_node(error, FTUN_E_INVALID, root, other, NULL, "duplicate JSON object key");
       }
     }
   } else if (cJSON_IsArray(item)) {
     for (child = item->child; child != NULL; child = child->next) children++;
   }
-  if (children > FTUN_CONFIG_MAX_ARRAY_ITEMS) return FTUN_E_LIMIT;
+  if (children > FTUN_CONFIG_MAX_ARRAY_ITEMS)
+    return ftun_config_error_node(error, FTUN_E_LIMIT, root, item, NULL, "JSON container has too many items");
   for (child = item->child; child != NULL; child = child->next) {
-    ftun_status_t status = ftun_json_tree_check(child, depth + 1u, nodes);
+    ftun_status_t status = ftun_json_tree_check(root, child, depth + 1u, nodes, error);
     if (status != FTUN_OK) return status;
   }
   return FTUN_OK;
 }
 
-ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
-  ftun_config_json_t *out)
+static ftun_status_t ftun_config_json_open_internal(ftun_budget_t *budget,
+  ftun_bytes_t json, ftun_config_json_t *out, bool wait, ftun_config_error_t *error)
 {
   char *input;
   cJSON *root;
-  size_t nodes = 0u, scratch_bytes;
+  const char *parse_end = NULL;
+  size_t nodes = 0u, scratch_bytes, prefix_bytes = 0u;
   ftun_reservation_t scratch = (ftun_reservation_t){0};
   ftun_status_t status;
   if (out == NULL) return FTUN_E_INVALID;
   memset(out, 0, sizeof(*out));
+  ftun_config_error_begin(error, FTUN_CONFIG_STEP_PARSE);
   if (json.length >= 3u && json.data != NULL && json.data[0] == 0xefu &&
       json.data[1] == 0xbbu && json.data[2] == 0xbfu) {
     json.data += 3u;
     json.length -= 3u;
+    prefix_bytes = 3u;
     if (json.length >= 3u && json.data[0] == 0xefu &&
         json.data[1] == 0xbbu && json.data[2] == 0xbfu) {
-      return FTUN_E_INVALID;
+      return ftun_config_error_set(error, FTUN_E_INVALID, "", "multiple JSON byte order marks");
     }
   }
   status = ftun_json_preflight(json, &scratch_bytes);
-  if (status != FTUN_OK) return status;
+  if (status != FTUN_OK) return ftun_config_error_set(error, status, "",
+    status == FTUN_E_LIMIT ? "JSON input exceeds configuration limits" : "invalid JSON encoding or structure");
   if (budget != NULL) {
     status = ftun_budget_reserve(budget, scratch_bytes, &scratch);
-    if (status != FTUN_OK) return status;
+    if (status != FTUN_OK) return ftun_config_error_set(error, status, "", "JSON parsing memory limit exceeded");
   }
   input = (char *)malloc(json.length + 1u);
   if (input == NULL) {
     ftun_reservation_release(&scratch);
-    return FTUN_E_LIMIT;
+    return ftun_config_error_set(error, FTUN_E_LIMIT, "", "JSON parsing allocation failed");
   }
   memcpy(input, json.data, json.length);
   input[json.length] = '\0';
-  ftun_mutex_lock(&parse_mutex);
-  root = cJSON_ParseWithLengthOpts(input, json.length + 1u, NULL, 1);
+  /* 解码后的树路径必须能安全序列化为UTF8；先拒绝整个输入中的非法字节。 */
+  if (!ftun_utf8_valid((const unsigned char *)input)) {
+    free(input);
+    ftun_reservation_release(&scratch);
+    return ftun_config_error_set(error, FTUN_E_INVALID, "", "JSON input is not valid UTF-8");
+  }
+  if (wait) ftun_mutex_lock(&parse_mutex);
+  else if (!ftun_mutex_trylock(&parse_mutex)) {
+    free(input);
+    ftun_reservation_release(&scratch);
+    return FTUN_E_AGAIN;
+  }
+  root = cJSON_ParseWithLengthOpts(input, json.length + 1u, &parse_end, 1);
+  if (root == NULL) {
+    (void)ftun_config_error_set(error, FTUN_E_INVALID, "", "invalid JSON syntax");
+    if (error != NULL && parse_end != NULL) {
+      error->offset = prefix_bytes + (size_t)(parse_end - input);
+      error->offset_valid = true;
+    }
+  }
   ftun_mutex_unlock(&parse_mutex);
   free(input);
   if (root == NULL || !cJSON_IsObject(root)) {
     cJSON_Delete(root);
     ftun_reservation_release(&scratch);
-    return FTUN_E_INVALID;
+    return ftun_config_error_set(error, FTUN_E_INVALID, "", "configuration must be a JSON object");
   }
-  status = ftun_json_tree_check(root, 1u, &nodes);
+  status = ftun_json_tree_check(root, root, 1u, &nodes, error);
   if (status != FTUN_OK) {
     cJSON_Delete(root);
     ftun_reservation_release(&scratch);
@@ -328,6 +348,24 @@ ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
   out->root = root;
   out->reservation = scratch;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
+  ftun_config_json_t *out)
+{
+  return ftun_config_json_open_internal(budget, json, out, true, NULL);
+}
+
+ftun_status_t ftun_config_json_open_error(ftun_budget_t *budget, ftun_bytes_t json,
+  ftun_config_json_t *out, ftun_config_error_t *error)
+{
+  return ftun_config_json_open_internal(budget, json, out, true, error);
+}
+
+ftun_status_t ftun_config_json_try_open(ftun_budget_t *budget, ftun_bytes_t json,
+  ftun_config_json_t *out)
+{
+  return ftun_config_json_open_internal(budget, json, out, false, NULL);
 }
 
 void ftun_config_json_close(ftun_config_json_t *document)

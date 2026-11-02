@@ -202,6 +202,11 @@ static int handshake_case(const char *hostname, const char *ca_file,
 
   } else {
     CHECK(rejected && !client_done);
+    ftun_tls_info_t info;
+    char text[FTUN_TLS_ERROR_BYTES];
+    CHECK(ftun_tls_client_get_info(client, &info) == FTUN_OK && info.native_error != 0);
+    ftun_tls_error_text(info.native_error, text);
+    CHECK(text[0] != '\0' && strlen(text) < sizeof(text));
   }
   CHECK(ftun_tls_client_destroy(&client) == FTUN_OK);
   CHECK(ftun_budget_destroy(&budget) == FTUN_OK && budget == NULL);

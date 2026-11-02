@@ -4,6 +4,7 @@
 #include "ftun/ftun.h"
 #include "core/lifecycle.h"
 #include "core/log/event_log.h"
+#include "core/log/aggregate.h"
 #include "app/config/config.h"
 #include <stdbool.h>
 
@@ -29,6 +30,7 @@ typedef struct {
   ftun_app_generation_guard_t expected;
   const char *first;
   const char *second;
+  uint32_t source_signal; /* CLI信号来源；普通API/IPC为零，随任务按值拥有。 */
 } ftun_app_command_t;
 
 typedef enum {
@@ -42,7 +44,10 @@ typedef struct {
   ftun_app_command_kind_t kind;
   ftun_app_command_phase_t phase;
   ftun_error_t error;
+  ftun_config_error_t config_error;
   uint64_t generation;
+  /* 文件准备失败时的拥有型物理路径；由结果通道转义后显示。 */
+  char file_error[FTUN_APP_CONTROL_PATH_CAPACITY];
 } ftun_app_command_result_t;
 
 typedef void (*ftun_app_command_completion_fn)(ftun_operation_t *operation,
@@ -66,15 +71,32 @@ typedef struct {
   bool logger_present;
   ftun_logger_usage_t logger;
   ftun_log_totals_t log_totals;
+  ftun_log_aggregate_usage_t aggregation;
   /* runtime_stopped 表示业务模块/Worker/Operation 已停止；Core 仍须等
    * 日志排空和句柄回收后才进入 STOPPED。run_result 仅在 run_returned 时有效。 */
   bool runtime_stopped;
   bool run_returned;
   ftun_status_t run_result;
+  ftun_error_t startup_error;
   ftun_config_trace_t config_trace;
   uint64_t config_trace_generation;
   char config_path[FTUN_APP_CONTROL_PATH_CAPACITY];
+  char file_error[FTUN_APP_CONTROL_PATH_CAPACITY];
 } ftun_app_control_snapshot_t;
+
+/* 仅CREATED阶段调用；运行与reload只读，实例间互不影响。 */
+ftun_status_t ftun_app_control_set_no_color(ftun_core_t *core, bool no_color);
+/* 仅CREATED可设置；0使用配置，1/2分别强制debug/trace，随后跨reload保持。 */
+ftun_status_t ftun_app_control_set_verbosity(ftun_core_t *core, unsigned int verbosity);
+
+/* CREATED阶段设置；后台实例运行和reload强制仅文件输出。 */
+ftun_status_t ftun_app_control_set_background(ftun_core_t *core, bool background);
+
+/* CREATED阶段设置，owner在服务启动完成后、进入事件循环前调用一次且不持控制锁。
+ * user借用至run返回；回调失败使run进入正常停止清理。 */
+typedef ftun_status_t (*ftun_app_ready_fn)(ftun_core_t *core, void *user);
+ftun_status_t ftun_app_control_set_ready(ftun_core_t *core,
+  ftun_app_ready_fn ready, void *user);
 
 /* 上一次 run 是否因 owner 失去响应由看门狗终止。 */
 bool ftun_app_control_watchdog_fired(ftun_core_t *core);

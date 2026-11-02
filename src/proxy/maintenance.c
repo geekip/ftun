@@ -3,7 +3,65 @@
 #include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 #include "platform/thread.h"
+#include "platform/random.h"
+#include "core/log/event_log.h"
 #include "util/ip.h"
+#include "libs/tls/tls.h"
+
+static const ftun_log_event_t frs_waiting_event = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.frs-not-ready", "connection rejected: frs-not-ready"};
+
+#if defined(FTUN_HAVE_MODULE_FRS)
+static const ftun_log_event_t frs_ready_event = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.frs-ready", "frs ready"};
+static const ftun_log_event_t frs_failures[] = {
+  {FTUN_LOG_FRS, FTUN_LOG_WARN, "frs.download-failed", "download failed"},
+  {FTUN_LOG_FRS, FTUN_LOG_WARN, "frs.verify-failed", "verify failed"},
+  {FTUN_LOG_FRS, FTUN_LOG_WARN, "frs.prepare-failed", "rule set prepare failed"},
+  {FTUN_LOG_FRS, FTUN_LOG_WARN, "frs.publish-failed", "rule set publish failed"},
+  {FTUN_LOG_FRS, FTUN_LOG_WARN, "frs.durability-uncertain", "rule set durability unconfirmed"}
+};
+static const char *const frs_phases[] = {"download", "verify", "prepare", "publish", "durability"};
+static const ftun_log_event_t frs_updated_event = {FTUN_LOG_FRS, FTUN_LOG_INFO, "frs.updated", "rule set updated"};
+static const ftun_log_event_t frs_published_event = {FTUN_LOG_FRS, FTUN_LOG_INFO, "frs.published", "rule set published"};
+static const ftun_log_event_t frs_recovered_event = {FTUN_LOG_FRS, FTUN_LOG_INFO, "frs.recovered", "rule set recovered"};
+
+static void frs_failure(ftun_proxy_runtime_t *engine, unsigned phase,
+  ftun_status_t status, int tls_error, uint64_t now)
+{
+  char tls_text[FTUN_TLS_ERROR_BYTES];
+  ftun_log_field_t fields[3] = {{.key = "phase", .kind = FTUN_LOG_TEXT,
+    .value.text = {frs_phases[phase - 1u], strlen(frs_phases[phase - 1u])}}};
+  size_t count = 1u;
+  if (tls_error != 0) {
+    fields[count++] = (ftun_log_field_t){.key = "tls_code", .kind = FTUN_LOG_I64, .value.i64 = tls_error};
+    if (ftun_log_enabled(engine->core, FTUN_LOG_WARN)) {
+      ftun_tls_error_text(tls_error, tls_text);
+      fields[count++] = (ftun_log_field_t){.key = "tls_reason", .kind = FTUN_LOG_TEXT,
+        .value.text = {tls_text, strlen(tls_text)}};
+    }
+  }
+  if (engine->frs_log_entity == 0u) engine->frs_log_entity = ftun_correlation_next();
+  engine->frs_log_faults |= UINT32_C(1) << (phase - 1u);
+  (void)ftun_log_failure(engine->core, &(ftun_log_record_t){.event = &frs_failures[phase - 1u],
+    .generation = engine->generation, .error = {status, FTUN_STAGE_CONTROL, 0}, .fields = fields, .field_count = count},
+    engine->frs_log_entity, (ftun_string_t){"rule-set", 8u}, now);
+}
+
+static void frs_recovered(ftun_proxy_runtime_t *engine, unsigned completed_phases, uint64_t now)
+{
+  for (unsigned index = 0u; index < completed_phases; index++) {
+    if ((engine->frs_log_faults & (UINT32_C(1) << index)) == 0u) continue;
+    ftun_log_field_t field = {.key = "phase", .kind = FTUN_LOG_TEXT, .value.text = {frs_phases[index], strlen(frs_phases[index])}};
+    (void)ftun_log_recovery(engine->core, &frs_failures[index], engine->frs_log_entity,
+      &(ftun_log_record_t){.event = &frs_recovered_event, .generation = engine->generation, .fields = &field, .field_count = 1u}, now);
+    engine->frs_log_faults &= ~(UINT32_C(1) << index);
+  }
+  if (completed_phases == 5u && engine->frs_not_ready_logged) {
+    (void)ftun_log_recovery(engine->core, &frs_waiting_event, engine->frs_log_entity,
+      &(ftun_log_record_t){.event = &frs_ready_event, .generation = engine->generation}, now);
+    engine->frs_not_ready_logged = false;
+  }
+}
+#endif
 
 int ftun_proxy_runtime_duration_ms(const char *value, uint64_t *out)
 {
@@ -57,6 +115,7 @@ ftun_status_t ftun_proxy_runtime_http_execute(
   size_t maximum;
   size_t total;
   size_t copied_body;
+  uint8_t failure_phase = 0u;
   ftun_status_t status;
   if (out_result_size != NULL) *out_result_size = 0u;
   if (input.data == NULL || input.length < sizeof(*header) || result == NULL ||
@@ -99,12 +158,14 @@ ftun_status_t ftun_proxy_runtime_http_execute(
   spec.if_none_match.length = header->etag_length;
   memset(&fetched, 0, sizeof(fetched));
   status = ftun_http_fetch(&spec, &fetched);
+  if (status != FTUN_OK) failure_phase = 1u;
 #if defined(FTUN_HAVE_MODULE_FRS)
   if (status == FTUN_OK && header->validate_frs != 0u &&
       fetched.status == 200u) {
     const ftun_config_t *config = NULL;
     status = ftun_frs_open_bytes_budget(budget,
       (ftun_bytes_t){fetched.data, fetched.length}, &view);
+    if (status != FTUN_OK) failure_phase = 2u;
     if (status == FTUN_OK) {
       status = ftun_runtime_config(
         (ftun_runtime_t *)header->runtime_snapshot, &config);
@@ -171,9 +232,15 @@ ftun_status_t ftun_proxy_runtime_http_execute(
     output.cleanup_view = (uintptr_t)view;
   }
 #endif
+  output.tls_error = fetched.tls_error;
+  output.status = fetched.status;
+  output.body_length = fetched.length;
+  output.failure_phase = status == FTUN_OK ? 0u : failure_phase == 0u ? 3u : failure_phase;
+  output.failure_status = (uint8_t)status;
   ftun_http_fetch_release(&fetched);
   memcpy(result, &output, sizeof(output));
-  return status;
+  /* 网络/校验失败属于拥有型结果；Worker 的传输成功才会交付这些事实。 */
+  return FTUN_OK;
 }
 
 ftun_status_t ftun_proxy_runtime_http_input_cleanup(ftun_bytes_t input)
@@ -361,7 +428,7 @@ ftun_status_t ftun_proxy_runtime_fakeip_range(const char *text,
   if (first != NULL) *first = 0u;
   if (end != NULL) *end = 0u;
   if (text == NULL || first == NULL || end == NULL ||
-      !ftun_cidr_parse(text, strlen(text), true, &cidr) ||
+      !ftun_cidr_parse(text, strlen(text), false, &cidr) ||
       !ftun_cidr_ipv4_hosts(&cidr, first, end)) return FTUN_E_INVALID;
   return FTUN_OK;
 }
@@ -428,6 +495,38 @@ ftun_status_t ftun_proxy_runtime_wait_worker(ftun_proxy_runtime_t *engine,
                                         now + FTUN_PROXY_RUNTIME_WORKER_WAIT_MS);
 }
 
+static ftun_status_t ftun_proxy_runtime_fakeip_initialize(ftun_proxy_runtime_t *engine,
+  uint32_t first, uint32_t end, const char *range)
+{
+  ftun_file_info_t info;
+  ftun_fakeip_store_identity_t identity = {{0}, first, end};
+  ftun_status_t status = ftun_file_inspect_path_nofollow(engine->fakeip_directory, &info);
+  if (status == FTUN_OK) return info.directory ? FTUN_OK : FTUN_E_STATE_CORRUPT;
+  if (status != FTUN_E_EOF) return status;
+  status = ftun_random_bytes(identity.uuid, sizeof(identity.uuid));
+  if (status != FTUN_OK) return status;
+  identity.uuid[6] = (uint8_t)((identity.uuid[6] & 0x0fu) | 0x40u);
+  identity.uuid[8] = (uint8_t)((identity.uuid[8] & 0x3fu) | 0x80u);
+  status = ftun_fakeip_store_initialize_budget(engine->budget, engine->fakeip_directory, &identity);
+  if (status == FTUN_OK && ftun_log_enabled(engine->core, FTUN_LOG_WARN)) {
+    static const ftun_log_event_t created = {FTUN_LOG_FAKEIP, FTUN_LOG_WARN,
+      "fakeip.identity.created", "identity created"};
+    char uuid[9];
+    (void)snprintf(uuid, sizeof(uuid), "%02x%02x%02x%02x", identity.uuid[0], identity.uuid[1],
+      identity.uuid[2], identity.uuid[3]);
+    ftun_log_field_t fields[] = {
+      {.key = "range", .kind = FTUN_LOG_TEXT, .value.text = {range, strlen(range)}},
+      {.key = "uuid", .kind = FTUN_LOG_TEXT, .value.text = {uuid, 8u}},
+      {.key = "path", .kind = FTUN_LOG_TEXT,
+        .value.text = {engine->fakeip_directory, strlen(engine->fakeip_directory)}}
+    };
+    ftun_log_record_t record = {.event = &created, .generation = engine->generation,
+      .fields = fields, .field_count = sizeof(fields) / sizeof(fields[0])};
+    (void)ftun_log_record(engine->core, &record);
+  }
+  return status;
+}
+
 ftun_status_t ftun_proxy_runtime_fakeip_prepare(ftun_proxy_runtime_t *engine,
                                                  const ftun_config_t *config)
 {
@@ -450,6 +549,7 @@ ftun_status_t ftun_proxy_runtime_fakeip_prepare(ftun_proxy_runtime_t *engine,
   if (maximum == 0u) return FTUN_E_INVALID;
   memset(&service_options, 0, sizeof(service_options));
   service_options.budget = engine->budget;
+  service_options.core = engine->core;
   service_options.max_entries = maximum;
   if (ftun_config_resolver(config).fake_ip.persist) {
     if (ftun_config_base(config)->cache_file == NULL) return FTUN_E_INVALID;
@@ -472,7 +572,18 @@ ftun_status_t ftun_proxy_runtime_fakeip_prepare(ftun_proxy_runtime_t *engine,
     store_options.worker = engine->fakeip_worker;
     store_options.completion = ftun_proxy_runtime_fakeip_store_completed;
     store_options.user = engine;
-    status = ftun_fakeip_store_open(&store_options, &engine->fakeip_store);
+    status = ftun_proxy_runtime_fakeip_initialize(engine, first, end, ftun_config_resolver(config).fake_ip.range);
+    if (status == FTUN_OK) {
+      status = ftun_fakeip_store_open(&store_options, &engine->fakeip_store);
+      if (status != FTUN_OK) {
+        static const ftun_log_event_t locked = {FTUN_LOG_FAKEIP, FTUN_LOG_ERROR, "fakeip.lock-conflict", "lock conflict"};
+        static const ftun_log_event_t rejected = {FTUN_LOG_FAKEIP, FTUN_LOG_ERROR, "fakeip.state-rejected", "state rejected"};
+        FTUN_CORE_LOG(engine->core, status == FTUN_E_AGAIN ? &locked : &rejected,
+          .generation = engine->generation, .error = {status, FTUN_STAGE_STATE_RESTORE, 0},
+          .fields = (ftun_log_field_t[]){{.key = "path", .kind = FTUN_LOG_TEXT,
+            .value.text = {engine->fakeip_directory, strlen(engine->fakeip_directory)}}}, .field_count = 1u);
+      }
+    }
     if (status == FTUN_OK) {
       status = ftun_fakeip_snapshot_load(engine->fakeip_store, maximum,
                                          &snapshot);
@@ -495,7 +606,12 @@ ftun_status_t ftun_proxy_runtime_fakeip_prepare(ftun_proxy_runtime_t *engine,
     status = ftun_fakeip_service_create(&service_options, &engine->fakeip);
   }
   (void)ftun_fakeip_snapshot_destroy(&snapshot);
-  if (status != FTUN_OK) return status;
+  if (status != FTUN_OK) {
+    ftun_lifecycle_event_t failed = {.kind = FTUN_LIFECYCLE_MODULE_FAILED,
+      .module = FTUN_BUILD_MODULE_FAKEIP, .generation = engine->generation, .status = status};
+    (void)ftun_lifecycle_emit(engine->core, &failed);
+    return status;
+  }
   if (engine->fakeip_store == NULL || store_info.reserved_end >= end) {
     return FTUN_OK;
   }
@@ -776,6 +892,11 @@ ftun_status_t ftun_proxy_runtime_health_release(
     for (index = 0u; index < slot_count; index++) {
       if ((*slots)[index].operation != NULL) return FTUN_E_AGAIN;
     }
+    for (index = 0u; index < slot_count; index++) {
+      ftun_proxy_runtime_health_slot_t *slot = &(*slots)[index];
+      if (slot->log_failed) (void)ftun_log_retire(slot->engine->core,
+        FTUN_LOG_PROXY, slot->log_entity, slot->engine->now_ms);
+    }
   }
   free(*groups);
   free(*slots);
@@ -921,6 +1042,7 @@ void ftun_proxy_runtime_health_completed(ftun_operation_t *operation,
   uint64_t now_ms = 0u;
   uint64_t maximum_backoff;
   bool success = false;
+  int tls_error = 0;
   ftun_status_t status = error.status;
   if (slot == NULL || slot->operation != operation || slot->engine == NULL) {
     return;
@@ -932,6 +1054,11 @@ void ftun_proxy_runtime_health_completed(ftun_operation_t *operation,
       slot->generation != engine->generation) return;
   group = &engine->health_groups[slot->group_index];
   (void)ftun_monotonic_now(&now_ms);
+  if (result.data != NULL && result.length >= sizeof(*response)) {
+    response = (const ftun_proxy_runtime_http_result_t *)result.data;
+    tls_error = response->tls_error;
+    if (status == FTUN_OK && response->failure_status != 0u) status = (ftun_status_t)response->failure_status;
+  }
   if (status == FTUN_OK && result.data != NULL &&
       result.length >= sizeof(*response)) {
     response = (const ftun_proxy_runtime_http_result_t *)result.data;
@@ -959,6 +1086,32 @@ void ftun_proxy_runtime_health_completed(ftun_operation_t *operation,
   slot->sample.tcp_only = true;
   slot->sample.success = status == FTUN_OK && success;
   slot->sample.observed_ms = now_ms;
+  {
+    static const ftun_log_event_t failed = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.url-test-failed", "url-test failed"};
+    static const ftun_log_event_t recovered = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.url-test-recovered", "url-test recovered"};
+    if (!slot->sample.success && status != FTUN_E_CANCELLED) {
+      char reason[FTUN_TLS_ERROR_BYTES];
+      ftun_log_field_t fields[4] = {
+        {.key = "member_id", .kind = FTUN_LOG_U64, .value.u64 = slot->member_id},
+        {.key = "http_status", .kind = FTUN_LOG_U64, .value.u64 = response == NULL ? 0u : response->status}};
+      size_t count = 2u;
+      if (tls_error != 0 && ftun_log_enabled(engine->core, FTUN_LOG_WARN)) {
+        ftun_tls_error_text(tls_error, reason);
+        fields[count++] = (ftun_log_field_t){.key = "tls_code", .kind = FTUN_LOG_I64, .value.i64 = tls_error};
+        fields[count++] = (ftun_log_field_t){.key = "tls_reason", .kind = FTUN_LOG_TEXT, .value.text = {reason, strlen(reason)}};
+      }
+      if (slot->log_entity == 0u) slot->log_entity = ftun_correlation_next();
+      slot->log_failed = true;
+      (void)ftun_log_failure(engine->core, &(ftun_log_record_t){.event = &failed,
+        .generation = slot->generation, .error = status == error.status && status != FTUN_OK ? error : (ftun_error_t){status == FTUN_OK ? FTUN_E_PROTOCOL : status, FTUN_STAGE_CONTROL, 0},
+        .fields = fields, .field_count = count}, slot->log_entity, (ftun_string_t){"url-test", 8u}, now_ms);
+    } else if (slot->sample.success && slot->log_failed) {
+      (void)ftun_log_recovery(engine->core, &failed, slot->log_entity,
+        &(ftun_log_record_t){.event = &recovered, .generation = slot->generation,
+          .fields = (ftun_log_field_t[]){{.key = "member_id", .kind = FTUN_LOG_U64, .value.u64 = slot->member_id}}, .field_count = 1u}, now_ms);
+      slot->log_failed = false;
+    }
+  }
   if (now_ms >= slot->started_ms) {
     uint64_t latency = now_ms - slot->started_ms;
     slot->sample.latency_ms = latency > UINT32_MAX
@@ -1103,11 +1256,14 @@ void ftun_proxy_runtime_background_log(ftun_proxy_runtime_t *engine,
 void ftun_proxy_runtime_note_denied(ftun_proxy_runtime_t *engine,
                                            const ftun_route_result_t *route)
 {
-  if (!route->frs_not_ready || engine->frs_not_ready_logged) return;
+  if (!route->frs_not_ready) return;
+  uint64_t now;
+  if (ftun_monotonic_now(&now) != FTUN_OK) return;
+  if (engine->frs_log_entity == 0u) engine->frs_log_entity = ftun_correlation_next();
   engine->frs_not_ready_logged = true;
-  ftun_proxy_runtime_background_log(engine, FTUN_E_REJECTED,
-    FTUN_DIAGNOSTIC_FRS_UPDATE,
-    "connection rejected: frs-not-ready (rule file not downloaded yet)");
+  (void)ftun_log_failure(engine->core, &(ftun_log_record_t){.event = &frs_waiting_event,
+    .generation = route->generation, .error = {FTUN_E_REJECTED, FTUN_STAGE_CONTROL, 0}},
+    engine->frs_log_entity, (ftun_string_t){"rule-set", 8u}, now);
 }
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -1355,7 +1511,7 @@ void ftun_proxy_runtime_frs_publish_completed(ftun_operation_t *operation,
                                           engine);
     if (status == FTUN_OK) {
       engine->frs_not_ready = false;
-      engine->frs_not_ready_logged = false;
+      engine->frs_updated_valid = ftun_wallclock_unix_ms(&engine->frs_updated_unix_ms) == FTUN_OK;
       engine->frs_retry_ms = 0u;
       ftun_lifecycle_event_t event = {0};
       event.kind = FTUN_LIFECYCLE_CONFIG_PUBLISHED;
@@ -1364,6 +1520,8 @@ void ftun_proxy_runtime_frs_publish_completed(ftun_operation_t *operation,
       event.status = FTUN_OK;
       event.reason = FTUN_LIFECYCLE_REASON_FRS_UPDATE;
       (void)ftun_lifecycle_emit(engine->core, &event);
+      FTUN_CORE_LOG(engine->core, &frs_published_event, .generation = event.generation);
+      if (durability_status == FTUN_OK) frs_recovered(engine, 5u, now_ms);
       engine->frs_reserved_generation = 0u;
     }
   }
@@ -1385,10 +1543,9 @@ void ftun_proxy_runtime_frs_publish_completed(ftun_operation_t *operation,
   ftun_proxy_runtime_frs_schedule_next(engine, now_ms);
   if (status != FTUN_OK && status != FTUN_E_STALE &&
       status != FTUN_E_CANCELLED) {
-    ftun_proxy_runtime_background_log(engine, status, FTUN_DIAGNOSTIC_FRS_UPDATE, "FRS update failed");
+    frs_failure(engine, 4u, status, 0, now_ms);
   } else if (status == FTUN_OK && durability_status != FTUN_OK) {
-    ftun_proxy_runtime_background_log(engine, durability_status,
-      FTUN_DIAGNOSTIC_FRS_PUBLISH, "FRS update applied but directory durability is uncertain");
+    frs_failure(engine, 5u, durability_status, 0, now_ms);
   }
 }
 
@@ -1421,6 +1578,20 @@ void ftun_proxy_runtime_frs_completed(ftun_operation_t *operation,
   if (!engine->frs_enabled || engine->stopped ||
       engine->frs_operation_generation != engine->generation) {
     return;
+  }
+  if (status == FTUN_OK && result.data != NULL && result.length >= sizeof(*response)) {
+    const ftun_proxy_runtime_http_result_t *facts = (const ftun_proxy_runtime_http_result_t *)result.data;
+    status = (ftun_status_t)facts->failure_status;
+  }
+  if (result.data != NULL && result.length >= sizeof(*response)) {
+    const ftun_proxy_runtime_http_result_t *facts = (const ftun_proxy_runtime_http_result_t *)result.data;
+    if (facts->status == 200u) {
+      static const ftun_log_event_t progress = {FTUN_LOG_FRS, FTUN_LOG_DEBUG, "frs.download-progress", "download progress"};
+      FTUN_CORE_LOG(engine->core, &progress, .generation = engine->generation,
+        .fields = (ftun_log_field_t[]){
+          {.key = "bytes", .kind = FTUN_LOG_U64, .value.u64 = facts->body_length},
+          {.key = "complete", .kind = FTUN_LOG_U64, .value.u64 = 1u}}, .field_count = 2u);
+    }
   }
   if (status == FTUN_OK) {
     if (result.data == NULL || result.length < sizeof(*response)) {
@@ -1535,6 +1706,8 @@ void ftun_proxy_runtime_frs_completed(ftun_operation_t *operation,
       (ftun_bytes_t){body, (size_t)response->body_length},
       ftun_proxy_runtime_frs_publish_completed, &engine->frs_operation);
     if (status == FTUN_OK) {
+      FTUN_CORE_LOG(engine->core, &frs_updated_event, .generation = engine->frs_reserved_generation,
+        .fields = (ftun_log_field_t[]){{.key = "bytes", .kind = FTUN_LOG_U64, .value.u64 = response->body_length}}, .field_count = 1u);
       engine->frs_candidate = candidate;
       candidate = NULL;
       engine->frs_candidate_etag = candidate_etag;
@@ -1571,6 +1744,9 @@ void ftun_proxy_runtime_frs_completed(ftun_operation_t *operation,
   }
   (void)ftun_runtime_release(&baseline);
   if (publish_scheduled) return;
+  /* 内容未变化不执行文件发布，不能据此解除发布/耐久性故障。 */
+  if (status == FTUN_OK && unchanged)
+    frs_recovered(engine, response->status == 304u ? 1u : 3u, now_ms);
   ftun_proxy_runtime_frs_schedule_next(engine, now_ms);
   if (status == FTUN_E_AGAIN && now_ms != 0u &&
       now_ms <= UINT64_MAX - FTUN_PROXY_RUNTIME_FRS_GENERATION_RETRY_MS) {
@@ -1580,7 +1756,15 @@ void ftun_proxy_runtime_frs_completed(ftun_operation_t *operation,
   }
   if (status != FTUN_OK && status != FTUN_E_STALE &&
       status != FTUN_E_CANCELLED) {
-    ftun_proxy_runtime_background_log(engine, status, FTUN_DIAGNOSTIC_FRS_UPDATE, "FRS update failed");
+    unsigned phase = 3u;
+    int tls_error = 0;
+    if (result.data != NULL && result.length >= sizeof(ftun_proxy_runtime_http_result_t)) {
+      const ftun_proxy_runtime_http_result_t *facts = (const ftun_proxy_runtime_http_result_t *)result.data;
+      tls_error = facts->tls_error;
+      if (facts->failure_phase >= 1u && facts->failure_phase <= 3u) phase = facts->failure_phase;
+      else if (facts->status != 200u && facts->status != 304u) phase = 1u;
+    }
+    frs_failure(engine, phase, status, tls_error, now_ms);
   }
 }
 

@@ -9,6 +9,9 @@
 #define FTUN_DNS_LISTENER_MAX_TC_BYTES \
   (FTUN_DNS_HEADER_BYTES + FTUN_DNS_MAX_NAME_BYTES + 4u)
 
+static const ftun_log_event_t query_event = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "dns.query", "query"};
+static const ftun_log_event_t answer_event = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "dns.answer", "answer"};
+
 struct ftun_dns_listener {
   ftun_core_t *core;
   ftun_budget_t *budget;
@@ -26,6 +29,7 @@ struct ftun_dns_listener {
   size_t max_tcp_frame_bytes;
   size_t tcp_connections;
   size_t inflight;
+  ftun_dns_query_stats_t queries;
   ftun_dns_listener_reply_fn reply;
   void *reply_user;
   int accepting;
@@ -48,6 +52,7 @@ typedef struct {
   ftun_reservation_t reservation;
   ftun_dns_query_completion_fn completion;
   uint64_t peer_id;
+  uint64_t sid, generation, started_ms;
   uint16_t id;
   uint16_t flags;
   uint16_t type;
@@ -133,6 +138,8 @@ static void ftun_dns_listener_completed(ftun_operation_t *operation,
     FTUN_DNS_TRANSPORT_UDP : FTUN_DNS_TRANSPORT_TCP;
   ftun_bytes_t reply = response;
   (void)operation;
+  ftun_status_t outcome = error.status;
+  ftun_error_t outcome_error = error;
   /* 已接纳查询的上游失败应回复SERVFAIL；停止取消不再产生网络响应。 */
   if (error.status != FTUN_OK && error.status != FTUN_E_CANCELLED && listener->accepting) {
     ftun_dns_listener_tc(request, (ftun_bytes_t){NULL, 0u}, &reply);
@@ -158,6 +165,19 @@ static void ftun_dns_listener_completed(ftun_operation_t *operation,
       reply.length = response.length + 2u;
     }
   }
+  if (outcome == FTUN_OK) outcome = error.status;
+  if (ftun_log_enabled(listener->core, FTUN_LOG_DEBUG)) {
+    uint64_t now = request->started_ms;
+    (void)ftun_monotonic_now(&now);
+    ftun_log_field_t fields[] = {
+      {.key = "rcode", .kind = FTUN_LOG_U64, .value.u64 = response.length >= FTUN_DNS_HEADER_BYTES ? response.data[3] & 15u : 0u},
+      {.key = "rtt_ms", .kind = FTUN_LOG_U64, .value.u64 = now - request->started_ms}
+    };
+    FTUN_CORE_LOG(listener->core, &answer_event, .sid = request->sid, .generation = request->generation,
+      .error = {outcome, outcome_error.stage, outcome_error.native_code}, .fields = fields, .field_count = 2u);
+  }
+  if (outcome == FTUN_OK) listener->queries.success++;
+  else listener->queries.failures[outcome]++;
   if (listener->inflight != 0u) listener->inflight--;
   if (connection != NULL && connection->inflight != 0u) {
     connection->inflight--;
@@ -168,7 +188,7 @@ static void ftun_dns_listener_completed(ftun_operation_t *operation,
   ftun_reservation_release(&reservation);
 }
 
-static ftun_status_t ftun_dns_listener_accept(
+static ftun_status_t ftun_dns_listener_accept_one(
   ftun_dns_listener_t *listener, ftun_dns_connection_t *connection,
   uint64_t peer_id, ftun_bytes_t wire, size_t udp_limit,
   ftun_operation_t **out)
@@ -247,6 +267,9 @@ static ftun_status_t ftun_dns_listener_accept(
   metadata.original_target.port = 53u;
   memset(&query, 0, sizeof(query));
   query.id = message->id;
+  request->sid = query.sid = ftun_correlation_next();
+  request->generation = query.generation = generation;
+  request->started_ms = now;
   query.flags = message->flags;
   query.transport = connection == NULL ? FTUN_DNS_TRANSPORT_UDP :
                                          FTUN_DNS_TRANSPORT_TCP;
@@ -270,6 +293,15 @@ static ftun_status_t ftun_dns_listener_accept(
   query.entry = listener->entry;
   query.fixed_server = listener->fixed_server;
   query.metadata = listener->entry == FTUN_DNS_ENTRY_POLICY ? &metadata : NULL;
+  if (ftun_log_enabled(listener->core, FTUN_LOG_DEBUG)) {
+    ftun_log_field_t fields[] = {
+      {.key = "name", .kind = FTUN_LOG_TEXT, .value.text = {(const char *)request->domain, request->domain_length}},
+      {.key = "type", .kind = FTUN_LOG_U64, .value.u64 = query.question.type},
+      {.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = connection == NULL ? (ftun_string_t){"udp", 3u} : (ftun_string_t){"tcp", 3u}}
+    };
+    FTUN_CORE_LOG(listener->core, &query_event, .sid = query.sid, .generation = generation,
+      .fields = fields, .field_count = 3u);
+  }
   status = listener->dispatch(listener->dispatch_user, listener->core,
                               listener->dispatcher, &query, out);
   if (status != FTUN_OK) goto fail;
@@ -279,9 +311,23 @@ static ftun_status_t ftun_dns_listener_accept(
   return FTUN_OK;
 
 fail:
+  if (request->sid != 0u) FTUN_CORE_LOG(listener->core, &answer_event,
+    .sid = request->sid, .generation = request->generation, .error = {status, FTUN_STAGE_NONE, 0});
   free(request);
   ftun_reservation_release(&reservation);
   ftun_dns_message_release(&message);
+  return status;
+}
+
+static ftun_status_t ftun_dns_listener_accept(
+  ftun_dns_listener_t *listener, ftun_dns_connection_t *connection,
+  uint64_t peer_id, ftun_bytes_t wire, size_t udp_limit,
+  ftun_operation_t **out)
+{
+  ftun_status_t status;
+  listener->queries.queries++;
+  status = ftun_dns_listener_accept_one(listener, connection, peer_id, wire, udp_limit, out);
+  if (status != FTUN_OK) listener->queries.failures[status]++;
   return status;
 }
 
@@ -486,6 +532,7 @@ ftun_status_t ftun_dns_listener_get_info(const ftun_dns_listener_t *listener,
   out->tcp_connections = listener->tcp_connections;
   out->inflight = listener->inflight;
   out->accepting = listener->accepting != 0;
+  out->queries = listener->queries;
   return FTUN_OK;
 }
 

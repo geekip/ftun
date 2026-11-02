@@ -1,9 +1,12 @@
+#include "app/control/status.h"
+#include "app/runtime_internal.h"
 #include "platform/tun.h"
 #include "app/composition/egress.h"
 #include "app/config/model.h"
 #include "app/composition/bridges.h"
 #include "core/core.h"
 #include "app/runtime_support.h"
+#include "app/control/server.h"
 #include "core/ddra.h"
 #include "core/operation.h"
 #include "app/config/compile.h"
@@ -50,9 +53,11 @@ ftun_status_t ftun_app_event_source_capacity(const ftun_config_t *config, size_t
   if (out != NULL) *out = 0u;
   if (config == NULL || out == NULL) return FTUN_E_INVALID;
 #if defined(FTUN_HAVE_MODULE_PROXY)
-  return ftun_proxy_runtime_event_source_capacity(config, out);
+  ftun_status_t status = ftun_proxy_runtime_event_source_capacity(config, out);
+  if (status == FTUN_OK) (*out)++;
+  return status;
 #else
-  *out = 512u;
+  *out = 513u;
   return FTUN_OK;
 #endif
 }
@@ -75,9 +80,12 @@ typedef struct {
   ftun_core_t *core;
   ftun_reservation_t reservation;
   ftun_event_loop_t *loop;
+  ftun_ctl_server_t *ctl_server;
   ftun_operation_queue_t *operations;
   /* 网络变化事件源；不可用时回到各恢复实体自己的退避，不影响启动。 */
   ftun_netmon_t *netmon;
+  uint64_t network_entity;
+  bool network_storm;
   const ftun_egress_provider_t *egress, *pending_egress, *egress_binding;
   ftun_status_t first_error;
   ftun_status_t cleanup_error;
@@ -312,6 +320,13 @@ static ftun_status_t ftun_default_loop_destroy(ftun_default_runtime_t *runtime)
 {
   ftun_status_t status;
   if (runtime == NULL || runtime->loop == NULL) return FTUN_OK;
+  if (runtime->ctl_server != NULL) {
+    status = ftun_ctl_server_detach(runtime->ctl_server);
+    if (status != FTUN_OK) return status;
+    runtime->ctl_server = NULL;
+  }
+  status = ftun_log_aggregate_detach(runtime->core);
+  if (status != FTUN_OK) return status;
   status = ftun_event_loop_stop(runtime->loop);
   if (status != FTUN_OK) return status;
   status = ftun_event_backend_detach(runtime->loop);
@@ -335,10 +350,13 @@ static ftun_status_t ftun_default_prepare(
     return FTUN_E_INVALID;
   }
   if (*out != NULL) return FTUN_E_AGAIN;
-  (void)binding;
   status = ftun_app_event_source_capacity(config, &source_capacity);
   if (status != FTUN_OK) return status;
   source_capacity += 2u; /* 网络变化事件源：netlink 读取与去抖计时器 */
+  if (binding != NULL) {
+    if (binding->size != sizeof(ftun_ctl_server_t *)) return FTUN_E_INVALID;
+    source_capacity += FTUN_CTL_EVENT_SOURCES;
+  }
   status = ftun_budget_reserve(budget, sizeof(*runtime), &reservation);
   if (status != FTUN_OK) return status;
   runtime = (ftun_default_runtime_t *)calloc(1u, sizeof(*runtime));
@@ -349,6 +367,7 @@ static ftun_status_t ftun_default_prepare(
   runtime->reservation = reservation;
   runtime->core = core;
   runtime->operations = operations;
+  if (binding != NULL) runtime->ctl_server = *(ftun_ctl_server_t *const *)binding->value;
   memcpy(runtime->modules, ftun_default_modules,
          sizeof(ftun_default_modules));
   runtime->catalog.modules = runtime->modules;
@@ -357,6 +376,8 @@ static ftun_status_t ftun_default_prepare(
   status = ftun_event_loop_create_with_budget(
     core, budget, source_capacity, &runtime->loop);
   if (status == FTUN_OK) status = ftun_event_backend_attach(runtime->loop);
+  if (status == FTUN_OK) status = ftun_log_aggregate_attach(core, runtime->loop);
+  if (status == FTUN_OK && runtime->ctl_server != NULL) status = ftun_ctl_server_attach(runtime->ctl_server, runtime->loop);
   if (status == FTUN_OK) status = ftun_app_egress_prepare(budget, config,
     ftun_platform_tun_auto_route_supported() && (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
       ? config->base.proxy.routing_mark : 0u, &runtime->egress);
@@ -491,8 +512,29 @@ static void ftun_default_deliver_network_changes(ftun_default_runtime_t *runtime
       ftun_netmon_take(runtime->netmon, now_ms, &change) != FTUN_OK) return;
   ftun_core_module_runtime_network_changed(runtime->modules_runtime, &change, now_ms);
   memset(&event, 0, sizeof(event));
+  (void)ftun_core_context_generation(runtime->core, &event.generation);
+  static const ftun_log_event_t storm_event = {FTUN_LOG_NET, FTUN_LOG_WARN, "network.changed", "change storm"};
+  static const ftun_log_event_t recovered_event = {FTUN_LOG_NET, FTUN_LOG_INFO, "network.stable", "network stable"};
+  if (change.storm) {
+    if (runtime->network_entity == 0u) runtime->network_entity = ftun_correlation_next();
+    ftun_log_field_t fields[] = {
+      {.key = "events", .kind = FTUN_LOG_U64, .value.u64 = change.events},
+      {.key = "mask", .kind = FTUN_LOG_U64, .value.u64 = change.mask}
+    };
+    (void)ftun_log_failure(runtime->core, &(ftun_log_record_t){.event = &storm_event,
+      .generation = event.generation, .error = {FTUN_E_LIMIT, FTUN_STAGE_CONTROL, 0}, .fields = fields, .field_count = 2u},
+      runtime->network_entity, (ftun_string_t){"network-monitor", 15u}, now_ms);
+    runtime->network_storm = true;
+    return;
+  }
+  if (runtime->network_storm) {
+    (void)ftun_log_recovery(runtime->core, &storm_event, runtime->network_entity,
+      &(ftun_log_record_t){.event = &recovered_event, .generation = event.generation}, now_ms);
+    runtime->network_storm = false;
+  }
   event.kind = FTUN_LIFECYCLE_NETWORK_CHANGED;
-  event.status = change.storm ? FTUN_E_LIMIT : FTUN_OK;
+  event.reason = (change.mask & FTUN_NETWORK_CHANGE_OVERFLOW) != 0u
+    ? FTUN_LIFECYCLE_REASON_NETWORK_OVERFLOW : FTUN_LIFECYCLE_REASON_NETWORK_CHANGED;
   (void)ftun_lifecycle_emit(runtime->core, &event);
 }
 
@@ -503,6 +545,11 @@ static ftun_status_t ftun_default_run_once(
   ftun_default_runtime_t *runtime = (ftun_default_runtime_t *)implementation;
   if (runtime == NULL) return FTUN_E_INVALID;
   ftun_default_deliver_network_changes(runtime);
+  if (ftun_ctl_server_error(runtime->ctl_server) != FTUN_OK) {
+    memset(out_usage, 0, sizeof(*out_usage));
+    out_usage->fatal = true;
+    return ftun_ctl_server_error(runtime->ctl_server);
+  }
   return ftun_core_module_runtime_run_once(
     runtime->modules_runtime, may_block, out_usage);
 }
@@ -536,6 +583,11 @@ static ftun_status_t ftun_default_drain_until(void *implementation,
   uint64_t now = 0u;
   size_t callbacks = 0u;
   if (runtime == NULL) return FTUN_E_INVALID;
+  if (runtime->ctl_server != NULL) {
+    status = ftun_ctl_server_detach(runtime->ctl_server);
+    if (status != FTUN_OK) return status;
+    runtime->ctl_server = NULL;
+  }
   (void)ftun_netmon_destroy(&runtime->netmon);
   status = runtime->modules_runtime == NULL ? FTUN_OK :
     ftun_core_module_runtime_drain_until(runtime->modules_runtime, deadline_ms);
@@ -628,4 +680,57 @@ ftun_status_t ftun_core_create(const ftun_core_options_t *options,
 {
   return ftun_core_create_with_service(options,
                                        &ftun_default_service, out);
+}
+
+ftun_status_t ftun_app_default_status_fill(ftun_core_t *core, ftun_ctl_status_t *out)
+{
+  ftun_core_control_t *control;
+  ftun_default_runtime_t *runtime;
+  ftun_status_t status = ftun_core_control(core, &control);
+  if (status != FTUN_OK) return status;
+  if (control->service.descriptor != &ftun_default_service ||
+      control->service.implementation == NULL) return FTUN_E_UNSUPPORTED;
+  runtime = control->service.implementation;
+  out->services[out->service_count++] = (ftun_ctl_service_status_t){"core",
+    {out->host.core.state == FTUN_CORE_RUNNING ? FTUN_SERVICE_ACTIVE : FTUN_SERVICE_NOT_READY, FTUN_OK, 0u}};
+#if defined(FTUN_HAVE_MODULE_TUN)
+  {
+    ftun_service_status_t state = {FTUN_SERVICE_DISABLED, FTUN_OK, 0u};
+    const ftun_core_service_t *service;
+    status = ftun_core_module_runtime_service(runtime->modules_runtime, &ftun_tun_owner_service, &service);
+    if (status == FTUN_OK) {
+      ftun_l3_provider_info_t info;
+      status = ftun_l3_provider_get_info(&runtime->l3, &info);
+      if (status != FTUN_OK) return status;
+      state.state = service->cleanup_only ? FTUN_SERVICE_FAILED :
+        info.accepting ? FTUN_SERVICE_ACTIVE : FTUN_SERVICE_NOT_READY;
+      state.reason = service->first_error;
+    } else if (status != FTUN_E_EOF) return status;
+    out->services[out->service_count++] = (ftun_ctl_service_status_t){"tun", state};
+  }
+#endif
+#if defined(FTUN_HAVE_MODULE_DNS)
+  status = ftun_dns_service_status_fill(&runtime->dns, &out->dns);
+  if (status != FTUN_OK) return status;
+  out->services[out->service_count++] = (ftun_ctl_service_status_t){"dns", out->dns.status};
+#endif
+#if defined(FTUN_HAVE_MODULE_PROXY)
+  {
+    const ftun_core_service_t *service;
+    ftun_proxy_runtime_t *proxy = NULL;
+    status = ftun_core_module_runtime_service(runtime->modules_runtime, &ftun_proxy_service, &service);
+    if (status == FTUN_OK) proxy = service->implementation;
+    else if (status != FTUN_E_EOF) return status;
+    status = ftun_proxy_status_fill(proxy, &out->proxy);
+    if (status != FTUN_OK) return status;
+    out->services[out->service_count++] = (ftun_ctl_service_status_t){"proxy", out->proxy.status};
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+    out->services[out->service_count++] = (ftun_ctl_service_status_t){"fakeip", out->proxy.fakeip_status};
+#endif
+#if defined(FTUN_HAVE_MODULE_FRS)
+    out->services[out->service_count++] = (ftun_ctl_service_status_t){"frs", out->proxy.frs_status};
+#endif
+  }
+#endif
+  return FTUN_OK;
 }

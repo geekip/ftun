@@ -2,6 +2,7 @@
 #include "libs/tun/owner.h"
 
 #include "core/event/loop.h"
+#include "core/log/aggregate.h"
 #include "util/ip.h"
 #include "libs/buffer/buffer.h"
 #include "platform/clock.h"
@@ -67,6 +68,9 @@ typedef struct {
   bool network_timer_ready;
   bool has_network_result;
   uint64_t generation;
+  uint64_t log_entity;
+  size_t logged_repairs, logged_protection_missing;
+  bool protection_fault;
   uint64_t pending_generation;
   bool has_device_ops;
   bool active;
@@ -345,6 +349,16 @@ static ftun_status_t ftun_tun_owner_activate(void *implementation)
     return cleanup == FTUN_OK ? status : FTUN_E_STATE_CORRUPT;
   }
   owner->active = true;
+  if (ftun_log_enabled(owner->core, FTUN_LOG_INFO)) {
+    ftun_tun_service_usage_t usage;
+    if (ftun_tun_service_get_usage(owner->service, &usage) == FTUN_OK) {
+      static const ftun_log_event_t up = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.device-up", "device up"};
+      FTUN_CORE_LOG(owner->core, &up, .generation = owner->generation,
+        .fields = (ftun_log_field_t[]){
+          {.key = "device", .kind = FTUN_LOG_TEXT, .value.text = {owner->plan.name, strlen(owner->plan.name)}},
+          {.key = "device_gen", .kind = FTUN_LOG_U64, .value.u64 = usage.device_generation}}, .field_count = 2u);
+    }
+  }
   return FTUN_OK;
 }
 
@@ -687,6 +701,8 @@ static ftun_status_t ftun_tun_owner_update_run(
       ftun_tun_owner_update_failed(owner, status, FTUN_OK);
       return FTUN_OK;
     }
+    owner->logged_repairs = 0u;
+    owner->logged_protection_missing = 0u;
   }
   if (removing && owner->async_routes == NULL) {
     ftun_tun_owner_withdrawn(owner);
@@ -794,10 +810,33 @@ static ftun_status_t ftun_tun_owner_repair_run(
   if (status != FTUN_OK) return status;
   status = ops->query(ops->context, owner->async_routes, &info);
   if (status != FTUN_OK) return status;
+  static const ftun_log_event_t missing = {FTUN_LOG_TUN, FTUN_LOG_WARN, "tun.protect-rule-missing", "protect rule missing"};
+  static const ftun_log_event_t restored = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.protection-restored", "protection restored"};
+  if (info.protection_missing > owner->logged_protection_missing) {
+    if (owner->log_entity == 0u) owner->log_entity = ftun_correlation_next();
+    ftun_log_field_t field = {.key = "device", .kind = FTUN_LOG_TEXT,
+      .value.text = {owner->network_plan.name, strlen(owner->network_plan.name)}};
+    (void)ftun_log_failure(owner->core, &(ftun_log_record_t){.event = &missing,
+      .generation = owner->generation, .error = {FTUN_E_REJECTED, FTUN_STAGE_CONTROL, 0}, .fields = &field, .field_count = 1u},
+      owner->log_entity, (ftun_string_t){owner->network_plan.name, strlen(owner->network_plan.name)}, now_ms);
+    owner->protection_fault = true;
+    owner->logged_protection_missing = info.protection_missing;
+  }
   if (info.repairing && info.state == FTUN_INTERFACE_INSTALLING) return FTUN_OK;
   owner->repairing = false;
   if (info.state != FTUN_INTERFACE_READY) return FTUN_OK;
   if (info.repair_result == FTUN_OK) {
+    if (info.repairs > owner->logged_repairs) {
+      static const ftun_log_event_t reconciled = {FTUN_LOG_TUN, FTUN_LOG_INFO, "tun.route-reconciled", "route reconciled"};
+      FTUN_CORE_LOG(owner->core, &reconciled, .generation = owner->generation,
+        .fields = (ftun_log_field_t[]){{.key = "repairs", .kind = FTUN_LOG_U64, .value.u64 = info.repairs - owner->logged_repairs}}, .field_count = 1u);
+      owner->logged_repairs = info.repairs;
+    }
+    if (owner->protection_fault) {
+      (void)ftun_log_recovery(owner->core, &missing, owner->log_entity,
+        &(ftun_log_record_t){.event = &restored, .generation = owner->generation}, now_ms);
+      owner->protection_fault = false;
+    }
     owner->repair_streak = 0u;
   } else {
     ftun_tun_owner_schedule_repair(owner, now_ms);
@@ -1223,6 +1262,11 @@ static ftun_status_t ftun_tun_owner_destroy_until(
   status = ftun_buffer_pool_trim(owner->buffers, 0u);
   if (status == FTUN_OK) status = ftun_buffer_pool_destroy(&owner->buffers);
   if (status != FTUN_OK) return status;
+  if (owner->protection_fault) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK)
+      (void)ftun_log_retire(owner->core, FTUN_LOG_TUN, owner->log_entity, now);
+  }
   reservation = owner->reservation;
   owner->reservation = (ftun_reservation_t){0};
   owner->published = NULL;

@@ -67,7 +67,7 @@ void ftun_ipv4_store(uint32_t value, uint8_t bytes[4]);
 bool ftun_cidr_ipv4_range(const ftun_cidr_t *cidr, uint32_t *network,
                           uint32_t *broadcast);
 /* 可分配的主机地址区间 [first, end)：网络地址之后到广播地址之前；
- * 至少要有一个主机地址，否则返回 false。 */
+ * 主机位先按掩码归零；至少要有一个主机地址，否则返回 false。 */
 bool ftun_cidr_ipv4_hosts(const ftun_cidr_t *cidr, uint32_t *first,
                           uint32_t *end);
 

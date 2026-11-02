@@ -35,6 +35,10 @@ ftun_status_t ftun_tls_client_get_info(const ftun_tls_client_t *client, ftun_tls
 {
   return ftun_wolfssl_client_info(client, out);
 }
+void ftun_tls_error_text(int code, char out[FTUN_TLS_ERROR_BYTES])
+{
+  ftun_wolfssl_error_text(code, out);
+}
 ftun_status_t ftun_tls_client_destroy(ftun_tls_client_t **client)
 {
   return ftun_wolfssl_client_destroy(client);

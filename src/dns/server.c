@@ -2,7 +2,9 @@
 #include "dns/server.h"
 
 #include "core/context.h"
+#include "core/status.h"
 #include "platform/clock.h"
+#include "platform/socket.h"
 
 #include <assert.h>
 #include <stdlib.h>
@@ -14,6 +16,17 @@
 #define FTUN_DNS_SERVER_STAGE_TIMEOUT 4u
 /* 刚恢复的上游地址只给这么长的试探期限（与剩余期限的一半取小）。 */
 #define FTUN_DNS_SERVER_PROBE_MAX_MS 1000u
+
+static const ftun_log_event_t upstream_event = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "dns.upstream", "upstream query"};
+static const ftun_log_event_t cache_event = {FTUN_LOG_DNS, FTUN_LOG_DEBUG, "dns.cache-hit", "cache hit"};
+static const ftun_log_event_t failure_event = {FTUN_LOG_DNS, FTUN_LOG_WARN, "dns.upstream-failed", "upstream failures"};
+static const ftun_log_event_t invalid_event = {FTUN_LOG_DNS, FTUN_LOG_WARN, "dns.response-invalid", "response invalid"};
+static const ftun_log_event_t valid_event = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.response-valid", "response valid"};
+static const ftun_log_event_t healthy_event = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.upstream-healthy", "upstream healthy"};
+static const ftun_log_event_t unhealthy_event = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.upstream-unhealthy", "upstream unhealthy"};
+static const ftun_log_event_t switched_event = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.group-switched", "group switched"};
+static const ftun_log_event_t rejected_event = {FTUN_LOG_DNS, FTUN_LOG_WARN, "dns.query-rejected", "query rejected"};
+static const ftun_log_event_t admitted_event = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.query-admitted", "query admitted"};
 
 struct ftun_dns_server {
   ftun_budget_t *budget;
@@ -30,11 +43,22 @@ struct ftun_dns_server {
   void *now_user;
   ftun_reservation_t reservation;
   size_t inflight;
+  ftun_dns_query_stats_t queries;
+  uint64_t upstream_success, upstream_failures, latency_ms;
+  ftun_status_t last_failure;
+  bool latency_valid, unhealthy;
+  ftun_status_label_t label;
+  uint64_t entities[FTUN_UPSTREAM_SET_MAX];
+  bool failed[FTUN_UPSTREAM_SET_MAX];
+  bool invalid[FTUN_UPSTREAM_SET_MAX];
+  bool rejected[FTUN_UPSTREAM_SET_MAX];
+  size_t selected_upstream;
   int tcp_fallback;
   int fakeip;
 };
 
 typedef struct {
+  ftun_core_t *core; /* 查询拥有者保持Core至最终Operation回调返回。 */
   ftun_dns_server_t *server;
   ftun_operation_t *operation;
   ftun_operation_token_t completion_token;
@@ -46,6 +70,8 @@ typedef struct {
   uint8_t *response;
   size_t response_length;
   ftun_dns_transport_t current_transport;
+  uint64_t attempt_started_ms;
+  bool transport_attempted;
   ftun_dns_transport_binding_t binding;
   bool selected;
   bool upstream_chosen;
@@ -56,7 +82,83 @@ typedef struct {
   uint64_t attempt_deadline_ms;
   bool cancelling;
   bool completed_during_cancel;
+  bool failure_logged;
+  ftun_error_t attempt_error;
 } ftun_dns_exchange_context_t;
+
+static bool upstream_failure(ftun_status_t status)
+{
+  return status == FTUN_E_IO || status == FTUN_E_TIMEOUT ||
+    status == FTUN_E_PROTOCOL || status == FTUN_E_EOF;
+}
+
+/* 仅真实尝试改变健康；按配置上游聚合，域名和客户端不进入键。 */
+static void ftun_dns_server_failure(ftun_dns_exchange_context_t *context, ftun_status_t status)
+{
+  ftun_dns_server_t *server = context->server;
+  size_t index = context->upstream_index;
+  uint64_t now;
+  if (status == FTUN_E_CANCELLED || server->now(server->now_user, &now) != FTUN_OK) return;
+  ftun_log_field_t fields[3] = {
+    {.key = "upstream_index", .kind = FTUN_LOG_U64, .value.u64 = index},
+    {.key = "server", .kind = FTUN_LOG_TEXT, .value.text = {server->label.text, strlen(server->label.text)}}
+  };
+  ftun_log_record_t record = {.event = &failure_event, .error = {status, FTUN_DNS_SERVER_STAGE_TRANSPORT, 0},
+    .sid = context->query.sid, .generation = context->query.generation, .fields = fields, .field_count = 2u};
+  if (!upstream_failure(status)) {
+    record.event = &rejected_event;
+    record.error.stage = FTUN_DNS_SERVER_STAGE_ADMISSION;
+  }
+  if (context->attempt_error.status == status) record.error.native_code = context->attempt_error.native_code;
+  if (record.error.native_code != 0 && ftun_log_enabled(context->core, FTUN_LOG_WARN)) {
+    const char *name = ftun_socket_error_name(record.error.native_code);
+    fields[record.field_count++] = (ftun_log_field_t){.key = "errno", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}};
+  }
+  (void)ftun_log_failure(context->core, &record, server->entities[index],
+    (ftun_string_t){server->label.text, strlen(server->label.text)}, now);
+  if (!upstream_failure(status)) server->rejected[index] = true;
+  else if (!server->failed[index]) {
+    FTUN_CORE_LOG(context->core, &unhealthy_event, .generation = context->query.generation,
+      .fields = fields, .field_count = 2u);
+    server->failed[index] = true;
+  }
+  context->failure_logged = true;
+}
+
+static void ftun_dns_server_healthy(ftun_dns_exchange_context_t *context, uint64_t now)
+{
+  ftun_dns_server_t *server = context->server;
+  size_t index = context->upstream_index;
+  if (!server->failed[index] && !server->invalid[index] && !server->rejected[index] &&
+      (server->selected_upstream == SIZE_MAX || server->selected_upstream == index)) {
+    server->selected_upstream = index;
+    return;
+  }
+  ftun_log_field_t fields[] = {
+    {.key = "upstream_index", .kind = FTUN_LOG_U64, .value.u64 = index},
+    {.key = "server", .kind = FTUN_LOG_TEXT, .value.text = {server->label.text, strlen(server->label.text)}}
+  };
+  if (server->failed[index]) {
+    ftun_log_record_t record = {.event = &healthy_event, .generation = context->query.generation,
+      .fields = fields, .field_count = 2u};
+    (void)ftun_log_recovery(context->core, &failure_event, server->entities[index], &record, now);
+    server->failed[index] = false;
+  }
+  if (server->invalid[index]) {
+    (void)ftun_log_recovery(context->core, &invalid_event, server->entities[index],
+      &(ftun_log_record_t){.event = &valid_event, .generation = context->query.generation}, now);
+    server->invalid[index] = false;
+  }
+  if (server->rejected[index]) {
+    (void)ftun_log_recovery(context->core, &rejected_event, server->entities[index],
+      &(ftun_log_record_t){.event = &admitted_event, .generation = context->query.generation}, now);
+    server->rejected[index] = false;
+  }
+  if (server->selected_upstream != SIZE_MAX && server->selected_upstream != index)
+    FTUN_CORE_LOG(context->core, &switched_event, .generation = context->query.generation,
+      .fields = fields, .field_count = 2u);
+  server->selected_upstream = index;
+}
 
 static ftun_error_t ftun_dns_server_error(ftun_status_t status,
                                           uint32_t stage)
@@ -120,8 +222,10 @@ static ftun_status_t ftun_dns_server_finish(
   ftun_dns_exchange_context_t *context, ftun_status_t status,
   uint32_t stage)
 {
+  ftun_error_t error = ftun_dns_server_error(status, stage);
+  if (context->attempt_error.status == status) error.native_code = context->attempt_error.native_code;
   return ftun_operation_complete_deferred(context->completion_token,
-                                  ftun_dns_server_error(status, stage));
+                                  error);
 }
 
 static void ftun_dns_server_operation_completed(ftun_operation_t *operation,
@@ -137,6 +241,26 @@ static void ftun_dns_server_operation_completed(ftun_operation_t *operation,
     response.data = context->response;
     response.length = context->response_length;
   }
+  if (context->transport_attempted && error.status != FTUN_E_CANCELLED) {
+    uint64_t now;
+    if (error.status == FTUN_OK) {
+      server->upstream_success++;
+      server->unhealthy = false;
+      if (server->now(server->now_user, &now) == FTUN_OK && now >= context->attempt_started_ms) {
+        server->latency_ms = now - context->attempt_started_ms;
+        server->latency_valid = true;
+      }
+    } else {
+      if (!context->failure_logged) ftun_dns_server_failure(context, error.status);
+      if (upstream_failure(error.status)) {
+        server->upstream_failures++;
+        server->last_failure = error.status;
+        server->unhealthy = true;
+      }
+    }
+  }
+  if (error.status == FTUN_OK) server->queries.success++;
+  else server->queries.failures[error.status]++;
   context->operation = NULL;
   context->completion(operation, error, response, context->completion_user);
   if (server->inflight != 0u) server->inflight--;
@@ -169,7 +293,7 @@ static ftun_status_t ftun_dns_server_cancel(void *user)
 }
 
 static void ftun_dns_server_transport_completed(
-  void *user, ftun_status_t status, ftun_dns_transport_t transport,
+  void *user, ftun_error_t error, ftun_dns_transport_t transport,
   const ftun_endpoint_t *source, ftun_bytes_t response);
 
 static ftun_status_t ftun_dns_server_submit(
@@ -228,6 +352,22 @@ static ftun_status_t ftun_dns_server_submit(
   }
   context->query.transport = transport;
   context->current_transport = transport;
+  context->attempt_started_ms = now;
+  context->transport_attempted = true;
+  context->failure_logged = false;
+  context->attempt_error = (ftun_error_t){0};
+  if (ftun_log_enabled(context->core, FTUN_LOG_DEBUG)) {
+    char address[FTUN_IP_TEXT_BYTES];
+    ftun_ip_t ip = ftun_endpoint_ip(&context->query.upstream);
+    size_t length = ftun_ip_format(&ip, address, sizeof(address));
+    ftun_log_field_t fields[] = {
+      {.key = "upstream", .kind = FTUN_LOG_TEXT, .value.text = {address, length}},
+      {.key = "port", .kind = FTUN_LOG_U64, .value.u64 = context->query.upstream.port},
+      {.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = transport == FTUN_DNS_TRANSPORT_TCP ? (ftun_string_t){"tcp", 3u} : (ftun_string_t){"udp", 3u}}
+    };
+    FTUN_CORE_LOG(context->core, &upstream_event, .sid = context->query.sid, .generation = context->query.generation,
+      .fields = fields, .field_count = 3u);
+  }
   status = server->query_transport.submit(
     server->query_transport.context, &context->binding,
     context->query.policy_fingerprint, context->query.server_fingerprint,
@@ -247,13 +387,16 @@ static ftun_status_t ftun_dns_server_submit(
 /* 当前地址不健康（网络类失败，或应答无法解析/对不上）：记入集合，并在剩余期限内
  * 换下一个地址重新提交。上游自己返回的 SERVFAIL/REFUSED 是合法应答，不走这里。
  * 换成功返回 true；没有集合、没有备用地址或限额用完返回 false，由调用方如实失败。 */
-static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context)
+static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context, ftun_status_t reason)
 {
   ftun_dns_server_t *server = context->server;
   size_t next = 0u;
+  ftun_dns_server_failure(context, reason);
   if (server->upstream_set == NULL) return false;
   uint64_t now;
   ftun_status_t status = server->now(server->now_user, &now);
+  if (status == FTUN_OK) ftun_upstream_set_observe(server->upstream_set,
+    context->upstream_index, reason, now - context->attempt_started_ms);
   if (status == FTUN_OK) status = ftun_upstream_set_report_failure(server->upstream_set, context->upstream_index);
   if (status != FTUN_OK) {
     (void)ftun_dns_server_finish(context, status, FTUN_DNS_SERVER_STAGE_TRANSPORT);
@@ -273,7 +416,7 @@ static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context)
 }
 
 static void ftun_dns_server_transport_completed(
-  void *user, ftun_status_t status, ftun_dns_transport_t transport,
+  void *user, ftun_error_t error, ftun_dns_transport_t transport,
   const ftun_endpoint_t *source, ftun_bytes_t response)
 {
   ftun_dns_exchange_context_t *context =
@@ -282,15 +425,17 @@ static void ftun_dns_server_transport_completed(
   ftun_dns_message_t *message = NULL;
   bool matches = false;
   uint64_t now;
+  ftun_status_t status = error.status;
   assert(context != NULL && context->server != NULL);
   server = context->server;
+  context->attempt_error = error;
   if (context->cancelling) context->completed_during_cancel = true;
   context->transport_request = NULL;
   if (status != FTUN_OK) {
     /* 网络类失败（超时、IO）：记入健康状态并换地址。取消不算失败。 */
     if (!context->cancelling &&
         (status == FTUN_E_TIMEOUT || status == FTUN_E_IO) &&
-        ftun_dns_server_failover(context)) return;
+        ftun_dns_server_failover(context, status)) return;
     (void)ftun_dns_server_finish(context, status,
                                  FTUN_DNS_SERVER_STAGE_TRANSPORT);
     return;
@@ -309,7 +454,12 @@ static void ftun_dns_server_transport_completed(
   }
   if (transport != context->current_transport ||
       response.data == NULL || response.length > server->max_response_bytes) {
-    if (ftun_dns_server_failover(context)) return;
+    server->invalid[context->upstream_index] = true;
+    (void)ftun_log_failure(context->core, &(ftun_log_record_t){.event = &invalid_event,
+      .error = {FTUN_E_PROTOCOL, FTUN_DNS_SERVER_STAGE_RESPONSE, 0}, .sid = context->query.sid,
+      .generation = context->query.generation}, server->entities[context->upstream_index],
+      (ftun_string_t){server->label.text, strlen(server->label.text)}, now);
+    if (ftun_dns_server_failover(context, FTUN_E_PROTOCOL)) return;
     (void)ftun_dns_server_finish(context, FTUN_E_PROTOCOL,
                                  FTUN_DNS_SERVER_STAGE_RESPONSE);
     return;
@@ -320,16 +470,23 @@ static void ftun_dns_server_transport_completed(
                                       source, &matches);
   }
   if (status != FTUN_OK || !matches) {
+    server->invalid[context->upstream_index] = true;
+    (void)ftun_log_failure(context->core, &(ftun_log_record_t){.event = &invalid_event,
+      .error = {status == FTUN_OK ? FTUN_E_PROTOCOL : status, FTUN_DNS_SERVER_STAGE_RESPONSE, 0},
+      .sid = context->query.sid, .generation = context->query.generation}, server->entities[context->upstream_index],
+      (ftun_string_t){server->label.text, strlen(server->label.text)}, now);
     ftun_dns_message_release(&message);
     /* 应答无法解析或与查询对不上：按上游不健康处理。解析失败的原因可能是畸形的
      * 计数或标签（解析器对它们返回 LIMIT/PROTOCOL），无法与本地预算不足可靠区分；
      * 代价只是该地址进入一次退避，每次查询最多换一个地址。 */
-    if (ftun_dns_server_failover(context)) return;
+    if (ftun_dns_server_failover(context, status == FTUN_OK ? FTUN_E_PROTOCOL : status)) return;
     (void)ftun_dns_server_finish(context,
       status == FTUN_OK ? FTUN_E_PROTOCOL : status,
       FTUN_DNS_SERVER_STAGE_RESPONSE);
     return;
   }
+  if (server->upstream_set != NULL) ftun_upstream_set_observe(server->upstream_set,
+    context->upstream_index, FTUN_OK, now - context->attempt_started_ms);
   if ((message->flags & 0x0200u) != 0u && transport == FTUN_DNS_TRANSPORT_UDP) {
     ftun_dns_message_release(&message);
     if (!server->tcp_fallback) {
@@ -342,6 +499,7 @@ static void ftun_dns_server_transport_completed(
     (void)ftun_dns_server_submit(context, FTUN_DNS_TRANSPORT_TCP);
     return;
   }
+  ftun_dns_server_healthy(context, now);
   ftun_dns_message_release(&message);
   memcpy(context->response, response.data, response.length);
   context->response_length = response.length;
@@ -392,6 +550,9 @@ ftun_status_t ftun_dns_server_create(const ftun_dns_server_options_t *options,
   server->now = options->now == NULL ? ftun_dns_server_default_now : options->now;
   server->now_user = options->now_user;
   server->reservation = reservation;
+  server->selected_upstream = SIZE_MAX;
+  ftun_status_label_set(&server->label, options->name == NULL ? "default" : options->name);
+  for (size_t index = 0u; index < FTUN_UPSTREAM_SET_MAX; index++) server->entities[index] = ftun_correlation_next();
   *out = server;
   return FTUN_OK;
 }
@@ -407,6 +568,14 @@ ftun_status_t ftun_dns_server_get_info(const ftun_dns_server_t *server,
   out->transport = server->transport;
   out->tcp_fallback = server->tcp_fallback != 0;
   out->fakeip = server->fakeip != 0;
+  out->queries = server->queries;
+  out->upstream = server->upstream;
+  out->upstream_success = server->upstream_success;
+  out->upstream_failures = server->upstream_failures;
+  out->latency_ms = server->latency_ms;
+  out->latency_valid = server->latency_valid;
+  out->last_failure = server->last_failure;
+  out->unhealthy = server->unhealthy;
   return FTUN_OK;
 }
 
@@ -471,8 +640,10 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
     return FTUN_E_LIMIT;
   }
   context->server = server;
+  context->core = core;
   context->reservation = reservation;
   context->query = *query;
+  if (context->query.sid == 0u) context->query.sid = ftun_correlation_next();
   context->completion = query->completion;
   context->completion_user = query->completion_user;
   cursor = (uint8_t *)(context + 1);
@@ -497,8 +668,10 @@ ftun_status_t ftun_dns_exchange(ftun_core_t *core,
     goto fail;
   }
   server->inflight++;
+  server->queries.queries++;
   *out = context->operation;
   if (cache_status == FTUN_OK) {
+    FTUN_CORE_LOG(core, &cache_event, .sid = context->query.sid, .generation = context->query.generation);
     if (cached->wire_length <= server->max_response_bytes) {
       memcpy(context->response, cached->wire, cached->wire_length);
       context->response_length = cached->wire_length;
@@ -536,4 +709,10 @@ ftun_status_t ftun_dns_server_destroy(ftun_dns_server_t **server)
   *server = NULL;
   ftun_reservation_release(&reservation);
   return FTUN_OK;
+}
+
+void ftun_dns_server_add_counts(ftun_dns_server_t *server, uint64_t success, uint64_t failures)
+{
+  server->upstream_success += success;
+  server->upstream_failures += failures;
 }

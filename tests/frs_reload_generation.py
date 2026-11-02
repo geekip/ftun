@@ -131,7 +131,7 @@ def main():
         config = {
             'base': {'state-cache': False, 'cache-file': str(root / 'ftun.cache')},
             'dns': {'enable': False},
-            'log': {'level': 'info', 'file': str(log_path)},
+            'log': {'output': 'file', 'level': 'info', 'file': str(log_path)},
             'frs': {'path': str(rules),
                     'url': f'http://127.0.0.1:{server.server_port}/rules',
                     'auto-update': True, 'update-interval': '1s'},
@@ -143,20 +143,38 @@ def main():
         config_path.write_text(json.dumps(config))
         stderr_path = root / 'stderr.txt'
         with stderr_path.open('w+') as stderr:
-            process = subprocess.Popen([binary, 'run', '-c', str(config_path)],
+            process = subprocess.Popen([binary, 'run', '-c', str(config_path), '-p', str(config_path) + '.pid'],
                                        stdout=stderr, stderr=stderr)
             try:
                 log = lambda: log_path.read_text() if log_path.exists() else ''
                 wait_for(process, lambda: rules.read_bytes() == updated and
-                         'event=config.published module=frs' in log())
+                         'configuration published:' in log())
                 published = re.findall(
-                    r'event=config\.published module=frs generation=(\d+) '
+                    r'configuration published: gen=(\d+) [^\n]*service=frs '
                     r'reason=frs-update', log())
                 assert published == ['2'], published
+                queried = subprocess.run([binary, 'proxy', 'status', '-p', str(config_path) + '.pid', '--json'],
+                                         capture_output=True, text=True, timeout=5)
+                assert queried.returncode == 0 and not queried.stderr, queried
+                snapshot = json.loads(queried.stdout)
+                assert snapshot['generation'] == snapshot['stats_generation'] == 2, snapshot
+                assert snapshot['frs']['items'] and all(item['updated_unix_ms'] is not None
+                                                        for item in snapshot['frs']['items']), snapshot
+                assert all(abs(item['updated_unix_ms'] - int(time.time() * 1000)) < 10000
+                           for item in snapshot['frs']['items']), snapshot
+                def status():
+                    result = subprocess.run([binary, 'status', '-p', str(config_path) + '.pid', '--json'],
+                                            capture_output=True, text=True, timeout=5)
+                    assert result.returncode == 0, result
+                    return json.loads(result.stdout)
+                instance = status()
+                sequences = [instance['logs']['sequence']]
                 for expected in ('3', '4'):
                     process.send_signal(signal.SIGHUP)
-                    wait_for(process, lambda: f'event=reload.committed module=app '
-                             f'generation={expected}' in log())
+                    wait_for(process, lambda: re.search(r'configuration committed: op=\d+ gen=' + expected + r' ', log()))
+                    sampled = status()
+                    assert sampled['boot'] == instance['boot']
+                    sequences.append(sampled['logs']['sequence'])
                 process.send_signal(signal.SIGTERM)
                 assert process.wait(timeout=15) == 0
             finally:
@@ -168,25 +186,28 @@ def main():
         assert output.count('ftun: reload committed') == 2, output
         assert 'reload rejected' not in output, output
         text = log_path.read_text()
-        assert 'status=stale' not in text, text
-        # 每行带 UTC 时间戳、进程内单调序号和固定的 boot 标识；同一次 reload 的事件共用 id。
+        assert '[frs   ][INFO ] rule set loaded:' in text, text
+        assert '[frs   ][INFO ] rule set updated:' in text, text
+        assert '[frs   ][INFO ] rule set published:' in text, text
+        assert 'err=stale' not in text, text
+        # 文本用本地毫秒时间，boot仅在启动输出；状态序号递增，同次reload共用op。
         line_pattern = re.compile(
-            r'^ts=\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z seq=(\d+) '
-            r'boot=([0-9a-f]{16}) (?:id=(\d+) )?level=')
-        sequences, boots, requested, committed = [], set(), [], []
+            r'^\[\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} [+-]\d{4}\]'
+            r'\[[a-z ]{6}\]\[(?:ERROR|WARN |INFO |DEBUG|TRACE)\] ')
+        requested, committed = [], []
         for line in text.splitlines():
-            match = line_pattern.match(line)
-            assert match, line
-            sequences.append(int(match.group(1)))
-            boots.add(match.group(2))
-            if 'event=reload.requested ' in line:
-                requested.append(match.group(3))
-            if 'event=reload.committed ' in line:
-                committed.append(match.group(3))
-        assert sequences == sorted(set(sequences)), sequences
-        assert len(boots) == 1, boots
+            assert line_pattern.match(line), line
+            assert 'seq=' not in line, line
+            if '[config]' in line and (' reload requested:' in line or ' configuration committed:' in line):
+                op = re.search(r'\bop=(\d+)', line)
+                assert op, line
+                (requested if ' reload requested:' in line else committed).append(op.group(1))
+        boots = re.findall(r'\bboot=([0-9a-f]{16})\b', text)
+        assert boots == [instance['boot']], boots
+        assert len(sequences) == 3 and sequences == sorted(set(sequences)), sequences
         assert len(requested) == 2 and requested == committed, (requested, committed)
-        assert None not in requested and len(set(requested)) == 2, requested
+        assert len(set(requested)) == 2, requested
+
     server.shutdown()
     assert downloads, 'FRS update was never requested'
     print('PASS FRS update with changed rules: generation 2 published, reloads 3 and 4 committed')

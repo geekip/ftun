@@ -25,6 +25,7 @@ struct ftun_config {
   ftun_config_base_t base;
   struct {
     char *level;
+    char *output;
     char *file;
     /* 单个日志文件的大小上限（字节，0 不轮转）与保留的文件总数（含当前文件）。 */
     uint32_t max_size;

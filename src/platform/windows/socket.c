@@ -136,13 +136,35 @@ static ftun_status_t connect_socket(void *context, ftun_native_socket_t socket, 
   if (connect((SOCKET)socket, (struct sockaddr *)&address, length) == 0) return FTUN_OK;
   return socket_status(WSAGetLastError());
 }
-static ftun_status_t socket_error(void *context, ftun_native_socket_t socket)
+ftun_error_t ftun_socket_connect_error(ftun_native_socket_t socket)
 {
   int error = 0, length = sizeof(error);
+  if (getsockopt((SOCKET)socket, SOL_SOCKET, SO_ERROR, (char *)&error, &length) != 0) {
+    error = WSAGetLastError();
+    return (ftun_error_t){socket_status(error), 0u, error};
+  }
+  return (ftun_error_t){socket_status(error), 0u, error};
+}
+static ftun_status_t socket_error(void *context, ftun_native_socket_t socket)
+{
   (void)context;
-  if (getsockopt((SOCKET)socket, SOL_SOCKET, SO_ERROR, (char *)&error, &length) != 0)
-    return socket_status(WSAGetLastError());
-  return socket_status(error);
+  return ftun_socket_connect_error(socket).status;
+}
+const char *ftun_socket_error_name(int code)
+{
+  switch (code) {
+#define SOCKET_ERROR_NAME(name) case name: return #name
+    SOCKET_ERROR_NAME(WSAEACCES); SOCKET_ERROR_NAME(WSAEADDRINUSE);
+    SOCKET_ERROR_NAME(WSAEADDRNOTAVAIL); SOCKET_ERROR_NAME(WSAEMFILE);
+    SOCKET_ERROR_NAME(WSAENOBUFS); SOCKET_ERROR_NAME(WSAENETUNREACH);
+    SOCKET_ERROR_NAME(WSAEHOSTUNREACH); SOCKET_ERROR_NAME(WSAECONNREFUSED);
+    SOCKET_ERROR_NAME(WSAECONNRESET); SOCKET_ERROR_NAME(WSAETIMEDOUT);
+    SOCKET_ERROR_NAME(WSAEINVAL); SOCKET_ERROR_NAME(WSAENOTSOCK);
+    SOCKET_ERROR_NAME(WSAEALREADY); SOCKET_ERROR_NAME(WSAEINPROGRESS);
+    SOCKET_ERROR_NAME(WSAEWOULDBLOCK); SOCKET_ERROR_NAME(WSAEINTR);
+#undef SOCKET_ERROR_NAME
+    default: return "unknown";
+  }
 }
 static ftun_status_t close_socket(void *context, ftun_native_socket_t socket)
 {

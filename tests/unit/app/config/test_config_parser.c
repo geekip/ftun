@@ -184,7 +184,8 @@ int main(int argc, char **argv)
         config->base.proxy.capacity.tcp_flows == FTUN_CONFIG_CAPACITY_DEFAULT &&
         config->base.proxy.capacity.udp_flows == FTUN_CONFIG_CAPACITY_DEFAULT &&
         config->base.proxy.capacity.udp_associations == FTUN_CONFIG_CAPACITY_DEFAULT &&
-        strcmp(config->log.level, "warn") == 0 && config->dns.enable &&
+        strcmp(config->log.level, "info") == 0 &&
+        strcmp(config->log.output, "stderr") == 0 && config->dns.enable &&
         strcmp(config->dns.fake_ip.range, "198.18.0.0/15") == 0 &&
         config->sniff.tls_sni && config->sniff.http_host);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
@@ -201,6 +202,12 @@ int main(int argc, char **argv)
         config->tun.rule_priority == 12000u);
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   CHECK(expect_status("{\"base\":{\"routing-mark\":0}}", FTUN_E_INVALID));
+  CHECK(parse_text("{\"log\":{\"output\":\"both\"}}", &config) == FTUN_OK &&
+        strcmp(config->log.output, "both") == 0);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(parse_text("{\"log\":{\"output\":\"terminal\"}}", &config) == FTUN_OK);
+  CHECK(ftun_config_destroy(&config) == FTUN_OK);
+  CHECK(expect_status("{\"log\":{\"output\":false}}", FTUN_E_INVALID));
   /* log.max-size / log.max-files：日志轮转，默认 10MiB / 3 个文件。 */
   CHECK(parse_text("{}", &config) == FTUN_OK && config->log.max_size == 10485760u &&
         config->log.max_files == 3u);

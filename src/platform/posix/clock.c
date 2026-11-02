@@ -42,3 +42,35 @@ ftun_status_t ftun_wallclock_utc(ftun_calendar_time_t *out)
     parts.tm_hour, parts.tm_min, parts.tm_sec, (unsigned int)(now.tv_nsec / 1000000L)};
   return FTUN_OK;
 }
+
+ftun_status_t ftun_wallclock_unix_ms(int64_t *out)
+{
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return FTUN_E_IO;
+  *out = (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_wallclock_local(ftun_local_time_t *out)
+{
+  struct timespec now;
+  struct tm parts;
+  char zone[6];
+  int offset;
+  if (out == NULL) return FTUN_E_INVALID;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0) return FTUN_E_IO;
+  if (localtime_r(&now.tv_sec, &parts) == NULL ||
+      strftime(zone, sizeof(zone), "%z", &parts) != 5u) {
+    if (gmtime_r(&now.tv_sec, &parts) == NULL) return FTUN_E_IO;
+    offset = 0;
+  } else {
+    offset = ((zone[1] - '0') * 10 + zone[2] - '0') * 60 +
+      (zone[3] - '0') * 10 + zone[4] - '0';
+    if (zone[0] == '-') offset = -offset;
+  }
+  out->calendar = (ftun_calendar_time_t){parts.tm_year + 1900, parts.tm_mon + 1,
+    parts.tm_mday, parts.tm_hour, parts.tm_min, parts.tm_sec,
+    (unsigned int)(now.tv_nsec / 1000000L)};
+  out->offset_minutes = offset;
+  return FTUN_OK;
+}

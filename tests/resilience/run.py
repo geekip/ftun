@@ -27,6 +27,16 @@ def main():
         lab = lib.Lab(str(Path(args.ftun).resolve()), str(Path(args.fixture).resolve()), args.scale)
         try:
             scenarios.SCENARIOS[name](lab)
+            phrases = {
+                'R1': ('listener waiting', 'frs-not-ready', 'rule set published', 'frs ready'),
+                'R2': ('dial failed', 'dial recovered'),
+                'R3': ('network changed', 'listener waiting', 'listener started'),
+                'R5': ('listener waiting', 'resource-limit', 'listener started'),
+                'R7': ('upstream failures', 'group switched', 'upstream healthy'),
+                'R10': ('device up',),
+            }.get(name, ())
+            for phrase in phrases:
+                lib.wait_until(lambda: phrase in lab.log_text(), 5, what=f'event {phrase}')
             print(f'{name}: PASS')
         except lib.Skip as reason:
             print(f'{name}: SKIP {reason}')

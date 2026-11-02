@@ -35,7 +35,11 @@ def main():
         run([args.cmake, '--build', build, '--target', 'ftun', 'ftun-build-modules-test', '--parallel', '4'])
         if profile == 'dns-only':
             run([args.cmake, '--build', build, '--parallel', '4'])
+        if profile == 'dns-only':
+            run([sys.executable, root / 'tests/dns_only_product.py', build / 'ftun'])
         run([build / 'ftun-build-modules-test'])
+        run([sys.executable, root / 'tests/cli_arguments.py', build / 'ftun',
+             '--modules', ','.join(['core'] + [m.lower() for m in MODULES if m in enabled])])
         manifest = dict(line.split('=', 1) for line in (build / 'ftun-build-modules.txt').read_text().splitlines())
         for module in MODULES:
             assert manifest[module.lower()] == ('BUILTIN' if module in enabled else 'OFF'), profile

@@ -14,6 +14,37 @@ typedef enum {
   FTUN_LOG_TRACE
 } ftun_log_level_t;
 
+/* 显示模块与业务能力位无关；具体事件目录由生产者所在层拥有。 */
+typedef enum {
+  FTUN_LOG_APP = 0, FTUN_LOG_CONFIG, FTUN_LOG_CTL, FTUN_LOG_DNS,
+  FTUN_LOG_PROXY, FTUN_LOG_FRS, FTUN_LOG_FAKEIP, FTUN_LOG_TUN,
+  FTUN_LOG_NET, FTUN_LOG_LOG, FTUN_LOG_MODULE_COUNT
+} ftun_log_module_t;
+
+typedef struct {
+  ftun_log_module_t module;
+  ftun_log_level_t level;
+  const char *id;
+  const char *phrase;
+} ftun_log_event_t;
+
+typedef enum { FTUN_LOG_TEXT, FTUN_LOG_U64, FTUN_LOG_I64 } ftun_log_field_kind_t;
+typedef struct {
+  const char *key;
+  ftun_log_field_kind_t kind;
+  union { ftun_string_t text; uint64_t u64; int64_t i64; } value;
+} ftun_log_field_t;
+#define FTUN_LOG_MAX_FIELDS 16u
+
+/* 描述符使用生产者固定目录；字段在同步调用期间借用，入队前完成有界复制。 */
+typedef struct {
+  const ftun_log_event_t *event;
+  ftun_error_t error;
+  uint64_t generation, sid, operation;
+  const ftun_log_field_t *fields;
+  size_t field_count;
+} ftun_log_record_t;
+
 typedef ftun_status_t (*ftun_log_writer_fn)(void *user, ftun_bytes_t line);
 
 typedef struct ftun_log_ledger ftun_log_ledger_t;
@@ -30,6 +61,7 @@ typedef struct {
   uint64_t rejected;
   uint64_t io_errors;
   uint64_t close_errors;
+  uint64_t rotations, reopens, rotate_errors;
   uint64_t redacted;
   uint64_t oversized;
   uint64_t truncated;
@@ -46,18 +78,20 @@ ftun_status_t ftun_log_ledger_destroy(ftun_log_ledger_t **ledger);
 typedef struct {
   ftun_log_level_t level;
   const char *path;
+  /* 内建stderr可单独使用或与path组合；writer仍为测试/嵌入调用方独占。 */
+  bool stderr_output;
+  bool no_color;
   size_t queue_capacity;
   size_t line_capacity;
   ftun_log_writer_fn writer;
   void *writer_user;
   /* 可选借用。拥有者须保持至本实例 destroy 成功；ledger 可并发计数，
    * 不借 Core/Runtime。关联实例在创建前从 ledger 的 Budget 预留对象、
-   * 两个缓冲数组、文件 FD 和全部队列槽，直到 destroy 成功才归还；
+   * 两个缓冲数组、文件打开/切换峰值两个FD和全部队列槽，直到 destroy 成功才归还；
    * 新旧实例重叠计量，线程栈/allocator/内核缓冲不包含在逻辑字节中。
    * App 在所有 Worker 和候选/退休 logger 之后销毁 ledger。 */
   ftun_log_ledger_t *ledger;
-  /* 为每行加上 ts（UTC 毫秒）、seq（进程内单调序号）、boot（进程标识）及
-   * 非零的 id 前缀。底层单元测试不开启，产品路径开启。 */
+  /* 每行本地时间带毫秒和UTC偏移；单元测试可省略时间，产品路径开启。 */
   bool stamp;
   /* 文件轮转（仅 path 方式有效，自定义 writer 时必须为 0）。写入会让当前文件超过
    * max_size 字节时，先把 path.(n-1) 依次改名为 path.n 再新建 path；max_files 是保留
@@ -68,6 +102,8 @@ typedef struct {
 
 /* 进程标识：第一次调用时随机生成，此后不变。不是安全用途的标识。 */
 uint64_t ftun_log_boot_id(void);
+/* 实例内已接纳记录的最新序号；文本不打印序号。 */
+uint64_t ftun_log_last_sequence(void);
 /* 进程内单调递增的关联 ID，从 1 开始；线程安全。 */
 uint64_t ftun_correlation_next(void);
 
@@ -97,6 +133,21 @@ ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
 /* write/usage/stop 可并发；直接句柄的调用者须保证实例存活。每个字段
  * 最多检查 4096 字节，超长字段使整条诊断脱敏，不读取未检查的前缀。
  * 成功只表示日志已过滤或已接纳；队列满时丢弃新项并返回 OK。 */
+/* 原子级别门禁，调用方先判断再构造详细诊断；不读字段、不格式化。 */
+bool ftun_logger_enabled(const ftun_logger_t *logger, ftun_log_level_t level);
+/* Core存活期间可跨线程读取；替换时最多观察到相邻配置的门禁，入队再校验。 */
+bool ftun_log_enabled(const ftun_core_t *core, ftun_log_level_t level);
+ftun_status_t ftun_logger_record(ftun_logger_t *logger, const ftun_log_record_t *record);
+ftun_status_t ftun_log_record(ftun_core_t *core, const ftun_log_record_t *record);
+/* 表达式中的字段仅在级别启用后求值；logger必须处于显式借用期。 */
+#define FTUN_LOG(logger, descriptor, ...) do { \
+  if (ftun_logger_enabled((logger), (descriptor)->level)) \
+    (void)ftun_logger_record((logger), &(ftun_log_record_t){.event = (descriptor), __VA_ARGS__}); \
+} while (0)
+#define FTUN_CORE_LOG(core, descriptor, ...) do { \
+  if (ftun_log_enabled((core), (descriptor)->level)) \
+    (void)ftun_log_record((core), &(ftun_log_record_t){.event = (descriptor), __VA_ARGS__}); \
+} while (0)
 ftun_status_t ftun_logger_write(ftun_logger_t *logger, ftun_log_level_t level,
                                 const ftun_diagnostic_t *diagnostic);
 /* 请求重新打开日志文件（配合外部 logrotate：它改走了旧文件之后，下一次写入落在新建

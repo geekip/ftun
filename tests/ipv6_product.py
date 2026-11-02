@@ -125,9 +125,11 @@ def app(binary, host, dns=None, outbound=None, rules=None, dns_listener=0, liste
     with tempfile.TemporaryDirectory(prefix='ftun-ipv6-') as directory:
         root = Path(directory)
         path, log = root / 'config.json', root / 'run.log'
+        config['log']['output'] = 'file'
+        config['log']['file'] = str(root / 'events.log')
         path.write_text(json.dumps(config))
         with log.open('w') as output:
-            process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=output, stderr=output)
+            process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=output, stderr=output)
             try:
                 deadline = time.monotonic() + 5
                 while True:

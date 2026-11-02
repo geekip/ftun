@@ -17,6 +17,7 @@ struct ftun_upstream_set {
   size_t count;
   ftun_endpoint_t endpoints[FTUN_UPSTREAM_SET_MAX];
   ftun_upstream_entity_t entities[FTUN_UPSTREAM_SET_MAX];
+  ftun_upstream_info_t observations[FTUN_UPSTREAM_SET_MAX];
 };
 
 /* A0 到期只表示“可以再试一次”，不发起任何查询：同步结束尝试，实体回到
@@ -132,4 +133,36 @@ ftun_status_t ftun_upstream_set_report_failure(ftun_upstream_set_t *set, size_t 
   if (status != FTUN_OK) return status;
   return ftun_recovery_report_failure(set->scheduler, set->entities[index].id,
     now, FTUN_RECOVERY_FAULT_NETWORK);
+}
+
+ftun_status_t ftun_upstream_set_get_info(const ftun_upstream_set_t *set,
+  size_t index, ftun_upstream_info_t *out)
+{
+  ftun_status_t status;
+  memset(out, 0, sizeof(*out));
+  if (set == NULL || index >= set->count) return FTUN_E_EOF;
+  *out = set->observations[index];
+  out->address = set->endpoints[index];
+  status = ftun_recovery_query(set->scheduler, set->entities[index].id.slot, &out->recovery);
+  return status;
+}
+
+void ftun_upstream_set_observe(ftun_upstream_set_t *set, size_t index,
+  ftun_status_t status, uint64_t latency_ms)
+{
+  ftun_upstream_info_t *info = &set->observations[index];
+  if (status == FTUN_OK) {
+    info->success++;
+    info->latency_ms = latency_ms;
+    info->latency_valid = true;
+  } else {
+    info->failures++;
+    info->last_failure = status;
+  }
+}
+
+void ftun_upstream_set_add_counts(ftun_upstream_set_t *set, size_t index, uint64_t success, uint64_t failures)
+{
+  set->observations[index].success += success;
+  set->observations[index].failures += failures;
 }

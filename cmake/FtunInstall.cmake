@@ -11,6 +11,8 @@ if(TARGET ftun_lwip)
 endif()
 install(FILES third_party/cjson/LICENSE
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-cJSON)
+install(FILES third_party/optparse/UNLICENSE
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-optparse)
 install(FILES third_party/wolfssl/COPYING
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun RENAME LICENSE-wolfSSL)
 if(WIN32)
@@ -22,10 +24,15 @@ set(FTUN_DEPENDENCY_LOCK "${CMAKE_CURRENT_SOURCE_DIR}/third_party/LOCK.json")
 set(FTUN_NOTICES_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/THIRD_PARTY_NOTICES.md")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${FTUN_DEPENDENCY_LOCK}")
 include(cmake/ThirdPartyNotices.cmake)
-install(FILES LICENSE README.md "${FTUN_NOTICES_OUTPUT}" third_party/LOCK.json
+install(FILES LICENSE README.md CHANGELOG.md "${FTUN_NOTICES_OUTPUT}" third_party/LOCK.json
   DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun)
 install(DIRECTORY docs DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun
   FILES_MATCHING PATTERN "*.md")
+install(DIRECTORY examples schema packaging DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun
+  USE_SOURCE_PERMISSIONS)
+install(FILES third_party/README.md third_party/LOCK.json
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun/third_party)
+install(DIRECTORY include/ftun DESTINATION ${CMAKE_INSTALL_DATADIR}/doc/ftun/include)
 configure_file(cmake/uninstall.cmake.in uninstall.cmake @ONLY)
 add_custom_target(uninstall COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake)
 

@@ -10,6 +10,19 @@
   return 1; \
 } } while (0)
 
+/* 两个字段必须出现在同一行，允许中间保留阶段/原生错误等诊断字段。 */
+static bool has_line(const char *text, const char *first, const char *second)
+{
+  const char *match = text;
+  while ((match = strstr(match, first)) != NULL) {
+    const char *end = strchr(match, '\n');
+    const char *tail = strstr(match, second);
+    if (tail != NULL && (end == NULL || tail < end)) return true;
+    match++;
+  }
+  return false;
+}
+
 typedef struct {
   char output[65536];
   size_t length;
@@ -81,7 +94,8 @@ static int test_early(void)
   CHECK(ftun_event_log_begin(log) == FTUN_E_AGAIN);
   CHECK(ftun_event_log_get_usage(log, &usage) == FTUN_OK && usage.recorded == 17u &&
     usage.buffered == 16u && usage.early_dropped == 1u && usage.has_error &&
-    usage.last_error.generation == 99u && usage.last_error.status == FTUN_E_INVALID);
+    usage.last_error.generation == 99u && usage.last_error.status == FTUN_E_INVALID &&
+    usage.first_error.generation == 99u && usage.first_error.status == FTUN_E_INVALID);
   CHECK(ftun_event_log_publish(log, NULL, false) == FTUN_E_INVALID);
   CHECK(make_logger(&writer, FTUN_LOG_INFO, &logger) == FTUN_OK);
   CHECK(ftun_event_log_publish(log, logger, false) == FTUN_OK);
@@ -94,18 +108,19 @@ static int test_early(void)
   for (index = 1u; index <= 16u; index++) {
     char marker[128];
     (void)snprintf(marker, sizeof(marker),
-      "event=config.parsed module=app generation=%u reason=none suppressed=0", index);
+      "configuration parsed: gen=%u stage=%u service=app reason=none suppressed=0", index, FTUN_STAGE_CONFIG_PREPARE);
     cursor = strstr(cursor, marker);
     CHECK(cursor != NULL);
     cursor += strlen(marker);
   }
-  CHECK(strstr(writer.output, "generation=99 ") == NULL);
+  CHECK(strstr(writer.output, "gen=99 ") == NULL);
   CHECK(ftun_event_log_finish(log, logger) == FTUN_OK);
   CHECK(ftun_event_log_record(log, logger, &item, 0u) == FTUN_E_CANCELLED);
   CHECK(ftun_event_log_finish(log, logger) == FTUN_OK);
   CHECK(ftun_event_log_begin(log) == FTUN_OK);
   CHECK(ftun_event_log_get_usage(log, &usage) == FTUN_OK && usage.recorded == 17u &&
-    usage.forwarded == 16u && usage.buffered == 0u && !usage.has_error && !usage.closed);
+    usage.forwarded == 16u && usage.buffered == 0u && !usage.has_error && !usage.closed &&
+    usage.first_error.status == FTUN_OK);
   /* 配置失败后无 sink：保留失败值，finish 如实计入未输出事件。 */
   CHECK(ftun_event_log_record(log, NULL, &item, 0u) == FTUN_OK);
   CHECK(ftun_event_log_finish(log, NULL) == FTUN_OK);
@@ -185,15 +200,15 @@ static int test_rate_and_failures(void)
   CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 4u);
   CHECK(ftun_event_log_record(log, logger, &item, 1100u) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 6u);
-  CHECK(strstr(writer.output, "generation=5 reason=none suppressed=97") != NULL);
+  CHECK(has_line(writer.output, "stop failed: gen=5 ", "reason=none suppressed=97"));
   for (index = 0u; index < 4u; index++) {
     CHECK(ftun_event_log_record(log, logger, &item, 1100u) == FTUN_OK);
   }
   item.generation = 6u;
   CHECK(ftun_event_log_record(log, logger, &item, 1100u) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 11u);
-  CHECK(strstr(writer.output, "generation=5 reason=none suppressed=1") != NULL);
-  CHECK(strstr(writer.output, "generation=6 reason=none suppressed=0") != NULL);
+  CHECK(has_line(writer.output, "stop failed: gen=5 ", "reason=none suppressed=1"));
+  CHECK(has_line(writer.output, "stop failed: gen=6 ", "reason=none suppressed=0"));
   /* 时钟回退开启新窗口，不能把减法下溢当作无限期压制。 */
   CHECK(ftun_event_log_record(log, logger, &item, 10u) == FTUN_OK);
   CHECK(ftun_event_log_finish(log, logger) == FTUN_OK);
@@ -469,7 +484,7 @@ static int test_terminal(void)
   CHECK(ftun_core_context_publish_logger(core, logger, false) == FTUN_E_STALE);
   CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 6u);
   summary = strstr(writer.output, "suppressed=6");
-  last = strstr(writer.output, "event=runtime.stopped module=app generation=8 reason=log-draining");
+  last = strstr(writer.output, "runtime stopped: gen=8 ");
   CHECK(summary != NULL && last != NULL && summary < last &&
     strchr(last, '\n') == writer.output + writer.length - 1u);
   CHECK(ftun_event_log_get_usage(log, &usage) == FTUN_OK && usage.closed &&
@@ -516,9 +531,9 @@ static int test_diagnostics(void)
   memcpy(item.message, "changed diagnostic", 19u);
   CHECK(ftun_event_log_publish(log, logger, false) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK && writer.calls == 2u);
-  CHECK(strstr(writer.output, "event=starting ") != NULL &&
-    strstr(writer.output, "message=state save failed") != NULL &&
-    strstr(writer.output, "event=starting ") < strstr(writer.output, "message=state save failed"));
+  CHECK(strstr(writer.output, "starting: ") != NULL &&
+    strstr(writer.output, "message=\"state save failed\"") != NULL &&
+    strstr(writer.output, "starting: ") < strstr(writer.output, "message=\"state save failed\""));
   CHECK(strstr(writer.output, "changed diagnostic") == NULL);
   for (index = 0u; index < 100u; index++) {
     CHECK(ftun_event_log_diagnostic(log, logger, &item, 1u) == FTUN_OK);

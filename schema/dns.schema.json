@@ -21,7 +21,7 @@
         "persist": {
           "type": "boolean",
           "default": true,
-          "description": "先耐久预留地址，再批量保存映射；首次显式初始化，缺失/损坏不自动重建。池范围与持久化模式更改需要重启。"
+          "description": "先耐久预留地址，再批量保存映射；首次run仅在状态目录不存在时自动创建身份，已有目录缺文件或损坏时拒绝启动。实际池范围与持久化模式更改需要重启。"
         }
       },
       "additionalProperties": false,

@@ -90,7 +90,7 @@ def main():
                      'timeouts': {'tcp-keepalive': {'idle': '7s', 'interval': '3s', 'count': 2},
                                   'write-progress': '20s', 'tcp-idle': '3s'}},
             'dns': {'enable': False},
-            'log': {'level': 'warn', 'file': str(log_path)},
+            'log': {'output': 'file', 'level': 'warn', 'file': str(log_path)},
             'inbounds': [
                 {'name': 'short', 'type': 'socks5', 'listen': f'127.0.0.1:{short_port}'},
                 {'name': 'long', 'type': 'socks5', 'listen': f'127.0.0.1:{long_port}',
@@ -99,7 +99,7 @@ def main():
         }
         config_path = root / 'config.json'
         config_path.write_text(json.dumps(config))
-        process = subprocess.Popen([binary, 'run', '-c', str(config_path)],
+        process = subprocess.Popen([binary, 'run', '-c', str(config_path), '-p', str(config_path) + '.pid'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_for(process, lambda: subprocess.run(

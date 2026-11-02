@@ -1,6 +1,7 @@
 #ifndef FTUN_CORE_CONFIG_DOCUMENT_H
 #define FTUN_CORE_CONFIG_DOCUMENT_H
 #include "core/limits.h"
+#include "core/config/error.h"
 #include <cJSON.h>
 #define FTUN_CONFIG_MAX_JSON_BYTES (1024u * 1024u)
 #define FTUN_CONFIG_MAX_DEPTH 32u
@@ -33,6 +34,9 @@ typedef struct {
   ftun_reservation_t reservation;
   const ftun_config_modules_t *modules;
   const ftun_config_document_ops_t *ops;
+  /* 仅构造线程在parse调用内借用；返回模型或销毁JSON前必须清空。 */
+  const cJSON *parse_root;
+  ftun_config_error_t *parse_error;
 } ftun_config_document_t;
 
 /* 返回通用拥有信息的只读借用，生命期不超过 config。 */
@@ -61,6 +65,12 @@ ftun_status_t ftun_config_destroy(ftun_config_t **config);
  * 支持一个 BOM；拒绝重复键、非有限数、无效 UTF-8、深度/节点/长度超限。
  * 成功后 root 由 out 拥有，借用至 close；失败完全回滚，不交付部分树。 */
 ftun_status_t ftun_config_json_open(ftun_budget_t *budget, ftun_bytes_t json,
+  ftun_config_json_t *out);
+/* 与open相同边界；错误按值拥有，offset仅在解析器提供精确字节位置时有效。 */
+ftun_status_t ftun_config_json_open_error(ftun_budget_t *budget, ftun_bytes_t json,
+  ftun_config_json_t *out, ftun_config_error_t *error);
+/* owner控制通道不等待正在解析配置的Worker；解析器忙时返回AGAIN，输出为空。 */
+ftun_status_t ftun_config_json_try_open(ftun_budget_t *budget, ftun_bytes_t json,
   ftun_config_json_t *out);
 void ftun_config_json_close(ftun_config_json_t *document);
 #endif

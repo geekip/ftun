@@ -343,7 +343,7 @@ static int config(const char *path, const char *frs, const char *log)
   char logging[512];
   CHECK(file != NULL);
   if (log == NULL) (void)snprintf(logging, sizeof(logging), "\"level\":\"silent\"");
-  else CHECK(snprintf(logging, sizeof(logging), "\"level\":\"warn\",\"file\":\"%s\"", log) > 0);
+  else CHECK(snprintf(logging, sizeof(logging), "\"output\":\"file\",\"level\":\"warn\",\"file\":\"%s\"", log) > 0);
   CHECK(fprintf(file, "{\"base\":{\"state-cache\":false},"
     "\"dns\":{\"enable\":false},\"log\":{%s},"
     "\"frs\":{\"path\":\"%s\",\"url\":\"http://127.0.0.1/rules.frs\","
@@ -426,7 +426,7 @@ int main(void)
   CHECK(stop(thread) == 0);
   {
     char text[8192];
-    const char *warning = "FRS update applied but directory durability is uncertain";
+    const char *warning = "rule set durability unconfirmed (first)";
     FILE *file = fopen(log, "r");
     size_t length;
     CHECK(file != NULL);
@@ -434,7 +434,8 @@ int main(void)
     text[length] = '\0';
     CHECK(!ferror(file) && feof(file) && fclose(file) == 0);
     CHECK(strstr(text, warning) != NULL && strstr(strstr(text, warning) + strlen(warning), warning) == NULL);
-    CHECK(strstr(text, "level=error status=io ") != NULL);
+    CHECK(strstr(text, "[WARN ] rule set durability unconfirmed (first):") != NULL &&
+      strstr(text, "err=io") != NULL);
   }
   CHECK(downloads == 5u && publishes == 4u);
   CHECK(descriptors() == baseline);
@@ -478,6 +479,10 @@ int main(void)
   CHECK(access(next_file, F_OK) != 0 && descriptors() == baseline);
   CHECK(unlink(first_file) == 0);
   CHECK(unlink(original) == 0 && unlink(next) == 0 && unlink(bad) == 0 && unlink(log) == 0);
+  {
+    char lock_path[300];
+    CHECK(snprintf(lock_path, sizeof(lock_path), "%s.lock", log) > 0 && unlink(lock_path) == 0);
+  }
   CHECK(rmdir(directory) == 0);
   free(first);
   free(second);

@@ -107,7 +107,7 @@
             "debug",
             "trace"
           ],
-          "default": "warn",
+          "default": "info",
           "description": "silent 关闭日志格式化及输出。"
         },
         "file": {
@@ -127,6 +127,16 @@
           "maximum": 32,
           "default": 3,
           "description": "保留的日志文件总数（含当前文件）：ftun.log、ftun.log.1…；为 1 时超限直接截断重写。收到 SIGUSR1 会重新打开日志文件，配合外部 logrotate。"
+        },
+        "output": {
+          "type": "string",
+          "enum": [
+            "stderr",
+            "file",
+            "both"
+          ],
+          "default": "stderr",
+          "description": "运行诊断输出目标；文件路径独立于输出选择。后台运行将stderr改写为文件。"
         }
       },
       "additionalProperties": false

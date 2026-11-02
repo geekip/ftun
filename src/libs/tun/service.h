@@ -11,13 +11,13 @@ typedef struct ftun_tun_service ftun_tun_service_t;
 
 /* Composition 发布的 L3 Provider 是借用型代次句柄；物理 service 保持唯一
  * owner。consumer 只能凭当前 provider generation 获取独立 lease。 */
-typedef struct ftun_l3_provider {
+struct ftun_l3_provider {
   ftun_tun_service_t *service;
   ftun_budget_t *budget;
   uint64_t generation;
   uint64_t pending_generation;
   bool reload_prepared;
-} ftun_l3_provider_t;
+};
 
 typedef struct {
   ftun_tun_service_t *service;

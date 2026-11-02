@@ -67,7 +67,7 @@ def main():
         path = root / 'config.json'
         path.write_text(json.dumps(config(port, 'udp', proxy_mode, False)))
         with (root / 'run.log').open('w+') as log:
-            process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=log, stderr=log)
+            process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=log, stderr=log)
             try:
                 deadline = time.monotonic() + 5
                 while True:

@@ -35,13 +35,13 @@ def main(binary):
             'base': {'state-cache': False, 'cache-file': str(root / 'ftun.cache')},
             'dns': {'enable': False},
             # 最小的合法上限，保留 2 个文件：用 reload 事件产生足够的日志量。
-            'log': {'level': 'info', 'file': str(log), 'max-size': 65536, 'max-files': 2},
+            'log': {'output': 'file', 'level': 'info', 'file': str(log), 'max-size': 65536, 'max-files': 2},
             'inbounds': [{'name': 'in', 'type': 'socks5', 'listen': f'127.0.0.1:{free_port()}'}],
             'rules': ['MATCH,DIRECT'],
         }
         path = root / 'config.json'
         path.write_text(json.dumps(config))
-        process = subprocess.Popen([binary, 'run', '-c', str(path)],
+        process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             wait_for(lambda: log.exists() and log.stat().st_size > 0, what='first log line')
@@ -53,6 +53,13 @@ def main(binary):
                 time.sleep(0.05)
             wait_for(lambda: (root / 'ftun.log.1').exists(), what='rotation')
             assert process.poll() is None
+            def counters():
+                result = subprocess.run([binary, 'status', '-p', str(path) + '.pid', '--json'],
+                                        capture_output=True, text=True, timeout=6)
+                assert result.returncode == 0, result
+                return json.loads(result.stdout)['logs']
+            before = counters()
+            assert before['rotations'] >= 1 and before['rotate_errors'] == 0, before
             assert log.stat().st_size <= 65536
             assert not (root / 'ftun.log.2').exists(), 'max-files=2 keeps one rotated file'
             # 外部 logrotate：移走文件，SIGUSR1 之后新日志落在新文件。
@@ -63,6 +70,8 @@ def main(binary):
             process.send_signal(signal.SIGHUP)
             wait_for(lambda: log.exists() and log.stat().st_size > 0, what='new file after SIGUSR1')
             assert process.poll() is None
+            after = counters()
+            assert after['rotations'] >= before['rotations'] and after['reopens'] >= 1, (before, after)
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=15) == 0
         finally:

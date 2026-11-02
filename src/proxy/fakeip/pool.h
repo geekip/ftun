@@ -8,6 +8,7 @@
 
 typedef struct {
   ftun_budget_t *budget;
+  ftun_core_t *core; /* 可选，owner借用到destroy；独立池可不输出日志。 */
   ftun_fakeip_store_t *store; /* NULL 表示 persist=false。 */
   const ftun_fakeip_snapshot_t *snapshot;
   uint32_t first_address;

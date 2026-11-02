@@ -18,7 +18,12 @@ typedef struct {
   bool peer_verified;
   bool wants_read;
   bool wants_write;
+  int native_error; /* 最近一次终态wolfSSL错误；WANT_READ/WRITE不算失败。 */
 } ftun_tls_info_t;
+
+#define FTUN_TLS_ERROR_BYTES 128u
+/* 调用方在日志门禁后解码；只返回库固定文本，不包含证书或会话内容。 */
+void ftun_tls_error_text(int code, char out[FTUN_TLS_ERROR_BYTES]);
 
 /* Context 加载并验证 CA 后固定配置，可供多个会话共享；每个会话归自己的 owner。
  * context 的 budget 借用至销毁；会话可使用同根的其他预算节点。

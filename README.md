@@ -2,7 +2,7 @@
 
 FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明代理和嵌入式宿主集成。它提供独立命令行程序和稳定的 C API，通过规则、DNS、FakeIP、FRS 规则集合与代理组处理 TCP/UDP 流量。
 
-当前版本为 **1.0.5**，采用 C99 和 CMake，支持 IPv4/IPv6 双栈。提供 Linux amd64/arm64/armv7/mips/mipsel 的 musl 全静态构建，以及 Darwin 和 Windows 的 amd64/arm64 用户态程序构建。Windows 通过 Wintun 提供手动路由模式的 TUN，Darwin 暂不含 TUN；平台 ABI、能力与验证边界见[平台构建说明](docs/building.md)。功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
+当前版本为 **1.1.0**，采用 C99 和 CMake，支持 IPv4/IPv6 双栈。提供 Linux amd64/arm64/armv7/mips/mipsel 的 musl 全静态构建，以及 Darwin 和 Windows 的 amd64/arm64 用户态程序构建。Windows 通过 Wintun 提供手动路由模式的 TUN，Darwin 暂不含 TUN；平台 ABI、能力与验证边界见[平台构建说明](docs/building.md)。功能在构建时选择并静态内置，运行时只为配置启用的服务分配资源。
 
 ## 主要能力
 
@@ -12,9 +12,10 @@ FTUN 是一个轻量、可裁剪的代理内核，面向 Linux 网关、透明�
 - DNS UDP/TCP 服务、Bootstrap、FakeIP 映射和状态持久化。
 - TLS SNI 与 HTTP Host 嗅探。
 - 配置检查、事务重载、进程控制和宿主 C API。
+- 本机状态查询、PID 实例锁、POSIX 后台运行与按模块显示的日志、故障聚合。
 - Core、DNS、Proxy 与 TUN provider 模块化构建，可按组合裁剪。
 
-FTUN 当前不提供 AnyTLS、管理 HTTP API、Full Cone、Mesh、NAT 穿透、P2P/Relay、QUIC 或协议混淆。`ftun version` 会列出产物实际内置的能力。
+FTUN 当前不提供 AnyTLS、管理 HTTP API、Full Cone、Mesh、NAT 穿透、P2P/Relay、QUIC 或协议混淆。`ftun version --modules` 会列出产物实际内置的能力。
 
 ## 快速开始
 
@@ -37,12 +38,18 @@ ctest --preset debug
 ```text
 ftun version
 ftun help
-ftun check -c CONFIG
-ftun run -c CONFIG
-ftun stop PID
-ftun reload PID
-ftun fakeip init -c CONFIG
+ftun check [-c CONFIG] [--json]
+ftun run [-c CONFIG] [-p PIDFILE] [-b] [-v|-vv] [--no-color]
+ftun status [PID | -p PIDFILE] [--json]
+ftun dns status [PID | -p PIDFILE] [--json]
+ftun proxy status [PID | -p PIDFILE] [--json]
+ftun reload [PID | -p PIDFILE] [--timeout SEC] [--no-wait] [--json]
+ftun stop [PID | -p PIDFILE] [--timeout SEC] [--no-wait] [--json]
 ```
+
+直接执行 `ftun run` 会在默认配置不存在时创建 `~/.ftun/config.json`，启用回环 SOCKS5 `127.0.0.1:1080` 与 DIRECT；`check` 和显式 `-c` 不创建配置。持久 FakeIP 在状态目录确实不存在时自动创建身份，已有损坏状态会被拒绝。前台就绪时输出 `ready` 或带原因的 `ready (degraded)`，后台 `-b` 在收到就绪结果后返回。由 systemd/procd 管理时保持前台运行。
+
+日志默认以 `info` 输出到 stderr，正常转发不逐连接输出；`-v` 开启 debug，`-vv` 开启 trace，覆盖在重载后保留。Linux/Darwin 的本机控制通道校验实例身份与操作终态；Windows 当前不提供本机控制通道和 `-b`。完整定位规则、退出码与排错示例见[运维手册](docs/operations.md)。
 
 Linux TUN 与自动路由需要 root 或相应网络能力。Windows Wintun 需要管理员权限，使用手动路由，详见[Windows TUN 说明](docs/building.md#windows-wintun)。只使用 SOCKS5/Mixed 入站时，普通用户只需具备监听端口、配置文件和状态文件权限。系统无法建立必需的出口保护时，FTUN 会在启动阶段失败并报告原因。
 

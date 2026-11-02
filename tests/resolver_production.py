@@ -161,7 +161,7 @@ def exercise(binary, root, mode, dns, dns_port, other, other_port, tcp_port, udp
     path.write_text(json.dumps(config))
     log_path = root / f'{mode}.log'
     with log_path.open('w+') as log:
-        process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=log, stderr=log)
+        process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=log, stderr=log)
         try:
             def listening():
                 try:

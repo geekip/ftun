@@ -1,4 +1,5 @@
 #include "dns/module.h"
+#include "dns/status.h"
 
 #include "platform/clock.h"
 #include "core/limits.h"
@@ -31,6 +32,7 @@ typedef struct {
   bool reload_prepared;
   bool activated;
   bool stopped;
+  bool retired_archived;
 } ftun_dns_service_instance_t;
 
 bool ftun_dns_service_binding_valid(const ftun_dns_service_binding_t *binding)
@@ -55,6 +57,7 @@ static void ftun_dns_service_publish(ftun_dns_service_instance_t *service,
                                      bool accepting)
 {
   service->slot->active = service->active;
+  service->slot->retired = service->retired_archived ? NULL : service->retired;
   service->slot->generation = service->generation;
   service->slot->accepting = accepting && service->active != NULL;
 }
@@ -199,6 +202,7 @@ static ftun_status_t ftun_dns_service_reload_commit(
     &service->active, &service->pending, &service->retired);
   if (status != FTUN_OK) return status;
   service->generation = generation;
+  service->retired_archived = false;
   service->pending_generation = 0u;
   service->reload_prepared = false;
   ftun_dns_service_publish(service, true);
@@ -297,12 +301,22 @@ static ftun_status_t ftun_dns_service_run_once(
   if (status == FTUN_OK) status = ftun_dns_service_schedule(service);
   if (status == FTUN_OK) status = ftun_dns_runtime_run_once(
     service->active, FTUN_DNS_SERVICE_QUOTA, &active_work);
-  if (status == FTUN_OK && service->retired != NULL) {
+  if (status == FTUN_OK && service->retired != NULL && !service->retired_archived) {
     status = ftun_dns_runtime_run_once(
       service->retired, FTUN_DNS_SERVICE_QUOTA, &retired_work);
   }
   if (status == FTUN_OK && service->retired != NULL) {
-    ftun_status_t reap = ftun_dns_runtime_reap(&service->retired);
+    ftun_status_t reap = FTUN_OK;
+    if (!service->retired_archived) {
+      reap = ftun_dns_runtime_idle(service->retired);
+      if (reap == FTUN_OK) reap = ftun_dns_status_archive(service->retired,
+        service->active, &service->slot->history);
+      if (reap == FTUN_OK) {
+        service->retired_archived = true;
+        service->slot->retired = NULL;
+      }
+    }
+    if (reap == FTUN_OK) reap = ftun_dns_runtime_destroy(&service->retired);
     if (reap != FTUN_OK && reap != FTUN_E_AGAIN) status = reap;
   }
   if (status != FTUN_OK) return status;
@@ -404,6 +418,7 @@ static ftun_status_t ftun_dns_service_destroy_until(
   if (status == FTUN_OK) status = ftun_dns_runtime_destroy(&service->active);
   if (status != FTUN_OK) return status;
   service->slot->active = NULL;
+  service->slot->retired = NULL;
   service->slot->generation = 0u;
   service->slot->accepting = false;
   reservation = service->reservation;

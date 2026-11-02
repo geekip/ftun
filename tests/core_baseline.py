@@ -539,7 +539,7 @@ def run_once(binary, active_seconds, run):
       "rules": ["MATCH,DIRECT"],
     }), encoding="utf-8")
     with stderr_path.open("w+") as stderr_file:
-      process = subprocess.Popen([str(binary), "run", "-c", str(config)],
+      process = subprocess.Popen([str(binary), "run", "-c", str(config), "-p", str(config) + ".pid"],
                                  stdout=subprocess.DEVNULL,
                                  stderr=stderr_file)
       try:

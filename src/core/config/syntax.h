@@ -1,8 +1,9 @@
 #ifndef FTUN_CORE_CONFIG_SYNTAX_H
 #define FTUN_CORE_CONFIG_SYNTAX_H
+#include "core/config/error.h"
 #include "core/config/document.h"
 #include "util/ip.h"
-/* 无I/O、无分配的字段词法校验；诊断字符串为静态借用。 */
+/* 无I/O、无分配的字段词法校验；诊断路径与文本由输出记录拥有。 */
 typedef ftun_cidr_t ftun_config_cidr_t;
 
 typedef struct {
@@ -10,7 +11,7 @@ typedef struct {
   uint16_t port;
 } ftun_config_listener_t;
 
-ftun_status_t ftun_config_diagnostic(ftun_diagnostic_t *out,
+ftun_status_t ftun_config_diagnostic(ftun_config_error_t *out,
                                             ftun_status_t status,
                                             const char *path,
                                             const char *message);

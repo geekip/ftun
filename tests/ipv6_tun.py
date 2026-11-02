@@ -94,7 +94,7 @@ def main():
                 'inbounds': [{'name': 'tun', 'type': 'tun', 'dns-hijack': False}],
                 'rules': ['MATCH,DIRECT']}))
             with log.open('w') as output:
-                process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=output, stderr=output)
+                process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=output, stderr=output)
                 try:
                     deadline = time.monotonic() + 8
                     while True:

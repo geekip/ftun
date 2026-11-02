@@ -18,11 +18,18 @@ typedef ftun_file_handle_t ftun_platform_file_lock_t;
 /* 文件句柄由平台操作；close 即使返回错误也消费句柄。
  * open_append 借用 path，返回文件当前字节数；不保留路径、不分配堆存储。
  * write 返回实际写入字节数，失败也报告已写前缀，不重发已交付的数据。 */
+/* 只读终端能力查询，不拥有或改变句柄。 */
+bool ftun_file_is_terminal(ftun_handle_t descriptor);
+/* 终端颜色能力：Windows启用VT显示并保留其余模式位，失败返回false。 */
+bool ftun_file_enable_ansi(ftun_handle_t descriptor);
 bool ftun_platform_file_is_open(const ftun_file_handle_t *file);
 ftun_status_t ftun_platform_file_open_append(const char *path, bool truncate,
   ftun_file_handle_t *out, uint64_t *size);
 ftun_status_t ftun_platform_file_close(ftun_file_handle_t *file);
 ftun_status_t ftun_platform_file_write(ftun_file_handle_t *file,
+  ftun_bytes_t contents, size_t *written);
+/* 与write相同，但在系统调用失败处拥有原生错误码；成功或无原生错误时为0。 */
+ftun_error_t ftun_platform_file_write_error(ftun_file_handle_t *file,
   ftun_bytes_t contents, size_t *written);
 /* 用于日志编号轮转：来源不存在时无需改名，其他失败明确返回错误。 */
 ftun_status_t ftun_platform_file_rename_if_exists(const char *from, const char *to);
@@ -37,11 +44,19 @@ ftun_status_t ftun_platform_file_parent(const char *path, ftun_string_t *out);
 ftun_status_t ftun_platform_file_lock_acquire(const char *path, ftun_platform_file_lock_t *out);
 ftun_status_t ftun_platform_file_lock_release(ftun_platform_file_lock_t *lock);
 /* 同步持久化，占用两个 FD；按 fsync/rename/fsync 顺序调用 hook。
- * published 在 rename 成功时置位，后续失败也不撤销；hook 不得修改相关路径。
+ * replace_existing=false使用原子无覆盖发布，已有目录项返回STALE。
+ * published 在发布成功时置位，后续失败也不撤销；hook 不得修改相关路径。
  * 输入同步借用，返回前关闭全部 FD，不拥有任何路径或 hook_user。 */
 ftun_status_t ftun_platform_file_replace(const char *temporary,
   const char *destination, const char *parent, ftun_file_stage_hook_fn hook,
-  void *hook_user, bool *published);
+  void *hook_user, bool replace_existing, bool *published);
+/* 创建0700唯一临时目录，修改XXXXXX模板；created后即使失败也由调用方清理。 */
+ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created);
+/* 占用2 FD；同步完整临时目录、原子无覆盖发布、同步父目录。
+ * hook/published语义同file_replace；已发布后失败不删除权威目录。
+ * Windows使用同卷MoveFileExW WRITE_THROUGH屏障，不模拟目录fsync。 */
+ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
+  const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published);
 /* 占用一个 FD，修改调用方提供的唯一临时路径模板；完整写入并关闭。
  * created 说明路径已创建，失败时仍由调用方清理，不保留 contents。 */
 ftun_status_t ftun_platform_file_write_temporary(char *temporary,
@@ -62,11 +77,14 @@ typedef struct {
   uint64_t size;
   bool regular;
   bool directory;
+  int64_t modified_unix_ms;
 } ftun_file_info_t;
 ftun_status_t ftun_file_open(const char *path, ftun_file_open_mode_t mode, ftun_handle_t *out);
 ftun_status_t ftun_file_close(ftun_handle_t descriptor);
 ftun_status_t ftun_file_inspect(ftun_handle_t descriptor, ftun_file_info_t *out);
 ftun_status_t ftun_file_inspect_path(const char *path, ftun_file_info_t *out);
+/* 不跟随符号链接/reparse point；仅ENOENT返回EOF。 */
+ftun_status_t ftun_file_inspect_path_nofollow(const char *path, ftun_file_info_t *out);
 ptrdiff_t ftun_file_read(ftun_handle_t descriptor, void *buffer, size_t capacity);
 ptrdiff_t ftun_file_write_some(ftun_handle_t descriptor, const void *buffer, size_t length,
   ftun_status_t *status);

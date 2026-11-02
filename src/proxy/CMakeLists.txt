@@ -31,6 +31,7 @@ set(ftun_sources_proxy
   session.c
   slot_pool.c
   snapshot.c
+  status.c
   sniff/http_host.c
   sniff/sniff.c
   sniff/tls_sni.c

@@ -44,7 +44,7 @@ static int ftun_outbound_exists(const ftun_config_t *config, const char *name)
 }
 
 static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
-                                         ftun_diagnostic_t *out)
+                                         ftun_config_error_t *out)
 {
   static const char *const levels[] = {
     "silent", "error", "warn", "info", "debug", "trace"
@@ -72,6 +72,11 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/level",
                                   "log level is invalid");
   }
+  if (strcmp(config->log.output, "stderr") != 0 &&
+      strcmp(config->log.output, "file") != 0 && strcmp(config->log.output, "both") != 0) {
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/output",
+      "log output must be stderr, file or both");
+  }
   if (!ftun_path_valid(config->log.file)) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "/log/file",
                                   "log file path is invalid");
@@ -90,7 +95,7 @@ static ftun_status_t ftun_validate_basic(const ftun_config_t *config,
 }
 
 static ftun_status_t ftun_validate_listener_conflicts(const ftun_config_t *config,
-  ftun_diagnostic_t *out)
+  ftun_config_error_t *out)
 {
   size_t left, right;
   if (!config->dns.enable) return FTUN_OK;
@@ -102,8 +107,8 @@ static ftun_status_t ftun_validate_listener_conflicts(const ftun_config_t *confi
       ftun_config_listener_t dns;
       (void)ftun_listen_address(config->dns.listeners[right].listen, &dns);
       if (ftun_listener_conflict(&inbound, &dns)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/listeners",
-          "DNS and inbound listeners conflict");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "DNS and inbound listeners conflict",
+          "/dns/listeners/%zu/listen", right);
       }
     }
   }
@@ -111,21 +116,21 @@ static ftun_status_t ftun_validate_listener_conflicts(const ftun_config_t *confi
 }
 
 static ftun_status_t ftun_validate_dns_links(const ftun_config_t *config,
-  ftun_diagnostic_t *out)
+  ftun_config_error_t *out)
 {
   size_t index;
   if (!config->dns.enable) return FTUN_OK;
   for (index = 0u; index < config->dns.server_count; index++) {
     if (!ftun_outbound_exists(config, config->dns.servers[index].outbound)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/dns/servers",
-        "DNS server outbound does not exist");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "DNS server outbound does not exist",
+        "/dns/servers/%zu/outbound", index);
     }
   }
   return FTUN_OK;
 }
 
 static ftun_status_t ftun_validate_outbound_links(const ftun_config_t *config,
-  const ftun_config_cidr_t *fake_range, ftun_diagnostic_t *out)
+  const ftun_config_cidr_t *fake_range, ftun_config_error_t *out)
 {
   size_t index;
   for (index = 0u; index < config->outbound_count; index++) {
@@ -134,21 +139,21 @@ static ftun_status_t ftun_validate_outbound_links(const ftun_config_t *config,
     int is_ipv4 = 0;
     if (config->dns.enable && item->dns_server[0] != '\0' &&
         !ftun_dns_server_exists(&config->dns, item->dns_server)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-        "outbound DNS server does not exist");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound DNS server does not exist",
+        "/outbounds/%zu/dns-server", index);
     }
     if (!config->dns.enable || !config->dns.fake_ip.enable) continue;
     if (item->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) {
       (void)ftun_server_address(item->server, 1, &address, &is_ipv4);
       if (is_ipv4 && ftun_config_cidr_has(fake_range, &address)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-          "SOCKS5 server overlaps FakeIP range");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "SOCKS5 server overlaps FakeIP range",
+          "/outbounds/%zu/server", index);
       }
     } else if (item->kind == FTUN_CONFIG_OUTBOUND_URL_TEST) {
       (void)ftun_http_url(item->url, &address, &is_ipv4);
       if (is_ipv4 && ftun_config_cidr_has(fake_range, &address)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-          "health check URL overlaps FakeIP range");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "health check URL overlaps FakeIP range",
+          "/outbounds/%zu/url", index);
       }
     }
   }
@@ -156,7 +161,7 @@ static ftun_status_t ftun_validate_outbound_links(const ftun_config_t *config,
 }
 
 static ftun_status_t ftun_validate_tun_overlap(const ftun_config_t *config,
-  const ftun_config_cidr_t *fake_range, ftun_diagnostic_t *out)
+  const ftun_config_cidr_t *fake_range, ftun_config_error_t *out)
 {
   size_t index;
   ftun_config_cidr_t range;
@@ -180,7 +185,7 @@ static ftun_status_t ftun_validate_tun_overlap(const ftun_config_t *config,
 }
 
 static ftun_status_t ftun_validate_frs_links(const ftun_config_t *config,
-  const ftun_config_cidr_t *fake_range, ftun_diagnostic_t *out)
+  const ftun_config_cidr_t *fake_range, ftun_config_error_t *out)
 {
   ftun_ip_t address = {0};
   int is_ipv4 = 0;
@@ -200,49 +205,31 @@ static ftun_status_t ftun_validate_frs_links(const ftun_config_t *config,
   return FTUN_OK;
 }
 /* 无副作用语义校验。 */
-ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_t *out)
+ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_config_error_t *out)
 {
   ftun_config_cidr_t fake_range;
   uint32_t required;
   size_t index;
   ftun_status_t status;
-  if (out != NULL) memset(out, 0, sizeof(*out));
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   if (config == NULL) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID, "",
                                   "configuration is missing");
   }
   required = ftun_config_required_modules(config);
-  status = ftun_build_require_modules(required, out);
+  status = ftun_build_require_modules(required, NULL);
   if (status != FTUN_OK) {
-    if (out != NULL) {
-      const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
-      static const char proxy_path[] = "/";
-      static const char dns_path[] = "/dns/enable";
-      static const char fakeip_path[] = "/dns/servers";
-      static const char tun_path[] = "/inbounds";
-      static const char frs_path[] = "/rules";
-      if ((required & FTUN_BUILD_MODULE_PROXY) != 0u &&
-          (capabilities->builtins & FTUN_BUILD_MODULE_PROXY) == 0u) {
-        out->path.data = proxy_path;
-        out->path.length = sizeof(proxy_path) - 1u;
-      } else if ((required & FTUN_BUILD_MODULE_DNS) != 0u &&
-          (capabilities->builtins & FTUN_BUILD_MODULE_DNS) == 0u) {
-        out->path.data = dns_path;
-        out->path.length = sizeof(dns_path) - 1u;
-      } else if ((required & FTUN_BUILD_MODULE_FAKEIP) != 0u &&
-                 (capabilities->builtins & FTUN_BUILD_MODULE_FAKEIP) == 0u) {
-        out->path.data = fakeip_path;
-        out->path.length = sizeof(fakeip_path) - 1u;
-      } else if ((required & FTUN_BUILD_MODULE_TUN) != 0u &&
-                 (capabilities->builtins & FTUN_BUILD_MODULE_TUN) == 0u) {
-        out->path.data = tun_path;
-        out->path.length = sizeof(tun_path) - 1u;
-      } else {
-        out->path.data = frs_path;
-        out->path.length = sizeof(frs_path) - 1u;
-      }
-    }
-    return status;
+    const ftun_build_capabilities_t *capabilities = ftun_build_capabilities();
+    uint32_t missing = required & ~capabilities->builtins;
+    const char *path = "";
+    if ((missing & FTUN_BUILD_MODULE_PROXY) != 0u) {
+      path = config->inbound_count != 0u ? "/inbounds" : "/rules";
+      if (config->inbound_count == 0u && config->rules.count == 0u) path = "/dns/servers";
+    } else if ((missing & FTUN_BUILD_MODULE_DNS) != 0u) path = "/dns/enable";
+    else if ((missing & FTUN_BUILD_MODULE_FAKEIP) != 0u) path = "/dns/servers";
+    else if ((missing & FTUN_BUILD_MODULE_TUN) != 0u) path = "/inbounds";
+    else if ((missing & FTUN_BUILD_MODULE_FRS) != 0u) path = "/rules";
+    return ftun_config_diagnostic(out, status, path, "required build module is not built in");
   }
   status = ftun_validate_basic(config, out);
   if (status != FTUN_OK) return status;
@@ -264,9 +251,9 @@ ftun_status_t ftun_config_validate(const ftun_config_t *config, ftun_diagnostic_
   if (status == FTUN_OK) status = ftun_validate_frs_links(config, &fake_range, out);
   if (status != FTUN_OK) return status;
   for (index = 0u; index < config->rules.count; index++) {
-    status = ftun_config_validate_rule(config->outbounds, config->outbound_count, config->rules.items[index], out);
+    status = ftun_config_validate_rule(config->outbounds, config->outbound_count, config->rules.items[index], index, out);
     if (status != FTUN_OK) return status;
   }
-  if (out != NULL) memset(out, 0, sizeof(*out));
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   return FTUN_OK;
 }

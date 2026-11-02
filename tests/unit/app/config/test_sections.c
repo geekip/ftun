@@ -55,7 +55,7 @@ static ftun_status_t parse(ftun_config_t *config, const cJSON *root)
   item = cJSON_GetObjectItemCaseSensitive(root, "frs");
   if (status == FTUN_OK && item != NULL) status = ftun_config_parse_frs(item, config, &config->frs);
   item = cJSON_GetObjectItemCaseSensitive(root, "sniff");
-  if (status == FTUN_OK && item != NULL) status = ftun_config_parse_sniff(item, &config->sniff);
+  if (status == FTUN_OK && item != NULL) status = ftun_config_parse_sniff(item, config, &config->sniff);
   item = cJSON_GetObjectItemCaseSensitive(root, "inbounds");
   if (status == FTUN_OK && item != NULL) status = ftun_config_parse_inbounds(item, config,
     &config->inbounds, &config->inbound_count);
@@ -104,7 +104,7 @@ int main(void)
       if (status == FTUN_OK) status = parse(config, json.root);
       CHECK(status == cases[index].expected || (capacity < 32768u && status == FTUN_E_LIMIT));
       if (status == FTUN_OK && capacity == 32768u) {
-        ftun_diagnostic_t diagnostic;
+        ftun_config_error_t diagnostic;
         CHECK(ftun_config_validate_dns(&config->dns, &diagnostic) == FTUN_OK);
         CHECK(ftun_config_validate_outbounds(budget, config->outbounds,
           config->outbound_count, &diagnostic) == FTUN_OK);
@@ -114,9 +114,9 @@ int main(void)
         CHECK(ftun_config_validate_frs(&config->frs, config->outbounds,
           config->outbound_count, &diagnostic) == FTUN_OK);
         CHECK(ftun_config_validate_rule(config->outbounds, config->outbound_count,
-          "MATCH,DIRECT", &diagnostic) == FTUN_OK);
+          "MATCH,DIRECT", 0u, &diagnostic) == FTUN_OK);
         CHECK(ftun_config_validate_rule(config->outbounds, config->outbound_count,
-          "MATCH,missing", &diagnostic) == FTUN_E_INVALID);
+          "MATCH,missing", 0u, &diagnostic) == FTUN_E_INVALID);
         if (index == 1u) {
           char *name = config->dns.servers[0].name;
           ftun_config_outbound_t group = {0};
@@ -124,8 +124,8 @@ int main(void)
           ftun_budget_usage_t before, after;
           config->dns.servers[0].name = "bad,name";
           CHECK(ftun_config_validate_dns(&config->dns, &diagnostic) == FTUN_E_INVALID);
-          CHECK(diagnostic.path.length == strlen("/dns/servers") &&
-            memcmp(diagnostic.path.data, "/dns/servers", diagnostic.path.length) == 0);
+          CHECK(strlen(diagnostic.pointer) == strlen("/dns/servers/0/name") &&
+            memcmp(diagnostic.pointer, "/dns/servers/0/name", strlen(diagnostic.pointer)) == 0);
           config->dns.servers[0].name = name;
           group.kind = FTUN_CONFIG_OUTBOUND_SELECT;
           group.name = "loop";

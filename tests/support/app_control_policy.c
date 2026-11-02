@@ -31,14 +31,14 @@ static ftun_status_t start(ftun_core_t *core, ftun_budget_t *budget,
 
 static ftun_status_t prepare(ftun_budget_t *budget, const ftun_config_t *config, uint64_t maximum,
   const ftun_app_prepare_context_t *context,
-  ftun_app_runtime_candidate_t **out, bool *publish)
+  ftun_app_runtime_candidate_t **out, bool *publish, ftun_config_error_t *error)
 {
   prepares++;
   /* 第二次候选关闭 TUN，仍必须使用尚未提交的当前路由授权。 */
   if (context->generation != (prepares == 1u ? 2u : 3u) ||
       context->allow_system_resolver == auto_route() ||
       context->socket_mark != UINT32_C(0x4654)) invalid = true;
-  return original->prepare(budget, config, maximum, context, out, publish);
+  return original->prepare(budget, config, maximum, context, out, publish, error);
 }
 
 const ftun_app_runtime_support_t *__real_ftun_app_runtime_support(void);

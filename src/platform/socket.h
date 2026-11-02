@@ -16,7 +16,7 @@ typedef enum {
 } ftun_socket_accept_disposition_t;
 
 
-/* 仅供隔离后的 blocking worker 使用；owner loop 不得调用这些接口。 */
+/* 仅供隔离后的 blocking worker 或独立命令进程使用；owner loop 不得调用。 */
 ftun_status_t ftun_blocking_socket_status(int error_code);
 bool ftun_blocking_socket_wait(ftun_handle_t descriptor, uint32_t events,
                                uint64_t deadline_ms);
@@ -42,6 +42,9 @@ typedef struct {
 } ftun_socket_io_t;
 /* 默认表只执行原生 socket 操作；不含准入、网络视图或异步任务策略。 */
 const ftun_socket_io_t *ftun_socket_default_io(void);
+/* 原生SO_ERROR只读一次，立即按值保留系统码；不在清理后查询errno。 */
+ftun_error_t ftun_socket_connect_error(ftun_native_socket_t socket);
+const char *ftun_socket_error_name(int code);
 ftun_status_t ftun_socket_datagram_send(void *context, ftun_native_socket_t socket,
   const void *data, size_t length, size_t *sent);
 ftun_status_t ftun_socket_datagram_receive(void *context, ftun_native_socket_t socket,

@@ -213,11 +213,17 @@ static void ftun_dial_io_ready(ftun_event_source_t *source,
     (void)ftun_dial_finish(context, context->pending_error);
     return;
   }
-  status = context->io.get_socket_error(context->io.context,
-                                        context->result.socket);
-  if (status == FTUN_E_AGAIN) return;
-  (void)ftun_dial_finish(context,
-    ftun_dial_error(status, FTUN_DIAL_STAGE_WAIT));
+  ftun_error_t error;
+  if (context->io.get_socket_error == ftun_socket_default_io()->get_socket_error)
+    error = ftun_socket_connect_error(context->result.socket);
+  else {
+    /* 现有注入驱动只有通用状态，不能把当前线程的errno当作它的失败原因。 */
+    status = context->io.get_socket_error(context->io.context, context->result.socket);
+    error = ftun_dial_error(status, FTUN_DIAL_STAGE_WAIT);
+  }
+  if (error.status == FTUN_E_AGAIN) return;
+  error.stage = FTUN_DIAL_STAGE_WAIT;
+  (void)ftun_dial_finish(context, error);
 }
 
 static void ftun_dial_timer_ready(ftun_event_source_t *source,

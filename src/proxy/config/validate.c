@@ -39,17 +39,17 @@ static int ftun_outbound_exists(const ftun_config_outbound_t *outbounds, size_t 
 static ftun_status_t ftun_validate_group_visit(const ftun_config_outbound_t *outbounds, size_t outbound_count,
                                                size_t index, uint8_t *colors,
                                                size_t depth,
-                                               ftun_diagnostic_t *out)
+                                               ftun_config_error_t *out)
 {
   const ftun_config_outbound_t *group = &outbounds[index];
   size_t member_index;
   if (depth > FTUN_CONFIG_MAX_GROUP_DEPTH) {
-    return ftun_config_diagnostic(out, FTUN_E_LIMIT, "/outbounds",
-                                  "outbound group depth exceeds limit");
+    return ftun_config_error_setf(out, FTUN_E_LIMIT, "outbound group depth exceeds limit",
+      "/outbounds/%zu/outbounds", index);
   }
   if (colors[index] == 1u) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                  "outbound group contains a cycle");
+    return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound group contains a cycle",
+      "/outbounds/%zu/outbounds", index);
   }
   if (colors[index] == 2u || group->kind == FTUN_CONFIG_OUTBOUND_SOCKS5) return FTUN_OK;
   colors[index] = 1u;
@@ -67,9 +67,10 @@ static ftun_status_t ftun_validate_group_visit(const ftun_config_outbound_t *out
 }
 
 ftun_status_t ftun_config_validate_rule(const ftun_config_outbound_t *outbounds, size_t outbound_count,
-                                        const char *rule,
-                                        ftun_diagnostic_t *out)
+                                        const char *rule, size_t index,
+                                        ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   const char *first;
   const char *second;
   const char *outbound;
@@ -79,27 +80,27 @@ ftun_status_t ftun_config_validate_rule(const ftun_config_outbound_t *outbounds,
   uint32_t ignored;
   ftun_config_cidr_t ignored_cidr;
   if (rule == NULL) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                  "rule is missing");
+    return ftun_config_error_setf(out, FTUN_E_INVALID, "rule is missing",
+      "/rules/%zu", index);
   }
   first = strchr(rule, ',');
   if (first == NULL) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                  "rule has invalid field count");
+    return ftun_config_error_setf(out, FTUN_E_INVALID, "rule has invalid field count",
+      "/rules/%zu", index);
   }
   type_length = (size_t)(first - rule);
   if (ftun_span_equal_ascii_fold(rule, type_length, "MATCH")) {
     outbound = first + 1;
     if (outbound[0] == '\0' || strchr(outbound, ',') != NULL) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                    "MATCH rule has invalid field count");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "MATCH rule has invalid field count",
+        "/rules/%zu", index);
     }
   } else {
     second = strchr(first + 1, ',');
     if (second == NULL || second == first + 1 || second[1] == '\0' ||
         strchr(second + 1, ',') != NULL) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                    "rule has invalid field count");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "rule has invalid field count",
+        "/rules/%zu", index);
     }
     operand_length = (size_t)(second - first - 1);
     outbound = second + 1;
@@ -107,60 +108,60 @@ ftun_status_t ftun_config_validate_rule(const ftun_config_outbound_t *outbounds,
         ftun_span_equal_ascii_fold(rule, type_length, "IP-CIDR")) {
       char buffer[32];
       if (operand_length >= sizeof(buffer)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "rule CIDR is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "rule CIDR is invalid",
+          "/rules/%zu", index);
       }
       memcpy(buffer, first + 1, operand_length);
       buffer[operand_length] = '\0';
       if (!ftun_cidr(buffer, 0, &ignored_cidr)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "rule CIDR is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "rule CIDR is invalid",
+          "/rules/%zu", index);
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN") ||
                ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN-SUFFIX")) {
       if (!ftun_domain_span(first + 1, operand_length)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "rule domain is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "rule domain is invalid",
+          "/rules/%zu", index);
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "DOMAIN-KEYWORD")) {
       if (!ftun_ascii_token(first + 1, operand_length)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "domain keyword is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "domain keyword is invalid",
+          "/rules/%zu", index);
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "FRS-IP") ||
                ftun_span_equal_ascii_fold(rule, type_length, "FRS-DOMAIN")) {
       if (!ftun_name_span_valid(first + 1, operand_length)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "FRS label is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "FRS label is invalid",
+          "/rules/%zu", index);
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "DST-PORT")) {
       if (!ftun_decimal_parse(first + 1, operand_length, 65535u, &ignored) || ignored == 0u) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "rule port is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "rule port is invalid",
+          "/rules/%zu", index);
       }
     } else if (ftun_span_equal_ascii_fold(rule, type_length, "NETWORK")) {
       if (!ftun_span_equal(first + 1, operand_length, "tcp") &&
           !ftun_span_equal(first + 1, operand_length, "udp")) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                      "rule network is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "rule network is invalid",
+          "/rules/%zu", index);
       }
     } else {
-      return ftun_config_diagnostic(out, FTUN_E_UNSUPPORTED, "/rules",
-                                    "rule type is not supported");
+      return ftun_config_error_setf(out, FTUN_E_UNSUPPORTED, "rule type is not supported",
+        "/rules/%zu", index);
     }
   }
   outbound_length = strlen(outbound);
   if (!ftun_name_span_valid(outbound, outbound_length) ||
       !ftun_outbound_exists_span(outbounds, outbound_count, outbound, outbound_length)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/rules",
-                                  "rule outbound does not exist");
+    return ftun_config_error_setf(out, FTUN_E_INVALID, "rule outbound does not exist",
+      "/rules/%zu", index);
   }
   return FTUN_OK;
 }
 
 static ftun_status_t ftun_validate_timeouts(const ftun_config_proxy_base_t *base,
   const ftun_config_inbound_t *inbounds, size_t inbound_count,
-                                            ftun_diagnostic_t *out)
+                                            ftun_config_error_t *out)
 {
   const uint32_t minimum_ms = 100u;
   const uint32_t maximum_ms = 600u * 1000u;
@@ -219,16 +220,17 @@ static ftun_status_t ftun_validate_timeouts(const ftun_config_proxy_base_t *base
   for (index = 0u; index < inbound_count; index++) {
     uint32_t idle = inbounds[index].tcp_idle_ms;
     if (idle != 0u && (idle < 1000u || idle > maximum_idle_ms)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                    "inbound TCP idle timeout is out of range");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound TCP idle timeout is out of range",
+        "/inbounds/%zu/tcp-idle", index);
     }
   }
   return FTUN_OK;
 }
 
 ftun_status_t ftun_config_validate_proxy_base(const ftun_config_proxy_base_t *base,
-  const ftun_config_inbound_t *inbounds, size_t inbound_count, ftun_diagnostic_t *out)
+  const ftun_config_inbound_t *inbounds, size_t inbound_count, ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   if (base->capacity.tcp_flows < FTUN_CONFIG_CAPACITY_MINIMUM ||
       base->capacity.tcp_flows > FTUN_CONFIG_CAPACITY_MAXIMUM) {
     return ftun_config_diagnostic(out, FTUN_E_INVALID,
@@ -262,8 +264,9 @@ ftun_status_t ftun_config_validate_proxy_base(const ftun_config_proxy_base_t *ba
 
 ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
   const ftun_config_outbound_t *outbounds, size_t outbound_count,
-                                             ftun_diagnostic_t *out)
+                                             ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   uint8_t *colors;
   ftun_reservation_t workspace = (ftun_reservation_t){0};
   size_t index;
@@ -272,13 +275,13 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
     const ftun_config_outbound_t *outbound = &outbounds[index];
     if (!ftun_name_valid(outbound->name) || strcmp(outbound->name, "DIRECT") == 0 ||
         strcmp(outbound->name, "REJECT") == 0) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                    "outbound name is invalid or reserved");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound name is invalid or reserved",
+        "/outbounds/%zu/name", index);
     }
     for (other = 0u; other < index; other++) {
       if (strcmp(outbound->name, outbounds[other].name) == 0) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "outbound name is duplicated");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound name is duplicated",
+          "/outbounds/%zu/name", index);
       }
     }
 
@@ -288,41 +291,43 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
       ftun_ip_t address = {0};
       int is_ipv4 = 0;
       if (!ftun_server_address(outbound->server, 1, &address, &is_ipv4)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "SOCKS5 server address is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "SOCKS5 server address is invalid",
+          "/outbounds/%zu/server", index);
       }
 
       if ((outbound->username == NULL) != (outbound->password == NULL) ||
           (outbound->username != NULL &&
            (user_length == 0u || user_length > 255u ||
             password_length == 0u || password_length > 255u))) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "SOCKS5 credentials are invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "SOCKS5 credentials are invalid",
+          "/outbounds/%zu/%s", index,
+          outbound->username == NULL || user_length == 0u || user_length > 255u ? "username" : "password");
       }
       continue;
     }
-    if (outbound->members.items == NULL || outbound->members.count == 0u ||
-        !ftun_name_valid(outbound->default_member)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                    "outbound group members are invalid");
+    if (outbound->members.items == NULL || outbound->members.count == 0u) {
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound group members are invalid",
+        "/outbounds/%zu/outbounds", index);
     }
+    if (!ftun_name_valid(outbound->default_member)) return ftun_config_error_setf(out,
+      FTUN_E_INVALID, "outbound group default is invalid", "/outbounds/%zu/default", index);
     for (other = 0u; other < outbound->members.count; other++) {
       size_t previous;
       const char *member = outbound->members.items[other];
       if (!ftun_name_valid(member) || !ftun_outbound_exists(outbounds, outbound_count, member)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "outbound group member does not exist");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound group member does not exist",
+          "/outbounds/%zu/outbounds/%zu", index, other);
       }
       for (previous = 0u; previous < other; previous++) {
         if (strcmp(member, outbound->members.items[previous]) == 0) {
-          return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                        "outbound group member is duplicated");
+          return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound group member is duplicated",
+            "/outbounds/%zu/outbounds/%zu", index, other);
         }
       }
     }
     if (!ftun_list_contains(&outbound->members, outbound->default_member)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                    "outbound group default is not a member");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "outbound group default is not a member",
+        "/outbounds/%zu/default", index);
     }
     if (outbound->kind == FTUN_CONFIG_OUTBOUND_URL_TEST) {
       uint64_t interval;
@@ -330,14 +335,16 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
       ftun_ip_t address = {0};
       int is_ipv4 = 0;
       if (!ftun_http_url(outbound->url, &address, &is_ipv4)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "health check URL is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "health check URL is invalid",
+          "/outbounds/%zu/url", index);
       }
 
-      if (!ftun_duration_parse_ms(outbound->interval, &interval) ||
-          !ftun_duration_parse_ms(outbound->timeout, &timeout) || timeout > interval) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/outbounds",
-                                      "health check durations are invalid");
+      if (!ftun_duration_parse_ms(outbound->interval, &interval))
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "health check interval is invalid",
+          "/outbounds/%zu/interval", index);
+      if (!ftun_duration_parse_ms(outbound->timeout, &timeout) || timeout > interval) {
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "health check durations are invalid",
+          "/outbounds/%zu/timeout", index);
       }
     }
   }
@@ -368,71 +375,72 @@ ftun_status_t ftun_config_validate_outbounds(ftun_budget_t *budget,
 
 ftun_status_t ftun_config_validate_inbounds(const ftun_config_inbound_t *inbounds, size_t inbound_count,
   const ftun_config_outbound_t *outbounds, size_t outbound_count,
-                                            ftun_diagnostic_t *out)
+                                            ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   size_t index;
   size_t other;
   size_t tun_count = 0u;
   for (index = 0u; index < inbound_count; index++) {
     const ftun_config_inbound_t *inbound = &inbounds[index];
     if (!ftun_name_valid(inbound->name)) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                    "inbound name is invalid");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound name is invalid",
+        "/inbounds/%zu/name", index);
     }
     for (other = 0u; other < index; other++) {
       if (strcmp(inbound->name, inbounds[other].name) == 0) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                      "inbound name is duplicated");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound name is duplicated",
+          "/inbounds/%zu/name", index);
       }
     }
     if (inbound->outbound == NULL ||
         (inbound->outbound[0] != '\0' && !ftun_outbound_exists(outbounds, outbound_count, inbound->outbound))) {
-      return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                    "inbound outbound does not exist");
+      return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound outbound does not exist",
+        "/inbounds/%zu/outbound", index);
     }
     if (inbound->kind == FTUN_CONFIG_INBOUND_TUN) {
       ftun_config_cidr_t tun_range;
       tun_count++;
       if (tun_count > 1u) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                      "only one TUN inbound is allowed");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "only one TUN inbound is allowed",
+          "/inbounds/%zu/type", index);
       }
       if (!ftun_path_valid(inbound->interface_name) ||
           strlen(inbound->interface_name) > 15u) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
+        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/tun/interface",
                                       "TUN interface name is invalid");
       }
       if (inbound->mtu == 0u || strcmp(inbound->stack, "lwip") != 0 ||
           (!inbound->tcp && !inbound->udp) ||
           (inbound->strict_route && !inbound->auto_route)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                      "TUN options are invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "TUN options are invalid",
+          "/inbounds/%zu", index);
       }
       if ((!ftun_cidr(inbound->ipv4_address, 0, &tun_range) || tun_range.address.family != FTUN_IP_V4)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
+        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/tun/ipv4/address",
                                       "TUN IPv4 address is invalid");
       }
 
     } else {
       ftun_config_listener_t ignored;
       if (!ftun_listen_address(inbound->listen, &ignored)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                      "inbound listen address is invalid");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound listen address is invalid",
+          "/inbounds/%zu/listen", index);
       }
       for (other = 0u; other < inbound->user_count; other++) {
         size_t user_length;
         size_t password_length;
         if (inbound->users == NULL || inbound->users[other].name == NULL ||
             inbound->users[other].password == NULL) {
-          return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                        "inbound credentials are invalid");
+          return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound credentials are invalid",
+            "/inbounds/%zu/users", index);
         }
         user_length = strlen(inbound->users[other].name);
         password_length = strlen(inbound->users[other].password);
         if (user_length == 0u || user_length > 255u ||
             password_length == 0u || password_length > 255u) {
-          return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-                                        "inbound credentials are invalid");
+          return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound credentials are invalid",
+            "/inbounds/%zu/users", index);
         }
       }
     }
@@ -446,8 +454,8 @@ ftun_status_t ftun_config_validate_inbounds(const ftun_config_inbound_t *inbound
       if (inbounds[other].kind == FTUN_CONFIG_INBOUND_TUN) continue;
       (void)ftun_listen_address(inbounds[other].listen, &right);
       if (ftun_listener_conflict(&left, &right)) {
-        return ftun_config_diagnostic(out, FTUN_E_INVALID, "/inbounds",
-          "inbound listeners conflict");
+        return ftun_config_error_setf(out, FTUN_E_INVALID, "inbound listeners conflict",
+          "/inbounds/%zu/listen", other);
       }
     }
   }
@@ -456,8 +464,9 @@ ftun_status_t ftun_config_validate_inbounds(const ftun_config_inbound_t *inbound
 
 ftun_status_t ftun_config_validate_frs(const ftun_config_frs_t *frs,
   const ftun_config_outbound_t *outbounds, size_t outbound_count,
-                                       ftun_diagnostic_t *out)
+                                       ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   uint64_t ignored;
   ftun_ip_t address = {0};
   int is_ipv4 = 0;

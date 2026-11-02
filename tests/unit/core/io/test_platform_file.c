@@ -4,6 +4,7 @@
 
 #include <sys/types.h>
 #include "core/io/file.h"
+#include "core/limits.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -126,9 +127,72 @@ static int test_replace_validation(void)
   return 0;
 }
 
+static int test_lock_pool(void)
+{
+  char directory[] = "/tmp/ftun-lock-pool.XXXXXX", path[256];
+  ftun_budget_t *budget = NULL;
+  ftun_file_lock_pool_t *pool = NULL, *other = NULL;
+  ftun_file_lock_t *first = NULL, *second = NULL, *contender = NULL;
+  ftun_budget_options_t options = {{65536u, 4u, 16u}, {0}, {0}};
+  ftun_budget_usage_t baseline, one, shared, released;
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(path_join(path, sizeof(path), directory, "cache.lock"));
+  CHECK(ftun_budget_create_resources(NULL, &options, &budget) == FTUN_OK);
+  CHECK(ftun_file_lock_pool_create(budget, &pool) == FTUN_OK);
+  CHECK(ftun_file_lock_pool_create(budget, &other) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &baseline) == FTUN_OK);
+  CHECK(ftun_file_lock_pool_acquire(pool, path, &first) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &one) == FTUN_OK);
+  CHECK(one.used_resources.descriptors == baseline.used_resources.descriptors + 1u);
+  CHECK(ftun_file_lock_pool_acquire(pool, path, &second) == FTUN_OK && second == first);
+  CHECK(ftun_budget_get_usage(budget, &shared) == FTUN_OK);
+  CHECK(shared.used_resources.memory_bytes == one.used_resources.memory_bytes &&
+        shared.used_resources.descriptors == one.used_resources.descriptors);
+  CHECK(ftun_file_lock_pool_acquire(other, path, &contender) == FTUN_E_AGAIN && contender == NULL);
+  CHECK(ftun_file_lock_pool_destroy(&pool) == FTUN_E_AGAIN && pool != NULL);
+  CHECK(ftun_file_lock_release(&first) == FTUN_OK && first == NULL);
+  CHECK(ftun_file_lock_acquire(path, &contender) == FTUN_E_AGAIN);
+  /* Worker 的引用可晚于当前配置引用结束；最后一个引用结束才允许外部接管。 */
+  ftun_file_lock_retain(second);
+  first = second;
+  CHECK(ftun_file_lock_release(&second) == FTUN_OK);
+  CHECK(ftun_file_lock_acquire(path, &contender) == FTUN_E_AGAIN);
+  CHECK(ftun_file_lock_release(&first) == FTUN_OK);
+  CHECK(ftun_budget_get_usage(budget, &released) == FTUN_OK);
+  CHECK(released.used_resources.memory_bytes == baseline.used_resources.memory_bytes &&
+        released.used_resources.descriptors == baseline.used_resources.descriptors);
+  CHECK(ftun_file_lock_pool_acquire(other, path, &contender) == FTUN_OK);
+  CHECK(ftun_file_lock_release(&contender) == FTUN_OK);
+  CHECK(ftun_file_lock_pool_destroy(&pool) == FTUN_OK);
+  CHECK(ftun_file_lock_pool_destroy(&other) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+  return 0;
+}
+
+static int test_create_without_replace(void)
+{
+  char directory[] = "/tmp/ftun-create-test.XXXXXX";
+  char path[256], value[64];
+  struct stat info;
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(path_join(path, sizeof(path), directory, "config.json"));
+  CHECK(ftun_file_create_atomic_budget(NULL, path, bytes("first"), 0600u) == FTUN_OK);
+  CHECK(stat(path, &info) == 0 && (info.st_mode & 0777) == 0600);
+  CHECK(ftun_file_create_atomic_budget(NULL, path, bytes("second"), 0600u) == FTUN_E_STALE);
+  CHECK(read_text(path, value, sizeof(value)) && strcmp(value, "first") == 0);
+  CHECK(unlink(path) == 0 && symlink("absent", path) == 0);
+  CHECK(ftun_file_create_atomic_budget(NULL, path, bytes("second"), 0600u) == FTUN_E_STALE);
+  CHECK(lstat(path, &info) == 0 && S_ISLNK(info.st_mode));
+  CHECK(unlink(path) == 0 && rmdir(directory) == 0);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(test_atomic_boundaries_and_lock() == 0);
   CHECK(test_replace_validation() == 0);
+  CHECK(test_lock_pool() == 0);
+  CHECK(test_create_without_replace() == 0);
   return 0;
 }

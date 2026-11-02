@@ -122,8 +122,11 @@ typedef struct {
   uint64_t body_length;
   uintptr_t prepared_runtime;
   uintptr_t cleanup_view;
+  int32_t tls_error;
   uint8_t tls_verified;
-  uint8_t reserved[7];
+  uint8_t failure_phase; /* 1下载、2规则校验、3候选准备；仅Worker拥有型结果。 */
+  uint8_t failure_status;
+  uint8_t reserved;
 } ftun_proxy_runtime_http_result_t;
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -181,6 +184,8 @@ struct ftun_proxy_runtime_health_slot {
   uint32_t member_id;
   uint64_t generation;
   uint64_t started_ms;
+  uint64_t log_entity;
+  bool log_failed;
 };
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -201,6 +206,14 @@ static inline ftun_status_t ftun_proxy_runtime_file_stage(ftun_file_stage_t stag
 
 typedef struct ftun_proxy_runtime_udp_slot {
   ftun_proxy_slot_token_t slot_token;
+  uint64_t sid;
+  uint64_t log_generation;
+  uint64_t log_started_ms;
+  uint64_t log_read_bytes;
+  uint64_t log_written_bytes;
+  const ftun_runtime_t *log_runtime; /* channel存活时借用UDP flow所持快照，destroy即撤下。 */
+  ftun_error_t log_error;
+  bool log_failure_recorded;
   struct ftun_proxy_runtime *engine;
   ftun_budget_t *budget;
   ftun_reservation_t admission;
@@ -301,6 +314,9 @@ struct ftun_proxy_runtime_listener {
   char *name;
   ftun_config_inbound_kind_t kind;
   uint32_t inbound_id;
+  uint64_t log_entity;
+  bool log_faulted;
+  bool log_waiting;
   /* 恢复：地址与是否带 UDP 在打开时记下；waiting 表示 socket 已关闭、等待重新
    * bind；paused 表示 socket 仍在、accept 因资源不足暂停读取。 */
   ftun_endpoint_t address;
@@ -314,6 +330,10 @@ struct ftun_proxy_runtime_listener {
 };
 
 struct ftun_proxy_runtime_flow {
+  uint64_t sid, log_generation, log_started_ms;
+  uint64_t log_read_bytes, log_written_bytes;
+  ftun_error_t log_error;
+  bool log_failure_recorded;
   ftun_proxy_slot_token_t slot_token;
   ftun_proxy_runtime_flow_t *ready_next;
   ftun_proxy_runtime_flow_t *association_client_next;
@@ -332,6 +352,7 @@ struct ftun_proxy_runtime_flow {
   ftun_path_scope_t *path_scope;
   ftun_resolver_scope_t *resolver_scope;
   ftun_session_t *session;
+  bool connection_counted;
   ftun_relay_t *relay;
   ftun_operation_t *open_operation;
   ftun_runtime_t *udp_runtime;
@@ -496,9 +517,14 @@ struct ftun_proxy_runtime {
   uint16_t next_dns_query_id;
   /* 规则因引用未就绪的 FRS 集合而拒绝连接的日志，每个 NOT_READY 期间只记一次。 */
   bool frs_not_ready_logged;
+  uint64_t frs_log_entity;
+  uint32_t frs_log_faults;
 #if defined(FTUN_HAVE_MODULE_FRS)
   /* 启动时本地规则文件缺失：FRS 规则 NOT_READY，后台下载按退避重试（1s→30s）。 */
+  bool frs_loaded_logged;
   bool frs_not_ready;
+  int64_t frs_updated_unix_ms;
+  bool frs_updated_valid;
   uint64_t frs_retry_ms;
   ftun_operation_t *frs_operation;
   ftun_runtime_t *frs_candidate;
@@ -730,6 +756,7 @@ ftun_status_t ftun_proxy_runtime_leaf(
   const ftun_config_outbound_t **out_config);
 ftun_status_t ftun_proxy_runtime_listener_bind(
   ftun_proxy_runtime_listener_t *listener);
+void ftun_proxy_runtime_listener_log(ftun_proxy_runtime_listener_t *listener, bool stopped);
 ftun_status_t ftun_proxy_runtime_listener_close(
   ftun_proxy_runtime_listener_t *listener);
 ftun_status_t ftun_proxy_runtime_listener_endpoint(
@@ -918,6 +945,7 @@ ftun_status_t ftun_proxy_runtime_udp_open(
   ftun_datagram_result_fn result,
   ftun_datagram_receive_fn receive, void *callback_user,
   uint32_t *outbound_id, ftun_endpoint_t *remote, ftun_datagram_t **out);
+void ftun_proxy_runtime_udp_log_failure(ftun_proxy_runtime_udp_slot_t *slot, ftun_error_t error);
 void ftun_proxy_runtime_udp_path_notify(ftun_path_t *path, uint32_t events,
   ftun_error_t error, void *user);
 ftun_proxy_runtime_udp_pending_t *ftun_proxy_runtime_udp_pending_at(

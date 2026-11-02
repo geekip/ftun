@@ -3,11 +3,14 @@
 
 #include "core/lifecycle.h"
 #include "dns/service.h"
+#include "dns/stats.h"
 
 /* Composition 拥有发布槽；DNS service 在 activate/commit 时发布当前代，
  * quiesce/destroy 时先关闭接纳。消费者只借用，不拥有 DNS runtime。 */
 typedef struct ftun_dns_service_slot {
   ftun_dns_runtime_t *active;
+  ftun_dns_runtime_t *retired;
+  ftun_dns_lifetime_stats_t history;
   uint64_t generation;
   bool accepting;
 } ftun_dns_service_slot_t;

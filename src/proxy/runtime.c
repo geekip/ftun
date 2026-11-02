@@ -410,6 +410,30 @@ ftun_status_t ftun_proxy_runtime_activate(ftun_proxy_runtime_t *engine)
   }
 #endif
   engine->accepting = true;
+  for (size_t index = 0u; index < engine->listener_count; index++)
+    ftun_proxy_runtime_listener_log(&engine->listeners[index], false);
+#if defined(FTUN_HAVE_MODULE_FAKEIP)
+  if (engine->fakeip_store != NULL && ftun_log_enabled(engine->core, FTUN_LOG_INFO)) {
+    ftun_fakeip_store_info_t info;
+    if (ftun_fakeip_store_get_info(engine->fakeip_store, &info) == FTUN_OK) {
+      static const ftun_log_event_t loaded = {FTUN_LOG_FAKEIP, FTUN_LOG_INFO, "fakeip.identity.loaded", "identity loaded"};
+      char uuid[9], start[FTUN_IP_TEXT_BYTES], end[FTUN_IP_TEXT_BYTES];
+      ftun_ip_t first_ip = {.family = FTUN_IP_V4}, end_ip = {.family = FTUN_IP_V4};
+      ftun_ipv4_store(info.identity.first_address, first_ip.bytes);
+      ftun_ipv4_store(info.identity.end_address_exclusive, end_ip.bytes);
+      size_t start_length = ftun_ip_format(&first_ip, start, sizeof(start));
+      size_t end_length = ftun_ip_format(&end_ip, end, sizeof(end));
+      (void)snprintf(uuid, sizeof(uuid), "%02x%02x%02x%02x", info.identity.uuid[0], info.identity.uuid[1], info.identity.uuid[2], info.identity.uuid[3]);
+      FTUN_CORE_LOG(engine->core, &loaded, .generation = engine->generation,
+        .fields = (ftun_log_field_t[]){
+          {.key = "uuid", .kind = FTUN_LOG_TEXT, .value.text = {uuid, 8u}},
+          {.key = "path", .kind = FTUN_LOG_TEXT, .value.text = {engine->fakeip_directory, strlen(engine->fakeip_directory)}},
+          {.key = "pool_start", .kind = FTUN_LOG_TEXT, .value.text = {start, start_length}},
+          {.key = "pool_end_exclusive", .kind = FTUN_LOG_TEXT, .value.text = {end, end_length}}}, .field_count = 4u);
+    }
+  }
+#endif
+
   return FTUN_OK;
 }
 
@@ -789,6 +813,25 @@ ftun_status_t ftun_proxy_runtime_run_once(ftun_proxy_runtime_t *engine, bool may
       out_usage == NULL) {
     return FTUN_E_INVALID;
   }
+#if defined(FTUN_HAVE_MODULE_FRS)
+  if (!engine->frs_loaded_logged) {
+    engine->frs_loaded_logged = true;
+    if (ftun_log_enabled(engine->core, FTUN_LOG_INFO)) {
+      ftun_runtime_t *runtime = NULL;
+      ftun_frs_view_t *view = NULL;
+      const ftun_config_t *config = NULL;
+      if (ftun_runtime_active_acquire(engine->core, &runtime) == FTUN_OK &&
+          ftun_runtime_frs_view(runtime, &view) == FTUN_OK &&
+          ftun_runtime_config(runtime, &config) == FTUN_OK) {
+        static const ftun_log_event_t loaded = {FTUN_LOG_FRS, FTUN_LOG_INFO, "frs.loaded", "rule set loaded"};
+        const char *path = ftun_config_frs(config)->path;
+        FTUN_CORE_LOG(engine->core, &loaded, .generation = engine->generation,
+          .fields = (ftun_log_field_t[]){{.key = "file", .kind = FTUN_LOG_TEXT, .value.text = {path, strlen(path)}}}, .field_count = 1u);
+      }
+      (void)ftun_runtime_release(&runtime);
+    }
+  }
+#endif
   engine->health_scan_work = 0u;
   status = ftun_buffer_pool_get_usage(engine->relay_pool, &pool_usage);
   if (status != FTUN_OK) return status;
@@ -1045,6 +1088,10 @@ ftun_status_t ftun_proxy_runtime_quiesce(ftun_proxy_runtime_t *engine)
   ftun_status_t result = FTUN_OK;
   if (engine == NULL) return FTUN_E_INVALID;
   if (engine->stopped) return FTUN_OK;
+  if (engine->accepting) {
+    for (size_t index = 0u; index < engine->listener_count; index++)
+      ftun_proxy_runtime_listener_log(&engine->listeners[index], true);
+  }
   engine->accepting = false;
   if (engine->resolver_provider != NULL) {
     ftun_status_t status = ftun_resolver_provider_quiesce(
@@ -1315,6 +1362,12 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
       ftun_tun_service_release(&owned->tun_lease) != FTUN_OK) {
     return FTUN_E_AGAIN;
   }
+  if (owned->tun_listener.log_faulted) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK)
+      (void)ftun_log_retire(owned->core, FTUN_LOG_PROXY, owned->tun_listener.log_entity, now);
+    owned->tun_listener.log_faulted = false;
+  }
   free(owned->tun_listener.name);
   owned->tun_listener.name = NULL;
 #endif
@@ -1347,8 +1400,22 @@ ftun_status_t ftun_proxy_runtime_destroy_until(ftun_proxy_runtime_t **engine,
   ftun_reservation_release(&owned->fakeip_directory_reservation);
 #endif
   for (index = 0u; index < owned->listener_count; index++) {
+    if (owned->listeners[index].log_faulted) {
+      uint64_t now;
+      if (ftun_monotonic_now(&now) == FTUN_OK)
+        (void)ftun_log_retire(owned->core, FTUN_LOG_PROXY, owned->listeners[index].log_entity, now);
+      owned->listeners[index].log_faulted = false;
+    }
     free(owned->listeners[index].name);
     owned->listeners[index].name = NULL;
+  }
+  if (owned->frs_log_entity != 0u) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK) {
+      (void)ftun_log_retire(owned->core, FTUN_LOG_FRS, owned->frs_log_entity, now);
+      (void)ftun_log_retire(owned->core, FTUN_LOG_PROXY, owned->frs_log_entity, now);
+    }
+    owned->frs_log_entity = 0u;
   }
   if (ftun_recovery_scheduler_destroy(&owned->recovery) != FTUN_OK) {
     return FTUN_E_AGAIN;

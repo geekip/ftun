@@ -54,7 +54,7 @@ cleanup()
     echo "release production test failed (status $status, stage $stage)" >&2
     sed -n '1,200p' "$temporary/ftun.log" >&2 || true
     sed -n '1,200p' "$temporary/peer.log" >&2 || true
-    sed -n '1,200p' /tmp/ftun-release.log >&2 || true
+    tail -n 200 /tmp/ftun-release.log >&2 || true
   fi
   rm -f /tmp/ftun-release.log "$temporary/config.json" "$temporary/ready" \
     "$temporary/config.next" "$temporary/config.good" \
@@ -103,7 +103,7 @@ sysctl -q -w net.ipv4.conf.lan0.rp_filter=0
 cat >"$temporary/config.json" <<EOF
 {
   "base": {"cache-file":"$temporary/cache","state-cache":false},
-  "log": {"level":"debug","file":"/tmp/ftun-release.log"},
+  "log": {"output":"file","level":"debug","file":"/tmp/ftun-release.log"},
   "frs": {
     "path":"$temporary/rules.frs",
     "url":"http://frs.release.test:18082/redirect",
@@ -158,10 +158,7 @@ cat >"$temporary/config.json" <<EOF
 }
 EOF
 
-# FakeIP offline initialization validates the same active FRS references; give
-# it the valid local artifact, then remove it to exercise run-time bootstrap.
-cp "$temporary/source.frs" "$temporary/rules.frs"
-"$ftun_binary" fakeip init -c "$temporary/config.json"
+# 缺失FRS由运行时更新，FakeIP身份由本次首次启动创建。
 rm -f "$temporary/rules.frs"
 
 ip netns exec ftun-peer "$helper_binary" --peer "$temporary/ready" \
@@ -179,12 +176,13 @@ while [ ! -f "$temporary/ready" ]; do
   sleep 0.01
 done
 
-"$ftun_binary" run -c "$temporary/config.json" \
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" \
   >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 
 attempt=0
-while ! ip link show ftun-prod0 >/dev/null 2>&1; do
+while ! ip link show ftun-prod0 >/dev/null 2>&1 ||
+      ! grep -q '^ftun: ready' "$temporary/ftun.log"; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 200 ] || ! kill -0 "$ftun_pid" 2>/dev/null; then
     sed -n '1,200p' "$temporary/ftun.log" >&2
@@ -196,7 +194,7 @@ done
 # 本地规则文件缺失：服务不等待下载，以 NOT_READY 启动；后台下载成功并发布新
 # 快照后才继续（此前的第一条 FRS 规则会拒绝新连接）。
 attempt=0
-while ! grep -q 'config.published.*reason=frs-update' /tmp/ftun-release.log; do
+while ! grep -q 'configuration published:.*reason=frs-update' /tmp/ftun-release.log; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 500 ] || ! kill -0 "$ftun_pid" 2>/dev/null; then
     echo "FRS background download did not publish" >&2
@@ -448,11 +446,12 @@ ftun_pid=
 
 # 持久映射必须在优雅停止时快照，并在重启后保持同一域名地址身份。
 stage=persistence-restart
-"$ftun_binary" run -c "$temporary/config.json" \
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" \
   >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 attempt=0
-while ! ip link show ftun-prod0 >/dev/null 2>&1; do
+while ! ip link show ftun-prod0 >/dev/null 2>&1 ||
+      ! grep -q '^ftun: ready' "$temporary/ftun.log"; do
   attempt=$((attempt + 1))
   if [ "$attempt" -ge 200 ] || ! kill -0 "$ftun_pid" 2>/dev/null; then
     sed -n '1,200p' "$temporary/ftun.log" >&2
@@ -475,7 +474,7 @@ fi
 # silently repaired from the configured URL.
 stage=corrupt-local-frs
 : >"$temporary/rules.frs"
-if "$ftun_binary" run -c "$temporary/config.json" \
+if "$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" \
     >"$temporary/ftun.log" 2>&1; then
   echo "corrupt local FRS unexpectedly started" >&2
   exit 1
@@ -488,7 +487,7 @@ rm -f "$temporary/rules.frs"
 sed 's#http://frs.release.test:18082/redirect#http://frs.release.test:9/unavailable#' \
   "$temporary/config.json" >"$temporary/config.next"
 mv "$temporary/config.next" "$temporary/config.json"
-"$ftun_binary" run -c "$temporary/config.json" \
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" \
   >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 sleep 3
@@ -524,7 +523,7 @@ done
 cat >"$temporary/config.json" <<EOF
 {
   "base":{"state-cache":false},
-  "log":{"level":"debug","file":"$temporary/ftun.log"},
+  "log":{"output":"file","level":"debug","file":"$temporary/ftun.log"},
   "dns":{"enable":false},
   "inbounds":[
     {"name":"system-socks","type":"socks5","listen":"127.0.0.1:11083","udp":true}
@@ -533,7 +532,7 @@ cat >"$temporary/config.json" <<EOF
   "rules":["MATCH,DIRECT"]
 }
 EOF
-"$ftun_binary" run -c "$temporary/config.json" \
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" \
   >>"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 attempt=0

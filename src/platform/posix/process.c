@@ -2,6 +2,9 @@
 #define _POSIX_C_SOURCE 200809L
 #include "platform/posix/socket_native.h"
 #include "platform/process.h"
+#include "platform/clock.h"
+#include <fcntl.h>
+#include <poll.h>
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
@@ -114,3 +117,90 @@ ftun_status_t ftun_process_notify(const char *state)
   return sent < 0 ? FTUN_E_IO : FTUN_OK;
 }
 
+
+ftun_status_t ftun_process_background_fork(ftun_handle_t *channel, bool *child, uint32_t *pid)
+{
+  int descriptors[2];
+  pid_t created;
+  *channel = -1;
+  *child = false;
+  *pid = 0u;
+  if (pipe(descriptors) != 0) return FTUN_E_IO;
+  if (fcntl(descriptors[0], F_SETFD, FD_CLOEXEC) != 0 ||
+      fcntl(descriptors[1], F_SETFD, FD_CLOEXEC) != 0 ||
+      fcntl(descriptors[0], F_SETFL, O_NONBLOCK) != 0 ||
+      fcntl(descriptors[1], F_SETFL, O_NONBLOCK) != 0) {
+    (void)close(descriptors[0]); (void)close(descriptors[1]);
+    return FTUN_E_IO;
+  }
+  created = fork();
+  if (created < 0) {
+    (void)close(descriptors[0]); (void)close(descriptors[1]);
+    return FTUN_E_IO;
+  }
+  *child = created == 0;
+  *pid = created == 0 ? (uint32_t)getpid() : (uint32_t)created;
+  *channel = descriptors[created == 0 ? 1 : 0];
+  (void)close(descriptors[created == 0 ? 0 : 1]);
+  return FTUN_OK;
+}
+ftun_status_t ftun_process_standard_ensure(void)
+{
+  int descriptor;
+  for (descriptor = 0; descriptor < 3; descriptor++) {
+    if (fcntl(descriptor, F_GETFD) >= 0) continue;
+    if (errno != EBADF || open("/dev/null", O_RDWR) < 0) return FTUN_E_IO;
+  }
+  return FTUN_OK;
+}
+ftun_status_t ftun_process_background_session(void)
+{
+  return setsid() < 0 ? FTUN_E_IO : FTUN_OK;
+}
+
+static ftun_status_t ftun_process_pipe_io(ftun_handle_t descriptor, void *data,
+  size_t length, uint64_t deadline_ms, bool writing)
+{
+  size_t offset = 0u;
+  while (offset < length) {
+    uint64_t now;
+    struct pollfd observed = {(int)descriptor, writing ? POLLOUT : POLLIN, 0};
+    int ready, milliseconds;
+    if (ftun_monotonic_now(&now) != FTUN_OK) return FTUN_E_IO;
+    if (now >= deadline_ms) return FTUN_E_TIMEOUT;
+    milliseconds = deadline_ms - now > 100u ? 100 : (int)(deadline_ms - now);
+    ready = poll(&observed, 1u, milliseconds);
+    if (ready < 0) { if (errno == EINTR) continue; return FTUN_E_IO; }
+    if (ready == 0) continue;
+    if (ftun_monotonic_now(&now) != FTUN_OK) return FTUN_E_IO;
+    if (now >= deadline_ms) return FTUN_E_TIMEOUT;
+    ssize_t count = writing ? write((int)descriptor, (const uint8_t *)data + offset, length - offset) :
+      read((int)descriptor, (uint8_t *)data + offset, length - offset);
+    if (count > 0) offset += (size_t)count;
+    else if (count == 0) return FTUN_E_EOF;
+    else if (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) return FTUN_E_IO;
+  }
+  return FTUN_OK;
+}
+ftun_status_t ftun_process_pipe_read(ftun_handle_t channel, void *data, size_t length, uint64_t deadline_ms)
+{
+  return ftun_process_pipe_io(channel, data, length, deadline_ms, false);
+}
+ftun_status_t ftun_process_pipe_write(ftun_handle_t channel, const void *data, size_t length, uint64_t deadline_ms)
+{
+  return ftun_process_pipe_io(channel, (void *)data, length, deadline_ms, true);
+}
+
+ftun_status_t ftun_process_null_open(ftun_handle_t *out)
+{
+  *out = open("/dev/null", O_RDWR | O_CLOEXEC);
+  return *out >= 0 ? FTUN_OK : FTUN_E_IO;
+}
+ftun_status_t ftun_process_stdio_null(ftun_handle_t descriptor)
+{
+  int target;
+  for (target = 0; target < 3; target++) {
+    if (dup2((int)descriptor, target) < 0) return FTUN_E_IO;
+  }
+  return FTUN_OK;
+}

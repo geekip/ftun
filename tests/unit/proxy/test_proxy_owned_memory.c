@@ -60,8 +60,10 @@ ftun_status_t __wrap_ftun_worker_submit(ftun_worker_t *worker,
     size_t size = SIZE_MAX;
     ftun_status_t status = job->execute(job->input, result, sizeof(result), &size);
     *out = NULL;
-    return size == sizeof(ftun_proxy_runtime_http_result_t)
-      ? status : FTUN_E_STATE_CORRUPT;
+    if (status != FTUN_OK || size != sizeof(ftun_proxy_runtime_http_result_t)) return FTUN_E_STATE_CORRUPT;
+    const ftun_proxy_runtime_http_result_t *facts = (const ftun_proxy_runtime_http_result_t *)result;
+    return facts->failure_status == FTUN_E_IO && facts->failure_phase == 1u
+      ? FTUN_E_IO : FTUN_E_STATE_CORRUPT;
   }
   if (health_reject_submit) {
     health_submit_calls++;

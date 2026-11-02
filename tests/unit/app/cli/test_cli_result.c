@@ -123,11 +123,17 @@ static int ordered_output(void)
   static const char expected[] =
     "ftun: reload committed\n"
     "ftun: reload rejected at stage 7: io\n"
-    "ftun: reload request rejected: limit\n";
+    "ftun: reload request rejected: limit\n"
+    "ftun: run: tun prepare failed: again: \"/tmp/缓存\\x0a\\\"\\\\\"\n"
+    "ftun: run: app setup failed: io\n"
+    "ftun: ready\n"
+    "ftun: ready (degraded: proxy waiting (io))\n";
   ftun_cli_result_sink_t *sink = NULL;
-  ftun_cli_result_ticket_t *tickets[4] = {NULL, NULL, NULL, NULL};
+  ftun_cli_result_ticket_t *tickets[8] = {0};
+  char path[] = "/tmp/缓存\n\"\\";
+  char oversized[FTUN_APP_CONTROL_PATH_CAPACITY + 1u];
   int descriptors[2];
-  char output[256];
+  char output[512];
   size_t used = 0u;
   ssize_t got;
   CHECK(pipe(descriptors) == 0);
@@ -144,6 +150,25 @@ static int ordered_output(void)
   CHECK(ftun_cli_result_publish(tickets[2],
     FTUN_CLI_RESULT_RELOAD_REQUEST_REJECTED, FTUN_E_LIMIT, 0u) == FTUN_OK);
   CHECK(ftun_cli_result_abandon(tickets[3]) == FTUN_OK);
+  CHECK(ftun_cli_result_reserve(sink, &tickets[4]) == FTUN_OK);
+  CHECK(ftun_cli_result_publish_run_failure(tickets[4],
+    FTUN_E_AGAIN, FTUN_STAGE_CONFIG_PREPARE, FTUN_BUILD_MODULE_TUN, path) == FTUN_OK);
+  memset(path, 'x', sizeof(path) - 1u);
+  CHECK(ftun_cli_result_reserve(sink, &tickets[5]) == FTUN_OK);
+  memset(oversized, 'x', sizeof(oversized));
+  oversized[sizeof(oversized) - 1u] = '\0';
+  CHECK(ftun_cli_result_publish_file(tickets[5], FTUN_CLI_RESULT_RUN_FAILED,
+    FTUN_E_IO, 0u, oversized) == FTUN_E_LIMIT);
+  CHECK(ftun_cli_result_publish(tickets[5], FTUN_CLI_RESULT_RUN_FAILED,
+    FTUN_E_IO, 0u) == FTUN_OK);
+  CHECK(ftun_cli_result_reserve(sink, &tickets[6]) == FTUN_OK);
+  CHECK(ftun_cli_result_publish_ready(tickets[6], "") == FTUN_OK);
+  CHECK(ftun_cli_result_reserve(sink, &tickets[7]) == FTUN_OK);
+  {
+    char reasons[] = "proxy waiting (io)";
+    CHECK(ftun_cli_result_publish_ready(tickets[7], reasons) == FTUN_OK);
+    memset(reasons, 'x', sizeof(reasons) - 1u);
+  }
   CHECK(ftun_cli_result_sink_stop_until(&sink, UINT64_MAX) == FTUN_OK &&
         sink == NULL);
   while ((got = read(descriptors[0], output + used, sizeof(output) - used)) > 0) {
@@ -280,7 +305,7 @@ static int terminal_reserve(void)
   ftun_cli_result_usage_t usage;
   char output[160];
   static const char expected[] = "ftun: stop request failed: io\n"
-    "ftun: run: timeout\n";
+    "ftun: run: app setup failed: timeout\n";
   size_t index;
   int fds[2];
   CHECK(pipe(fds) == 0);
@@ -544,6 +569,38 @@ static int independent_lifetime(void)
   return 0;
 }
 
+static int background_output_boundaries(void)
+{
+  ftun_cli_result_sink_t *sink = NULL;
+  ftun_cli_result_ticket_t *ticket = NULL;
+  char temporary[] = "/tmp/ftun-background-result.XXXXXX";
+  char path[FTUN_APP_CONTROL_PATH_CAPACITY];
+  char reasons[FTUN_CLI_READY_REASONS_CAPACITY];
+  char output[20000];
+  size_t used = 0u, escaped = 0u, index;
+  ssize_t count;
+  int descriptor = mkstemp(temporary);
+  CHECK(descriptor >= 0);
+  CHECK(ftun_cli_result_sink_create(descriptor, &sink) == FTUN_OK);
+  CHECK(ftun_cli_result_reserve(sink, &ticket) == FTUN_OK);
+  memset(path, '\n', sizeof(path) - 1u); path[sizeof(path) - 1u] = '\0';
+  memset(reasons, 'r', sizeof(reasons) - 1u); reasons[sizeof(reasons) - 1u] = '\0';
+  CHECK(ftun_cli_result_publish_background_ready(ticket, 42u, path, reasons) == FTUN_OK);
+  memset(path, 'x', sizeof(path) - 1u);
+  memset(reasons, 'x', sizeof(reasons) - 1u);
+  CHECK(ftun_cli_result_sink_stop_until(&sink, UINT64_MAX) == FTUN_OK);
+  CHECK(lseek(descriptor, 0, SEEK_SET) == 0);
+  while ((count = read(descriptor, output + used, sizeof(output) - 1u - used)) > 0) used += (size_t)count;
+  CHECK(count == 0 && used > 16000u && used < sizeof(output) - 1u);
+  output[used] = '\0';
+  CHECK(strstr(output, "ftun: ready (degraded: rrrrr") == output && strstr(output, "(pid 42); log file: ") != NULL);
+  CHECK(strstr(output, "xxxxxxxx") == NULL);
+  for (index = 0u; index + 4u < used; index++) if (memcmp(output + index, "\\x0a", 4u) == 0) escaped++;
+  CHECK(escaped == sizeof(path) - 1u && strchr(output, '\n') == output + used - 1u);
+  CHECK(close(descriptor) == 0 && unlink(temporary) == 0);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(ordered_output() == 0);
@@ -557,6 +614,7 @@ int main(void)
   CHECK(concurrent_results() == 0);
   CHECK(partial_write() == 0);
   CHECK(independent_lifetime() == 0);
-  puts("CLI result contract: 11 scenarios passed");
+  CHECK(background_output_boundaries() == 0);
+  puts("CLI result contract: 12 scenarios passed");
   return 0;
 }

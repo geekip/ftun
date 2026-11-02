@@ -238,33 +238,6 @@ static void ftun_store_snapshot_empty_encode(
   ftun_store_u64(data + 40u, ftun_store_checksum(data, 40u));
 }
 
-static ftun_status_t ftun_store_sync_parent(ftun_budget_t *budget, const char *path)
-{
-  const char *slash = strrchr(path, '/');
-  size_t length = slash == NULL || slash == path ? 1u : (size_t)(slash - path);
-  char *parent = NULL;
-  ftun_handle_t descriptor = -1;
-  ftun_reservation_t memory_reservation = (ftun_reservation_t){0}, fd_reservation = (ftun_reservation_t){0};
-  ftun_status_t status;
-  if (budget != NULL) {
-    status = ftun_budget_reserve(budget, length + 1u, &memory_reservation);
-    if (status != FTUN_OK) return status;
-  }
-  parent = (char *)malloc(length + 1u);
-  if (parent == NULL) { status = FTUN_E_LIMIT; goto done; }
-  if (slash == NULL) memcpy(parent, ".", 2u);
-  else { memcpy(parent, path, length); parent[length] = '\0'; }
-  status = ftun_store_open_file(budget, parent,
-    FTUN_FILE_READ_DIRECTORY, &descriptor, &fd_reservation);
-  if (status == FTUN_E_STATE_CORRUPT) status = FTUN_E_IO;
-  if (status == FTUN_OK && ftun_file_sync(descriptor, false) != 0) status = FTUN_E_IO;
-  if (descriptor >= 0 && ftun_store_close_file(descriptor, &fd_reservation) != 0) status = FTUN_E_IO;
-done:
-  free(parent);
-  ftun_reservation_release(&memory_reservation);
-  return status;
-}
-
 ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
   const char *directory, const ftun_fakeip_store_identity_t *identity)
 {
@@ -274,23 +247,41 @@ ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
   char *mapping_path = NULL;
   char *lock_path = NULL;
   ftun_reservation_t paths[4] = {0};
+  ftun_reservation_t temporary_budget = {0}, parent_budget = {0}, descriptors = {0};
+  char *temporary = NULL, *parent = NULL;
+  ftun_string_t parent_view;
+  ftun_file_info_t info;
+  ftun_file_lock_t *lock = NULL;
+  bool created = false, published = false;
   uint8_t identity_data[FTUN_FAKEIP_IDENTITY_BYTES];
   uint8_t log_data[FTUN_FAKEIP_LOG_HEADER_BYTES];
   uint8_t snapshot_data[FTUN_FAKEIP_SNAPSHOT_HEADER_BYTES];
   ftun_status_t status = FTUN_OK;
-  int created = 0;
   if (directory == NULL || directory[0] == '\0' ||
       !ftun_store_identity_valid(identity)) return FTUN_E_INVALID;
-  status = ftun_directory_create(directory, 0700);
+  status = ftun_file_inspect_path_nofollow(directory, &info);
+  if (status == FTUN_OK) return FTUN_E_STALE;
+  if (status != FTUN_E_EOF) return status;
+  status = ftun_platform_file_parent(directory, &parent_view);
   if (status != FTUN_OK) return status;
-  created = 1;
-  status = ftun_store_path(budget, directory, "identity", &identity_path, &paths[0]);
+  if (budget != NULL) {
+    status = ftun_budget_reserve(budget, parent_view.length + 1u, &parent_budget);
+    if (status != FTUN_OK) return status;
+  }
+  parent = malloc(parent_view.length + 1u);
+  if (parent == NULL) { status = FTUN_E_LIMIT; goto done; }
+  memcpy(parent, parent_view.data, parent_view.length);
+  parent[parent_view.length] = '\0';
+  status = ftun_store_path(budget, parent, ".ftun.fakeip.XXXXXX", &temporary, &temporary_budget);
+  if (status == FTUN_OK) status = ftun_directory_create_temporary(temporary, &created);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(budget, directory, "reservations", &reservation_path, &paths[1]);
+  status = ftun_store_path(budget, temporary, "identity", &identity_path, &paths[0]);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(budget, directory, "mappings", &mapping_path, &paths[2]);
+  status = ftun_store_path(budget, temporary, "reservations", &reservation_path, &paths[1]);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_path(budget, directory, "lock", &lock_path, &paths[3]);
+  status = ftun_store_path(budget, temporary, "mappings", &mapping_path, &paths[2]);
+  if (status != FTUN_OK) goto done;
+  status = ftun_store_path(budget, temporary, "lock", &lock_path, &paths[3]);
   if (status != FTUN_OK) goto done;
   ftun_store_identity_encode(identity, identity_data);
   ftun_store_log_header_encode(identity, log_data);
@@ -307,20 +298,33 @@ ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
   status = ftun_file_write_atomic_budget(budget, lock_path,
     (ftun_bytes_t){empty, 0u}, 0600u, NULL, NULL);
   if (status != FTUN_OK) goto done;
-  status = ftun_store_sync_parent(budget, directory);
+  status = ftun_file_lock_acquire_budget(budget, lock_path, &lock);
+  if (status == FTUN_OK && budget != NULL) status = ftun_budget_reserve_resources(budget,
+    (ftun_budget_resources_t){0u, 2u, 0u}, &descriptors);
+  if (status == FTUN_OK) status = ftun_directory_publish(temporary, directory, parent,
+    NULL, NULL, &published);
+  ftun_reservation_release(&descriptors);
 
 done:
-  if (status != FTUN_OK && created) {
+  {
+    ftun_status_t released = ftun_file_lock_release(&lock);
+    if (status == FTUN_OK) status = released;
+  }
+  if (created && !published) {
     if (identity_path != NULL) ftun_platform_file_remove_temporary(identity_path);
     if (reservation_path != NULL) ftun_platform_file_remove_temporary(reservation_path);
     if (mapping_path != NULL) ftun_platform_file_remove_temporary(mapping_path);
     if (lock_path != NULL) ftun_platform_file_remove_temporary(lock_path);
-    ftun_directory_remove(directory);
+    ftun_directory_remove(temporary);
   }
   free(identity_path);
   free(reservation_path);
   free(mapping_path);
   free(lock_path);
+  free(temporary);
+  free(parent);
+  ftun_reservation_release(&temporary_budget);
+  ftun_reservation_release(&parent_budget);
   { size_t i; for (i = 0u; i < 4u; i++) ftun_reservation_release(&paths[i]); }
   return status;
 }
@@ -592,6 +596,12 @@ ftun_status_t ftun_fakeip_store_open(const ftun_fakeip_store_options_t *options,
       options->worker == NULL || options->completion == NULL || out == NULL) {
     return FTUN_E_INVALID;
   }
+  {
+    ftun_file_info_t info;
+    status = ftun_file_inspect_path_nofollow(options->directory, &info);
+    if (status != FTUN_OK) return status;
+    if (!info.directory) return FTUN_E_STATE_CORRUPT;
+  }
   directory_length = strlen(options->directory);
   if (directory_length > SIZE_MAX - sizeof(*store) - 1u) return FTUN_E_LIMIT;
   status = ftun_budget_reserve(options->budget,
@@ -618,6 +628,13 @@ ftun_status_t ftun_fakeip_store_open(const ftun_fakeip_store_options_t *options,
   if (status != FTUN_OK) goto fail;
   status = ftun_store_path(options->budget, store->directory, "lock", &lock_path, &lock_reservation);
   if (status != FTUN_OK) goto fail;
+  {
+    ftun_file_info_t info;
+    status = ftun_file_inspect_path_nofollow(lock_path, &info);
+    if (status == FTUN_OK && !info.regular) status = FTUN_E_STATE_CORRUPT;
+    if (status == FTUN_E_EOF) status = FTUN_E_STATE_CORRUPT;
+    if (status != FTUN_OK) goto fail;
+  }
   status = ftun_file_lock_acquire_budget(options->budget, lock_path, &store->lock);
   if (status != FTUN_OK) goto fail;
   status = ftun_store_read_identity(options->budget, identity_path, &store->identity);

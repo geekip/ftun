@@ -3,6 +3,39 @@
 #include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
+void ftun_proxy_runtime_listener_log(ftun_proxy_runtime_listener_t *listener, bool stopped)
+{
+  static const ftun_log_event_t started = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.listener-started", "listener started"};
+  static const ftun_log_event_t waiting = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.listener-waiting", "listener waiting"};
+  static const ftun_log_event_t ended = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.listener-stopped", "listener stopped"};
+  bool unavailable = !stopped && (listener->waiting || listener->paused);
+  ftun_core_t *core = listener->engine->core;
+  if (!unavailable && !listener->log_waiting && !ftun_log_enabled(core, FTUN_LOG_INFO)) return;
+  uint64_t now;
+  if (ftun_monotonic_now(&now) != FTUN_OK) return;
+  const char *reason = stopped ? "quiesced" : listener->paused ? "resource-limit" :
+    listener->waiting ? (listener->bind_issue == FTUN_SOCKET_BIND_ADDRESS_UNAVAILABLE ? "address-not-available" : "network-failure") : "ok";
+  ftun_log_field_t fields[] = {
+    {.key = "name", .kind = FTUN_LOG_TEXT, .value.text = {listener->name, strlen(listener->name)}},
+    {.key = "reason", .kind = FTUN_LOG_TEXT, .value.text = {reason, strlen(reason)}},
+    {.key = "port", .kind = FTUN_LOG_U64, .value.u64 = listener->address.port}
+  };
+  ftun_log_record_t record = {.generation = listener->engine->generation, .fields = fields, .field_count = 3u};
+  if (unavailable) {
+    record.event = &waiting;
+    record.error = (ftun_error_t){listener->paused ? FTUN_E_LIMIT : FTUN_E_IO, FTUN_STAGE_CONTROL, 0};
+    (void)ftun_log_failure(core, &record, listener->log_entity, (ftun_string_t){listener->name, strlen(listener->name)}, now);
+    listener->log_waiting = listener->log_faulted = true;
+  } else if (!stopped && listener->log_waiting) {
+    record.event = &started;
+    (void)ftun_log_recovery(core, &waiting, listener->log_entity, &record, now);
+    listener->log_waiting = false;
+  } else {
+    record.event = stopped ? &ended : &started;
+    (void)ftun_log_record(core, &record);
+  }
+}
+
 ftun_status_t ftun_proxy_runtime_listener_endpoint(
   ftun_proxy_runtime_listener_t *listener, const ftun_config_inbound_t *config,
   uint32_t inbound_id)
@@ -18,6 +51,7 @@ ftun_status_t ftun_proxy_runtime_listener_endpoint(
   listener->tcp_idle_ms = config->tcp_idle_ms;
   listener->kind = config->kind;
   listener->inbound_id = inbound_id;
+  listener->log_entity = ftun_correlation_next();
   return FTUN_OK;
 }
 
@@ -85,6 +119,8 @@ ftun_status_t ftun_proxy_runtime_listener_fail(
   (void)ftun_monotonic_now(&now_ms);
   listener->waiting = true;
   listener->paused = false;
+  listener->bind_issue = FTUN_SOCKET_BIND_OTHER;
+  ftun_proxy_runtime_listener_log(listener, false);
   engine->object_faults++;
   return ftun_recovery_report_failure(engine->recovery, listener->recovery,
                                       now_ms, fault);
@@ -112,7 +148,10 @@ ftun_status_t ftun_proxy_runtime_listener_recover(
     } else if (listener->bind_issue == FTUN_SOCKET_BIND_PERMISSION) {
       fault = FTUN_RECOVERY_FAULT_CONFIG;
     }
-    if (status == FTUN_OK) listener->waiting = false;
+    if (status == FTUN_OK) {
+      listener->waiting = false;
+      ftun_proxy_runtime_listener_log(listener, false);
+    }
   }
   (void)ftun_recovery_attempt_finish(engine->recovery, id, now_ms, status, fault);
   return FTUN_OK;
@@ -131,6 +170,7 @@ ftun_status_t ftun_proxy_runtime_accept_pause(
   status = ftun_event_io_update(listener->source, FTUN_EVENT_ERROR);
   if (status != FTUN_OK) return status;
   listener->paused = true;
+  ftun_proxy_runtime_listener_log(listener, false);
   (void)ftun_monotonic_now(&now_ms);
   return ftun_recovery_report_failure(engine->recovery, listener->recovery,
                                       now_ms, FTUN_RECOVERY_FAULT_RESOURCE);
@@ -161,6 +201,7 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
       }
     }
     /* 接入的 TCP 连接设置存活探测与确认期限；设置失败只丢弃这一条连接。 */
+    if (listener->log_waiting) ftun_proxy_runtime_listener_log(listener, false);
     if (ftun_socket_apply_liveness(descriptor, &engine->liveness) != FTUN_OK) {
       (void)ftun_socket_close((ftun_native_socket_t)descriptor);
       continue;

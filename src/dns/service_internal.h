@@ -95,7 +95,7 @@ typedef struct ftun_dns_runtime_transport_request {
   ftun_operation_t *writing;
   ftun_packet_t received;
   ftun_endpoint_t peer;
-  ftun_status_t io_status;
+  ftun_error_t io_error;
   ftun_status_t completion_status;
   size_t completion_depth;
   uint64_t completed_ms;
@@ -270,7 +270,6 @@ ftun_status_t ftun_dns_runtime_bootstrap_endpoint(
 
 uint64_t ftun_dns_runtime_hash_bytes(uint64_t hash, const void *data,
                                            size_t length);
-ftun_status_t ftun_dns_runtime_idle(const ftun_dns_runtime_t *dns);
 ftun_status_t ftun_dns_runtime_listener_bind(
   ftun_dns_runtime_listener_slot_t *slot, const char *listen);
 void ftun_dns_runtime_listener_ready(ftun_event_source_t *source,

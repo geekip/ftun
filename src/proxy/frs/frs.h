@@ -22,7 +22,18 @@ typedef struct {
   size_t reference_count;
   uint64_t file_checksum;
   ftun_frs_storage_t storage;
+  int64_t modified_unix_ms;
+  bool modified_valid;
 } ftun_frs_view_info_t;
+
+typedef struct {
+  ftun_string_t label;
+  ftun_frs_set_kind_t kind;
+  size_t ranges, nodes, keywords;
+} ftun_frs_set_info_t;
+/* owner只读目录，不重新解析文件；label借用至view释放，越过末项返回EOF。 */
+ftun_status_t ftun_frs_view_set_info(const ftun_frs_view_t *view, size_t index,
+  ftun_frs_set_info_t *out);
 
 /* Linux 默认只读 mmap；只有映射不可用或建立失败时才回退有界读取。格式校验
  * 失败不允许换后端重试。文件构造失败且撤销映射也失败时，返回原构造错误，

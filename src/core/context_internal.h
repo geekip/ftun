@@ -13,7 +13,10 @@ struct ftun_core {
   ftun_budget_t *budget;
   ftun_reservation_t reservation;
   ftun_logger_t *logger;
+  /* 仅缓存门禁，不借用可退休logger；真正入队仍取得发布锁。 */
+  ftun_atomic_size_t log_level;
   ftun_event_log_t *events;
+  ftun_log_aggregate_t *aggregate;
   void *control;
   void *extension;
   /* 运行配置代次只由 owner 经 reserve/publish 推进，跨线程原子读取。 */

@@ -318,7 +318,7 @@ static bool expired_in_callback(fixture_t *f)
   return status == FTUN_E_TIMEOUT && rejected == NULL;
 }
 
-static void direct_done(void *user, ftun_status_t status,
+static void direct_done(void *user, ftun_error_t error,
   ftun_dns_transport_t transport, const ftun_endpoint_t *source,
   ftun_bytes_t response)
 {
@@ -327,7 +327,7 @@ static void direct_done(void *user, ftun_status_t status,
   size_t work = SIZE_MAX;
   (void)transport; (void)source;
   state->calls++;
-  state->valid = status == state->expected && (state->payload
+  state->valid = error.status == state->expected && (state->payload
     ? response.length == 12u && response.data[11] == 0xa5u : response.length == 0u);
   if (state->reenter) {
     state->valid = state->valid &&

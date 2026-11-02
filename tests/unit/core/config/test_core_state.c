@@ -30,7 +30,7 @@ static ftun_config_t *make_config(const char *path, int remove_node_b)
   ftun_bytes_t bytes;
   ftun_config_t *config = NULL;
   ftun_feature_plan_t *plan = NULL;
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   int length = snprintf(text, sizeof(text),
     "{\"base\":{\"cache-file\":\"%s\",\"state-cache\":true},"
     "\"dns\":{\"enable\":false},\"outbounds\":["

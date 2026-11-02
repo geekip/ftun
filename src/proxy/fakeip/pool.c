@@ -1,6 +1,9 @@
 #include "proxy/fakeip/pool.h"
 
 #include "core/index.h"
+#include "core/context.h"
+#include "platform/clock.h"
+#include "util/ip.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -15,6 +18,8 @@ typedef struct {
 
 struct ftun_fakeip_service {
   ftun_budget_t *budget;
+  ftun_core_t *core;
+  uint64_t log_entity;
   ftun_fakeip_store_t *store;
   ftun_index_t *domains;
   ftun_index_t *addresses;
@@ -32,6 +37,21 @@ struct ftun_fakeip_service {
   int persistent;
   int halted;
 };
+
+static const ftun_log_event_t exhausted_event = {FTUN_LOG_FAKEIP, FTUN_LOG_WARN, "fakeip.pool-exhausted", "pool exhausted"};
+static const ftun_log_event_t rejected_event = {FTUN_LOG_FAKEIP, FTUN_LOG_ERROR, "fakeip.state-rejected", "state rejected"};
+static const ftun_log_event_t mapping_event = {FTUN_LOG_FAKEIP, FTUN_LOG_DEBUG, "fakeip.mapping-created", "mapping created"};
+
+static void pool_failure(ftun_fakeip_service_t *service, const ftun_log_event_t *event, ftun_status_t status)
+{
+  if (service->core == NULL) return;
+  uint64_t now, generation = 0u;
+  if (ftun_monotonic_now(&now) != FTUN_OK) return;
+  if (service->log_entity == 0u) service->log_entity = ftun_correlation_next();
+  (void)ftun_core_context_generation(service->core, &generation);
+  (void)ftun_log_failure(service->core, &(ftun_log_record_t){.event = event, .generation = generation,
+    .error = {status, FTUN_STAGE_CONTROL, 0}}, service->log_entity, (ftun_string_t){"fakeip-pool", 11u}, now);
+}
 
 struct ftun_fakeip_handle {
   ftun_fakeip_service_t *service;
@@ -180,6 +200,7 @@ ftun_status_t ftun_fakeip_service_create(
                                                     sizeof(*service->entries));
   if (service->entries == NULL) goto limit;
   service->budget = options->budget;
+  service->core = options->core;
   service->store = options->store;
   service->reservation = reservation;
   service->max_entries = options->max_entries;
@@ -324,10 +345,19 @@ ftun_status_t ftun_fakeip_service_acquire(ftun_fakeip_service_t *service,
   if (status == FTUN_OK) return ftun_fakeip_handle_create(service, entry_index, out);
   if (status != FTUN_E_EOF) return status;
   status = ftun_fakeip_refresh(service);
-  if (status != FTUN_OK) return status;
-  if (service->halted) return FTUN_E_STATE_CORRUPT;
+  if (status != FTUN_OK) {
+    if (status != FTUN_E_AGAIN && status != FTUN_E_CANCELLED) pool_failure(service, &rejected_event, status);
+    return status;
+  }
+  if (service->halted) {
+    pool_failure(service, &rejected_event, FTUN_E_STATE_CORRUPT);
+    return FTUN_E_STATE_CORRUPT;
+  }
   if (service->entry_count >= service->max_entries ||
-      service->next_address >= service->end_address_exclusive) return FTUN_E_LIMIT;
+      service->next_address >= service->end_address_exclusive) {
+    pool_failure(service, &exhausted_event, FTUN_E_LIMIT);
+    return FTUN_E_LIMIT;
+  }
   if (service->next_address >= service->durable_end) {
     return service->persistent ? FTUN_E_AGAIN : FTUN_E_LIMIT;
   }
@@ -335,6 +365,18 @@ ftun_status_t ftun_fakeip_service_acquire(ftun_fakeip_service_t *service,
   status = ftun_fakeip_add(service, normalized, length, service->next_address);
   if (status != FTUN_OK) return status;
   service->next_address++;
+  if (ftun_log_enabled(service->core, FTUN_LOG_DEBUG)) {
+    char address[FTUN_IP_TEXT_BYTES];
+    ftun_ip_t ip = {.family = FTUN_IP_V4};
+    uint64_t generation = 0u;
+    ftun_ipv4_store(service->entries[entry_index].address, ip.bytes);
+    size_t address_length = ftun_ip_format(&ip, address, sizeof(address));
+    (void)ftun_core_context_generation(service->core, &generation);
+    FTUN_CORE_LOG(service->core, &mapping_event, .generation = generation,
+      .fields = (ftun_log_field_t[]){
+        {.key = "name", .kind = FTUN_LOG_TEXT, .value.text = {normalized, length}},
+        {.key = "address", .kind = FTUN_LOG_TEXT, .value.text = {address, address_length}}}, .field_count = 2u);
+  }
   status = ftun_fakeip_handle_create(service, entry_index, out);
   if (status != FTUN_OK) {
     /* 映射身份已经发布到服务，不能因 handle 内存不足回收或复用。 */
@@ -479,6 +521,11 @@ ftun_status_t ftun_fakeip_service_destroy(ftun_fakeip_service_t **service)
     ftun_reservation_release(&entry_reservation);
   }
   reservation = owned->reservation;
+  if (owned->log_entity != 0u) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK)
+      (void)ftun_log_retire(owned->core, FTUN_LOG_FAKEIP, owned->log_entity, now);
+  }
   free(owned->entries);
   memset(owned, 0, sizeof(*owned));
   free(owned);

@@ -3,6 +3,9 @@
 
 #include "ftun/ftun.h"
 #include "app/config/model.h"
+#include "app/cli/args.h"
+#include "cJSON.h"
+#include "core/config/error.h"
 
 int ftun_cli_error(const char *operation, ftun_status_t status);
 ftun_status_t ftun_cli_core_create(const ftun_config_t *config,
@@ -12,15 +15,18 @@ ftun_status_t ftun_cli_core_create(const ftun_config_t *config,
 typedef struct {
   ftun_core_t *core;
   ftun_config_t *config;
+  ftun_config_error_t error;
+  size_t frs_sets;
 } ftun_cli_checked_config_t;
 ftun_status_t ftun_cli_check_config(const char *path, int require_inbound,
   ftun_cli_checked_config_t *out);
 ftun_status_t ftun_cli_checked_config_destroy(ftun_cli_checked_config_t *checked);
-int ftun_cli_check(const char *path);
-int ftun_cli_run(const char *path);
-int ftun_cli_signal_process(const char *text, int signal_number,
-                            const char *operation);
-int ftun_cli_fakeip_init(const char *path);
-void ftun_cli_print_version(void);
+ftun_status_t ftun_cli_config_path(const char *path, char *output, size_t capacity);
+int ftun_cli_config_error(const char *operation, const ftun_config_error_t *error, bool json);
+int ftun_cli_check(const char *path, bool json);
+int ftun_cli_run(const char *path, const char *pidfile, bool no_color, unsigned int verbosity, bool background);
+int ftun_cli_status_render(const char *operation, const cJSON *root);
+int ftun_cli_control(const ftun_cli_args_t *args, const char *operation);
+int ftun_cli_print_version(const ftun_cli_args_t *args);
 
 #endif

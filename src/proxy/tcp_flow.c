@@ -2,6 +2,64 @@
 
 #include "util/endpoint.h"
 #include "proxy/engine_internal.h"
+#include "core/log/log.h"
+
+static const ftun_log_event_t connect_event = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.connect", "connect"};
+static const ftun_log_event_t rule_event = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.rule-matched", "rule matched"};
+static const ftun_log_event_t closed_event = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.closed", "closed"};
+static const ftun_log_event_t dial_failed_event = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.dial-failed", "dial failed"};
+static const ftun_log_event_t dial_recovered_event = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.dial-recovered", "dial recovered"};
+static const ftun_log_event_t protocol_failed_event = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.protocol-failed", "protocol failed"};
+static const ftun_log_event_t resolve_failed_event = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.resolve-failed", "resolve failed"};
+
+/* 按所持快照/配置入口聚合，不以flow、域名或客户端建立故障键。 */
+static void flow_failure(ftun_proxy_runtime_flow_t *flow, ftun_error_t error)
+{
+  const ftun_runtime_t *runtime = NULL;
+  ftun_session_info_t info = {0};
+  uint64_t now;
+  if (flow->log_failure_recorded || error.status == FTUN_OK || error.status == FTUN_E_EOF || error.status == FTUN_E_CANCELLED) return;
+  if (ftun_monotonic_now(&now) != FTUN_OK) return;
+  if (flow->session != NULL) {
+    if (ftun_session_get_info(flow->session, &info) != FTUN_OK ||
+        ftun_session_get_runtime(flow->session, &runtime) != FTUN_OK) return;
+    if (info.state != FTUN_SESSION_CONNECTING && info.state != FTUN_SESSION_RESOLVING &&
+        !(info.state == FTUN_SESSION_ROUTING && info.route_pinned)) return;
+  }
+  const ftun_log_event_t *event = flow->session == NULL ? &protocol_failed_event :
+    info.route_pinned ? &dial_failed_event : &resolve_failed_event;
+  const char *phase = flow->session == NULL ? "handshake" :
+    info.state == FTUN_SESSION_RESOLVING ? "resolve" : "connect";
+  ftun_log_field_t fields[2] = {{.key = "phase", .kind = FTUN_LOG_TEXT, .value.text = {phase, strlen(phase)}}};
+  size_t field_count = 1u;
+  if (error.native_code != 0 && ftun_log_enabled(flow->engine->core, FTUN_LOG_WARN)) {
+    const char *name = ftun_socket_error_name(error.native_code);
+    fields[field_count++] = (ftun_log_field_t){.key = "errno", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}};
+  }
+  ftun_log_record_t record = {.event = event, .sid = flow->sid, .generation = flow->log_generation,
+    .error = error, .fields = fields, .field_count = field_count};
+  if (info.route_pinned) ftun_runtime_outbound_log_failure((ftun_runtime_t *)runtime,
+    info.outbound_id, &record, now);
+  else {
+    flow->listener->log_faulted = true;
+    (void)ftun_log_failure(flow->engine->core, &record, flow->listener->log_entity,
+      (ftun_string_t){flow->listener->name, strlen(flow->listener->name)}, now);
+  }
+  flow->log_failure_recorded = true;
+}
+
+static void flow_dial_recovered(ftun_proxy_runtime_flow_t *flow)
+{
+  const ftun_runtime_t *runtime;
+  ftun_session_info_t info;
+  uint64_t now;
+  if (ftun_session_get_runtime(flow->session, &runtime) != FTUN_OK ||
+      ftun_session_get_info(flow->session, &info) != FTUN_OK ||
+      ftun_monotonic_now(&now) != FTUN_OK) return;
+  ftun_runtime_outbound_log_recovery((ftun_runtime_t *)runtime, info.outbound_id,
+    &dial_failed_event, &(ftun_log_record_t){.event = &dial_recovered_event,
+      .generation = flow->log_generation}, now);
+}
 
 ftun_status_t ftun_proxy_runtime_flow_slot_acquire(
   ftun_proxy_runtime_t *engine, ftun_proxy_runtime_flow_t **out)
@@ -15,6 +73,9 @@ ftun_status_t ftun_proxy_runtime_flow_slot_acquire(
     (void **)&flow, &token);
   if (status != FTUN_OK) return status;
   flow->slot_token = token;
+  flow->sid = ftun_correlation_next();
+  flow->log_generation = engine->generation;
+  flow->log_started_ms = engine->round_ms;
   flow->client_socket.descriptor = -1;
   flow->remote_socket.descriptor = -1;
   *out = flow;
@@ -267,6 +328,7 @@ void ftun_proxy_runtime_udp_path_notify(ftun_path_t *path, uint32_t events,
   (void)path;
   if ((events & FTUN_PATH_ERROR) != 0u && error.status != FTUN_OK && error.status != FTUN_E_AGAIN) {
     slot->failure = error.status;
+    ftun_proxy_runtime_udp_log_failure(slot, error);
   }
   ftun_proxy_runtime_udp_schedule(slot);
 }
@@ -876,6 +938,8 @@ void ftun_proxy_runtime_flow_close(ftun_proxy_runtime_flow_t *flow,
   ftun_error_t error;
   if (flow == NULL || !flow->active ||
       flow->state == FTUN_PROXY_RUNTIME_FLOW_QUARANTINED) return;
+  if (flow->state != FTUN_PROXY_RUNTIME_FLOW_CLOSING)
+    flow_failure(flow, flow->log_error.status != FTUN_OK ? flow->log_error : (ftun_error_t){reason, FTUN_STAGE_CONTROL, 0});
   /* A protocol-level failure reply owns the close sequence.  Keep the flow
    * alive until that bounded reply is drained; hard transport failures and
    * timeouts still tear it down immediately. */
@@ -888,6 +952,8 @@ void ftun_proxy_runtime_flow_close(ftun_proxy_runtime_flow_t *flow,
     return;
   }
   flow->state = FTUN_PROXY_RUNTIME_FLOW_CLOSING;
+  if (flow->log_error.status == FTUN_OK && reason != FTUN_OK)
+    flow->log_error = (ftun_error_t){reason, FTUN_STAGE_CONTROL, 0};
 #if defined(FTUN_HAVE_MODULE_TUN)
   if (flow->tun && flow->client != NULL && flow->engine->tun_ingress != NULL) {
     (void)ftun_tun_ingress_abort_stream(flow->engine->tun_ingress,
@@ -920,6 +986,7 @@ ftun_status_t ftun_proxy_runtime_protocol_finish(
 void ftun_proxy_runtime_downstream_failed(ftun_proxy_runtime_flow_t *flow,
   ftun_status_t failure)
 {
+  flow_failure(flow, flow->log_error.status != FTUN_OK ? flow->log_error : (ftun_error_t){failure, FTUN_STAGE_CONTROL, 0});
   if (flow->state != FTUN_PROXY_RUNTIME_FLOW_CLOSING &&
       ftun_proxy_runtime_protocol_finish(flow, failure, NULL) == FTUN_OK &&
       ftun_proxy_runtime_protocol_pending(flow)) {
@@ -961,6 +1028,7 @@ ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
   if (status != FTUN_OK) return status;
   flow->state = FTUN_PROXY_RUNTIME_FLOW_RELAY;
   flow->last_activity_ms = flow->engine->round_ms;
+  flow_dial_recovered(flow);
   {
     uint32_t client_interests;
     uint32_t remote_interests;
@@ -982,6 +1050,8 @@ ftun_status_t ftun_proxy_runtime_relay_ready(ftun_proxy_runtime_flow_t *flow,
 ftun_status_t ftun_proxy_runtime_operation_complete(ftun_proxy_runtime_flow_t *flow,
   ftun_operation_t *operation, ftun_error_t error)
 {
+  if (error.status != FTUN_OK && error.status != FTUN_E_CANCELLED) flow->log_error = error;
+  flow_failure(flow, error);
   ftun_inbound_adapter_info_t info;
   if (flow->protocol != NULL && flow->state != FTUN_PROXY_RUNTIME_FLOW_CLOSING &&
       ftun_inbound_adapter_get_info(flow->protocol, &info) == FTUN_OK && info.waiting_downstream) {
@@ -998,6 +1068,7 @@ void ftun_proxy_runtime_path_notify(ftun_path_t *path, uint32_t events,
   if ((events & FTUN_PATH_READABLE) != 0u) flow->path_events |= FTUN_EVENT_READ;
   if ((events & FTUN_PATH_WRITABLE) != 0u) flow->path_events |= FTUN_EVENT_WRITE;
   if ((events & FTUN_PATH_ERROR) != 0u && error.status != FTUN_OK) {
+    flow->log_error = error;
     ftun_proxy_runtime_flow_close(flow, error.status);
   }
   ftun_proxy_runtime_flow_schedule(flow);
@@ -1020,6 +1091,7 @@ ftun_status_t ftun_proxy_runtime_relay_path_ready(ftun_proxy_runtime_flow_t *flo
   if (status == FTUN_OK) status = ftun_proxy_runtime_protocol_finish(flow, FTUN_OK, &bound);
   if (status != FTUN_OK) return status;
   flow->state = FTUN_PROXY_RUNTIME_FLOW_RELAY;
+  flow_dial_recovered(flow);
   flow->last_activity_ms = flow->engine->round_ms;
   /* 早到 READ 已保存在 path_events；普通 Path 等真实提示，避免空探测。 */
   flow->path_events |= FTUN_EVENT_WRITE;
@@ -1261,6 +1333,22 @@ ftun_status_t ftun_proxy_runtime_session_start_metadata(
   }
   (void)ftun_runtime_release(&runtime);
   if (status != FTUN_OK) return status;
+  flow->log_generation = metadata.generation;
+  if (ftun_log_enabled(flow->engine->core, FTUN_LOG_DEBUG)) {
+    char address[FTUN_IP_TEXT_BYTES];
+    ftun_string_t target = metadata.domain;
+    if (target.length == 0u && ftun_endpoint_is_ip(&metadata.original_target)) {
+      ftun_ip_t ip = ftun_endpoint_ip(&metadata.original_target);
+      target = (ftun_string_t){address, ftun_ip_format(&ip, address, sizeof(address))};
+    }
+    ftun_log_field_t fields[] = {
+      {.key = "in", .kind = FTUN_LOG_TEXT, .value.text = {flow->listener->name, strlen(flow->listener->name)}},
+      {.key = "target", .kind = FTUN_LOG_TEXT, .value.text = target},
+      {.key = "port", .kind = FTUN_LOG_U64, .value.u64 = metadata.original_target.port}
+    };
+    FTUN_CORE_LOG(flow->engine->core, &connect_event, .sid = flow->sid, .generation = flow->log_generation,
+      .fields = fields, .field_count = 3u);
+  }
   status = ftun_session_transition(flow->session, FTUN_SESSION_ROUTING, NULL);
   if (status != FTUN_OK) return status;
   return ftun_proxy_runtime_route_open(flow);
@@ -1345,6 +1433,8 @@ ftun_status_t ftun_proxy_runtime_route_open(ftun_proxy_runtime_flow_t *flow)
   }
   if (status == FTUN_OK && route.kind == FTUN_ROUTE_DENY) {
     ftun_proxy_runtime_note_denied(flow->engine, &route);
+    ftun_runtime_outbound_started((ftun_runtime_t *)session_runtime, FTUN_OUTBOUND_ID_REJECT);
+    ftun_runtime_outbound_finished((ftun_runtime_t *)session_runtime, FTUN_OUTBOUND_ID_REJECT, FTUN_E_REJECTED);
     status = FTUN_E_REJECTED;
   }
   if (status == FTUN_OK) {
@@ -1365,6 +1455,19 @@ ftun_status_t ftun_proxy_runtime_route_open(ftun_proxy_runtime_flow_t *flow)
   if (status == FTUN_OK && !resume_proxy) {
     route.outbound_id = leaf.id;
     status = ftun_session_pin_route(flow->session, &route);
+    if (status == FTUN_OK) {
+      if (ftun_log_enabled(flow->engine->core, FTUN_LOG_DEBUG)) {
+        const char *name = leaf.id == FTUN_OUTBOUND_ID_DIRECT ? "DIRECT" :
+          leaf.id == FTUN_OUTBOUND_ID_REJECT ? "REJECT" : proxy_config->name;
+        FTUN_CORE_LOG(flow->engine->core, &rule_event, .sid = flow->sid, .generation = flow->log_generation,
+          .fields = (ftun_log_field_t[]){
+            {.key = "rule", .kind = FTUN_LOG_U64, .value.u64 = route.rule_index},
+            {.key = "out_id", .kind = FTUN_LOG_U64, .value.u64 = route.outbound_id},
+            {.key = "out", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}}}, .field_count = 3u);
+      }
+      ftun_runtime_outbound_started((ftun_runtime_t *)session_runtime, route.outbound_id);
+      flow->connection_counted = true;
+    }
   }
   if (status == FTUN_OK) {
     status = ftun_target_from_metadata(metadata, &target);
@@ -1575,6 +1678,7 @@ ftun_status_t ftun_proxy_runtime_flow_create(ftun_proxy_runtime_t *engine,
     goto fail;
   }
   flow->handshake_deadline_ms = now + engine->handshake_ms;
+  flow->log_started_ms = now;
   if (peer != NULL && ftun_endpoint_is_ip(peer)) flow->tcp_peer = *peer;
   status = ftun_proxy_runtime_stream_create(flow, &flow->client_socket, descriptor,
                                      &flow->client);
@@ -1665,6 +1769,13 @@ ftun_status_t ftun_proxy_runtime_flow_finalize(ftun_proxy_runtime_flow_t *flow)
   }
   if (status != FTUN_OK) return status;
   if (flow->relay != NULL) {
+    if (ftun_log_enabled(flow->engine->core, FTUN_LOG_DEBUG)) {
+      ftun_relay_usage_t usage;
+      if (ftun_relay_get_usage(flow->relay, &usage) == FTUN_OK) {
+        flow->log_read_bytes = usage.total_read_bytes;
+        flow->log_written_bytes = usage.total_written_bytes;
+      }
+    }
     ftun_status_t current = ftun_relay_destroy(&flow->relay);
     if (current != FTUN_OK && current != FTUN_E_AGAIN) return current;
     if (current == FTUN_E_AGAIN) return current;
@@ -1687,6 +1798,14 @@ ftun_status_t ftun_proxy_runtime_flow_finalize(ftun_proxy_runtime_flow_t *flow)
     status = ftun_session_get_info(flow->session, &info);
     if (status != FTUN_OK || info.state != FTUN_SESSION_CLOSED) {
       return status == FTUN_OK ? FTUN_E_AGAIN : status;
+    }
+    if (flow->log_error.status == FTUN_OK) flow->log_error = info.terminal_error;
+    if (flow->connection_counted) {
+      const ftun_runtime_t *runtime;
+      status = ftun_session_get_runtime(flow->session, &runtime);
+      if (status != FTUN_OK) return status;
+      ftun_runtime_outbound_finished((ftun_runtime_t *)runtime, info.outbound_id, info.terminal_error.status);
+      flow->connection_counted = false;
     }
     status = ftun_session_destroy(&flow->session);
     if (status != FTUN_OK) return status;
@@ -1742,6 +1861,17 @@ ftun_status_t ftun_proxy_runtime_flow_finalize(ftun_proxy_runtime_flow_t *flow)
   status = ftun_proxy_runtime_object_release(&flow->budget, &flow->admission);
   if (status != FTUN_OK) return status;
   ftun_proxy_runtime_flow_unclassify(flow);
+  if (ftun_log_enabled(flow->engine->core, FTUN_LOG_DEBUG)) {
+    uint64_t now = flow->log_started_ms;
+    (void)ftun_monotonic_now(&now);
+    ftun_log_field_t fields[] = {
+      {.key = "duration_ms", .kind = FTUN_LOG_U64, .value.u64 = now - flow->log_started_ms},
+      {.key = "read_bytes", .kind = FTUN_LOG_U64, .value.u64 = flow->log_read_bytes},
+      {.key = "written_bytes", .kind = FTUN_LOG_U64, .value.u64 = flow->log_written_bytes}
+    };
+    FTUN_CORE_LOG(flow->engine->core, &closed_event, .sid = flow->sid, .generation = flow->log_generation,
+      .error = flow->log_error, .fields = fields, .field_count = 3u);
+  }
   return ftun_proxy_runtime_flow_slot_release(&flow);
 }
 

@@ -7,6 +7,35 @@
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <string.h>
+
+ftun_status_t ftun_process_exited(uint32_t pid, bool *exited)
+{
+  char path[64], contents[256], *state;
+  int descriptor, read_error;
+  ssize_t count;
+  *exited = false;
+  (void)snprintf(path, sizeof(path), "/proc/%u/stat", pid);
+  descriptor = open(path, O_RDONLY | O_CLOEXEC);
+  if (descriptor < 0) {
+    if (errno != ENOENT) return FTUN_E_IO;
+    *exited = true;
+    return FTUN_OK;
+  }
+  count = read(descriptor, contents, sizeof(contents) - 1u);
+  read_error = count < 0 ? errno : 0;
+  if (close(descriptor) != 0) return FTUN_E_IO;
+  if (read_error == ESRCH) { *exited = true; return FTUN_OK; }
+  if (count <= 0) return FTUN_E_IO;
+  contents[count] = '\0';
+  state = strrchr(contents, ')');
+  if (state == NULL || state[1] != ' ' || state[2] == '\0') return FTUN_E_INVALID;
+  *exited = state[2] == 'Z' || state[2] == 'X';
+  return FTUN_OK;
+}
 
 uint64_t ftun_process_boot_token(void)
 {

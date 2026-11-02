@@ -26,7 +26,7 @@ static int expect_validation(const char *text, ftun_status_t expected,
                              const char *path)
 {
   ftun_config_t *config = NULL;
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   ftun_status_t status;
   if (parse_text(text, &config) != FTUN_OK || config == NULL) {
     fprintf(stderr, "validation fixture did not parse\n");
@@ -41,17 +41,17 @@ static int expect_validation(const char *text, ftun_status_t expected,
     return 0;
   }
   if (expected == FTUN_OK) {
-    if (diagnostic.message.data != NULL || diagnostic.message.length != 0u ||
-        diagnostic.path.data != NULL || diagnostic.path.length != 0u) {
+    if (diagnostic.message[0] != '\0' || strlen(diagnostic.message) != 0u ||
+        diagnostic.pointer[0] != '\0' || strlen(diagnostic.pointer) != 0u) {
       fprintf(stderr, "success diagnostic was not cleared\n");
       (void)ftun_config_destroy(&config);
       return 0;
     }
-  } else if (diagnostic.message.data == NULL || diagnostic.message.length == 0u ||
-             diagnostic.path.data == NULL ||
-             diagnostic.path.length != strlen(path) ||
-             memcmp(diagnostic.path.data, path, diagnostic.path.length) != 0) {
-    fprintf(stderr, "failure diagnostic is incomplete\n");
+  } else if (diagnostic.message[0] == '\0' || strlen(diagnostic.message) == 0u ||
+             diagnostic.pointer[0] == '\0' ||
+             strlen(diagnostic.pointer) != strlen(path) ||
+             memcmp(diagnostic.pointer, path, strlen(diagnostic.pointer)) != 0) {
+    fprintf(stderr, "failure diagnostic is incomplete: got %s expected %s\n", diagnostic.pointer, path);
     (void)ftun_config_destroy(&config);
     return 0;
   }
@@ -153,7 +153,7 @@ int main(int argc, char **argv)
     "\"outbounds\":[{\"name\":\"p\",\"type\":\"socks5\","
     "\"server\":\"127.0.0.1:1\",\"dns-server\":\"missing\"}]}";
   ftun_config_t *config = NULL;
-  ftun_diagnostic_t diagnostic;
+  ftun_config_error_t diagnostic;
   ftun_bytes_t bytes;
   char *file_data;
   char *deep_groups;
@@ -167,13 +167,13 @@ int main(int argc, char **argv)
   CHECK(ftun_config_parse(bytes, &config) == FTUN_OK && config != NULL);
   memset(&diagnostic, 0xa5, sizeof(diagnostic));
   CHECK(ftun_config_validate(config, &diagnostic) == FTUN_OK);
-  CHECK(diagnostic.error.status == FTUN_OK && diagnostic.message.data == NULL &&
-        diagnostic.path.data == NULL);
+  CHECK(diagnostic.error.status == FTUN_OK && diagnostic.message[0] == '\0' &&
+        diagnostic.pointer[0] == '\0');
   CHECK(ftun_config_destroy(&config) == FTUN_OK);
   free(file_data);
 
   CHECK(ftun_config_validate(NULL, &diagnostic) == FTUN_E_INVALID);
-  CHECK(diagnostic.path.length == 0u && diagnostic.message.length > 0u);
+  CHECK(strlen(diagnostic.pointer) == 0u && strlen(diagnostic.message) > 0u);
   CHECK(expect_validation(valid_rules, FTUN_OK, ""));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"outbounds\":[{"
                           "\"name\":\"　Proxy　\",\"type\":\"socks5\","
@@ -183,38 +183,42 @@ int main(int argc, char **argv)
                           "\"name\":\"Proxy\",\"type\":\"socks5\","
                           "\"server\":\"127.0.0.1:1\"}],\"rules\":["
                           "\"FRS-DOMAIN,CN,proxy\"]}", FTUN_E_INVALID,
-                          "/rules"));
+                          "/rules/0"));
   CHECK(expect_validation(disabled_dns_refs, FTUN_OK, ""));
   CHECK(expect_validation("{\"base\":{\"ipv6\":true}}", FTUN_OK,
                           ""));
+  CHECK(expect_validation("{\"log\":{\"output\":\"terminal\"}}", FTUN_E_INVALID, "/log/output"));
   CHECK(expect_validation("{\"log\":{\"level\":\"verbose\"}}", FTUN_E_INVALID,
                           "/log/level"));
+  CHECK(expect_validation("{\"dns\":{\"fake-ip\":{\"range\":\"198.18.1.99/15\"}}}", FTUN_OK, NULL));
+  CHECK(expect_validation("{\"dns\":{\"fake-ip\":{\"range\":\"198.18.0.0/31\"}}}", FTUN_E_INVALID, "/dns/fake-ip/range"));
+  CHECK(expect_validation("{\"dns\":{\"fake-ip\":{\"range\":\"198.18.0.1/32\"}}}", FTUN_E_INVALID, "/dns/fake-ip/range"));
   CHECK(expect_validation("{\"dns\":{\"fake-ip\":{\"range\":\"198.18.0.0/33\"}}}",
                           FTUN_E_INVALID, "/dns/fake-ip/range"));
   CHECK(expect_validation("{\"dns\":{\"bootstrap\":[\"01.1.1.1\"]}}",
-                          FTUN_E_INVALID, "/dns/bootstrap"));
+                          FTUN_E_INVALID, "/dns/bootstrap/0"));
   CHECK(expect_validation("{\"dns\":{\"default-server\":\"missing\"}}",
                           FTUN_E_INVALID, "/dns/default-server"));
   CHECK(expect_validation("{\"dns\":{\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
                           "\"address\":[\"dns.example:53\"],\"outbound\":\"missing\"}]}}",
-                          FTUN_E_INVALID, "/dns/servers"));
+                          FTUN_E_INVALID, "/dns/servers/0/outbound"));
   CHECK(expect_validation("{\"dns\":{\"listeners\":[{\"listen\":\"0.0.0.0:53\"},"
                           "{\"listen\":\"127.0.0.1:53\"}]}}",
-                          FTUN_E_INVALID, "/dns/listeners"));
+                          FTUN_E_INVALID, "/dns/listeners/1/listen"));
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"mixed\","
                           "\"listen\":\"0.0.0.0:1080\"},{\"name\":\"b\","
                           "\"type\":\"socks5\",\"listen\":\"127.0.0.1:1080\"}]}",
-                          FTUN_E_INVALID, "/inbounds"));
+                          FTUN_E_INVALID, "/inbounds/1/listen"));
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"bad,name\",\"type\":\"mixed\","
                           "\"listen\":\"127.0.0.1:1\"}]}",
-                          FTUN_E_INVALID, "/inbounds"));
+                          FTUN_E_INVALID, "/inbounds/0/name"));
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"mixed\","
                           "\"listen\":\"127.0.0.1:1\"},{\"name\":\"a\","
                           "\"type\":\"socks5\",\"listen\":\"127.0.0.1:2\"}]}",
-                          FTUN_E_INVALID, "/inbounds"));
+                          FTUN_E_INVALID, "/inbounds/1/name"));
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"mixed\","
                           "\"listen\":\"127.0.0.1:1\",\"outbound\":\"missing\"}]}",
-                          FTUN_E_INVALID, "/inbounds"));
+                          FTUN_E_INVALID, "/inbounds/0/outbound"));
   CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{"
                           "\"address\":\"198.18.0.1/30\"}},"
                           "\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
@@ -222,10 +226,10 @@ int main(int argc, char **argv)
   /* 路由表号避开系统保留表，规则优先级须在内核可用范围内。 */
   CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
                           "\"route-table\":254},\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
-                          FTUN_E_INVALID, "/tun"));
+                          FTUN_E_INVALID, "/tun/route-table"));
   CHECK(expect_validation("{\"tun\":{\"interface\":\"t0\",\"ipv4\":{\"address\":\"172.19.0.1/30\"},"
                           "\"rule-priority\":32766},\"inbounds\":[{\"name\":\"t\",\"type\":\"tun\"}]}",
-                          FTUN_E_INVALID, "/tun"));
+                          FTUN_E_INVALID, "/tun/rule-priority"));
   /* 日志轮转：max-size 为 0（不轮转）或至少 64KiB。 */
   CHECK(expect_validation("{\"log\":{\"max-size\":0}}", FTUN_OK, NULL));
   CHECK(expect_validation("{\"log\":{\"max-size\":65536}}", FTUN_OK, NULL));
@@ -236,7 +240,7 @@ int main(int argc, char **argv)
                           "\"outbound\":\"DIRECT\"}]}}", FTUN_OK, NULL));
   CHECK(expect_validation("{\"dns\":{\"servers\":[{\"name\":\"s\",\"type\":\"udp\","
                           "\"address\":[\"1.1.1.1\",\"1.0.0.1\",\"8.8.8.8\",\"8.8.4.4\",\"9.9.9.9\"],"
-                          "\"outbound\":\"DIRECT\"}]}}", FTUN_E_INVALID, "/dns/servers"));
+                          "\"outbound\":\"DIRECT\"}]}}", FTUN_E_INVALID, "/dns/servers/0/address"));
   CHECK(expect_validation("{\"base\":{\"watchdog\":\"500ms\"}}",
                           FTUN_E_INVALID, "/base/watchdog"));
   CHECK(expect_validation("{\"base\":{\"watchdog\":\"11m\"}}",
@@ -260,38 +264,38 @@ int main(int argc, char **argv)
                           "\"write-progress\":\"30s\"}}}", FTUN_OK, NULL));
   CHECK(expect_validation("{\"inbounds\":[{\"name\":\"a\",\"type\":\"socks5\","
                           "\"listen\":\"127.0.0.1:1\",\"tcp-idle\":\"500ms\"}]}",
-                          FTUN_E_INVALID, "/inbounds"));
+                          FTUN_E_INVALID, "/inbounds/0/tcp-idle"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"DIRECT\",\"type\":\"socks5\","
                           "\"server\":\"127.0.0.1:1\"}]}",
-                          FTUN_E_INVALID, "/outbounds"));
+                          FTUN_E_INVALID, "/outbounds/0/name"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"p\",\"type\":\"socks5\","
                           "\"server\":\"bad_domain:1\"}]}",
-                          FTUN_E_INVALID, "/outbounds"));
+                          FTUN_E_INVALID, "/outbounds/0/server"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"g\",\"type\":\"select\","
                           "\"outbounds\":[\"DIRECT\"],\"default\":\"REJECT\"}]}",
-                          FTUN_E_INVALID, "/outbounds"));
+                          FTUN_E_INVALID, "/outbounds/0/default"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"a\",\"type\":\"select\","
                           "\"outbounds\":[\"b\"],\"default\":\"b\"},{\"name\":\"b\","
                           "\"type\":\"select\",\"outbounds\":[\"a\"],\"default\":\"a\"}]}",
-                          FTUN_E_INVALID, "/outbounds"));
+                          FTUN_E_INVALID, "/outbounds/0/outbounds"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"g\",\"type\":\"url-test\","
                           "\"outbounds\":[\"DIRECT\"],\"default\":\"DIRECT\","
                           "\"url\":\"ftp://example.com/x\",\"interval\":\"5s\","
-                          "\"timeout\":\"6s\"}]}", FTUN_E_INVALID, "/outbounds"));
+                          "\"timeout\":\"6s\"}]}", FTUN_E_INVALID, "/outbounds/0/url"));
   CHECK(expect_validation("{\"outbounds\":[{\"name\":\"g\",\"type\":\"url-test\","
                           "\"outbounds\":[\"DIRECT\"],\"default\":\"DIRECT\","
                           "\"url\":\"https://example.com/x\",\"interval\":\"5s\","
-                          "\"timeout\":\"6s\"}]}", FTUN_E_INVALID, "/outbounds"));
+                          "\"timeout\":\"6s\"}]}", FTUN_E_INVALID, "/outbounds/0/timeout"));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
                           "\"IP-CIDR,10.0.0.1/8,DIRECT\"]}", FTUN_OK, ""));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
                           "\"IP-CIDR,10.0.0.1/33,DIRECT\"]}",
-                          FTUN_E_INVALID, "/rules"));
+                          FTUN_E_INVALID, "/rules/0"));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
                           "\"DOMAIN,é.example,DIRECT\"]}",
-                          FTUN_E_INVALID, "/rules"));
+                          FTUN_E_INVALID, "/rules/0"));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
-                          "\"MATCH,missing\"]}", FTUN_E_INVALID, "/rules"));
+                          "\"MATCH,missing\"]}", FTUN_E_INVALID, "/rules/0"));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"rules\":["
                           "\"FRS-IP,private,DIRECT\"]}", FTUN_OK, ""));
   CHECK(expect_validation("{\"dns\":{\"enable\":false},\"frs\":42}",
@@ -302,7 +306,7 @@ int main(int argc, char **argv)
 
   deep_groups = make_deep_group_config(65u);
   CHECK(deep_groups != NULL);
-  CHECK(expect_validation(deep_groups, FTUN_E_LIMIT, "/outbounds"));
+  CHECK(expect_validation(deep_groups, FTUN_E_LIMIT, "/outbounds/65/outbounds"));
   free(deep_groups);
   return 0;
 }

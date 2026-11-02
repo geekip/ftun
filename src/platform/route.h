@@ -83,6 +83,7 @@ typedef struct {
   ftun_status_t repair_result;
   size_t repair_runs;
   size_t repairs;
+  size_t protection_missing;
   size_t repair_failures;
   size_t strays_removed;
 } ftun_route_async_info_t;

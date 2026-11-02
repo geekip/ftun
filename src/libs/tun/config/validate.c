@@ -6,15 +6,15 @@
 
 ftun_status_t ftun_config_validate_tun_device(
   const ftun_config_tun_t *tun,
-  ftun_diagnostic_t *out)
+  ftun_config_error_t *out)
 {
+  ftun_config_error_begin(out, FTUN_CONFIG_STEP_VALIDATE);
   ftun_config_cidr_t tun_range;
-  const char *base = "/tun";
   const char *route_error;
   if (tun == NULL || !tun->present) return FTUN_OK;
   if (!ftun_path_valid(tun->interface_name) ||
       strlen(tun->interface_name) > 15u) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/tun/interface",
                                   "TUN interface name is invalid");
   }
   if (tun->auto_route && !ftun_platform_tun_auto_route_supported()) {
@@ -23,14 +23,20 @@ ftun_status_t ftun_config_validate_tun_device(
   }
   route_error = ftun_platform_route_config_error(
     (ftun_route_settings_t){tun->route_table, tun->rule_priority});
-  if (route_error != NULL) return ftun_config_diagnostic(out, FTUN_E_INVALID, base, route_error);
+  if (route_error != NULL) {
+    ftun_route_settings_t defaults = ftun_platform_route_defaults();
+    const char *path = ftun_platform_route_config_error(
+      (ftun_route_settings_t){tun->route_table, defaults.precedence}) != NULL
+      ? "/tun/route-table" : "/tun/rule-priority";
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, path, route_error);
+  }
   if (tun->mtu == 0u ||
       (tun->strict_route && !tun->auto_route)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, tun->mtu == 0u ? "/tun/mtu" : "/tun/strict-route",
                                   "TUN options are invalid");
   }
   if ((!ftun_cidr(tun->ipv4_address, 0, &tun_range) || tun_range.address.family != FTUN_IP_V4)) {
-    return ftun_config_diagnostic(out, FTUN_E_INVALID, base,
+    return ftun_config_diagnostic(out, FTUN_E_INVALID, "/tun/ipv4/address",
                                   "TUN IPv4 address is invalid");
   }
 

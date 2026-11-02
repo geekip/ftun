@@ -2,6 +2,7 @@
 #include "proxy/snapshot.h"
 
 #include <string.h>
+#include <assert.h>
 
 static ftun_status_t ftun_runtime_outbound_index(
   const ftun_runtime_t *runtime, uint32_t outbound_id, size_t *out)
@@ -49,6 +50,20 @@ static int ftun_runtime_group_has_member(const ftun_runtime_t *runtime,
 
 static int ftun_runtime_string_equal(ftun_string_t value, const char *text);
 
+static void group_log(ftun_runtime_t *runtime, size_t index, uint32_t member, bool degraded)
+{
+  if (!ftun_log_enabled(runtime->owner, FTUN_LOG_INFO)) return;
+  static const ftun_log_event_t selected = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.group-selected", "group selected"};
+  const char *name = ftun_config_outbounds(runtime->snapshot.config)[index].name;
+  const char *out = member == FTUN_OUTBOUND_ID_DIRECT ? "DIRECT" : member == FTUN_OUTBOUND_ID_REJECT ? "REJECT" :
+    ftun_config_outbounds(runtime->snapshot.config)[member - FTUN_OUTBOUND_ID_NAMED_BASE].name;
+  FTUN_CORE_LOG(runtime->owner, &selected, .generation = runtime->generation,
+    .fields = (ftun_log_field_t[]){
+      {.key = "group", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}},
+      {.key = "out", .kind = FTUN_LOG_TEXT, .value.text = {out, strlen(out)}},
+      {.key = "degraded", .kind = FTUN_LOG_U64, .value.u64 = degraded ? 1u : 0u}}, .field_count = 3u);
+}
+
 ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
                                       uint32_t group_id,
                                       uint32_t member_id)
@@ -67,9 +82,12 @@ ftun_status_t ftun_runtime_select_set(ftun_core_t *core,
   if (!ftun_runtime_group_has_member(runtime, index, member_id)) {
     return FTUN_E_REJECTED;
   }
+  bool changed = !runtime->owner_state.group_choices[index].selected ||
+    runtime->owner_state.group_choices[index].selected_member_id != member_id || runtime->owner_state.group_choices[index].degraded;
   runtime->owner_state.group_choices[index].selected_member_id = member_id;
   runtime->owner_state.group_choices[index].selected = true;
   runtime->owner_state.group_choices[index].degraded = false;
+  if (changed) group_log(runtime, index, member_id, false);
   return FTUN_OK;
 }
 
@@ -162,9 +180,13 @@ ftun_status_t ftun_runtime_group_publish(ftun_core_t *core,
   if (!ftun_runtime_group_has_member(runtime, index, choice->leaf_id)) {
     return FTUN_E_REJECTED;
   }
+  bool changed = !runtime->owner_state.group_choices[index].selected ||
+    runtime->owner_state.group_choices[index].selected_member_id != choice->leaf_id ||
+    runtime->owner_state.group_choices[index].degraded != choice->degraded;
   runtime->owner_state.group_choices[index].selected_member_id = choice->leaf_id;
   runtime->owner_state.group_choices[index].selected = true;
   runtime->owner_state.group_choices[index].degraded = choice->degraded;
+  if (changed) group_log(runtime, index, choice->leaf_id, choice->degraded);
   return FTUN_OK;
 }
 
@@ -317,9 +339,130 @@ ftun_status_t ftun_runtime_group_publish_health(
   runtime = FTUN_MANAGER(core)->active;
   status = ftun_runtime_outbound_index(runtime, group_id, &index);
   if (status != FTUN_OK) return status;
+  bool health_changed = !runtime->owner_state.group_choices[index].health_valid ||
+    runtime->owner_state.group_choices[index].health_success != sample->success;
   runtime->owner_state.group_choices[index].health_valid = true;
   runtime->owner_state.group_choices[index].health_success = sample->success;
   runtime->owner_state.group_choices[index].latency_ms = sample->latency_ms;
   runtime->owner_state.group_choices[index].observed_ms = sample->observed_ms;
+  if (health_changed && ftun_log_enabled(core, FTUN_LOG_INFO)) {
+    static const ftun_log_event_t result = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.url-test-result", "url-test result"};
+    const char *name = ftun_config_outbounds(runtime->snapshot.config)[index].name;
+    FTUN_CORE_LOG(core, &result, .generation = runtime->generation,
+      .fields = (ftun_log_field_t[]){
+        {.key = "group", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}},
+        {.key = "success", .kind = FTUN_LOG_U64, .value.u64 = sample->success ? 1u : 0u},
+        {.key = "latency_ms", .kind = FTUN_LOG_U64, .value.u64 = sample->latency_ms}}, .field_count = 3u);
+  }
   return FTUN_OK;
+}
+
+static ftun_outbound_stats_t *ftun_runtime_outbound_counters(
+  ftun_runtime_t *runtime, uint32_t id)
+{
+  size_t index;
+  if (id < FTUN_OUTBOUND_ID_NAMED_BASE) return &runtime->builtin_connections[id];
+  if (ftun_runtime_outbound_index(runtime, id, &index) != FTUN_OK) return NULL;
+  return &runtime->owner_state.group_choices[index].connections;
+}
+
+static ftun_runtime_log_state_t *outbound_log(ftun_runtime_t *runtime, uint32_t id)
+{
+  size_t index;
+  if (id < FTUN_OUTBOUND_ID_NAMED_BASE) return &runtime->builtin_logs[id];
+  if (ftun_runtime_outbound_index(runtime, id, &index) != FTUN_OK) return NULL;
+  return &runtime->owner_state.group_choices[index].log;
+}
+
+void ftun_runtime_outbound_log_failure(ftun_runtime_t *runtime, uint32_t id,
+  const ftun_log_record_t *record, uint64_t now_ms)
+{
+  ftun_runtime_log_state_t *state = outbound_log(runtime, id);
+  assert(state != NULL);
+  if (state->entity == 0u) state->entity = ftun_correlation_next();
+  state->failed = true;
+  const char *name = id == FTUN_OUTBOUND_ID_DIRECT ? "DIRECT" : id == FTUN_OUTBOUND_ID_REJECT ? "REJECT" :
+    ftun_config_outbounds(runtime->snapshot.config)[id - FTUN_OUTBOUND_ID_NAMED_BASE].name;
+  (void)ftun_log_failure(runtime->owner, record, state->entity,
+    (ftun_string_t){name, strlen(name)}, now_ms);
+}
+
+void ftun_runtime_outbound_log_recovery(ftun_runtime_t *runtime, uint32_t id,
+  const ftun_log_event_t *failure, const ftun_log_record_t *record, uint64_t now_ms)
+{
+  ftun_runtime_log_state_t *state = outbound_log(runtime, id);
+  assert(state != NULL);
+  if (!state->failed) return;
+  (void)ftun_log_recovery(runtime->owner, failure, state->entity, record, now_ms);
+  state->failed = false;
+}
+
+static void outbound_stats_add(ftun_outbound_stats_t *total,
+  const ftun_outbound_stats_t *source)
+{
+  size_t index;
+  total->active += source->active;
+  total->connections += source->connections;
+  for (index = 0u; index <= FTUN_E_STATE_CORRUPT; ++index)
+    total->failures[index] += source->failures[index];
+}
+
+/* 名称在各自不可变配置中匹配，不能使用裁剪后的显示标签或新代下标。 */
+static const ftun_outbound_stats_t *outbound_matching(
+  const ftun_runtime_t *source, const ftun_runtime_t *target, uint32_t id)
+{
+  uint32_t source_id = id;
+  if (id >= FTUN_OUTBOUND_ID_NAMED_BASE) {
+    const char *name = ftun_config_outbounds(target->snapshot.config)
+      [id - FTUN_OUTBOUND_ID_NAMED_BASE].name;
+    ftun_string_t span = {name, strlen(name)};
+    if (ftun_runtime_resolve_outbound_name(source, span, &source_id) != FTUN_OK)
+      return NULL;
+  }
+  return ftun_runtime_outbound_counters((ftun_runtime_t *)source, source_id);
+}
+
+void ftun_runtime_outbound_archive(const ftun_runtime_t *source,
+  ftun_runtime_t *target)
+{
+  uint32_t id;
+  for (id = 0u; id < target->owner_state.group_choice_count + FTUN_OUTBOUND_ID_NAMED_BASE; ++id) {
+    const ftun_outbound_stats_t *stats = outbound_matching(source, target, id);
+    if (stats != NULL) outbound_stats_add(ftun_runtime_outbound_counters(target, id), stats);
+  }
+}
+
+ftun_status_t ftun_runtime_outbound_stats(const ftun_runtime_t *runtime,
+  uint32_t outbound_id, ftun_outbound_stats_t *out)
+{
+  const ftun_outbound_stats_t *stats = ftun_runtime_outbound_counters(
+    (ftun_runtime_t *)runtime, outbound_id);
+  const ftun_snapshot_manager_t *manager = FTUN_MANAGER(runtime->owner);
+  const ftun_runtime_t *retained;
+  if (stats == NULL) return FTUN_E_INVALID;
+  *out = *stats;
+  if (manager->active == runtime) {
+    for (retained = manager->retained; retained != NULL; retained = retained->next_retained) {
+      stats = outbound_matching(retained, runtime, outbound_id);
+      if (stats != NULL) outbound_stats_add(out, stats);
+    }
+  }
+  return FTUN_OK;
+}
+
+void ftun_runtime_outbound_started(ftun_runtime_t *runtime, uint32_t outbound_id)
+{
+  ftun_outbound_stats_t *stats = ftun_runtime_outbound_counters(runtime, outbound_id);
+  assert(stats != NULL);
+  stats->active++;
+  stats->connections++;
+}
+
+void ftun_runtime_outbound_finished(ftun_runtime_t *runtime, uint32_t outbound_id,
+  ftun_status_t result)
+{
+  ftun_outbound_stats_t *stats = ftun_runtime_outbound_counters(runtime, outbound_id);
+  assert(stats != NULL && stats->active != 0u);
+  stats->active--;
+  if (result != FTUN_OK) stats->failures[result]++;
 }

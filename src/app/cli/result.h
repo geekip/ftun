@@ -2,6 +2,9 @@
 #define FTUN_APP_CLI_RESULT_H
 
 #include "core/limits.h"
+#include "app/control.h"
+
+#define FTUN_CLI_READY_REASONS_CAPACITY 384u
 
 typedef struct ftun_cli_result_sink ftun_cli_result_sink_t;
 typedef struct ftun_cli_result_ticket ftun_cli_result_ticket_t;
@@ -11,7 +14,9 @@ typedef enum {
   FTUN_CLI_RESULT_RELOAD_REJECTED,
   FTUN_CLI_RESULT_RELOAD_REQUEST_REJECTED,
   FTUN_CLI_RESULT_STOP_FAILED,
-  FTUN_CLI_RESULT_RUN_FAILED
+  FTUN_CLI_RESULT_RUN_FAILED,
+  FTUN_CLI_RESULT_RUN_READY,
+  FTUN_CLI_RESULT_BACKGROUND_READY
 } ftun_cli_result_kind_t;
 
 typedef struct {
@@ -49,6 +54,17 @@ ftun_status_t ftun_cli_result_report_admission_rejected(
 ftun_status_t ftun_cli_result_publish(ftun_cli_result_ticket_t *ticket,
                                       ftun_cli_result_kind_t kind,
                                       ftun_status_t status, uint32_t stage);
+/* path 同步借用并复制至已准入 ticket；格式化与控制字符转义由 writer 执行。 */
+ftun_status_t ftun_cli_result_publish_file(ftun_cli_result_ticket_t *ticket,
+  ftun_cli_result_kind_t kind, ftun_status_t status, uint32_t stage, const char *path);
+/* 启动失败的模块能力位和阶段按值拥有，path仍同步复制。 */
+ftun_status_t ftun_cli_result_publish_run_failure(ftun_cli_result_ticket_t *ticket,
+  ftun_status_t status, uint32_t stage, uint32_t module, const char *path);
+/* reasons为有界固定服务名/状态列表，同步复制；空串表示全部active或disabled。 */
+ftun_status_t ftun_cli_result_publish_ready(ftun_cli_result_ticket_t *ticket, const char *reasons);
+/* 父进程的拥有型就绪结果；log_file为空表示实际日志关闭，原因同步复制。 */
+ftun_status_t ftun_cli_result_publish_background_ready(ftun_cli_result_ticket_t *ticket,
+  uint32_t pid, const char *log_file, const char *reasons);
 /* 未产生用户可见结果时归还尚未发布的 ticket。 */
 ftun_status_t ftun_cli_result_abandon(ftun_cli_result_ticket_t *ticket);
 ftun_status_t ftun_cli_result_get_usage(ftun_cli_result_sink_t *sink,

@@ -1065,3 +1065,21 @@ ftun_status_t ftun_core_module_runtime_get_info(
   }
   return FTUN_OK;
 }
+
+ftun_status_t ftun_core_module_runtime_service(
+  const ftun_core_module_runtime_t *runtime,
+  const ftun_core_service_descriptor_t *descriptor,
+  const ftun_core_service_t **out)
+{
+  size_t index;
+  *out = NULL;
+  if (runtime == NULL || descriptor == NULL) return FTUN_E_INVALID;
+  for (index = 0u; index < runtime->entry_count; ++index) {
+    const ftun_core_module_entry_t *entry = &runtime->entries[index];
+    if (entry->descriptor->service == descriptor) {
+      *out = &entry->service;
+      return FTUN_OK;
+    }
+  }
+  return FTUN_E_EOF;
+}

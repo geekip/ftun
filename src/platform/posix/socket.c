@@ -36,14 +36,14 @@ bool ftun_blocking_socket_wait(ftun_handle_t descriptor, uint32_t events,
   uint64_t now;
   int timeout;
   int result;
-  if (ftun_monotonic_now(&now) != FTUN_OK || now >= deadline_ms) return false;
-  timeout = deadline_ms - now > (uint64_t)INT32_MAX
-    ? INT32_MAX : (int)(deadline_ms - now);
   memset(&item, 0, sizeof(item));
   item.fd = (int)descriptor;
   item.events = (short)(((events & FTUN_POLLER_READ) != 0u ? POLLIN : 0) |
                         ((events & FTUN_POLLER_WRITE) != 0u ? POLLOUT : 0));
   do {
+    if (ftun_monotonic_now(&now) != FTUN_OK || now >= deadline_ms) return false;
+    timeout = deadline_ms - now > (uint64_t)INT32_MAX
+      ? INT32_MAX : (int)(deadline_ms - now);
     result = poll(&item, 1u, timeout);
   } while (result < 0 && errno == EINTR);
   return result == 1 &&

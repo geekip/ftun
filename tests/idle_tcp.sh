@@ -65,7 +65,7 @@ while [ ! -f "$temporary/dns.ready" ]; do
   sleep 0.01
 done
 
-"$ftun_binary" run -c "$config_file" >"$temporary/ftun.log" 2>&1 &
+"$ftun_binary" run -c "$config_file" -p "$config_file.pid" >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 sleep 0.2
 kill -0 "$ftun_pid"

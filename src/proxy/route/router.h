@@ -2,6 +2,7 @@
 #define FTUN_PROXY_ROUTE_ROUTER_H
 
 #include "util/types.h"
+#include "core/config/error.h"
 #include "proxy/route/rule.h"
 
 /* 表拥有全部编译规则；文本和 resolver 输入只在 create 调用期间借用。 */
@@ -14,6 +15,11 @@ ftun_status_t ftun_route_table_create_with_frs(
   ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
   ftun_rule_frs_bind_fn frs_bind, void *frs_user,
   ftun_route_table_t **out);
+ftun_status_t ftun_route_table_create_with_frs_error(
+  uint64_t generation, const char *const *rules, size_t rule_count,
+  ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
+  ftun_rule_frs_bind_fn frs_bind, void *frs_user,
+  ftun_route_table_t **out, ftun_config_error_t *error);
 ftun_status_t ftun_route_table_set_generation(ftun_route_table_t *table,
                                               uint64_t generation);
 ftun_status_t ftun_route_table_destroy(ftun_route_table_t **table);

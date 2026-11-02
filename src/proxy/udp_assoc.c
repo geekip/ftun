@@ -3,6 +3,31 @@
 #include "util/endpoint.h"
 #include "proxy/engine_internal.h"
 
+static const ftun_log_event_t udp_connect = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.udp-connect", "connect"};
+static const ftun_log_event_t udp_rule = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.udp-rule", "rule matched"};
+static const ftun_log_event_t udp_closed = {FTUN_LOG_PROXY, FTUN_LOG_DEBUG, "proxy.udp-closed", "closed"};
+static const ftun_log_event_t udp_failed = {FTUN_LOG_PROXY, FTUN_LOG_WARN, "proxy.dial-failed", "dial failed"};
+static const ftun_log_event_t udp_recovered = {FTUN_LOG_PROXY, FTUN_LOG_INFO, "proxy.dial-recovered", "dial recovered"};
+
+void ftun_proxy_runtime_udp_log_failure(ftun_proxy_runtime_udp_slot_t *slot, ftun_error_t error)
+{
+  if (slot->destroying || slot->log_runtime == NULL || slot->log_failure_recorded ||
+      error.status == FTUN_OK || error.status == FTUN_E_EOF || error.status == FTUN_E_CANCELLED) return;
+  uint64_t now;
+  if (ftun_monotonic_now(&now) != FTUN_OK) return;
+  ftun_log_field_t fields[2] = {{.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = {"udp", 3u}}};
+  size_t count = 1u;
+  if (error.native_code != 0 && ftun_log_enabled(slot->engine->core, FTUN_LOG_WARN)) {
+    const char *name = ftun_socket_error_name(error.native_code);
+    fields[count++] = (ftun_log_field_t){.key = "errno", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}};
+  }
+  ftun_runtime_outbound_log_failure((ftun_runtime_t *)slot->log_runtime, slot->outbound_id,
+    &(ftun_log_record_t){.event = &udp_failed, .sid = slot->sid, .generation = slot->log_generation,
+      .error = error, .fields = fields, .field_count = count}, now);
+  slot->log_error = error;
+  slot->log_failure_recorded = true;
+}
+
 void ftun_proxy_runtime_udp_sent(ftun_datagram_t *channel, ftun_error_t error,
   const ftun_endpoint_t *target, const ftun_packet_t *packet, void *user)
 {
@@ -12,6 +37,8 @@ void ftun_proxy_runtime_udp_sent(ftun_datagram_t *channel, ftun_error_t error,
   (void)target;
   (void)packet;
   if (slot->cancelling_send) return;
+  ftun_proxy_runtime_udp_log_failure(slot, error);
+  if (error.status == FTUN_OK) slot->log_written_bytes += packet->payload.length;
   if (send.channel != NULL && ftun_datagram_send_complete(send, error) == FTUN_OK) {
     memset(&slot->sending, 0, sizeof(slot->sending));
   }
@@ -100,6 +127,17 @@ ftun_status_t ftun_proxy_runtime_udp_slot_reset(ftun_proxy_runtime_udp_slot_t *s
   ftun_resolver_scope_release(&slot->resolver_scope);
   status = ftun_proxy_runtime_object_release(&slot->budget, &slot->admission);
   if (status != FTUN_OK) return status;
+  if (slot->sid != 0u && ftun_log_enabled(engine->core, FTUN_LOG_DEBUG)) {
+    uint64_t now = slot->log_started_ms;
+    (void)ftun_monotonic_now(&now);
+    FTUN_CORE_LOG(engine->core, &udp_closed, .sid = slot->sid, .generation = slot->log_generation,
+      .error = slot->log_error,
+      .fields = (ftun_log_field_t[]){
+        {.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = {"udp", 3u}},
+        {.key = "duration_ms", .kind = FTUN_LOG_U64, .value.u64 = now - slot->log_started_ms},
+        {.key = "read_bytes", .kind = FTUN_LOG_U64, .value.u64 = slot->log_read_bytes},
+        {.key = "written_bytes", .kind = FTUN_LOG_U64, .value.u64 = slot->log_written_bytes}}, .field_count = 4u);
+  }
   owned = slot;
   return ftun_proxy_slot_pool_release(engine->udp_pool, token, &owned);
 }
@@ -208,6 +246,7 @@ void ftun_proxy_runtime_udp_destroy(void *user)
   /* 后端 destroy 无返回值；槽继续拥有 Path/子操作，owner 后续重试回收。 */
   slot->channel = NULL;
   slot->destroying = true;
+  slot->log_runtime = NULL;
   ftun_proxy_runtime_udp_schedule(slot);
 }
 
@@ -245,6 +284,7 @@ void ftun_proxy_runtime_udp_direct_completed(ftun_operation_t *operation,
   slot->ready = status == FTUN_OK && !slot->destroying;
   slot->resume_pending = slot->ready;
   slot->open_status = status;
+  ftun_proxy_runtime_udp_log_failure(slot, error.status == status ? error : (ftun_error_t){status, 0u, 0});
   ftun_proxy_runtime_udp_schedule(slot);
 }
 
@@ -350,6 +390,7 @@ void ftun_proxy_runtime_udp_proxy_resolved(
   if (status != FTUN_OK) {
     ftun_proxy_runtime_udp_backoff_failed(slot->engine, slot->outbound_id);
     slot->open_status = status;
+    ftun_proxy_runtime_udp_log_failure(slot, error.status == status ? error : (ftun_error_t){status, 0u, 0});
     ftun_proxy_runtime_udp_finish_pending(slot, status);
   }
 }
@@ -366,6 +407,7 @@ void ftun_proxy_runtime_udp_socks_completed(ftun_operation_t *operation,
   slot->ready = status == FTUN_OK && !slot->destroying;
   slot->resume_pending = slot->ready;
   slot->open_status = status;
+  ftun_proxy_runtime_udp_log_failure(slot, error.status == status ? error : (ftun_error_t){status, 0u, 0});
   if (status != FTUN_OK && !slot->destroying) ftun_proxy_runtime_udp_backoff_failed(slot->engine, slot->outbound_id);
   ftun_proxy_runtime_udp_schedule(slot);
 }
@@ -548,6 +590,30 @@ ftun_status_t ftun_proxy_runtime_udp_open(
     (void)ftun_proxy_runtime_udp_slot_reset(slot);
     return status;
   }
+  slot->sid = ftun_correlation_next();
+  slot->log_generation = metadata->generation;
+  (void)ftun_monotonic_now(&slot->log_started_ms);
+  if (ftun_log_enabled(core, FTUN_LOG_DEBUG)) {
+    char address[FTUN_IP_TEXT_BYTES];
+    ftun_string_t identity = metadata->domain;
+    if (identity.length == 0u && ftun_endpoint_is_ip(&metadata->original_target)) {
+      ftun_ip_t ip = ftun_endpoint_ip(&metadata->original_target);
+      identity = (ftun_string_t){address, ftun_ip_format(&ip, address, sizeof(address))};
+    }
+    FTUN_CORE_LOG(core, &udp_connect, .sid = slot->sid, .generation = slot->log_generation,
+      .fields = (ftun_log_field_t[]){
+        {.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = {"udp", 3u}},
+        {.key = "in", .kind = FTUN_LOG_TEXT, .value.text = {inbound->name, strlen(inbound->name)}},
+        {.key = "target", .kind = FTUN_LOG_TEXT, .value.text = identity},
+        {.key = "port", .kind = FTUN_LOG_U64, .value.u64 = metadata->original_target.port}}, .field_count = 4u);
+    const char *name = leaf.kind == FTUN_OUTBOUND_LEAF_DIRECT ? "DIRECT" : proxy_config->name;
+    FTUN_CORE_LOG(core, &udp_rule, .sid = slot->sid, .generation = slot->log_generation,
+      .fields = (ftun_log_field_t[]){
+        {.key = "transport", .kind = FTUN_LOG_TEXT, .value.text = {"udp", 3u}},
+        {.key = "out", .kind = FTUN_LOG_TEXT, .value.text = {name, strlen(name)}},
+        {.key = "out_id", .kind = FTUN_LOG_U64, .value.u64 = leaf.id},
+        {.key = "rule", .kind = FTUN_LOG_U64, .value.u64 = route.rule_index}}, .field_count = 4u);
+  }
   if (target.allowed_count != 0u) {
     slot->remote = target.allowed[0];
   } else {
@@ -557,6 +623,7 @@ ftun_status_t ftun_proxy_runtime_udp_open(
   }
   slot->socks5 = leaf.kind == FTUN_OUTBOUND_LEAF_SOCKS5;
   slot->outbound_id = leaf.id;
+  slot->log_runtime = runtime;
   slot->open_status = FTUN_E_AGAIN;
   slot->active = true;
   if (admission != NULL) {
@@ -640,6 +707,7 @@ ftun_status_t ftun_proxy_runtime_udp_open(
     }
   }
   if (status != FTUN_OK) {
+    ftun_proxy_runtime_udp_log_failure(slot, (ftun_error_t){status, 0u, 0});
     (void)ftun_datagram_stop(slot->channel);
     (void)ftun_datagram_destroy(&slot->channel);
     return status;
@@ -1024,6 +1092,13 @@ ftun_status_t ftun_proxy_runtime_udp_received(ftun_datagram_t *channel,
   if (!slot->ready) return FTUN_E_AGAIN;
   if (!ftun_proxy_runtime_endpoint_equal(source, &slot->remote)) return FTUN_OK;
   status = ftun_datagram_deliver(slot->channel, &slot->remote, packet);
+  if (status == FTUN_OK) slot->log_read_bytes += packet->payload.length;
+  if (status == FTUN_OK) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK)
+      ftun_runtime_outbound_log_recovery((ftun_runtime_t *)slot->log_runtime, slot->outbound_id,
+        &udp_failed, &(ftun_log_record_t){.event = &udp_recovered, .generation = slot->log_generation}, now);
+  }
   if (status == FTUN_OK && slot->socks5) ftun_proxy_runtime_udp_backoff_succeeded(slot->engine, slot->outbound_id);
   return status;
 }

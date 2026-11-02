@@ -188,7 +188,7 @@ class RunningFtun:
     self.log = self.log_path.open("w+")
     preexec = child_fd_limit(fd_limit) if fd_limit is not None else None
     self.process = subprocess.Popen(
-      [str(binary), "run", "-c", str(self.config)],
+      [str(binary), "run", "-c", str(self.config), "-p", str(self.config) + ".pid"],
       stdout=subprocess.DEVNULL, stderr=self.log, preexec_fn=preexec)
     wait_listener(self.process, self.proxy_port, self.log_path)
 

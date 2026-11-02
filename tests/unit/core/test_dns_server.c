@@ -28,6 +28,7 @@ typedef struct {
   uint32_t next_leaf;
   uint32_t submitted_leaf;
   ftun_status_t select_status;
+  ftun_status_t submit_status;
   unsigned int cancels;
   int pending;
   ftun_status_t cancel_status;
@@ -39,6 +40,7 @@ typedef struct {
   unsigned int calls;
   ftun_status_t status;
   uint32_t stage;
+  int native_code;
   uint8_t response[64];
   size_t response_length;
 } completion_t;
@@ -78,6 +80,7 @@ static ftun_status_t transport_submit(
   if (transport == NULL || upstream == NULL || query.data == NULL ||
       query.length < 12u || completion == NULL || out_request == NULL ||
       transport->pending) return FTUN_E_INVALID;
+  if (transport->submit_status != FTUN_OK) return transport->submit_status;
   transport->completion = completion;
   transport->completion_user = completion_user;
   transport->upstream = *upstream;
@@ -107,7 +110,7 @@ static ftun_status_t transport_cancel(void *user, void **request)
     transport->pending = 0;
     transport->completion = NULL;
     transport->completion_user = NULL;
-    callback(callback_user, FTUN_OK, protocol, &upstream,
+    callback(callback_user, (ftun_error_t){0}, protocol, &upstream,
       (ftun_bytes_t){transport->cancel_response,
                      transport->cancel_response_length});
     /* 原请求直到 cancel 返回前才清空，不能覆盖回调中新建的 fallback。 */
@@ -133,7 +136,7 @@ static int transport_deliver(transport_t *transport, ftun_status_t status,
   transport->pending = 0;
   transport->completion = NULL;
   transport->completion_user = NULL;
-  completion(user, status, transport->protocol, &transport->upstream,
+  completion(user, (ftun_error_t){status, 0u, status == FTUN_OK ? 0 : 1234}, transport->protocol, &transport->upstream,
              (ftun_bytes_t){wire, length});
   return 1;
 }
@@ -146,6 +149,7 @@ static void completed(ftun_operation_t *operation, ftun_error_t error,
   completion->calls++;
   completion->status = error.status;
   completion->stage = error.stage;
+  completion->native_code = error.native_code;
   completion->response_length = response.length;
   if (response.length <= sizeof(completion->response) && response.data != NULL) {
     memcpy(completion->response, response.data, response.length);
@@ -511,7 +515,7 @@ static int test_upstream_failover(void)
   CHECK(transport.pending && transport.upstream.address[3] == 54u &&
         transport.deadline == now + 4000u);
   CHECK(transport_deliver(&transport, FTUN_E_TIMEOUT, NULL, 0u));
-  CHECK(dispatch_one(operations) && completion.status == FTUN_E_TIMEOUT);
+  CHECK(dispatch_one(operations) && completion.status == FTUN_E_TIMEOUT && completion.native_code == 1234);
   memset(&completion, 0, sizeof(completion));
   query_init(&query, &completion, request, now + 4000u);
   {
@@ -630,6 +634,17 @@ int main(void)
         completion.status == FTUN_OK && completion.response_length == 45u);
   CHECK(ftun_dns_server_get_info(server, &info) == FTUN_OK &&
         info.inflight == 0u && info.outbound_id == 42u);
+  CHECK(info.queries.queries == 1u && info.queries.success == 1u &&
+        info.upstream_success == 1u && !info.unhealthy && info.latency_valid);
+
+  /* 本地准入拒绝不归咎于上游，也不携带上一尝试的原生错误。 */
+  memset(&completion, 0, sizeof(completion));
+  query_init(&query, &completion, request, 5000u);
+  transport.submit_status = FTUN_E_LIMIT;
+  CHECK(ftun_dns_exchange(core, server, &query, &operation) == FTUN_OK);
+  CHECK(dispatch_one(operations) && completion.status == FTUN_E_LIMIT && completion.native_code == 0);
+  CHECK(ftun_dns_server_get_info(server, &info) == FTUN_OK && !info.unhealthy && info.upstream_failures == 0u);
+  transport.submit_status = FTUN_OK;
 
   memset(&completion, 0, sizeof(completion));
   query_init(&query, &completion, request, 5000u);
@@ -637,6 +652,8 @@ int main(void)
   response_init(response, 0x8180u, 0x9999u);
   CHECK(transport_deliver(&transport, FTUN_OK, response, sizeof(response)));
   CHECK(dispatch_one(operations) && completion.status == FTUN_E_PROTOCOL);
+  CHECK(ftun_dns_server_get_info(server, &info) == FTUN_OK &&
+        info.queries.failures[FTUN_E_PROTOCOL] == 1u && info.unhealthy && info.last_failure == FTUN_E_PROTOCOL);
 
   memset(&completion, 0, sizeof(completion));
   query_init(&query, &completion, request, 5000u);

@@ -33,7 +33,7 @@ def main():
         path.write_text(json.dumps(config))
         log_path = root / 'run.log'
         with log_path.open('w+') as log:
-            process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=log, stderr=log)
+            process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=log, stderr=log)
             def wait(predicate):
                 deadline = time.monotonic() + 7
                 while not predicate(log_path.read_text()):

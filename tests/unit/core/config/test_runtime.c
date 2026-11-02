@@ -38,9 +38,68 @@ static int check_budget(ftun_budget_t *budget, size_t used)
   return 0;
 }
 
+/* 多个旧代同时存活，命名出口重排后仍按完整名称累计，回收前后相等。 */
+static int counters_across_reload(void)
+{
+  const char *texts[] = {
+    "{\"dns\":{\"enable\":false},\"outbounds\":[{\"name\":\"node\",\"type\":\"socks5\",\"server\":\"127.0.0.1:9\"},{\"name\":\"other\",\"type\":\"socks5\",\"server\":\"127.0.0.1:8\"}]}",
+    "{\"dns\":{\"enable\":false},\"outbounds\":[{\"name\":\"other\",\"type\":\"socks5\",\"server\":\"127.0.0.1:8\"},{\"name\":\"node\",\"type\":\"socks5\",\"server\":\"127.0.0.1:9\"}]}"
+  };
+  ftun_budget_t *budget = NULL;
+  ftun_core_t *core = NULL;
+  ftun_runtime_t *candidate = NULL, *first = NULL, *second = NULL, *current = NULL;
+  ftun_outbound_stats_t stats;
+  ftun_string_t name = {"node", 4u};
+  uint32_t ids[3];
+  size_t index;
+  CHECK(ftun_budget_create(NULL, 1024u * 1024u, 0u, &budget) == FTUN_OK);
+  CHECK(ftun_runtime_manager_create(budget, 3u, &core) == FTUN_OK);
+  for (index = 0u; index < 3u; ++index) {
+    ftun_config_t *config = make_config(texts[index % 2u]);
+    CHECK(config != NULL);
+    CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
+    CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+    CHECK(ftun_config_destroy(&config) == FTUN_OK);
+    CHECK(ftun_runtime_active_acquire(core, &current) == FTUN_OK);
+    CHECK(ftun_runtime_resolve_outbound_name(current, name, &ids[index]) == FTUN_OK);
+    if (index == 0u) first = current;
+    if (index == 1u) second = current;
+    if (index < 2u) ftun_runtime_outbound_started(current, ids[index]);
+  }
+  CHECK(ids[0] != ids[1] && ids[0] == ids[2]);
+  CHECK(ftun_runtime_outbound_stats(current, ids[2], &stats) == FTUN_OK);
+  CHECK(stats.connections == 2u && stats.active == 2u);
+  ftun_runtime_outbound_finished(first, ids[0], FTUN_E_TIMEOUT);
+  CHECK(ftun_runtime_outbound_stats(current, ids[2], &stats) == FTUN_OK);
+  CHECK(stats.connections == 2u && stats.active == 1u && stats.failures[FTUN_E_TIMEOUT] == 1u);
+  CHECK(ftun_runtime_release(&first) == FTUN_OK);
+  CHECK(ftun_runtime_outbound_stats(current, ids[2], &stats) == FTUN_OK);
+  CHECK(stats.connections == 2u && stats.active == 1u && stats.failures[FTUN_E_TIMEOUT] == 1u);
+  ftun_runtime_outbound_finished(second, ids[1], FTUN_OK);
+  CHECK(ftun_runtime_release(&second) == FTUN_OK);
+  CHECK(ftun_runtime_release(&current) == FTUN_OK);
+  {
+    ftun_config_t *config = make_config(texts[1]);
+    CHECK(config != NULL);
+    CHECK(ftun_runtime_prepare(core, config, &candidate) == FTUN_OK);
+    CHECK(ftun_runtime_commit(core, &candidate) == FTUN_OK);
+    CHECK(ftun_config_destroy(&config) == FTUN_OK);
+    CHECK(ftun_runtime_active_acquire(core, &current) == FTUN_OK);
+    CHECK(ftun_runtime_resolve_outbound_name(current, name, &ids[2]) == FTUN_OK);
+    CHECK(ftun_runtime_outbound_stats(current, ids[2], &stats) == FTUN_OK);
+    CHECK(stats.connections == 2u && stats.active == 0u && stats.failures[FTUN_E_TIMEOUT] == 1u);
+    CHECK(ftun_runtime_release(&current) == FTUN_OK);
+  }
+  CHECK(ftun_runtime_manager_destroy(&core) == FTUN_OK);
+  CHECK(check_budget(budget, 0u) == 0);
+  CHECK(ftun_budget_destroy(&budget) == FTUN_OK);
+  return 0;
+}
+
 /* 候选峰值、提交、旧代引用和回收。 */
 int main(void)
 {
+  CHECK(counters_across_reload() == 0);
   static const char first_text[] =
     "{\"dns\":{\"enable\":false},\"inbounds\":[{\"name\":\"one\","
     "\"type\":\"mixed\",\"listen\":\"127.0.0.1:1001\"}]}";

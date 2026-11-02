@@ -3,6 +3,7 @@
 #include "platform/clock.h"
 #include "platform/thread.h"
 #include <stdlib.h>
+#include <stddef.h>
 #include <string.h>
 
 #define FTUN_EVENT_SOURCE_CAPACITY 1024u
@@ -41,11 +42,12 @@ struct ftun_event_source {
 struct ftun_event_loop {
   ftun_core_t *core;
   ftun_budget_t *budget;
+  ftun_budget_t *control_budget;
+  size_t control_capacity, control_count;
   ftun_reservation_t reservation;
   ftun_event_source_t *sources;
   ftun_event_source_t *ready_head;
   ftun_event_source_t *ready_tail;
-  ftun_event_deferred_t deferred[FTUN_EVENT_DEFERRED_CAPACITY];
   ftun_mutex_t mutex;
   ftun_event_wakeup_fn wakeup;
   void *wakeup_user;
@@ -75,6 +77,7 @@ struct ftun_event_loop {
   size_t last_timer_work;
   uint64_t last_wait_ms;
   bool backend_quota_exhausted;
+  ftun_event_deferred_t deferred[FTUN_EVENT_DEFERRED_CAPACITY];
   ftun_event_source_t *timer_heap[];
 };
 
@@ -121,11 +124,13 @@ ftun_status_t ftun_event_loop_create_with_budget(
     status = ftun_budget_reserve_resources(budget, charge, &reservation);
     if (status != FTUN_OK) return status;
   }
-  loop = (ftun_event_loop_t *)calloc(1u, allocation_size);
+  loop = (ftun_event_loop_t *)malloc(allocation_size);
   if (loop == NULL) {
     ftun_reservation_release(&reservation);
     return FTUN_E_LIMIT;
   }
+  /* 队列与timer heap只读已入队项，不预先触碰尚未使用的固定存储。 */
+  memset(loop, 0, offsetof(ftun_event_loop_t, deferred));
   if (ftun_mutex_init(&loop->mutex) != FTUN_OK) {
     free(loop);
     ftun_reservation_release(&reservation);
@@ -243,21 +248,49 @@ ftun_status_t ftun_event_loop_detach_backend(ftun_event_loop_t *loop)
   return FTUN_OK;
 }
 
+ftun_status_t ftun_event_loop_bind_control(ftun_event_loop_t *loop,
+  ftun_budget_t *budget, size_t capacity)
+{
+  bool same = false;
+  if (budget == NULL && capacity == 0u) {
+    if (loop->control_count != 0u) return FTUN_E_AGAIN;
+    loop->control_budget = NULL;
+    loop->control_capacity = 0u;
+    return FTUN_OK;
+  }
+  if (loop->source_count != 0u || loop->control_budget != NULL) return FTUN_E_AGAIN;
+  if (budget == NULL || budget == loop->budget || capacity == 0u ||
+      capacity >= loop->source_capacity ||
+      ftun_budget_same_root(loop->budget, budget, &same) != FTUN_OK || !same) return FTUN_E_INVALID;
+  loop->control_budget = budget;
+  loop->control_capacity = capacity;
+  return FTUN_OK;
+}
+
+ftun_budget_t *ftun_event_source_budget(ftun_event_source_t *source)
+{
+  return source->reservation.budget;
+}
+
 static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
                                            ftun_event_source_kind_t kind,
                                            ftun_event_callback_fn callback, void *user,
-                                           ftun_event_source_t **out)
+                                           ftun_event_source_t **out, bool control)
 {
   ftun_event_source_t *source;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_status_t status;
+  ftun_budget_t *budget;
   if (out != NULL) *out = NULL;
   if (loop == NULL || callback == NULL || out == NULL) return FTUN_E_INVALID;
   if (!loop->accepting) return FTUN_E_CANCELLED;
-  if (loop->source_count >= loop->source_capacity) return FTUN_E_LIMIT;
-  if (loop->budget != NULL) {
+  if (control && loop->control_budget == NULL) return FTUN_E_INVALID;
+  if (control ? loop->control_count >= loop->control_capacity :
+      loop->source_count - loop->control_count >= loop->source_capacity - loop->control_capacity) return FTUN_E_LIMIT;
+  budget = control ? loop->control_budget : loop->budget;
+  if (budget != NULL) {
     const ftun_budget_resources_t charge = {sizeof(*source), 0u, 1u};
-    status = ftun_budget_reserve_resources(loop->budget, charge, &reservation);
+    status = ftun_budget_reserve_resources(budget, charge, &reservation);
     if (status != FTUN_OK) return status;
   }
   source = (ftun_event_source_t *)calloc(1u, sizeof(*source));
@@ -276,6 +309,7 @@ static ftun_status_t ftun_event_source_add(ftun_event_loop_t *loop,
   if (loop->sources != NULL) loop->sources->previous = source;
   loop->sources = source;
   loop->source_count++;
+  if (control) loop->control_count++;
   *out = source;
   return FTUN_OK;
 }
@@ -294,6 +328,8 @@ static void ftun_event_source_unlink(ftun_event_source_t *source)
   else loop->sources = source->next;
   if (source->next != NULL) source->next->previous = source->previous;
   loop->source_count--;
+  if (loop->control_budget != NULL &&
+      source->reservation.budget == loop->control_budget) loop->control_count--;
   source->loop = NULL;
   source->previous = NULL;
   source->next = NULL;
@@ -334,9 +370,9 @@ static void ftun_event_ready_enqueue(ftun_event_source_t *source)
   loop->ready_count++;
 }
 
-ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
+static ftun_status_t ftun_event_io_start_internal(ftun_event_loop_t *loop, ftun_native_socket_t socket,
                                   uint32_t interests, ftun_event_callback_fn callback,
-                                  void *user, ftun_event_source_t **out)
+                                  void *user, ftun_event_source_t **out, bool control)
 {
   ftun_event_source_t *source;
   ftun_status_t status;
@@ -345,7 +381,7 @@ ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t 
   if (out == NULL || (interests & ~FTUN_EVENT_WAITABLE) == 0u || (interests & ~allowed) != 0u) {
     return FTUN_E_INVALID;
   }
-  status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_IO, callback, user, &source);
+  status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_IO, callback, user, &source, control);
   if (status != FTUN_OK) return status;
   source->socket = socket;
   source->interests = interests & ~FTUN_EVENT_WAITABLE;
@@ -361,10 +397,22 @@ ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t 
   return FTUN_OK;
 }
 
+ftun_status_t ftun_event_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
+  uint32_t interests, ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
+{
+  return ftun_event_io_start_internal(loop, socket, interests, callback, user, out, false);
+}
+
+ftun_status_t ftun_event_control_io_start(ftun_event_loop_t *loop, ftun_native_socket_t socket,
+  uint32_t interests, ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
+{
+  return ftun_event_io_start_internal(loop, socket, interests, callback, user, out, true);
+}
+
 ftun_status_t ftun_event_task_start(ftun_event_loop_t *loop,
   ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
 {
-  return ftun_event_source_add(loop, FTUN_EVENT_SOURCE_TASK, callback, user, out);
+  return ftun_event_source_add(loop, FTUN_EVENT_SOURCE_TASK, callback, user, out, false);
 }
 
 ftun_status_t ftun_event_task_ready(ftun_event_source_t *source)
@@ -379,16 +427,16 @@ ftun_status_t ftun_event_task_ready(ftun_event_source_t *source)
 static void ftun_event_timer_insert(ftun_event_source_t *source);
 static void ftun_event_timer_remove(ftun_event_source_t *source);
 
-ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
+static ftun_status_t ftun_event_timer_start_internal(ftun_event_loop_t *loop, uint64_t deadline_ms,
                                      ftun_event_callback_fn callback, void *user,
-                                     ftun_event_source_t **out)
+                                     ftun_event_source_t **out, bool control)
 {
   ftun_event_source_t *source;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
   if (out == NULL) return FTUN_E_INVALID;
   status = ftun_event_source_add(loop, FTUN_EVENT_SOURCE_TIMER,
-                                 callback, user, &source);
+                                 callback, user, &source, control);
   if (status != FTUN_OK) return status;
   source->deadline_ms = deadline_ms;
   if (loop->backend != NULL) {
@@ -402,6 +450,18 @@ ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_
   if (source->pending == 0u) ftun_event_timer_insert(source);
   *out = source;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_event_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
+  ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
+{
+  return ftun_event_timer_start_internal(loop, deadline_ms, callback, user, out, false);
+}
+
+ftun_status_t ftun_event_control_timer_start(ftun_event_loop_t *loop, uint64_t deadline_ms,
+  ftun_event_callback_fn callback, void *user, ftun_event_source_t **out)
+{
+  return ftun_event_timer_start_internal(loop, deadline_ms, callback, user, out, true);
 }
 
 ftun_status_t ftun_event_io_update(ftun_event_source_t *source,

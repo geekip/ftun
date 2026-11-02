@@ -8,12 +8,13 @@
 
 #include "platform/thread.h"
 #include <stdio.h>
+#include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
 
 #define FTUN_CLI_RESULT_CAPACITY 32u
 #define FTUN_CLI_RESULT_TOTAL (FTUN_CLI_RESULT_CAPACITY + 2u)
-#define FTUN_CLI_RESULT_LINE_BYTES 160u
+#define FTUN_CLI_RESULT_LINE_BYTES (768u + 4u * FTUN_APP_CONTROL_PATH_CAPACITY)
 
 enum {
   FTUN_CLI_RESULT_FREE = 0,
@@ -26,8 +27,11 @@ struct ftun_cli_result_ticket {
   struct ftun_cli_result_sink *sink;
   ftun_status_t status;
   uint32_t stage;
+  uint32_t module, pid;
+  char background_reasons[FTUN_CLI_READY_REASONS_CAPACITY];
   uint8_t kind;
   uint8_t state;
+  char file_error[FTUN_APP_CONTROL_PATH_CAPACITY];
 };
 
 struct ftun_cli_result_sink {
@@ -37,7 +41,7 @@ struct ftun_cli_result_sink {
   ftun_condition_t available;
   ftun_condition_t exited_condition;
   ftun_thread_t thread;
-  ftun_cli_result_ticket_t tickets[FTUN_CLI_RESULT_TOTAL];
+  bool initialized[FTUN_CLI_RESULT_TOTAL];
   size_t ready_slots[FTUN_CLI_RESULT_TOTAL];
   size_t ready_head;
   size_t ready_tail;
@@ -58,7 +62,20 @@ struct ftun_cli_result_sink {
   int failed;
   int timed_out;
   int exited;
+  ftun_cli_result_ticket_t tickets[FTUN_CLI_RESULT_TOTAL];
 };
+
+/* 只在持锁预留时初始化；writer及发布方只接收已交付的ticket。 */
+static ftun_cli_result_ticket_t *ftun_cli_result_ticket_slot(ftun_cli_result_sink_t *sink, size_t slot)
+{
+  ftun_cli_result_ticket_t *ticket = &sink->tickets[slot];
+  if (!sink->initialized[slot]) {
+    memset(ticket, 0, sizeof(*ticket));
+    ticket->sink = sink;
+    sink->initialized[slot] = true;
+  }
+  return ticket;
+}
 
 static void ftun_cli_result_count(uint64_t *value)
 {
@@ -90,10 +107,34 @@ static void ftun_cli_result_release(ftun_cli_result_sink_t *sink)
   ftun_condition_destroy(&sink->exited_condition);
   ftun_condition_destroy(&sink->available);
   ftun_mutex_destroy(&sink->mutex);
-  memset(sink, 0, sizeof(*sink));
   free(sink);
   ftun_reservation_release(&reservation);
   (void)ftun_budget_destroy(&budget);
+}
+
+static const char *ftun_cli_result_module(uint32_t module)
+{
+  switch (module) {
+    case FTUN_BUILD_MODULE_CORE: return "core";
+    case FTUN_BUILD_MODULE_DNS: return "dns";
+    case FTUN_BUILD_MODULE_TUN: return "tun";
+    case FTUN_BUILD_MODULE_FRS: return "frs";
+    case FTUN_BUILD_MODULE_FAKEIP: return "fakeip";
+    case FTUN_BUILD_MODULE_PROXY: return "proxy";
+    default: return "app";
+  }
+}
+
+static const char *ftun_cli_result_stage(uint32_t stage)
+{
+  switch (stage) {
+    case FTUN_STAGE_CONFIG_READ: return "config-read";
+    case FTUN_STAGE_CONFIG_PREPARE: return "prepare";
+    case FTUN_STAGE_STATE_RESTORE: return "state-restore";
+    case FTUN_STAGE_COMMIT: return "commit";
+    case FTUN_STAGE_CONTROL: return "control";
+    default: return "setup";
+  }
 }
 
 static size_t ftun_cli_result_format(const ftun_cli_result_ticket_t *ticket,
@@ -119,14 +160,51 @@ static size_t ftun_cli_result_format(const ftun_cli_result_ticket_t *ticket,
       length = snprintf(line, FTUN_CLI_RESULT_LINE_BYTES,
         "ftun: stop request failed: %s\n", ftun_status_name(ticket->status));
       break;
+    case FTUN_CLI_RESULT_BACKGROUND_READY:
+      length = ticket->background_reasons[0] == '\0' ?
+        snprintf(line, FTUN_CLI_RESULT_LINE_BYTES, "ftun: ready (pid %u); %s\n", ticket->pid,
+          ticket->file_error[0] == '\0' ? "logging disabled" : "log file") :
+        snprintf(line, FTUN_CLI_RESULT_LINE_BYTES, "ftun: ready (degraded: %s) (pid %u); %s\n",
+          ticket->background_reasons, ticket->pid, ticket->file_error[0] == '\0' ? "logging disabled" : "log file");
+      break;
+    case FTUN_CLI_RESULT_RUN_READY:
+      length = snprintf(line, FTUN_CLI_RESULT_LINE_BYTES, "ftun: ready\n");
+      break;
     case FTUN_CLI_RESULT_RUN_FAILED:
       length = snprintf(line, FTUN_CLI_RESULT_LINE_BYTES,
-        "ftun: run: %s\n", ftun_status_name(ticket->status));
+        "ftun: run: %s %s failed: %s\n", ftun_cli_result_module(ticket->module),
+        ftun_cli_result_stage(ticket->stage), ftun_status_name(ticket->status));
       break;
     default:
       return 0u;
   }
   if (length <= 0) return 0u;
+  if (ticket->file_error[0] != '\0') {
+    static const char hex[] = "0123456789abcdef";
+    const unsigned char *path = (const unsigned char *)ticket->file_error;
+    size_t used = (size_t)length - 1u;
+    if (ticket->kind == FTUN_CLI_RESULT_RUN_READY) {
+      static const char prefix[] = " (degraded: ";
+      memcpy(line + used, prefix, sizeof(prefix) - 1u);
+      used += sizeof(prefix) - 1u;
+    } else {
+      line[used++] = ':'; line[used++] = ' '; line[used++] = '"';
+    }
+    /* 每字节至多4字符，缓冲按路径上限预留，不能把路径变成另一条诊断。 */
+    for (; *path != 0u; ++path) {
+      if (*path == '\\' || *path == '"') {
+        line[used++] = '\\'; line[used++] = (char)*path;
+      } else if (*path < 32u || *path == 127u) {
+        line[used++] = '\\'; line[used++] = 'x';
+        line[used++] = hex[*path >> 4u]; line[used++] = hex[*path & 15u];
+      } else {
+        line[used++] = (char)*path;
+      }
+    }
+    line[used++] = ticket->kind == FTUN_CLI_RESULT_RUN_READY ? ')' : '"';
+    line[used++] = '\n'; line[used] = '\0';
+    return used;
+  }
   if ((size_t)length >= FTUN_CLI_RESULT_LINE_BYTES) {
     line[FTUN_CLI_RESULT_LINE_BYTES - 2u] = '\n';
     line[FTUN_CLI_RESULT_LINE_BYTES - 1u] = '\0';
@@ -259,7 +337,6 @@ ftun_status_t ftun_cli_result_sink_create(ftun_handle_t descriptor,
   ftun_reservation_t reservation = (ftun_reservation_t){0};
   ftun_budget_options_t options = {0};
   ftun_status_t status;
-  size_t index;
   if (out != NULL) *out = NULL;
   if (descriptor < 0 || out == NULL) return FTUN_E_INVALID;
   options.limit = (ftun_budget_resources_t){sizeof(*sink), 1u, FTUN_CLI_RESULT_TOTAL};
@@ -269,12 +346,13 @@ ftun_status_t ftun_cli_result_sink_create(ftun_handle_t descriptor,
     (void)ftun_budget_destroy(&budget);
     return status;
   }
-  sink = (ftun_cli_result_sink_t *)calloc(1u, sizeof(*sink));
+  sink = (ftun_cli_result_sink_t *)malloc(sizeof(*sink));
   if (sink == NULL) {
     ftun_reservation_release(&reservation);
     (void)ftun_budget_destroy(&budget);
     return FTUN_E_LIMIT;
   }
+  memset(sink, 0, offsetof(ftun_cli_result_sink_t, tickets));
   sink->budget = budget;
   sink->reservation = reservation;
   sink->descriptor = -1;
@@ -285,9 +363,6 @@ ftun_status_t ftun_cli_result_sink_create(ftun_handle_t descriptor,
   if (sink->descriptor < 0) goto exited_io;
   sink->accepting = 1;
   sink->references = 2u;
-  for (index = 0u; index < FTUN_CLI_RESULT_TOTAL; index++) {
-    sink->tickets[index].sink = sink;
-  }
   if (ftun_thread_create(&sink->thread, ftun_cli_result_writer, sink) != FTUN_OK) {
     goto descriptor_io;
   }
@@ -323,9 +398,12 @@ ftun_status_t ftun_cli_result_reserve(ftun_cli_result_sink_t *sink,
     return status;
   }
   for (index = 0u; index < FTUN_CLI_RESULT_CAPACITY; index++) {
-    ftun_cli_result_ticket_t *ticket = &sink->tickets[index];
+    ftun_cli_result_ticket_t *ticket = ftun_cli_result_ticket_slot(sink, index);
     if (ticket->state != FTUN_CLI_RESULT_FREE) continue;
     ticket->state = FTUN_CLI_RESULT_RESERVED;
+    ticket->module = 0u;
+    ticket->pid = 0u;
+    ticket->background_reasons[0] = '\0';
     sink->reserved_count++;
     ftun_cli_result_count(&sink->accepted);
     *out = ticket;
@@ -347,14 +425,17 @@ ftun_status_t ftun_cli_result_reserve_terminal(ftun_cli_result_sink_t *sink,
       (kind != FTUN_CLI_RESULT_STOP_FAILED &&
        kind != FTUN_CLI_RESULT_RUN_FAILED)) return FTUN_E_INVALID;
   ftun_mutex_lock(&sink->mutex);
-  ticket = &sink->tickets[FTUN_CLI_RESULT_CAPACITY +
-    (kind == FTUN_CLI_RESULT_RUN_FAILED ? 1u : 0u)];
+  ticket = ftun_cli_result_ticket_slot(sink, FTUN_CLI_RESULT_CAPACITY +
+    (kind == FTUN_CLI_RESULT_RUN_FAILED ? 1u : 0u));
   if (!sink->accepting || sink->failed) {
     status = sink->failed ? FTUN_E_IO : FTUN_E_CANCELLED;
   } else if (ticket->state != FTUN_CLI_RESULT_FREE) {
     status = FTUN_E_LIMIT;
   } else {
     ticket->state = FTUN_CLI_RESULT_RESERVED;
+    ticket->module = 0u;
+    ticket->pid = 0u;
+    ticket->background_reasons[0] = '\0';
     sink->reserved_count++;
     ftun_cli_result_count(&sink->accepted);
     *out = ticket;
@@ -390,11 +471,19 @@ ftun_status_t ftun_cli_result_publish(ftun_cli_result_ticket_t *ticket,
                                       ftun_cli_result_kind_t kind,
                                       ftun_status_t status, uint32_t stage)
 {
+  return ftun_cli_result_publish_file(ticket, kind, status, stage, NULL);
+}
+
+ftun_status_t ftun_cli_result_publish_file(ftun_cli_result_ticket_t *ticket,
+  ftun_cli_result_kind_t kind, ftun_status_t status, uint32_t stage, const char *path)
+{
   ftun_cli_result_sink_t *sink;
   size_t slot;
+  size_t path_length = path == NULL ? 0u : strnlen(path, FTUN_APP_CONTROL_PATH_CAPACITY);
+  if (path_length >= FTUN_APP_CONTROL_PATH_CAPACITY) return FTUN_E_LIMIT;
   if (ticket == NULL || ticket->sink == NULL ||
       kind < FTUN_CLI_RESULT_RELOAD_COMMITTED ||
-      kind > FTUN_CLI_RESULT_RUN_FAILED) return FTUN_E_INVALID;
+      kind > FTUN_CLI_RESULT_BACKGROUND_READY) return FTUN_E_INVALID;
   sink = ticket->sink;
   slot = (size_t)(ticket - sink->tickets);
   if (slot >= FTUN_CLI_RESULT_TOTAL) return FTUN_E_INVALID;
@@ -408,6 +497,8 @@ ftun_status_t ftun_cli_result_publish(ftun_cli_result_ticket_t *ticket,
   ticket->kind = (uint8_t)kind;
   ticket->status = status;
   ticket->stage = stage;
+  if (path_length != 0u) memcpy(ticket->file_error, path, path_length);
+  ticket->file_error[path_length] = '\0';
   if (sink->failed) {
     ticket->state = FTUN_CLI_RESULT_FREE;
     ftun_cli_result_count(&sink->undelivered);
@@ -421,6 +512,30 @@ ftun_status_t ftun_cli_result_publish(ftun_cli_result_ticket_t *ticket,
   ftun_condition_signal(&sink->available);
   ftun_mutex_unlock(&sink->mutex);
   return FTUN_OK;
+}
+
+ftun_status_t ftun_cli_result_publish_run_failure(ftun_cli_result_ticket_t *ticket,
+  ftun_status_t status, uint32_t stage, uint32_t module, const char *path)
+{
+  if (ticket == NULL) return FTUN_E_INVALID;
+  ticket->module = module;
+  return ftun_cli_result_publish_file(ticket, FTUN_CLI_RESULT_RUN_FAILED, status, stage, path);
+}
+
+ftun_status_t ftun_cli_result_publish_ready(ftun_cli_result_ticket_t *ticket, const char *reasons)
+{
+  return ftun_cli_result_publish_file(ticket, FTUN_CLI_RESULT_RUN_READY, FTUN_OK, 0u, reasons);
+}
+
+ftun_status_t ftun_cli_result_publish_background_ready(ftun_cli_result_ticket_t *ticket,
+  uint32_t pid, const char *log_file, const char *reasons)
+{
+  size_t length = strnlen(reasons, FTUN_CLI_READY_REASONS_CAPACITY);
+  if (length == FTUN_CLI_READY_REASONS_CAPACITY) return FTUN_E_LIMIT;
+  if (ticket == NULL) return FTUN_E_INVALID;
+  ticket->pid = pid;
+  memcpy(ticket->background_reasons, reasons, length + 1u);
+  return ftun_cli_result_publish_file(ticket, FTUN_CLI_RESULT_BACKGROUND_READY, FTUN_OK, 0u, log_file);
 }
 
 ftun_status_t ftun_cli_result_abandon(ftun_cli_result_ticket_t *ticket)
@@ -490,6 +605,7 @@ ftun_status_t ftun_cli_result_sink_stop_until(ftun_cli_result_sink_t **sink_ptr,
   sink->stopping = 1;
   sink->deadline_ms = deadline_ms;
   for (index = 0u; index < FTUN_CLI_RESULT_TOTAL; index++) {
+    if (!sink->initialized[index]) continue;
     if (sink->tickets[index].state == FTUN_CLI_RESULT_RESERVED) {
       sink->tickets[index].state = FTUN_CLI_RESULT_FREE;
       if (sink->reserved_count != 0u) sink->reserved_count--;

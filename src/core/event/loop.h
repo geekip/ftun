@@ -77,6 +77,19 @@ ftun_status_t ftun_event_loop_create_with_budget(ftun_core_t *core,
  * source 不拥有业务 socket，不重复计 FD；取消失败仍保留额度。
  * 返回创建时绑定的借用预算，寿命至少覆盖 loop；NULL Core 工具用法返回 NULL。 */
 ftun_status_t ftun_event_loop_budget(ftun_event_loop_t *loop, ftun_budget_t **out);
+/* owner在创建source前绑定独立同根控制预算和槽位。普通source不能占用预留槽；
+ * 控制source独占其原生句柄，不与普通source共享FD；其后端watcher同域准入。
+ * 全部控制source撤销后以NULL/0解绑，
+ * 解绑前预算必须存活，避免停机超时后loop仍借用已销毁的控制预算。 */
+ftun_status_t ftun_event_loop_bind_control(ftun_event_loop_t *loop,
+  ftun_budget_t *budget, size_t capacity);
+ftun_status_t ftun_event_control_io_start(ftun_event_loop_t *loop,
+  ftun_native_socket_t socket, uint32_t interests, ftun_event_callback_fn callback,
+  void *user, ftun_event_source_t **out);
+ftun_status_t ftun_event_control_timer_start(ftun_event_loop_t *loop,
+  uint64_t deadline_ms, ftun_event_callback_fn callback, void *user,
+  ftun_event_source_t **out);
+ftun_budget_t *ftun_event_source_budget(ftun_event_source_t *source);
 ftun_status_t ftun_event_loop_set_wakeup(ftun_event_loop_t *loop,
                                          ftun_event_wakeup_fn wakeup, void *user);
 /* backend 必须在创建 source 前附加，ops/context 保持有效至 detach。 */

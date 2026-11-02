@@ -539,10 +539,10 @@ static int generation_case(int variant)
   return 0;
 }
 
-static void unexpected_completion(void *user, ftun_status_t status,
+static void unexpected_completion(void *user, ftun_error_t error,
   ftun_dns_transport_t transport, const ftun_endpoint_t *source, ftun_bytes_t response)
 {
-  (void)user; (void)status; (void)transport; (void)source; (void)response;
+  (void)user; (void)error; (void)transport; (void)source; (void)response;
   abort();
 }
 

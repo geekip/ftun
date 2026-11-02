@@ -13,45 +13,43 @@ ftun_status_t ftun_config_parse_tun_device(const cJSON *item,
   static const char *const ipv4_fields[] = {"address"};
   const cJSON *ipv4;
   ftun_status_t status;
-  if (item == NULL || config == NULL || !cJSON_IsObject(item)) {
-    return FTUN_E_INVALID;
-  }
-  status = ftun_config_check_fields(item, fields, 8u);
+  status = ftun_config_check_fields(config, item, fields, 8u);
   if (status == FTUN_OK) {
     status = ftun_config_replace_string(config, &tun->interface_name,
-      cJSON_GetObjectItemCaseSensitive(item, "interface"), 1);
+      item, "interface", 1);
   }
   if (status == FTUN_OK) {
-    status = ftun_config_optional_uint(item, "mtu", 1u, UINT32_MAX,
+    status = ftun_config_optional_uint(config, item, "mtu", 1u, UINT32_MAX,
                                 &tun->mtu);
   }
   ipv4 = cJSON_GetObjectItemCaseSensitive(item, "ipv4");
-  if (status == FTUN_OK && ipv4 == NULL) status = FTUN_E_INVALID;
-  if (status == FTUN_OK) status = ftun_config_check_fields(ipv4, ipv4_fields, 1u);
+  if (status == FTUN_OK && ipv4 == NULL) status = ftun_config_parse_failure(
+    config, item, "ipv4", FTUN_E_INVALID, "required IPv4 object is missing");
+  if (status == FTUN_OK) status = ftun_config_check_fields(config, ipv4, ipv4_fields, 1u);
   if (status == FTUN_OK) {
     status = ftun_config_replace_string(config, &tun->ipv4_address,
-      cJSON_GetObjectItemCaseSensitive(ipv4, "address"), 1);
+      ipv4, "address", 1);
   }
   const cJSON *ipv6 = cJSON_GetObjectItemCaseSensitive(item, "ipv6");
   if (status == FTUN_OK && ipv6 != NULL) {
-    status = ftun_config_check_fields(ipv6, ipv4_fields, 1u);
+    status = ftun_config_check_fields(config, ipv6, ipv4_fields, 1u);
     if (status == FTUN_OK) status = ftun_config_replace_string(config, &tun->ipv6_address,
-      cJSON_GetObjectItemCaseSensitive(ipv6, "address"), 1);
+      ipv6, "address", 1);
   }
   if (status == FTUN_OK) {
-    status = ftun_config_optional_bool(item, "auto-route",
+    status = ftun_config_optional_bool(config, item, "auto-route",
                                 &tun->auto_route);
   }
   if (status == FTUN_OK) {
-    status = ftun_config_optional_bool(item, "strict-route",
+    status = ftun_config_optional_bool(config, item, "strict-route",
                                 &tun->strict_route);
   }
   if (status == FTUN_OK) {
-    status = ftun_config_optional_uint(item, "route-table", 1u, UINT32_MAX,
+    status = ftun_config_optional_uint(config, item, "route-table", 1u, UINT32_MAX,
                                 &tun->route_table);
   }
   if (status == FTUN_OK) {
-    status = ftun_config_optional_uint(item, "rule-priority", 1u, UINT32_MAX,
+    status = ftun_config_optional_uint(config, item, "rule-priority", 1u, UINT32_MAX,
                                 &tun->rule_priority);
   }
   if (status == FTUN_OK) tun->present = true;

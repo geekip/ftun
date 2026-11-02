@@ -1,4 +1,5 @@
 #include "proxy/snapshot.h"
+#include "platform/clock.h"
 #include "proxy/config/plan.h"
 #include "proxy/config/transport.h"
 #include "proxy/config/plan.h"
@@ -196,6 +197,19 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
   if (status != FTUN_OK) return status;
   free(runtime->snapshot.prepared_items);
   runtime->snapshot.prepared_items = NULL;
+  if (runtime->owner != NULL) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK) {
+      for (size_t index = 0u; index < 2u; index++) {
+        if (runtime->builtin_logs[index].failed)
+          (void)ftun_log_retire(runtime->owner, FTUN_LOG_PROXY, runtime->builtin_logs[index].entity, now);
+      }
+      for (size_t index = 0u; index < runtime->owner_state.group_choice_count; index++) {
+        ftun_runtime_log_state_t *log = &runtime->owner_state.group_choices[index].log;
+        if (log->failed) (void)ftun_log_retire(runtime->owner, FTUN_LOG_PROXY, log->entity, now);
+      }
+    }
+  }
   free(runtime->owner_state.group_choices);
   runtime->owner_state.group_choices = NULL;
   ftun_reservation_release(&runtime->reservation);
@@ -210,7 +224,10 @@ static ftun_status_t ftun_runtime_finalize(ftun_runtime_t *runtime)
 static ftun_status_t ftun_runtime_retire(ftun_core_t *core,
   ftun_runtime_t *runtime)
 {
-  ftun_status_t status = ftun_runtime_finalize(runtime);
+  ftun_status_t status;
+  if (FTUN_MANAGER(core)->active != NULL && FTUN_MANAGER(core)->active != runtime)
+    ftun_runtime_outbound_archive(runtime, FTUN_MANAGER(core)->active);
+  status = ftun_runtime_finalize(runtime);
   if (status != FTUN_OK) {
     runtime->next_retained = FTUN_MANAGER(core)->cleanup;
     FTUN_MANAGER(core)->cleanup = runtime;
@@ -430,7 +447,7 @@ static ftun_status_t ftun_runtime_frs_bind(uint16_t kind, ftun_string_t label,
 
 static ftun_status_t ftun_runtime_prepare_internal(
   ftun_core_t *core, const ftun_config_t *config, ftun_frs_view_t *provided_frs,
-  bool frs_pending, ftun_runtime_t **out)
+  bool frs_pending, ftun_runtime_t **out, ftun_config_error_t *error, size_t *frs_sets)
 {
   ftun_runtime_t *runtime;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
@@ -438,6 +455,7 @@ static ftun_status_t ftun_runtime_prepare_internal(
   size_t accounted_bytes;
   ftun_status_t status;
   if (out != NULL) *out = NULL;
+  if (frs_sets != NULL) *frs_sets = 0u;
   if (!ftun_runtime_core_valid(core) || config == NULL || out == NULL ||
       !ftun_proxy_config_plan(config).present) return FTUN_E_INVALID;
   status = ftun_runtime_config_budget(core, config);
@@ -492,7 +510,15 @@ static ftun_status_t ftun_runtime_prepare_internal(
     } else {
       status = ftun_frs_open(core, ftun_config_frs(config)->path, &runtime->snapshot.frs_view);
     }
-    if (status != FTUN_OK) goto fail;
+    if (status == FTUN_OK && frs_sets != NULL) {
+      ftun_frs_view_info_t info;
+      status = ftun_frs_view_get_info(runtime->snapshot.frs_view, &info);
+      if (status == FTUN_OK) *frs_sets = info.set_count;
+    }
+    if (status != FTUN_OK) {
+      (void)ftun_config_error_set(error, status, "/frs/path", "cannot read or validate FRS file");
+      goto fail;
+    }
   } else if (provided_frs != NULL) {
     status = FTUN_E_INVALID;
     goto fail;
@@ -503,11 +529,11 @@ static ftun_status_t ftun_runtime_prepare_internal(
     goto fail;
   }
 #endif
-  status = ftun_route_table_create_with_frs(
+  status = ftun_route_table_create_with_frs_error(
     0u, (const char *const *)ftun_config_rules(config)->items, ftun_config_rules(config)->count,
     ftun_runtime_resolve_outbound, (void *)config,
     (ftun_proxy_config_plan(config).prepare & FTUN_PROXY_PLAN_FRS) != 0u ? ftun_runtime_frs_bind : NULL,
-    runtime->snapshot.frs_view, &runtime->snapshot.routes);
+    runtime->snapshot.frs_view, &runtime->snapshot.routes, error);
   if (status != FTUN_OK) goto fail;
   runtime->snapshot.prepared_item_count = item_count;
   runtime->snapshot.accounted_bytes = accounted_bytes;
@@ -530,7 +556,13 @@ ftun_status_t ftun_runtime_prepare(ftun_core_t *core,
                                    const ftun_config_t *config,
                                    ftun_runtime_t **out)
 {
-  return ftun_runtime_prepare_internal(core, config, NULL, false, out);
+  return ftun_runtime_prepare_internal(core, config, NULL, false, out, NULL, NULL);
+}
+
+ftun_status_t ftun_runtime_prepare_error(ftun_core_t *core, const ftun_config_t *config,
+  ftun_runtime_t **out, ftun_config_error_t *error, size_t *frs_sets)
+{
+  return ftun_runtime_prepare_internal(core, config, NULL, false, out, error, frs_sets);
 }
 
 ftun_status_t ftun_runtime_prepare_frs_pending(ftun_core_t *core,
@@ -542,7 +574,7 @@ ftun_status_t ftun_runtime_prepare_frs_pending(ftun_core_t *core,
     if (out != NULL) *out = NULL;
     return FTUN_E_INVALID;
   }
-  return ftun_runtime_prepare_internal(core, config, NULL, true, out);
+  return ftun_runtime_prepare_internal(core, config, NULL, true, out, NULL, NULL);
 }
 
 ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
@@ -554,12 +586,13 @@ ftun_status_t ftun_runtime_prepare_with_frs(ftun_core_t *core,
     if (out != NULL) *out = NULL;
     return FTUN_E_INVALID;
   }
-  return ftun_runtime_prepare_internal(core, config, view, false, out);
+  return ftun_runtime_prepare_internal(core, config, view, false, out, NULL, NULL);
 }
 
 #if defined(FTUN_HAVE_MODULE_FRS)
-ftun_status_t ftun_runtime_prepare_detached(
-  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out)
+ftun_status_t ftun_runtime_prepare_detached_error(
+  const ftun_config_t *config, ftun_frs_view_t *view, ftun_runtime_t **out,
+  ftun_config_error_t *error)
 {
   ftun_runtime_t *runtime;
   ftun_reservation_t reservation = (ftun_reservation_t){0};
@@ -594,10 +627,10 @@ ftun_status_t ftun_runtime_prepare_detached(
       ftun_config_outbound_count(config), sizeof(*runtime->owner_state.group_choices));
     if (runtime->owner_state.group_choices == NULL) goto allocation_error;
   }
-  status = ftun_route_table_create_with_frs(
+  status = ftun_route_table_create_with_frs_error(
     0u, (const char *const *)ftun_config_rules(config)->items, ftun_config_rules(config)->count,
     ftun_runtime_resolve_outbound, (void *)config,
-    view == NULL ? NULL : ftun_runtime_frs_bind, view, &runtime->snapshot.routes);
+    view == NULL ? NULL : ftun_runtime_frs_bind, view, &runtime->snapshot.routes, error);
   if (status != FTUN_OK) goto status_error;
   runtime->snapshot.config = config;
   runtime->reservation = reservation;
@@ -628,6 +661,12 @@ allocation_error:
   free(runtime);
   ftun_reservation_release(&reservation);
   return FTUN_E_LIMIT;
+}
+
+ftun_status_t ftun_runtime_prepare_detached(const ftun_config_t *config,
+  ftun_frs_view_t *view, ftun_runtime_t **out)
+{
+  return ftun_runtime_prepare_detached_error(config, view, out, NULL);
 }
 
 ftun_status_t ftun_runtime_prepare_detached_frs(

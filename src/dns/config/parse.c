@@ -6,12 +6,12 @@
 static ftun_status_t ftun_parse_fake_ip(const cJSON *item, ftun_config_t *config, ftun_config_dns_t *dns)
 {
   static const char *const fields[] = {"enable", "range", "persist"};
-  ftun_status_t status = ftun_config_check_fields(item, fields, 3u);
+  ftun_status_t status = ftun_config_check_fields(config, item, fields, 3u);
   if (status != FTUN_OK) return status;
-  status = ftun_config_optional_bool(item, "enable", &dns->fake_ip.enable);
+  status = ftun_config_optional_bool(config, item, "enable", &dns->fake_ip.enable);
   if (status == FTUN_OK) status = ftun_config_replace_string(config, &dns->fake_ip.range,
-    cJSON_GetObjectItemCaseSensitive(item, "range"), 0);
-  if (status == FTUN_OK) status = ftun_config_optional_bool(item, "persist",
+    item, "range", 0);
+  if (status == FTUN_OK) status = ftun_config_optional_bool(config, item, "persist",
     &dns->fake_ip.persist);
   return status;
 }
@@ -24,7 +24,8 @@ static ftun_status_t ftun_parse_dns_listeners(const cJSON *array,
   const cJSON *item;
   size_t count = 0u;
   size_t index = 0u;
-  if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
+  if (!cJSON_IsArray(array)) return ftun_config_parse_failure(config, array, NULL,
+    FTUN_E_INVALID, "expected an array");
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
   dns->listeners = (ftun_config_dns_listener_t *)ftun_config_allocate(config,
@@ -32,15 +33,15 @@ static ftun_status_t ftun_parse_dns_listeners(const cJSON *array,
   if (dns->listeners == NULL) return FTUN_E_LIMIT;
   dns->listener_count = count;
   for (item = array->child; item != NULL; item = item->next, index++) {
-    ftun_status_t status = ftun_config_check_fields(item, fields, 2u);
+    ftun_status_t status = ftun_config_check_fields(config, item, fields, 2u);
     if (status != FTUN_OK) return status;
     status = ftun_config_replace_string(config, &dns->listeners[index].listen,
-      cJSON_GetObjectItemCaseSensitive(item, "listen"), 1);
+      item, "listen", 1);
     if (status != FTUN_OK) return status;
     dns->listeners[index].server = ftun_config_string_copy(config, "");
     if (dns->listeners[index].server == NULL) return FTUN_E_LIMIT;
     status = ftun_config_replace_string(config, &dns->listeners[index].server,
-      cJSON_GetObjectItemCaseSensitive(item, "server"), 0);
+      item, "server", 0);
     if (status != FTUN_OK) return status;
   }
   return FTUN_OK;
@@ -56,7 +57,8 @@ static ftun_status_t ftun_parse_dns_servers(const cJSON *array,
   const cJSON *item;
   size_t count = 0u;
   size_t index = 0u;
-  if (!cJSON_IsArray(array)) return FTUN_E_INVALID;
+  if (!cJSON_IsArray(array)) return ftun_config_parse_failure(config, array, NULL,
+    FTUN_E_INVALID, "expected an array");
   for (item = array->child; item != NULL; item = item->next) count++;
   if (count == 0u) return FTUN_OK;
   dns->servers = (ftun_config_dns_server_t *)ftun_config_allocate(config,
@@ -65,26 +67,24 @@ static ftun_status_t ftun_parse_dns_servers(const cJSON *array,
   dns->server_count = count;
   for (item = array->child; item != NULL; item = item->next, index++) {
     ftun_config_dns_server_t *server = &dns->servers[index];
-    const cJSON *addresses;
-    ftun_status_t status = ftun_config_check_fields(item, fields, 5u);
+      ftun_status_t status = ftun_config_check_fields(config, item, fields, 5u);
     if (status != FTUN_OK) return status;
     status = ftun_config_replace_string(config, &server->name,
-      cJSON_GetObjectItemCaseSensitive(item, "name"), 1);
+      item, "name", 1);
     if (status == FTUN_OK) status = ftun_config_replace_string(config, &server->type,
-      cJSON_GetObjectItemCaseSensitive(item, "type"), 1);
+      item, "type", 1);
     if (status != FTUN_OK) return status;
     if (strcmp(server->type, "udp") != 0 && strcmp(server->type, "tcp") != 0) {
-      return FTUN_E_UNSUPPORTED;
+      return ftun_config_parse_failure(config, item, "type", FTUN_E_UNSUPPORTED,
+        "DNS server type is unsupported");
     }
-    addresses = cJSON_GetObjectItemCaseSensitive(item, "address");
-    if (addresses == NULL) return FTUN_E_INVALID;
-    status = ftun_config_parse_string_list(config, addresses, &server->addresses, 1);
+    status = ftun_config_parse_string_list(config, item, "address", &server->addresses, 1);
     if (status != FTUN_OK) return status;
     server->outbound = ftun_config_string_copy(config, "DIRECT");
     if (server->outbound == NULL) return FTUN_E_LIMIT;
     status = ftun_config_replace_string(config, &server->outbound,
-      cJSON_GetObjectItemCaseSensitive(item, "outbound"), 0);
-    if (status == FTUN_OK) status = ftun_config_optional_bool(item, "fake-ip", &server->fake_ip);
+      item, "outbound", 0);
+    if (status == FTUN_OK) status = ftun_config_optional_bool(config, item, "fake-ip", &server->fake_ip);
     if (status != FTUN_OK) return status;
   }
   return FTUN_OK;
@@ -98,16 +98,16 @@ ftun_status_t ftun_config_parse_dns(const cJSON *item, ftun_config_t *config, ft
     "listeners", "servers"
   };
   const cJSON *child;
-  ftun_status_t status = ftun_config_check_fields(item, fields, 7u);
+  ftun_status_t status = ftun_config_check_fields(config, item, fields, 7u);
   if (status != FTUN_OK) return status;
-  status = ftun_config_optional_bool(item, "enable", &dns->enable);
-  if (status == FTUN_OK) status = ftun_config_optional_bool(item, "cache", &dns->cache);
+  status = ftun_config_optional_bool(config, item, "enable", &dns->enable);
+  if (status == FTUN_OK) status = ftun_config_optional_bool(config, item, "cache", &dns->cache);
   child = cJSON_GetObjectItemCaseSensitive(item, "bootstrap");
   if (status == FTUN_OK && child != NULL) {
-    status = ftun_config_parse_string_list(config, child, &dns->bootstrap, 0);
+    status = ftun_config_parse_string_list(config, item, "bootstrap", &dns->bootstrap, 0);
   }
   if (status == FTUN_OK) status = ftun_config_replace_string(config, &dns->default_server,
-    cJSON_GetObjectItemCaseSensitive(item, "default-server"), 0);
+    item, "default-server", 0);
   child = cJSON_GetObjectItemCaseSensitive(item, "fake-ip");
   if (status == FTUN_OK && child != NULL) status = ftun_parse_fake_ip(child, config, dns);
   child = cJSON_GetObjectItemCaseSensitive(item, "listeners");

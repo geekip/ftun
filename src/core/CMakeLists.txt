@@ -1,5 +1,6 @@
 set(ftun_sources_core
   config/document.c
+  config/error.c
   config/fields.c
   config/syntax.c
   context.c
@@ -11,6 +12,7 @@ set(ftun_sources_core
   io/file.c
   lifecycle.c
   limits.c
+  log/aggregate.c
   log/event_log.c
   log/log.c
   operation.c

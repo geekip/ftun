@@ -66,7 +66,7 @@ def run(binary, ipv6):
         second = stack.enter_context(proxy_server(SOCKS, host='127.0.0.2', port=first.server_address[1]))
         _, _, listener = free_ports()
         config = {'base': {'ipv6': ipv6, 'state-cache': False},
-                  'log': {'level': 'debug', 'file': str(root / 'run.log')},
+                  'log': {'output': 'file', 'level': 'debug', 'file': str(root / 'run.log')},
                   'outbounds': [{'name': 'proxy', 'type': 'socks5', 'udp': True,
                                  'server': f'proxy.test:{first.server_address[1]}'}],
                   'dns': {'enable': True, 'cache': False, 'fake-ip': {'enable': False},
@@ -79,9 +79,9 @@ def run(binary, ipv6):
         path.write_text(json.dumps(config))
         log = root / 'run.log'
         with (root / 'stderr').open('w') as output:
-            process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=output, stderr=output)
+            process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=output, stderr=output)
             try:
-                wait(process, lambda: log.exists() and 'event=running ' in log.read_text(), log)
+                wait(process, lambda: log.exists() and ' ready: ' in log.read_text(), log)
                 assert not bootstrap.queries
                 families = 2 if ipv6 else 1
                 def burst(start, expected, block=False):

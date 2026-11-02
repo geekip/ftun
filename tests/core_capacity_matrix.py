@@ -160,7 +160,7 @@ def write_tun_config(path, interface_name, use_proxy):
 
 
 def start_ftun(binary, config, log_path, namespace=None):
-  command = [str(binary), "run", "-c", str(config)]
+  command = [str(binary), "run", "-c", str(config), "-p", str(config) + ".pid"]
   if namespace is not None:
     command = ["ip", "netns", "exec", namespace] + command
   log = log_path.open("w+")

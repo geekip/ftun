@@ -8,6 +8,7 @@
 #include "app/control.h"
 #include "app/runtime_support.h"
 #include "app/control/watchdog.h"
+#include "app/control/server.h"
 
 #include "app/config/config.h"
 #include "app/config/compile.h"
@@ -18,6 +19,7 @@
 #include "core/worker.h"
 #include "core/recovery.h"
 #include "core/log/log.h"
+#include "core/io/file.h"
 #include "core/log/event_log.h"
 #include "core/context.h"
 #include "platform/clock.h"
@@ -69,6 +71,7 @@ typedef struct ftun_control_task {
   ftun_app_command_completion_fn command_completion;
   ftun_app_generation_guard_t expected;
   uint64_t result_generation;
+  uint32_t source_signal;
   void *completion_user;
   char *first;
   char *second;
@@ -84,18 +87,25 @@ typedef struct ftun_control_task {
   int control_priority;
   bool reload_event_recorded; /* 只由 owner 的完成/取消派发使用。 */
   void *reload_transaction;
+  ftun_config_error_t config_error;
+  /* 仅 RELOAD 在分配时追加此缓冲，其他控制命令不支付文件诊断成本。 */
+  char file_error[];
 } ftun_control_task_t;
 
 typedef struct {
   uint32_t magic;
   uint32_t socket_mark;
   bool allow_system_resolver;
+  bool log_file_only;
+  bool log_no_color;
+  ftun_log_level_t log_level_override;
   uint64_t base_generation;
   uint64_t maximum_bytes;
   uintptr_t service_descriptor;
   uintptr_t owner;
   uintptr_t log_ledger;
   uintptr_t plan_budget;
+  uintptr_t state_locks;
   uint32_t path_length;
 } ftun_core_reload_work_t;
 
@@ -103,6 +113,7 @@ typedef struct {
   uint64_t base_generation;
   uintptr_t owner;
   ftun_status_t status;
+  uint32_t stage;
   uintptr_t config;
   uintptr_t attachment;
   ftun_core_service_plan_t service_plan;
@@ -110,6 +121,8 @@ typedef struct {
   ftun_core_owned_path_t source_path;
   bool publish_required;
   ftun_config_trace_t config_trace;
+  uintptr_t state_lock;
+  char file_error[FTUN_APP_CONTROL_PATH_CAPACITY];
 } ftun_core_reload_result_t;
 
 typedef struct {
@@ -117,6 +130,7 @@ typedef struct {
   ftun_app_runtime_candidate_t *candidate;
   ftun_core_service_plan_t service_plan;
   ftun_logger_t *next_logger;
+  ftun_file_lock_t *next_state_lock;
   ftun_core_owned_path_t next_path;
   ftun_reservation_t reservation;
   uint64_t next_generation;
@@ -138,9 +152,14 @@ typedef struct {
   ftun_logger_t *retired_logger;
   const ftun_core_service_descriptor_t *service_descriptor;
   ftun_core_service_t service;
+  ftun_ctl_server_t *ctl_server; /* CLI拥有，默认组合只借用至detach。 */
   ftun_core_t *core;
   ftun_worker_t *reload_worker;
   ftun_worker_t *state_worker;
+  ftun_file_lock_pool_t *state_locks;
+  ftun_file_lock_t *state_lock;
+  ftun_file_lock_t *startup_state_lock;
+  char file_error[FTUN_APP_CONTROL_PATH_CAPACITY];
   ftun_core_reload_result_t retired_result;
   ftun_core_reload_transaction_t *retired_transaction;
   const ftun_app_runtime_support_t *support;
@@ -149,11 +168,22 @@ typedef struct {
   ftun_app_runtime_candidate_t *startup_candidate;
   ftun_logger_t *startup_logger;
   ftun_event_log_t *events;
+  ftun_log_aggregate_t *aggregate;
   ftun_log_ledger_t *log_ledger;
+  bool log_file_only;
+  bool log_no_color; /* 仅CREATED阶段设置，随后跨reload保持。 */
+  ftun_log_level_t log_level_override; /* SILENT表示使用配置级别。 */
+  ftun_app_ready_fn ready;
+  void *ready_user;
   bool lifecycle_started;
   bool runtime_stopped;
   bool run_returned;
   ftun_status_t run_result;
+  ftun_error_t startup_error;
+  uint64_t run_started_ms, reload_sequence, last_reload_generation;
+  ftun_status_t last_reload_result;
+  ftun_calendar_time_t last_reload_time;
+  bool last_reload_time_valid;
   ftun_config_trace_t config_trace;
   uint64_t config_trace_generation;
   ftun_control_task_t **tasks;
@@ -210,7 +240,8 @@ ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
 ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path);
 ftun_status_t ftun_core_prepare_parent(const char *path);
 ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
-  ftun_log_ledger_t *ledger, ftun_logger_t **out);
+  ftun_log_ledger_t *ledger, bool no_color, bool file_only, ftun_log_level_t level_override,
+  ftun_logger_t **out, char *file_error);
 ftun_status_t ftun_core_logger_reap(ftun_core_control_t *control,
   uint64_t deadline_ms);
 ftun_status_t ftun_core_logger_retire(ftun_core_control_t *control,
@@ -222,8 +253,12 @@ void ftun_core_log_status(ftun_core_t *core, ftun_status_t status,
   uint32_t stage, ftun_diagnostic_kind_t kind, const char *message);
 ftun_status_t ftun_core_transaction(ftun_core_t *core,
   ftun_core_control_t *control, const char *path, uint32_t *out_stage);
+/* 调用方持有control互斥量；接纳拒绝与owner终态共用观察记录。 */
+void ftun_core_reload_observe_locked(ftun_core_control_t *control, ftun_status_t status);
 void ftun_core_reload_event(ftun_control_task_t *task,
   ftun_core_control_t *control, ftun_status_t status);
+void ftun_core_signal_reload_log(ftun_control_task_t *task,
+  ftun_core_control_t *control, bool requested, ftun_status_t status);
 ftun_status_t ftun_core_reload_result_release(
   ftun_core_reload_result_t *result, uint64_t deadline);
 ftun_status_t ftun_core_reload_transaction_cleanup(ftun_core_t *core,

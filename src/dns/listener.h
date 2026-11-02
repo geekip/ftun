@@ -2,6 +2,7 @@
 #define FTUN_DNS_LISTENER_H
 
 #include "dns/dispatcher.h"
+#include "dns/stats.h"
 
 typedef void (*ftun_dns_listener_reply_fn)(
   ftun_dns_transport_t transport, uint64_t peer_id, ftun_error_t error,
@@ -29,6 +30,7 @@ typedef struct {
   size_t tcp_connections;
   size_t inflight;
   bool accepting;
+  ftun_dns_query_stats_t queries;
 } ftun_dns_listener_info_t;
 
 /* UDP 和 TCP DNS 接入。

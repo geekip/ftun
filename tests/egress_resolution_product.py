@@ -75,7 +75,7 @@ def run(binary, ipv6, transport, ipv6_proxy=False):
         nodes = [{'name': f'proxy{i}', 'type': 'socks5', 'udp': True,
                   'server': f'proxy{i}.test:{proxy.server_address[1]}'} for i in range(8)]
         config = {'base': {'ipv6': ipv6, 'state-cache': False},
-                  'log': {'level': 'debug', 'file': str(root / 'run.log')},
+                  'log': {'output': 'file', 'level': 'debug', 'file': str(root / 'run.log')},
                   'inbounds': [{'name': 'in', 'type': 'socks5', 'udp': False, 'listen': f'127.0.0.1:{inbound}'}],
                   'outbounds': nodes, 'rules': ['MATCH,DIRECT'],
                   'dns': {'enable': True, 'cache': False, 'fake-ip': {'enable': False},
@@ -91,7 +91,7 @@ def run(binary, ipv6, transport, ipv6_proxy=False):
         log = root / 'run.log'
         with (root / 'stderr').open('w') as output:
             started = time.monotonic()
-            process = subprocess.Popen([binary, 'run', '-c', str(path)], stdout=output, stderr=output)
+            process = subprocess.Popen([binary, 'run', '-c', str(path), '-p', str(path) + '.pid'], stdout=output, stderr=output)
             try:
                 def listening():
                     try:
@@ -125,7 +125,7 @@ def run(binary, ipv6, transport, ipv6_proxy=False):
                 config['log']['level'] = 'info'
                 path.write_text(json.dumps(config))
                 process.send_signal(signal.SIGHUP)
-                wait(process, lambda: 'event=reload.committed ' in log.read_text(), log, seconds=3)
+                wait(process, lambda: ' configuration committed: ' in log.read_text(), log, seconds=3)
                 assert len(bootstrap.queries) == before
                 # 留一个真实在途解析，SIGTERM必须取消并排空，不能等五秒超时。
                 with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:

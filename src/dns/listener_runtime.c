@@ -1,8 +1,24 @@
 #define _GNU_SOURCE 1
 
 #include "dns/service_internal.h"
+#include "core/log/log.h"
 
 #if defined(FTUN_HAVE_MODULE_DNS)
+
+static const ftun_log_event_t listener_started = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.listener-started", "listener started"};
+static const ftun_log_event_t listener_stopped = {FTUN_LOG_DNS, FTUN_LOG_INFO, "dns.listener-stopped", "listener stopped"};
+static const ftun_log_event_t listener_waiting = {FTUN_LOG_DNS, FTUN_LOG_WARN, "dns.listener-waiting", "listener waiting"};
+
+static void listener_log(ftun_dns_runtime_t *dns, size_t index, const ftun_log_event_t *event, const char *reason)
+{
+  if (!ftun_log_enabled(dns->core, event->level)) return;
+  const char *listen = ftun_config_dns(dns->config)->listeners[index].listen;
+  ftun_log_field_t fields[] = {
+    {.key = "listen", .kind = FTUN_LOG_TEXT, .value.text = {listen, strlen(listen)}},
+    {.key = "reason", .kind = FTUN_LOG_TEXT, .value.text = {reason, strlen(reason)}}
+  };
+  FTUN_CORE_LOG(dns->core, event, .generation = dns->generation, .fields = fields, .field_count = 2u);
+}
 
 ftun_status_t ftun_dns_runtime_outbound_id(
   ftun_dns_runtime_t *dns, const char *name, uint32_t required, uint32_t *out)
@@ -445,6 +461,7 @@ ftun_status_t ftun_dns_runtime_prepare_internal(
       &outbound_id);
     if (status != FTUN_OK) break;
     server.outbound_id = outbound_id;
+    server.name = item->name;
     server.fingerprint = (uint64_t)index + 1u;
     server.transport = strcmp(item->type, "tcp") == 0
       ? FTUN_DNS_TRANSPORT_TCP : FTUN_DNS_TRANSPORT_UDP;
@@ -708,6 +725,9 @@ ftun_status_t ftun_dns_runtime_quiesce(ftun_dns_runtime_t *dns)
   size_t index;
   ftun_status_t result = FTUN_OK;
   if (dns == NULL) return FTUN_OK;
+  if (dns->active) {
+    for (index = 0u; index < dns->listener_count; index++) listener_log(dns, index, &listener_stopped, "quiesced");
+  }
   dns->accepting = false;
   dns->active = false;
   for (index = 0u; index < dns->listener_count; index++) {
@@ -821,6 +841,11 @@ ftun_status_t ftun_dns_runtime_activate(ftun_dns_runtime_t *dns)
   status = dns->sources_prepared
     ? FTUN_OK : ftun_dns_runtime_listener_sources_start(dns);
   if (status == FTUN_OK) {
+    if (!dns->active) {
+      for (size_t index = 0u; index < dns->listener_count; index++)
+        listener_log(dns, index, dns->listeners[index].waiting ? &listener_waiting : &listener_started,
+          dns->listeners[index].waiting ? "address-not-available" : "ok");
+    }
     dns->accepting = true;
     dns->active = true;
     dns->sources_prepared = true;
@@ -1215,6 +1240,7 @@ ftun_status_t ftun_dns_runtime_slot_fail(
   ftun_status_t status = ftun_dns_runtime_now(NULL, &now);
   if (status == FTUN_OK) status = ftun_dns_runtime_slot_close(slot);
   if (status != FTUN_OK) return status;
+  if (!slot->waiting) listener_log(dns, (size_t)(slot - dns->listeners), &listener_waiting, "network-failure");
   slot->waiting = true;
   dns->object_faults++;
   return ftun_recovery_report_failure(dns->recovery, slot->recovery,
@@ -1246,6 +1272,7 @@ ftun_status_t ftun_dns_runtime_slot_recover(void *user,
     if (slot->descriptor >= 0) { (void)ftun_socket_close((ftun_native_socket_t)slot->descriptor); slot->descriptor = -1; }
   } else {
     slot->waiting = false;
+    listener_log(dns, index, &listener_started, "recovered");
   }
   (void)ftun_recovery_attempt_finish(dns->recovery, id,
     now, status,

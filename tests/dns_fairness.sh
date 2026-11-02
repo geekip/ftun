@@ -89,7 +89,7 @@ while [ ! -f "$temporary/hot.ready" ] ||
   sleep 0.01
 done
 
-"$ftun_binary" run -c "$temporary/config.json" >"$temporary/ftun.log" 2>&1 &
+"$ftun_binary" run -c "$temporary/config.json" -p "$temporary/config.json.pid" >"$temporary/ftun.log" 2>&1 &
 ftun_pid=$!
 sleep 0.1
 kill -0 "$ftun_pid"

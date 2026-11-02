@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(FTUN VERSION 1.0.5 LANGUAGES C)
+project(FTUN VERSION 1.1.0 LANGUAGES C)
 include(cmake/FtunOptions.cmake)
 # 单独编译公共层，供嵌入式集成检查使用。
 option(FTUN_PLATFORM_COMPILE_CHECK "Compile util, platform, core and libs without a native application" OFF)

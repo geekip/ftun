@@ -82,7 +82,7 @@ def main(binary):
         root = Path(directory)
         config = {
             'base': {'state-cache': False, 'cache-file': str(root / 'ftun.cache')},
-            'log': {'level': 'error', 'file': str(root / 'ftun.log')},
+            'log': {'output': 'file', 'level': 'error', 'file': str(root / 'ftun.log')},
             'dns': {'enable': True, 'cache': False, 'fake-ip': {'enable': False},
                     'default-server': 'multi',
                     'listeners': [{'listen': f'127.0.0.1:{listener_port}', 'server': 'multi'}],
@@ -91,7 +91,7 @@ def main(binary):
         }
         config_path = root / 'config.json'
         config_path.write_text(json.dumps(config))
-        process = subprocess.Popen([binary, 'run', '-c', str(config_path)],
+        process = subprocess.Popen([binary, 'run', '-c', str(config_path), '-p', str(config_path) + '.pid'],
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             time.sleep(0.5)

@@ -64,7 +64,7 @@ static void ftun_watchdog_diagnose(ftun_watchdog_t *watchdog, uint64_t silent_ms
   int length;
   if (watchdog->spec.diagnostic_fd < 0) return;
   length = snprintf(watchdog->diagnostic, sizeof(watchdog->diagnostic),
-    "ftun: watchdog: owner unresponsive for %llu ms; requesting stop\n",
+    "[app   ][ERROR] watchdog fired: owner unresponsive for %llu ms; requesting stop\n",
     (unsigned long long)silent_ms);
   if (length <= 0) return;
   (void)ftun_platform_file_write_ready(watchdog->spec.diagnostic_fd,

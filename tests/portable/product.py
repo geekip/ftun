@@ -14,6 +14,7 @@ import tempfile
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from fakeip_cidr import configuration as fakeip_configuration, query as fakeip_query
 from ipv6_product import (TCP, TCP6, UDP, UDP6, DNS, EchoTCP, EchoUDP,
                           serving, socks, datagram, connect_http, exact)
 
@@ -57,6 +58,53 @@ def query(address, tcp, kind):
     assert answer[:2] == b'\x12\x34' and answer[3] & 15 == 0 and answer.endswith(expected), answer.hex()
 
 
+def persistent_fakeip(runner, binary, host_binary):
+    with tempfile.TemporaryDirectory(prefix='ftun-portable-fakeip-') as directory:
+        root = Path(directory)
+        listener = free_port('127.0.0.1')
+        config = fakeip_configuration('198.18.11.97/24', Path('state.cache'), listener, persist=True)
+        config['log']['level'] = 'warn'
+        config['inbounds'] = [{'type': 'socks5', 'name': 'local', 'listen': f'127.0.0.1:{free_port("127.0.0.1")}'}]
+        config['rules'] = ['MATCH,DIRECT']
+        (root / 'config.json').write_text(json.dumps(config))
+        state = root / 'state.cache.fakeip'
+        original = None
+        for index in range(2):
+            log = root / f'run-{index}.log'
+            with log.open('wb') as output:
+                process = subprocess.Popen(runner + [host_binary, 'run', '-c', 'config.json', '-p', 'instance.pid'],
+                    cwd=root, stdout=output, stderr=output)
+                try:
+                    wait_for(lambda: 'ftun: ready' in log.read_text(errors='replace'), process, log)
+                    text = log.read_text(errors='replace')
+                    identity = (state / 'identity').read_bytes()
+                    if original is None:
+                        original = identity
+                        assert text.count('identity created:') == 1, text
+                    else:
+                        assert identity == original and 'identity created:' not in text, text
+                    assert fakeip_query(listener, 'persistent') == '198.18.11.1'
+                    pid = re.search(r'process-id: (\d+)', text).group(1)
+                    subprocess.run(runner + [binary, 'stop', pid], cwd=root, check=True, timeout=30)
+                    assert process.wait(timeout=20) == 0, log.read_text(errors='replace')
+                    assert not (root / 'instance.pid').exists()
+                except BaseException:
+                    print(log.read_text(errors='replace'), file=sys.stderr)
+                    raise
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+        (state / 'identity').write_bytes(b'broken')
+        with (root / 'rejected.log').open('wb') as output:
+            result = subprocess.run(runner + [binary, 'run', '-c', 'config.json', '-p', 'instance.pid'],
+                cwd=root, stdout=output, stderr=output, timeout=30)
+        assert result.returncode == 3 and 'fakeip commit failed: state-corrupt' in (root / 'rejected.log').read_text()
+        assert (state / 'identity').read_bytes() == b'broken' and not (root / 'instance.pid').exists()
+        assert not list(root.glob('.ftun.fakeip.*'))
+    print('portable FakeIP: automatic identity creation, mapping/UUID restart and corruption refusal passed')
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('build', type=Path)
@@ -67,8 +115,30 @@ def main():
     suffix = '.exe' if (build / 'ftun.exe').is_file() else ''
     binary = str(build / ('ftun' + suffix))
     host_binary = str(build / ('ftun-platform-test' + suffix))
-    version = subprocess.check_output(runner + [binary, 'version'], text=True, timeout=60)
-    assert 'FTUN 1.0.5' in version and 'proxy,dns,fakeip' in version, version
+    version = subprocess.check_output(runner + [binary, 'version', '--modules'], text=True, timeout=60)
+    assert 'FTUN 1.1.0' in version and 'proxy,dns,fakeip' in version, version
+    with tempfile.TemporaryDirectory(prefix='ftun-portable-check-') as directory:
+        path = Path(directory) / 'config.json'
+        for document, pointer in [({'dns': {'enable': False}}, None),
+                                  ({'outbounds': [{'type': 'socks5', 'name': 'a'}]}, '/outbounds/0/server'),
+                                  ({'dns': {'servers': [{'type': 'udp', 'name': 'up', 'address': ['bad_domain:53']}]}},
+                                   '/dns/servers/0/address/0')]:
+            path.write_text(json.dumps(document))
+            # 普通文件由最终可执行程序验证；Windows另用Win32 CreatePipe宿主验证管道。
+            with (Path(directory) / 'result.json').open('wb') as output:
+                result = subprocess.run(runner + [binary, 'check', '-c', path.name, '--json'],
+                                        cwd=directory, stdout=output, stderr=subprocess.PIPE, timeout=60)
+            value = json.loads((Path(directory) / 'result.json').read_text())
+            if suffix:
+                piped = subprocess.run(runner + [host_binary, 'cli-pipe', 'check', '-c', path.name, '--json'],
+                                       cwd=directory, capture_output=True, text=True, timeout=60)
+                assert piped.returncode == result.returncode and json.loads(piped.stdout) == value, piped
+            if pointer is None:
+                assert result.returncode == 0 and value['result'] == 'ok' and value['modules'] == ['core'], value
+                assert value['listeners'] == value['rules'] == value['frs_sets'] == 0, value
+            else:
+                assert result.returncode == 1 and value['pointer'] == pointer and value['message'], value
+        assert sorted(item.name for item in Path(directory).iterdir()) == ['config.json', 'result.json']
     subprocess.run(runner + [host_binary], check=True, timeout=60)
     if suffix:
         subprocess.run(runner + [str(build / 'ftun-wepoll-test.exe'), '--creation-failures'], check=True, timeout=60)
@@ -95,9 +165,21 @@ def main():
                 subprocess.run(runner + [binary, 'check', '-c', path.name], cwd=directory, check=True, timeout=60)
                 config['tun']['auto-route'] = True
                 path.write_text(json.dumps(config))
-                rejected = subprocess.run(runner + [binary, 'check', '-c', path.name], cwd=directory,
-                                          capture_output=True, text=True, timeout=60)
-                assert rejected.returncode != 0 and 'unsupported' in rejected.stderr, rejected
+                with (Path(directory) / 'error.txt').open('wb') as error_output:
+                    rejected = subprocess.run(runner + [binary, 'check', '-c', path.name], cwd=directory,
+                                              stdout=subprocess.PIPE, stderr=error_output, timeout=60)
+                assert rejected.returncode != 0 and 'unsupported' in (Path(directory) / 'error.txt').read_text(), rejected
+                piped = subprocess.run(runner + [host_binary, 'cli-pipe', 'check', '-c', path.name], cwd=directory,
+                                       capture_output=True, text=True, timeout=60)
+                assert piped.returncode == 1 and 'unsupported' in piped.stdout, piped
+
+        if suffix:
+            with tempfile.TemporaryDirectory(prefix='ftun-background-unsupported-') as background_directory:
+                error_path = Path(background_directory) / 'error.txt'
+                with error_path.open('wb') as output:
+                    rejected = subprocess.run(runner + [binary, 'run', '-b'], cwd=background_directory,
+                        stdout=subprocess.DEVNULL, stderr=output, timeout=60)
+                assert rejected.returncode == 1 and 'unsupported' in error_path.read_text(), rejected
 
         with subprocess.Popen(runner + [host_binary, 'pipe'], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE) as pipe:
             try:
@@ -133,7 +215,7 @@ def main():
         path.write_text(json.dumps(config), encoding='utf-8')
         subprocess.run(runner + [binary, 'check', '-c', 'config.json'], cwd=root, check=True, timeout=60)
         with log.open('w') as output:
-            process = subprocess.Popen(runner + [host_binary, 'run', '-c', 'config.json'], cwd=root,
+            process = subprocess.Popen(runner + [host_binary, 'run', '-c', 'config.json', '-p', 'instance.pid'], cwd=root,
                                        stdout=output, stderr=output)
             try:
                 clients = [('127.0.0.1', proxy_ports[0]), ('::1', proxy_ports[1])]
@@ -152,12 +234,14 @@ def main():
                         query(('127.0.0.1', dns_port), tcp, kind)
                 # 无效重载保持旧代可用，然后提交拒绝规则验证代次切换。
                 path.write_text('{', encoding='utf-8')
-                subprocess.run(runner + [binary, 'reload', pid], cwd=root, check=True, timeout=30)
+                result = subprocess.run(runner + [binary, 'reload', pid], cwd=root, timeout=30)
+                assert result.returncode == 5, result.returncode
                 wait_for(lambda: 'reload rejected' in log.read_text(errors='replace'), process, log)
                 socks(clients[0], '127.0.0.1', echo4.server_address[1])
                 config['rules'] = ['MATCH,REJECT']
                 path.write_text(json.dumps(config), encoding='utf-8')
-                subprocess.run(runner + [binary, 'reload', pid], cwd=root, check=True, timeout=30)
+                result = subprocess.run(runner + [binary, 'reload', pid], cwd=root, timeout=30)
+                assert result.returncode == 5, result.returncode
                 wait_for(lambda: 'reload committed' in log.read_text(errors='replace'), process, log)
                 socks(clients[0], '127.0.0.1', echo4.server_address[1], denied=True)
                 subprocess.run(runner + [binary, 'stop', pid], cwd=root, check=True, timeout=30)
@@ -169,6 +253,7 @@ def main():
                 if process.poll() is None:
                     process.kill()
                     process.wait()
+    persistent_fakeip(runner, binary, host_binary)
     print('portable product: IPv4/IPv6 TCP/UDP, SOCKS5/HTTP, DNS A/AAAA UDP/TCP, reload/stop passed')
 
 

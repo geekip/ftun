@@ -23,6 +23,8 @@ struct ftun_frs_view {
   ftun_reservation_t reservation;
   ftun_budget_t *budget;
   bool releasing;
+  int64_t modified_unix_ms;
+  bool modified_valid;
 };
 
 struct ftun_frs_set {
@@ -272,6 +274,8 @@ ftun_status_t ftun_frs_open_mode(ftun_core_t *core, const char *path,
   reservation = (ftun_reservation_t){0};
   view->budget = budget;
   view->file_bytes = file_bytes;
+  view->modified_unix_ms = info.modified_unix_ms;
+  view->modified_valid = true;
   if (mode == FTUN_FRS_OPEN_AUTO) {
     mapped = ftun_file_map_read(descriptor, file_bytes);
   }
@@ -370,6 +374,8 @@ ftun_status_t ftun_frs_view_get_info(const ftun_frs_view_t *view,
   out->reference_count = view->reference_count;
   out->file_checksum = view->layout.file_checksum;
   out->storage = view->storage;
+  out->modified_unix_ms = view->modified_unix_ms;
+  out->modified_valid = view->modified_valid;
   return FTUN_OK;
 }
 
@@ -496,5 +502,28 @@ ftun_status_t ftun_frs_view_bytes(const ftun_frs_view_t *view,
   if (view->releasing) return FTUN_E_AGAIN;
   out->data = view->file;
   out->length = view->file_bytes;
+  return FTUN_OK;
+}
+
+ftun_status_t ftun_frs_view_set_info(const ftun_frs_view_t *view, size_t index,
+  ftun_frs_set_info_t *out)
+{
+  const ftun_frs_section_layout_t *sets, *strings;
+  const uint8_t *record;
+  memset(out, 0, sizeof(*out));
+  if (view->releasing) return FTUN_E_AGAIN;
+  sets = ftun_frs_layout_section(&view->layout, FTUN_FRS_SECTION_SETS);
+  strings = ftun_frs_layout_section(&view->layout, FTUN_FRS_SECTION_STRINGS);
+  if (index >= sets->count) return FTUN_E_EOF;
+  record = view->file + (size_t)sets->offset + index * FTUN_FRS_SET_STRIDE;
+  out->label.data = (const char *)view->file + (size_t)strings->offset +
+    (size_t)ftun_frs_read_u64(record + FTUN_FRS_SET_LABEL_OFFSET);
+  out->label.length = ftun_frs_read_u32(record + FTUN_FRS_SET_LABEL_LENGTH);
+  out->kind = (ftun_frs_set_kind_t)ftun_frs_read_u16(record + FTUN_FRS_SET_KIND);
+  if (out->kind == FTUN_FRS_SET_IP) out->ranges = ftun_frs_read_u32(record + FTUN_FRS_SET_A_COUNT);
+  else {
+    out->nodes = ftun_frs_read_u32(record + FTUN_FRS_SET_A_COUNT);
+    out->keywords = ftun_frs_read_u32(record + FTUN_FRS_SET_C_COUNT);
+  }
   return FTUN_OK;
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""只分发已构建程序、模块清单与许可文档；不打包工作区。"""
+"""分发已构建程序、公开文档、配置和服务样例；不打包协作工作区。"""
 import argparse
 import gzip
 import hashlib
@@ -32,18 +32,26 @@ def main():
     if any(character not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-' for character in tag):
         raise SystemExit('invalid release tag')
     binary = 'ftun.exe' if args.platform.startswith('windows-') else 'ftun'
+    executables = {binary, 'packaging/openwrt/ftun.procd', 'packaging/padavan/ftun.sh'}
     files = {binary: (build / binary).read_bytes(),
              'ftun-build-modules.txt': (build / 'ftun-build-modules.txt').read_bytes()}
     for license in (build / 'toolchain-licenses').iterdir():
         files['docs/' + license.name] = license.read_bytes()
     files['README.md'] = (root / 'README.md').read_bytes()
+    for name in ('LICENSE', 'CHANGELOG.md', 'third_party/README.md', 'third_party/LOCK.json'):
+        files[name] = (root / name).read_bytes()
+    for directory in ('examples', 'schema', 'packaging', 'include/ftun'):
+        for path in (root / directory).rglob('*'):
+            if path.is_file():
+                files[path.relative_to(root).as_posix()] = path.read_bytes()
     for document in (root / 'docs').glob('*.md'):
         files['docs/' + document.name] = document.read_bytes()
     for path in ('LICENSE', 'third_party/LOCK.json'):
         files['docs/' + Path(path).name] = (root / path).read_bytes()
     files['docs/THIRD_PARTY_NOTICES.md'] = (build / 'THIRD_PARTY_NOTICES.md').read_bytes()
     files['docs/README-third-party.md'] = (root / 'third_party/README.md').read_bytes()
-    for component, source in [('cJSON', 'cjson/LICENSE'), ('wolfSSL', 'wolfssl/COPYING')]:
+    for component, source in [('cJSON', 'cjson/LICENSE'), ('wolfSSL', 'wolfssl/COPYING'),
+                              ('optparse', 'optparse/UNLICENSE')]:
         files['docs/LICENSE-' + component] = (root / 'third_party' / source).read_bytes()
     if args.platform.startswith('windows-'):
         files['docs/LICENSE-wepoll'] = (root / 'third_party/wepoll/LICENSE').read_bytes()
@@ -69,7 +77,7 @@ def main():
             for path, data in sorted(files.items()):
                 info = zipfile.ZipInfo(name + '/' + path, (1980, 1, 1, 0, 0, 0))
                 info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = (0o755 if path == binary else 0o644) << 16
+                info.external_attr = (0o755 if path in executables else 0o644) << 16
                 output.writestr(info, data)
     else:
         archive = args.output / (name + '.tar.gz')
@@ -78,7 +86,7 @@ def main():
                 for path, data in sorted(files.items()):
                     info = tarfile.TarInfo(name + '/' + path)
                     info.size, info.mtime = len(data), epoch
-                    info.mode = 0o755 if path == binary else 0o644
+                    info.mode = 0o755 if path in executables else 0o644
                     output.addfile(info, io.BytesIO(data))
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     archive.with_name(archive.name + '.sha256').write_text(f'{digest}  {archive.name}\n', encoding='ascii')

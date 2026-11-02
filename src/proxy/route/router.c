@@ -36,11 +36,11 @@ ftun_status_t ftun_route_table_accounted_bytes(const char *const *rules,
   return FTUN_OK;
 }
 
-ftun_status_t ftun_route_table_create_with_frs(
+ftun_status_t ftun_route_table_create_with_frs_error(
   uint64_t generation, const char *const *rules, size_t rule_count,
   ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
   ftun_rule_frs_bind_fn frs_bind, void *frs_user,
-  ftun_route_table_t **out)
+  ftun_route_table_t **out, ftun_config_error_t *error)
 {
   ftun_route_table_t *table;
   size_t index;
@@ -64,12 +64,23 @@ ftun_status_t ftun_route_table_create_with_frs(
                                         frs_bind, frs_user,
                                         &table->rules[index]);
     if (status != FTUN_OK) {
+      (void)ftun_config_error_setf(error, status, "cannot compile or bind rule",
+        "/rules/%zu", index);
       (void)ftun_route_table_destroy(&table);
       return status;
     }
   }
   *out = table;
   return FTUN_OK;
+}
+
+ftun_status_t ftun_route_table_create_with_frs(
+  uint64_t generation, const char *const *rules, size_t rule_count,
+  ftun_rule_outbound_resolver_fn resolver, void *resolver_user,
+  ftun_rule_frs_bind_fn frs_bind, void *frs_user, ftun_route_table_t **out)
+{
+  return ftun_route_table_create_with_frs_error(generation, rules, rule_count,
+    resolver, resolver_user, frs_bind, frs_user, out, NULL);
 }
 
 ftun_status_t ftun_route_table_create(

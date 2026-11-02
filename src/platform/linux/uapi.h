@@ -10,6 +10,8 @@
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 
+#define FTUN_RENAME_NOREPLACE 1u
+
 #define FTUN_TUNSETIFF _IOW('T', 202, int)
 #define FTUN_IFF_TUN 0x0001
 #define FTUN_IFF_NO_PI 0x1000

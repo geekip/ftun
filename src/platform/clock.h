@@ -13,4 +13,12 @@ typedef struct {
   unsigned int millisecond;
 } ftun_calendar_time_t;
 ftun_status_t ftun_wallclock_utc(ftun_calendar_time_t *out);
+/* 本地展示时间及有符号UTC偏移；平台无法取得时区时使用UTC，偏移为0。 */
+typedef struct {
+  ftun_calendar_time_t calendar;
+  int offset_minutes;
+} ftun_local_time_t;
+ftun_status_t ftun_wallclock_local(ftun_local_time_t *out);
+/* UTC Unix毫秒，用于状态更新时间；不用于期限或重试调度。 */
+ftun_status_t ftun_wallclock_unix_ms(int64_t *out);
 #endif

@@ -220,12 +220,12 @@ def r6(lab):
             lab.restore()
     lab.restore()
     # 已提交的每一代都应在日志里出现，且编号没有回退或跳号（被拒绝的 reload 不占代次）。
-    sequence = [int(g) for g in re.findall(r'event=reload\.committed[^\n]*generation=(\d+)',
+    sequence = [int(g) for g in re.findall(r'configuration committed:[^\n]*gen=(\d+)',
                                            lab.log_text())]
     assert len(sequence) >= int(8 * lab.scale), lab.log_text()[-2000:]
     assert all(b - a >= 1 for a, b in zip(sequence, sequence[1:])), sequence
     # FRS 更新与 reload 都消费代次：编号单调递增，且最终生效的就是最后提交的那一代。
-    assert not re.search(r'status=stale[^\n]*event=reload\.rejected', lab.log_text()), 'reload rejected as stale'
+    assert not re.search(r'configuration rejected:[^\n]*err=stale', lab.log_text()), 'reload rejected as stale'
     assert lab.socks_ok()
     assert lab.process.pid == pid
 
@@ -331,7 +331,7 @@ def r10(lab):
     rules_before = sh('ip', 'rule', 'show', capture=True).stdout
     # 同一身份的第二个实例：必须因拿不到实例锁而失败，且不改动现有资源。
     import subprocess
-    other = subprocess.run([lab.ftun, 'run', '-c', str(lab.config_path)], capture_output=True,
+    other = subprocess.run([lab.ftun, 'run', '-c', str(lab.config_path), '-p', str(lab.config_path) + '.pid'], capture_output=True,
                            timeout=20)
     assert other.returncode != 0, 'second instance must not start'
     assert sh('ip', 'rule', 'show', capture=True).stdout == rules_before
@@ -360,7 +360,7 @@ def r12(lab):
     tiny = lab.root / 'tinylog'
     tiny.mkdir()
     sh('mount', '-t', 'tmpfs', '-o', 'size=64k', 'tmpfs', tiny)
-    config = lab.config(log={'level': 'debug', 'file': str(tiny / 'ftun.log')})
+    config = lab.config(log={'output': 'file', 'level': 'debug', 'file': str(tiny / 'ftun.log')})
     lab.start(config)
     lab.wait_ready()
     wait_until(lab.socks_ok, 10, what='baseline')
@@ -384,6 +384,8 @@ def r12(lab):
     # 日志目录被写满后服务照常工作。
     used = sum(f.stat().st_size for f in tiny.iterdir())
     assert used > 0
+    wait_until(lambda: 'err=io native=28' in lab.output.read_text(), 5,
+               what='independent ENOSPC diagnosis')
     lab.alive()
     wait_until(lab.socks_ok, RECOVERY_MAX, what='service during flood')
     deadline = time.monotonic() + lab.seconds(8)

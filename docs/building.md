@@ -33,6 +33,7 @@ Linux 上交叉生成 Mach-O 时还需 `llvm-install-name-tool`（Debian/Ubuntu 
 - macOS 使用 kqueue 和 EVFILT_USER 唤醒；Windows 使用 wepoll 1.5.8 的水平触发就绪通知和 TCP 唤醒对。wepoll 通过 Git submodule 固定提交，内部使用 AFD/IOCP；单批最多交付 64 个事件，不再构造全量 WSAPoll 数组，也不再有后端的 8191 个 Socket 固定上限，实际容量受配置预算及系统资源限制。上游内部堆和 IOCP/AFD 句柄先准入再创建，延迟删除的 Socket 状态保持额度到实际释放；AFD 分组按上游实现保留到后端关闭。进程级 keyed event 采用每个后端一份保守句柄额度，预算不代表精确内核内存或 RSS。
 - 两个平台保留 TCP keepalive 和应用层绝对期限；不支持 Linux 的 TCP_USER_TIMEOUT 和累计 ACK 进度检测，不能提供 Linux 上同等的发送确认停滞判定。可按部署需要配置 `tcp-idle`。未实现原生网络变化订阅，恢复依靠现有期限与退避调度。
 - Windows 的 `ftun stop PID` / `ftun reload PID` 通过当前会话的进程事件工作，PID 为 Windows 原生 PID。普通退出可使用 Ctrl+C 或 `stop`。关闭控制台窗口时系统可能直接终止进程，需正常清理时使用 `stop`。
+- Windows 当前没有凭据校验的本机 IPC，因此 status、dns status、proxy status 及 `-p` 控制明确报告不支持；不提供 `run -b`。显式数字 PID 的 reload 只提交进程事件，无法确认配置提交，返回结果未知（退出码 5）；stop 默认等待进程实际退出。
 - Windows 的文件和目录使用 UTF-8 路径输入，新建私有状态及日志使用当前用户的受保护 DACL；文件锁、映射和同卷替换使用原生接口。文件先 FlushFileBuffers，再以 MoveFileEx WRITE_THROUGH 发布；不能将 Wine 文件测试等同于实际 NTFS 断电耐久验证。Windows BootTime 用于保守失效判断，系统时间调整可能使缓存提前失效。Wine 验证使用文件日志；Wine 从 Unix 继承的 stderr 管道不支持 Windows 等待模式，CLI 会明确启动失败，不能据此推定原生 Windows 管道行为。
 - HTTPS 显式验证 CA 和目标身份。可设置 `SSL_CERT_FILE` 指向 PEM CA 文件；设置后加载失败会拒绝连接，不取消验证。Linux/macOS 还会查找常见系统 PEM 路径（macOS 含 `/etc/ssl/cert.pem`）；Windows 必须提供 PEM 文件，当前不导入 Windows 证书仓库。CA 环境变量应在启动前设置。
 - macOS 的 CLI 看门狗使用进程级 ITIMER_REAL；同一进程只有一个此类定时器，嵌入宿主不得同时占用该定时器。系统服务通知仅在 Linux 提供；Windows 设置 `NOTIFY_SOCKET` 会返回不支持。

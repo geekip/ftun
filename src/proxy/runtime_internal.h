@@ -18,13 +18,20 @@ typedef struct {
 } ftun_runtime_prepared_item_t;
 
 typedef struct {
+  uint64_t entity;
+  bool failed;
+} ftun_runtime_log_state_t;
+
+typedef struct {
   uint32_t selected_member_id;
+  ftun_runtime_log_state_t log;
   uint32_t latency_ms;
   uint64_t observed_ms;
   bool selected;
   bool degraded;
   bool health_valid;
   bool health_success;
+  ftun_outbound_stats_t connections;
 } ftun_runtime_group_choice_state_t;
 
 /* Snapshot 在提交前完成构造，发布后只读。 */
@@ -48,6 +55,8 @@ struct ftun_runtime {
   ftun_reservation_t reservation;
   ftun_runtime_snapshot_t snapshot;
   ftun_runtime_owner_state_t owner_state;
+  ftun_outbound_stats_t builtin_connections[2];
+  ftun_runtime_log_state_t builtin_logs[2];
   size_t reference_count;
   uint64_t generation;
   ftun_runtime_state_t state;
@@ -56,6 +65,9 @@ struct ftun_runtime {
   bool blocks_active_acquire;
   bool cleanup_pending;
 };
+
+/* 回收旧代前将终态计数归并到当前代；仅owner调用。 */
+void ftun_runtime_outbound_archive(const ftun_runtime_t *source, ftun_runtime_t *target);
 
 typedef struct {
   uint32_t runtime_magic;

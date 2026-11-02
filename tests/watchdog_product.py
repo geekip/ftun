@@ -37,20 +37,21 @@ def main(binary):
             'base': {'state-cache': False, 'cache-file': str(root / 'ftun.cache'),
                      'watchdog': '1s'},
             'dns': {'enable': False},
-            'log': {'level': 'warn', 'file': str(root / 'ftun.log')},
+            'log': {'output': 'file', 'level': 'warn', 'file': str(root / 'ftun.log')},
             'inbounds': [{'name': 'in', 'type': 'socks5', 'listen': f'127.0.0.1:{free_port()}'}],
             'rules': ['MATCH,DIRECT'],
         }
         config_path = root / 'config.json'
         config_path.write_text(json.dumps(config))
         environment = dict(os.environ, NOTIFY_SOCKET=str(notify_path), WATCHDOG_USEC='600000')
-        process = subprocess.Popen([binary, 'run', '-c', str(config_path)], env=environment,
+        process = subprocess.Popen([binary, 'run', '-c', str(config_path), '-p', str(config_path) + '.pid'], env=environment,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         # WATCHDOG_PID 未设置时按全进程处理；先跑 4 秒，空闲期间不得被看门狗终止。
         messages = []
         deadline = time.monotonic() + 4.0
         while time.monotonic() < deadline:
-            assert process.poll() is None, f'ftun exited early: {process.returncode}'
+            assert process.poll() is None, (
+                f'ftun exited early: {process.returncode}: ' + process.stderr.read().decode())
             drain(server, messages)
             time.sleep(0.05)
         drain(server, messages)
@@ -69,7 +70,7 @@ def main(binary):
         assert usage.returncode == 2, usage.returncode
         bad = root / 'bad.json'
         bad.write_text('{"base":{"watchdog":"5ms"}}')
-        invalid = subprocess.run([binary, 'run', '-c', str(bad)], capture_output=True)
+        invalid = subprocess.run([binary, 'run', '-c', str(bad), '-p', str(bad) + '.pid'], capture_output=True)
         assert invalid.returncode == 1, invalid.returncode
     print('Watchdog product: idle heartbeat, notify messages, exit codes passed')
 

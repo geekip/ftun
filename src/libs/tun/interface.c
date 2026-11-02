@@ -171,6 +171,7 @@ static ftun_status_t async_query(void *context, const void *state,
   out->repair_result = info.repair_result;
   out->repair_runs = info.repair_runs;
   out->repairs = info.repairs;
+  out->protection_missing = info.protection_missing;
   out->repair_failures = info.repair_failures;
   return ftun_route_async_next_deadline(owned->operation,
     &out->next_deadline_ms, &out->has_deadline);

@@ -9,8 +9,6 @@
 #include "libs/resolver/control_channel.h"
 #if defined(FTUN_HAVE_MODULE_TUN)
 #include "libs/tun/service.h"
-#else
-typedef struct ftun_l3_provider ftun_l3_provider_t;
 #endif
 
 /* Composition 注入的不可变工厂表。Proxy 在自己的 Budget 和 generation 下

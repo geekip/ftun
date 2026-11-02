@@ -95,7 +95,7 @@ def main():
         process = None
         clients = []
         try:
-            process = subprocess.Popen([str(args.binary.resolve()), "run", "-c", str(path)], stdout=log, stderr=log)
+            process = subprocess.Popen([str(args.binary.resolve()), "run", "-c", str(path), "-p", str(path) + ".pid"], stdout=log, stderr=log)
             deadline = time.monotonic() + 5
             while True:
                 assert process.poll() is None, "daemon exited during startup"

@@ -11,12 +11,12 @@
 #include "proxy/state/restore.h"
 #include "core/log/log.h"
 #include "core/log/event_log.h"
+#include "core/io/file.h"
 #include "core/context.h"
 #include "platform/clock.h"
 #include "libs/transport/socket_path.h"
 #if defined(FTUN_HAVE_MODULE_FRS)
 #include "proxy/frs/frs.h"
-#include "core/io/file.h"
 #endif
 
 #include <stdlib.h>
@@ -69,6 +69,7 @@ typedef struct {
   uint32_t path_length;
   uint64_t contents_length;
   uintptr_t budget;
+  uintptr_t lock;
 } ftun_core_state_work_t;
 
 #if defined(FTUN_HAVE_MODULE_FRS)
@@ -208,13 +209,14 @@ done:
 static ftun_status_t ftun_proxy_support_prepare(
   ftun_budget_t *budget, const ftun_config_t *config,
   uint64_t maximum_bytes, const ftun_app_prepare_context_t *context,
-  ftun_app_runtime_candidate_t **out, bool *publish_required)
+  ftun_app_runtime_candidate_t **out, bool *publish_required, ftun_config_error_t *error)
 {
   ftun_app_runtime_candidate_t *attachment;
   ftun_runtime_t *runtime = NULL;
   ftun_status_t status = FTUN_OK;
   *out = NULL;
   *publish_required = false;
+  ftun_config_error_begin(error, FTUN_CONFIG_STEP_ATTACHMENTS);
   status = ftun_proxy_attachment_create(budget, config, out);
   if (status != FTUN_OK) return status;
   attachment = *out;
@@ -230,6 +232,9 @@ static ftun_status_t ftun_proxy_support_prepare(
     if ((config->plan->prepare & FTUN_PLAN_FRS) != 0u) {
       status = ftun_core_reload_read_file(budget, config->frs.path,
         maximum_bytes, &file, &file_length, &file_reservation);
+      if (status != FTUN_OK && !(status == FTUN_E_EOF && config->frs.auto_update &&
+          config->frs.url != NULL && config->frs.url[0] != '\0'))
+        (void)ftun_config_error_set(error, status, "/frs/path", "cannot read FRS file");
       if (status == FTUN_E_EOF && config->frs.auto_update &&
           config->frs.url != NULL && config->frs.url[0] != '\0') {
         ftun_http_fetch_spec_t fetch_spec;
@@ -264,6 +269,7 @@ static ftun_status_t ftun_proxy_support_prepare(
             status = FTUN_E_PROTOCOL;
           }
           if (status == FTUN_OK) publish = true;
+          else (void)ftun_config_error_set(error, status, "/frs/url", "cannot download FRS file");
         }
       }
       if (status == FTUN_OK) {
@@ -271,14 +277,16 @@ static ftun_status_t ftun_proxy_support_prepare(
           ? (ftun_bytes_t){fetched.data, fetched.length}
           : (ftun_bytes_t){file, file_length};
         status = ftun_frs_open_bytes_budget(budget, bytes, &view);
+        if (status != FTUN_OK) (void)ftun_config_error_set(error, status,
+          "/frs/path", "cannot validate FRS file");
       }
       if (status == FTUN_OK) {
-        status = ftun_runtime_prepare_detached(config, view, &runtime);
+        status = ftun_runtime_prepare_detached_error(config, view, &runtime, error);
         if (status == FTUN_OK) view = NULL;
       }
       *publish_required = publish;
     } else {
-      status = ftun_runtime_prepare_detached(config, NULL, &runtime);
+      status = ftun_runtime_prepare_detached_error(config, NULL, &runtime, error);
     }
     free(file);
     ftun_reservation_release(&file_reservation);
@@ -431,13 +439,17 @@ static ftun_status_t ftun_proxy_support_release(ftun_core_t *core,
 }
 
 static ftun_status_t ftun_proxy_support_check(ftun_core_t *core,
-  const ftun_config_t *config, bool for_run)
+  const ftun_config_t *config, bool for_run, ftun_config_error_t *error, size_t *frs_sets)
 {
   ftun_runtime_t *candidate = NULL;
-  ftun_status_t status = ftun_runtime_prepare(core, config, &candidate);
+  ftun_config_error_begin(error, FTUN_CONFIG_STEP_ATTACHMENTS);
+  ftun_status_t status = ftun_runtime_prepare_error(core, config, &candidate, error, frs_sets);
   if (status == FTUN_E_EOF && for_run && config->frs.active &&
       config->frs.auto_update && config->frs.url != NULL &&
-      config->frs.url[0] != '\0') status = FTUN_OK;
+      config->frs.url[0] != '\0') {
+    status = FTUN_OK;
+    ftun_config_error_begin(error, FTUN_CONFIG_STEP_ATTACHMENTS);
+  }
   if (candidate != NULL) {
     ftun_status_t cleanup = ftun_runtime_abort(core, &candidate);
     if (status == FTUN_OK) status = cleanup;
@@ -461,7 +473,8 @@ static ftun_status_t ftun_core_state_execute(
     return FTUN_E_INVALID;
   }
   work = (const ftun_core_state_work_t *)input.data;
-  if (work->magic != FTUN_CORE_STATE_WORK_MAGIC || work->budget == 0u || work->path_length == 0u) {
+  if (work->magic != FTUN_CORE_STATE_WORK_MAGIC || work->budget == 0u ||
+      work->lock == 0u || work->path_length == 0u) {
     return FTUN_E_INVALID;
   }
   contents_length = (size_t)work->contents_length;
@@ -480,8 +493,20 @@ static ftun_status_t ftun_core_state_execute(
     (ftun_bytes_t){input.data + prefix, contents_length});
 }
 
+static ftun_status_t ftun_core_state_input_cleanup(ftun_bytes_t input)
+{
+  ftun_core_state_work_t *work = (ftun_core_state_work_t *)(uintptr_t)input.data;
+  ftun_file_lock_t *lock;
+  ftun_status_t status;
+  if (input.length < sizeof(*work) || work->magic != FTUN_CORE_STATE_WORK_MAGIC) return FTUN_E_INVALID;
+  lock = (ftun_file_lock_t *)work->lock;
+  status = ftun_file_lock_release(&lock);
+  work->lock = (uintptr_t)lock;
+  return status;
+}
+
 static ftun_status_t ftun_proxy_support_state_job(
-  ftun_core_t *core, ftun_budget_t *budget, const char *path,
+  ftun_core_t *core, ftun_budget_t *budget, const char *path, ftun_file_lock_t *lock,
   uint64_t deadline_ms, ftun_worker_job_t *out, ftun_reservation_t *out_reservation)
 {
   ftun_core_state_work_t *work;
@@ -495,7 +520,7 @@ static ftun_status_t ftun_proxy_support_state_job(
   ftun_status_t status;
   if (out_reservation != NULL) *out_reservation = (ftun_reservation_t){0};
   if (core == NULL || budget == NULL || out == NULL || out_reservation == NULL ||
-      path == NULL || path[0] == '\0') return FTUN_E_INVALID;
+      path == NULL || path[0] == '\0' || lock == NULL) return FTUN_E_INVALID;
   path_length = strlen(path) + 1u;
   if (path_length > UINT32_MAX) return FTUN_E_LIMIT;
   status = ftun_group_cache_capture(core, budget, &captured, &captured_length, &captured_reservation);
@@ -516,12 +541,15 @@ static ftun_status_t ftun_proxy_support_state_job(
   work = (ftun_core_state_work_t *)input;
   work->magic = FTUN_CORE_STATE_WORK_MAGIC;
   work->budget = (uintptr_t)budget;
+  work->lock = (uintptr_t)lock;
+  ftun_file_lock_retain(lock);
   work->path_length = (uint32_t)path_length;
   work->contents_length = (uint64_t)captured_length;
   memcpy(input + sizeof(*work), path, path_length);
   memcpy(input + sizeof(*work) + path_length, captured, captured_length);
   memset(&job, 0, sizeof(job));
   job.execute = ftun_core_state_execute;
+  job.input_cleanup = ftun_core_state_input_cleanup;
   job.input = (ftun_bytes_t){input, input_length};
   job.deadline_ms = deadline_ms;
   *out = job;

@@ -1,4 +1,6 @@
 #include "platform/file.h"
+#include "platform/pidfile.h"
+#include "platform/process.h"
 #include "platform/random.h"
 #include <windows.h>
 #include <limits.h>
@@ -88,6 +90,8 @@ ftun_status_t ftun_file_inspect(ftun_handle_t descriptor, ftun_file_info_t *out)
   BY_HANDLE_FILE_INFORMATION info;
   if (!GetFileInformationByHandle(native_file(descriptor), &info)) return file_error(GetLastError());
   out->size = ((uint64_t)info.nFileSizeHigh << 32u) | info.nFileSizeLow;
+  out->modified_unix_ms = (int64_t)((((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32u) |
+    info.ftLastWriteTime.dwLowDateTime) / 10000u) - INT64_C(11644473600000);
   out->directory = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u;
   out->regular = !out->directory && GetFileType(native_file(descriptor)) == FILE_TYPE_DISK;
   return FTUN_OK;
@@ -101,6 +105,21 @@ ftun_status_t ftun_file_inspect_path(const char *path, ftun_file_info_t *out)
   status = ftun_file_inspect(file, out);
   ftun_status_t closed = ftun_file_close(file);
   return status == FTUN_OK ? closed : status;
+}
+ftun_status_t ftun_file_inspect_path_nofollow(const char *path, ftun_file_info_t *out)
+{
+  wchar_t wide[PATH_CHARS];
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  ftun_status_t status = wide_path(path, wide);
+  if (status != FTUN_OK) return status;
+  if (!GetFileAttributesExW(wide, GetFileExInfoStandard, &info)) return file_error(GetLastError());
+  if ((info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0u) return FTUN_E_REJECTED;
+  out->size = ((uint64_t)info.nFileSizeHigh << 32u) | info.nFileSizeLow;
+  out->modified_unix_ms = (int64_t)((((uint64_t)info.ftLastWriteTime.dwHighDateTime << 32u) |
+    info.ftLastWriteTime.dwLowDateTime) / 10000u) - INT64_C(11644473600000);
+  out->directory = (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0u;
+  out->regular = !out->directory;
+  return FTUN_OK;
 }
 ptrdiff_t ftun_file_read(ftun_handle_t descriptor, void *buffer, size_t capacity)
 {
@@ -147,15 +166,21 @@ ftun_status_t ftun_platform_file_close(ftun_file_handle_t *file)
 }
 ftun_status_t ftun_platform_file_write(ftun_file_handle_t *file, ftun_bytes_t contents, size_t *written)
 {
+  return ftun_platform_file_write_error(file, contents, written).status;
+}
+ftun_error_t ftun_platform_file_write_error(ftun_file_handle_t *file, ftun_bytes_t contents, size_t *written)
+{
   *written = 0u;
   while (*written < contents.length) {
-    ftun_status_t status;
-    ptrdiff_t count = ftun_file_write_some(file->descriptor, contents.data + *written,
-      contents.length - *written, &status);
-    if (status != FTUN_OK) return status;
+    DWORD count, length = contents.length - *written > MAXDWORD ? MAXDWORD : (DWORD)(contents.length - *written);
+    if (!WriteFile(native_file(file->descriptor), contents.data + *written, length, &count, NULL)) {
+      DWORD code = GetLastError();
+      return (ftun_error_t){file_error(code), 0u, (int)code};
+    }
+    if (count == 0u) return (ftun_error_t){FTUN_E_AGAIN, 0u, 0};
     *written += (size_t)count;
   }
-  return FTUN_OK;
+  return (ftun_error_t){FTUN_OK, 0u, 0};
 }
 ftun_status_t ftun_platform_file_rename_if_exists(const char *from, const char *to)
 {
@@ -196,19 +221,169 @@ ftun_status_t ftun_platform_file_lock_release(ftun_platform_file_lock_t *lock)
   ftun_status_t closed = ftun_platform_file_close(lock);
   return status == FTUN_OK ? closed : status;
 }
-ftun_status_t ftun_platform_file_write_temporary(char *temporary, ftun_bytes_t contents,
-  unsigned int mode, bool *created)
+
+/* PID 字节必须可由只读客户端查询，锁放在 EOF 之外，避免强制锁遮住内容。 */
+static OVERLAPPED ftun_pidfile_lock_offset(void)
+{
+  OVERLAPPED offset = {0};
+  offset.Offset = MAXDWORD;
+  return offset;
+}
+
+ftun_status_t ftun_pidfile_probe(const char *path, uint32_t *pid)
+{
+  ftun_handle_t descriptor;
+  OVERLAPPED offset = ftun_pidfile_lock_offset();
+  ftun_status_t status = open_path(path, GENERIC_READ, OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL, true, _O_RDONLY, &descriptor);
+  *pid = 0u;
+  if (status != FTUN_OK) return status;
+  if (LockFileEx(native_file(descriptor), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+      0u, 1u, 0u, &offset)) {
+    status = UnlockFileEx(native_file(descriptor), 0u, 1u, 0u, &offset)
+      ? FTUN_E_EOF : FTUN_E_IO;
+  } else if (GetLastError() == ERROR_LOCK_VIOLATION) {
+    status = ftun_pidfile_read(descriptor, pid);
+  } else {
+    status = file_error(GetLastError());
+  }
+  if (ftun_file_close(descriptor) != FTUN_OK) status = FTUN_E_IO;
+  return status;
+}
+
+ftun_status_t ftun_pidfile_rewrite(ftun_pidfile_t *pidfile)
+{
+  LARGE_INTEGER origin;
+  char contents[32];
+  size_t written;
+  int length = snprintf(contents, sizeof(contents), "%u\n", ftun_process_id());
+  origin.QuadPart = 0;
+  if (!SetFilePointerEx(native_file(pidfile->file.descriptor), origin, NULL, FILE_BEGIN) ||
+      !SetEndOfFile(native_file(pidfile->file.descriptor))) return FTUN_E_IO;
+  return ftun_platform_file_write(&pidfile->file,
+    (ftun_bytes_t){(const uint8_t *)contents, (size_t)length}, &written);
+}
+
+ftun_status_t ftun_pidfile_acquire(const char *path, ftun_pidfile_t *out,
+  uint32_t *holder)
+{
+  OVERLAPPED offset = ftun_pidfile_lock_offset();
+  ftun_status_t status;
+  *out = (ftun_pidfile_t)FTUN_PIDFILE_INVALID;
+  *holder = 0u;
+  status = open_path(path, GENERIC_READ | GENERIC_WRITE, OPEN_ALWAYS,
+    FILE_ATTRIBUTE_NORMAL, true, _O_RDWR, &out->file.descriptor);
+  if (status != FTUN_OK) return status;
+  if (!LockFileEx(native_file(out->file.descriptor), LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+      0u, 1u, 0u, &offset)) {
+    status = file_error(GetLastError());
+    (void)ftun_platform_file_close(&out->file);
+    if (status == FTUN_E_AGAIN) (void)ftun_pidfile_probe(path, holder);
+    return status;
+  }
+  out->path = path;
+  status = ftun_pidfile_rewrite(out);
+  if (status != FTUN_OK) (void)ftun_pidfile_release(out);
+  return status;
+}
+
+ftun_status_t ftun_pidfile_discard(ftun_pidfile_t *pidfile)
+{
+  OVERLAPPED offset = ftun_pidfile_lock_offset();
+  ftun_status_t status, closed;
+  if (!ftun_platform_file_is_open(&pidfile->file)) return FTUN_OK;
+  status = UnlockFileEx(native_file(pidfile->file.descriptor), 0u, 1u, 0u, &offset)
+    ? FTUN_OK : FTUN_E_IO;
+  closed = ftun_platform_file_close(&pidfile->file);
+  pidfile->path = NULL;
+  return status == FTUN_OK ? closed : status;
+}
+
+ftun_status_t ftun_pidfile_release(ftun_pidfile_t *pidfile)
+{
+  BY_HANDLE_FILE_INFORMATION owned, current;
+  wchar_t wide[PATH_CHARS];
+  ftun_handle_t descriptor;
+  ftun_status_t status, closed;
+  if (!ftun_platform_file_is_open(&pidfile->file)) return FTUN_OK;
+  status = open_path(pidfile->path, FILE_READ_ATTRIBUTES, OPEN_EXISTING,
+    FILE_ATTRIBUTE_NORMAL, true, _O_RDONLY, &descriptor);
+  if (status == FTUN_OK) {
+    if (!GetFileInformationByHandle(native_file(pidfile->file.descriptor), &owned) ||
+        !GetFileInformationByHandle(native_file(descriptor), &current)) {
+      status = FTUN_E_IO;
+    } else if (owned.dwVolumeSerialNumber == current.dwVolumeSerialNumber &&
+        owned.nFileIndexHigh == current.nFileIndexHigh && owned.nFileIndexLow == current.nFileIndexLow) {
+      status = wide_path(pidfile->path, wide);
+      if (status == FTUN_OK && !DeleteFileW(wide)) status = file_error(GetLastError());
+    }
+    if (ftun_file_close(descriptor) != FTUN_OK) status = FTUN_E_IO;
+  } else if (status == FTUN_E_EOF || status == FTUN_E_REJECTED) {
+    status = FTUN_OK;
+  }
+  closed = ftun_pidfile_discard(pidfile);
+  return status == FTUN_OK ? closed : status;
+}
+static ftun_status_t temporary_name(char *temporary)
 {
   static const char alphabet[] = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
   uint8_t random[6];
-  size_t length = strlen(temporary), written;
-  ftun_handle_t descriptor;
-  (void)mode;
-  *created = false;
+  size_t length = strlen(temporary);
   if (length < 6u || strcmp(temporary + length - 6u, "XXXXXX") != 0) return FTUN_E_INVALID;
   ftun_status_t status = ftun_random_bytes(random, sizeof(random));
   if (status != FTUN_OK) return status;
   for (size_t i = 0u; i < 6u; i++) temporary[length - 6u + i] = alphabet[random[i] % 62u];
+  return FTUN_OK;
+}
+ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created)
+{
+  *created = false;
+  ftun_status_t status = temporary_name(temporary);
+  if (status == FTUN_OK) status = ftun_directory_create(temporary, 0700u);
+  if (status == FTUN_OK) *created = true;
+  return status;
+}
+ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
+  const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published)
+{
+  wchar_t source[PATH_CHARS], target[PATH_CHARS];
+  ftun_handle_t directory = -1, parent_fd = -1;
+  *published = false;
+  ftun_status_t status = wide_path(temporary, source);
+  if (status == FTUN_OK) status = wide_path(destination, target);
+  if (status == FTUN_OK) status = ftun_file_open(temporary, FTUN_FILE_READ_DIRECTORY, &directory);
+  if (status == FTUN_OK) status = ftun_file_open(parent, FTUN_FILE_READ_DIRECTORY, &parent_fd);
+  if (status != FTUN_OK) goto done;
+  BY_HANDLE_FILE_INFORMATION from, folder;
+  if (!GetFileInformationByHandle(native_file(directory), &from) ||
+      !GetFileInformationByHandle(native_file(parent_fd), &folder)) { status = FTUN_E_IO; goto done; }
+  if ((from.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
+      (folder.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0u ||
+      from.dwVolumeSerialNumber != folder.dwVolumeSerialNumber) { status = FTUN_E_INVALID; goto done; }
+  if (hook != NULL) status = hook(FTUN_FILE_STAGE_TEMP_SYNCED, user);
+  if (status != FTUN_OK) goto done;
+  if (!MoveFileExW(source, target, MOVEFILE_WRITE_THROUGH)) {
+    DWORD error = GetLastError();
+    status = error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS ? FTUN_E_STALE : file_error(error);
+    goto done;
+  }
+  *published = true;
+  if (hook != NULL) status = hook(FTUN_FILE_STAGE_RENAMED, user);
+  if (status == FTUN_OK && hook != NULL) status = hook(FTUN_FILE_STAGE_DIRECTORY_SYNCED, user);
+done:
+  if (directory >= 0 && ftun_file_close(directory) != FTUN_OK && status == FTUN_OK) status = FTUN_E_IO;
+  if (parent_fd >= 0 && ftun_file_close(parent_fd) != FTUN_OK && status == FTUN_OK) status = FTUN_E_IO;
+  return status;
+}
+ftun_status_t ftun_platform_file_write_temporary(char *temporary, ftun_bytes_t contents,
+  unsigned int mode, bool *created)
+{
+  size_t written;
+  ftun_handle_t descriptor;
+  (void)mode;
+  *created = false;
+  ftun_status_t status = temporary_name(temporary);
+  if (status != FTUN_OK) return status;
   status = open_path(temporary, GENERIC_WRITE, CREATE_NEW, FILE_ATTRIBUTE_NORMAL,
     true, _O_WRONLY, &descriptor);
   if (status != FTUN_OK) return status;
@@ -224,7 +399,7 @@ void ftun_platform_file_remove_temporary(const char *temporary)
   if (wide_path(temporary, path) == FTUN_OK) DeleteFileW(path);
 }
 ftun_status_t ftun_platform_file_replace(const char *temporary, const char *destination,
-  const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published)
+  const char *parent, ftun_file_stage_hook_fn hook, void *user, bool replace_existing, bool *published)
 {
   wchar_t source[PATH_CHARS], target[PATH_CHARS];
   ftun_handle_t file = -1, directory = -1;
@@ -245,8 +420,12 @@ ftun_status_t ftun_platform_file_replace(const char *temporary, const char *dest
   if (status == FTUN_OK && hook != NULL) status = hook(FTUN_FILE_STAGE_TEMP_SYNCED, user);
   if (status != FTUN_OK) goto done;
   /* 不允许跨卷copy/delete；WRITE_THROUGH是Windows的移动耐久屏障。 */
-  if (!MoveFileExW(source, target, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-    status = file_error(GetLastError()); goto done;
+  if (!MoveFileExW(source, target, MOVEFILE_WRITE_THROUGH |
+      (replace_existing ? MOVEFILE_REPLACE_EXISTING : 0u))) {
+    DWORD error = GetLastError();
+    status = !replace_existing && (error == ERROR_ALREADY_EXISTS || error == ERROR_FILE_EXISTS) ?
+      FTUN_E_STALE : file_error(error);
+    goto done;
   }
   *published = true;
   if (hook != NULL) status = hook(FTUN_FILE_STAGE_RENAMED, user);
@@ -381,4 +560,19 @@ const char *ftun_file_system_ca(void)
 {
   const char *configured = getenv("SSL_CERT_FILE");
   return configured != NULL && configured[0] != '\0' ? configured : NULL;
+}
+
+bool ftun_file_is_terminal(ftun_handle_t descriptor)
+{
+  DWORD mode;
+  return GetConsoleMode(native_file(descriptor), &mode) != 0;
+}
+
+bool ftun_file_enable_ansi(ftun_handle_t descriptor)
+{
+  DWORD mode;
+  HANDLE handle = native_file(descriptor);
+  return GetConsoleMode(handle, &mode) != 0 &&
+    ((mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0u ||
+     SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0);
 }

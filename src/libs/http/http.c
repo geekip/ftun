@@ -531,6 +531,10 @@ static ftun_status_t ftun_http_fetch_once(
   free(request);
   ftun_reservation_release(&wire_reservation);
   ftun_reservation_release(&request_reservation);
+  if (status != FTUN_OK && tls != NULL) {
+    ftun_tls_info_t info;
+    if (ftun_tls_client_get_info(tls, &info) == FTUN_OK) out->tls_error = info.native_error;
+  }
   (void)ftun_tls_client_destroy(&tls);
   ftun_control_channel_drain(&channel);
   return status;
@@ -595,7 +599,11 @@ ftun_status_t ftun_http_fetch(const ftun_http_fetch_spec_t *spec,
   free(owned_url);
   ftun_reservation_release(&url_reservation);
   (void)ftun_tls_context_destroy(&local_context);
-  if (status != FTUN_OK) ftun_http_fetch_release(out);
+  if (status != FTUN_OK) {
+    int tls_error = out->tls_error;
+    ftun_http_fetch_release(out);
+    out->tls_error = tls_error;
+  }
   return status;
 }
 

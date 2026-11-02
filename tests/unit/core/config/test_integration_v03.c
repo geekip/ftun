@@ -131,7 +131,7 @@ static void transport_deliver(transport_t *transport, ftun_bytes_t response)
   void *user = transport->user;
   transport->pending = 0;
   transport->completion = NULL;
-  completion(user, FTUN_OK, transport->protocol, &transport->source, response);
+  completion(user, (ftun_error_t){0}, transport->protocol, &transport->source, response);
 }
 
 static void dns_completed(ftun_operation_t *operation, ftun_error_t error,

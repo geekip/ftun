@@ -96,6 +96,14 @@ class ConfigSchemaTest(unittest.TestCase):
                     walk(child)
         walk(SCHEMA)
 
+    def test_log_outputs(self):
+        for output in ['stderr', 'file', 'both']:
+            self.valid({'log': {'output': output}})
+        for output in ['terminal', '', None, False, 1]:
+            self.invalid({'log': {'output': output}})
+        self.assertEqual(SCHEMA['$defs']['Log']['properties']['level']['default'], 'info')
+        self.assertEqual(SCHEMA['$defs']['Log']['properties']['output']['default'], 'stderr')
+
     def test_unknown_fields_and_wrong_types(self):
         cases = [[], None, {'logging': {}}, {'base': {'ipvv6': False}},
                  {'dns': {'enable': 'false'}}, {'sniff': {'sni': True}},
