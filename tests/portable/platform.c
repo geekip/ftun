@@ -234,6 +234,31 @@ static void files(void)
     CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_OK && published);
     ftun_directory_remove(target);
   }
+  {
+    /* 临时目录里仍有打开的文件句柄（候选锁）时发布：结果必须与平台声明一致。
+     * Windows 拒绝重命名这样的目录；声明为假的平台，调用方必须先关闭句柄再发布。 */
+    char source[128], target[128], child[160];
+    ftun_platform_file_lock_t lock;
+    ftun_status_t status;
+    snprintf(source, sizeof(source), "%s/held.XXXXXX", directory);
+    snprintf(target, sizeof(target), "%s/held", directory);
+    CHECK(ftun_directory_create_temporary(source, &created) == FTUN_OK && created);
+    snprintf(child, sizeof(child), "%s/lock", source);
+    CHECK(ftun_platform_file_lock_acquire(child, &lock) == FTUN_OK);
+    status = ftun_directory_publish(source, target, directory, NULL, NULL, &published);
+    if (ftun_directory_publish_allows_open_files()) {
+      CHECK(status == FTUN_OK && published);
+    } else {
+      CHECK(status != FTUN_OK && !published);
+    }
+    CHECK(ftun_platform_file_lock_release(&lock) == FTUN_OK);
+    if (!published) {
+      CHECK(ftun_directory_publish(source, target, directory, NULL, NULL, &published) == FTUN_OK && published);
+    }
+    snprintf(child, sizeof(child), "%s/lock", target);
+    ftun_platform_file_remove_temporary(child);
+    ftun_directory_remove(target);
+  }
   ftun_directory_remove(directory);
 }
 static void pidfiles(void)

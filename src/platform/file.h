@@ -59,6 +59,10 @@ ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created);
  * Windows使用同卷MoveFileExW WRITE_THROUGH屏障，不模拟目录fsync。 */
 ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
   const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published);
+/* 临时目录里仍有打开的文件句柄（例如候选锁文件）时，ftun_directory_publish 能否成功。
+ * POSIX 为真；Windows 为假：系统拒绝重命名内部有打开句柄的目录（ERROR_ACCESS_DENIED）。
+ * 为假时调用方必须在发布前关闭目录内的全部句柄，包括锁文件。 */
+bool ftun_directory_publish_allows_open_files(void);
 /* 占用一个 FD，修改调用方提供的唯一临时路径模板；完整写入并关闭。
  * created 说明路径已创建，失败时仍由调用方清理，不保留 contents。 */
 ftun_status_t ftun_platform_file_write_temporary(char *temporary,

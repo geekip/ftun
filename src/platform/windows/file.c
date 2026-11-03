@@ -343,6 +343,11 @@ ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created)
   if (status == FTUN_OK) *created = true;
   return status;
 }
+bool ftun_directory_publish_allows_open_files(void)
+{
+  return false;
+}
+
 ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
   const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published)
 {

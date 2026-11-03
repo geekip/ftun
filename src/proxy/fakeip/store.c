@@ -301,6 +301,11 @@ ftun_status_t ftun_fakeip_store_initialize_budget(ftun_budget_t *budget,
   status = ftun_file_lock_acquire_budget(budget, lock_path, &lock);
   if (status == FTUN_OK && budget != NULL) status = ftun_budget_reserve_resources(budget,
     (ftun_budget_resources_t){0u, 2u, 0u}, &descriptors);
+  /* 有的平台（Windows）不允许重命名内部有打开句柄的目录，发布前先放掉候选锁。
+   * 临时目录此时对其他进程不可见，互斥由随后的无覆盖发布保证；失败者得到 STALE。 */
+  if (status == FTUN_OK && !ftun_directory_publish_allows_open_files()) {
+    status = ftun_file_lock_release(&lock);
+  }
   if (status == FTUN_OK) status = ftun_directory_publish(temporary, directory, parent,
     NULL, NULL, &published);
   ftun_reservation_release(&descriptors);

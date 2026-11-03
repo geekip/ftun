@@ -57,18 +57,21 @@ def keepalive_sockets(local_port=None, remote_port=None):
 
 
 def keepalive_timer_max(local_port):
-    """入站端口上带 keepalive 定时器的连接中，剩余时间最长的那个（秒）；没有则为 0。"""
-    output = subprocess.run(['ss', '-tno', 'state', 'established'], capture_output=True,
-                            text=True, check=True).stdout
+    """入站端口（127.0.0.1）上处于 keepalive 定时器状态的 ESTABLISHED 连接中，剩余时间最长的（秒）。
+
+    直接读内核的 /proc/net/tcp：tr=02 表示 keepalive 定时器，tm->when 是剩余的 1/100 秒。
+    不解析 ss 的文字输出——不同版本的 iproute2 会把 8.5 秒打印成 "8.500ms"，不可靠。"""
+    suffix = ':%04X' % local_port
     best = 0.0
-    for line in output.splitlines():
-        fields = line.split()
-        if len(fields) < 4 or not fields[2].endswith(f':{local_port}'):
-            continue
-        match = re.search(r'timer:\(keepalive,([0-9.]+)(ms|sec|min)', line)
-        if match:
-            value = float(match.group(1))
-            best = max(best, value / 1000 if match.group(2) == 'ms' else value * 60 if match.group(2) == 'min' else value)
+    with open('/proc/net/tcp', encoding='ascii') as table:
+        next(table)
+        for line in table:
+            fields = line.split()
+            if len(fields) < 6 or not fields[1].endswith(suffix) or fields[3] != '01':
+                continue
+            timer, when = fields[5].split(':')
+            if timer == '02':
+                best = max(best, int(when, 16) / 100.0)
     return best
 
 
@@ -151,9 +154,10 @@ def main():
             time.sleep(1.0)
             assert keepalive_sockets(local_port=long_port) == 1, keepalive_sockets(local_port=long_port)
             assert keepalive_sockets(remote_port=sink_port) == 1, keepalive_sockets(remote_port=sink_port)
-            # 再开启并换一个更长的空闲期（9 秒，探测总时长须小于 write-progress）：新连接带新值，
-            # 剩余时间超过旧配置的 7 秒上限。
-            config['base']['timeouts']['tcp-keepalive'] = {'idle': '9s', 'interval': '3s', 'count': 2}
+            # 再开启并换一个明显更长的空闲期（20 秒；探测总时长须小于 write-progress，所以同时放宽到 60 秒）：
+            # 新连接带新值，剩余时间超过旧配置的 7 秒上限。窗口很宽（建立后 12 秒内），慢速 CI 也稳。
+            config['base']['timeouts']['tcp-keepalive'] = {'idle': '20s', 'interval': '3s', 'count': 2}
+            config['base']['timeouts']['write-progress'] = '60s'
             config_path.write_text(json.dumps(config))
             subprocess.run([binary, 'reload', '-p', str(config_path) + '.pid'], check=True,
                            stdout=subprocess.DEVNULL, timeout=30)

@@ -124,6 +124,11 @@ ftun_status_t ftun_directory_create_temporary(char *temporary, bool *created)
   return chmod(temporary, 0700) == 0 ? FTUN_OK : ftun_file_errno(errno);
 }
 
+bool ftun_directory_publish_allows_open_files(void)
+{
+  return true;
+}
+
 ftun_status_t ftun_directory_publish(const char *temporary, const char *destination,
   const char *parent, ftun_file_stage_hook_fn hook, void *user, bool *published)
 {
