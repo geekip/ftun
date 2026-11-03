@@ -271,6 +271,27 @@ error:
   closesocket(socket);
   return status;
 }
+/* Windows 上没有经过验证的“接入连接继承存活参数”保证，保守地不声称继承：
+ * 调用方对每条接入连接继续调用 ftun_socket_apply_liveness，行为与之前一致。 */
+bool ftun_socket_accept_inherits_liveness(void)
+{
+  return false;
+}
+ftun_status_t ftun_socket_clear_liveness(ftun_handle_t descriptor)
+{
+  BOOL off = FALSE;
+  if (descriptor < 0) return FTUN_E_INVALID;
+  return setsockopt((SOCKET)descriptor, SOL_SOCKET, SO_KEEPALIVE, (const char *)&off, sizeof(off)) == 0
+    ? FTUN_OK : socket_status(WSAGetLastError());
+}
+ftun_status_t ftun_socket_listen_liveness(const ftun_endpoint_t *endpoint,
+  ftun_dial_transport_t transport, int backlog, const ftun_socket_liveness_t *liveness,
+  ftun_handle_t *out, ftun_socket_bind_issue_t *issue, bool *inherited)
+{
+  (void)liveness;
+  if (inherited != NULL) *inherited = false;
+  return ftun_socket_listen(endpoint, transport, backlog, out, issue);
+}
 ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out,
   ftun_endpoint_t *peer, ftun_socket_accept_disposition_t *disposition)
 {

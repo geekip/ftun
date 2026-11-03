@@ -296,6 +296,195 @@ static int test_stop_and_invalid(void)
   return finish(&budget, &s);
 }
 
+/* 随机操作序列对独立参照模型：每一步之后 next_deadline 必须等于由 query 与回调记录
+ * 算出的期望值；期望值尚未到期时 run 必须不做任何事（空闲快速路径的等价性）。 */
+typedef struct {
+  bool live;
+  bool timed_out;
+  uint64_t deadline;
+  uint64_t timeout;
+  uint32_t kind;
+  int attempts;
+  ftun_recovery_id_t id;
+} model_entity_t;
+
+static uint64_t model_now;
+
+static ftun_status_t model_attempt(void *user, ftun_recovery_id_t id)
+{
+  model_entity_t *e = (model_entity_t *)user;
+  (void)id;
+  e->attempts++;
+  e->timed_out = false;
+  e->deadline = e->timeout == 0u ? UINT64_MAX : model_now + e->timeout;
+  return FTUN_OK;
+}
+
+static void model_cancel(void *user, ftun_recovery_id_t id)
+{
+  model_entity_t *e = (model_entity_t *)user;
+  (void)id;
+  e->timed_out = true; /* 由 run 在期限到达时调用；注销触发的取消由 retiring 区分 */
+}
+
+static uint32_t model_random(uint64_t *state)
+{
+  uint64_t x = *state;
+  x ^= x << 13;
+  x ^= x >> 7;
+  x ^= x << 17;
+  *state = x;
+  return (uint32_t)(x >> 16);
+}
+
+static int model_expected(ftun_recovery_scheduler_t *s, model_entity_t *owner[],
+  size_t capacity, bool *present, uint64_t *deadline)
+{
+  size_t slot;
+  *present = false;
+  *deadline = 0u;
+  for (slot = 0u; slot < capacity; slot++) {
+    ftun_recovery_info_t info;
+    uint64_t when;
+    CHECK(ftun_recovery_query(s, slot, &info) == FTUN_OK);
+    if (!info.in_use) {
+      owner[slot] = NULL;
+      continue;
+    }
+    if (info.retiring) continue;
+    if (info.state == FTUN_RECOVERY_WAITING) {
+      when = info.next_ms;
+    } else if (info.state == FTUN_RECOVERY_ATTEMPTING && owner[slot] != NULL &&
+               !owner[slot]->timed_out && owner[slot]->deadline != UINT64_MAX) {
+      when = owner[slot]->deadline;
+    } else {
+      continue;
+    }
+    if (!*present || when < *deadline) {
+      *present = true;
+      *deadline = when;
+    }
+  }
+  return 0;
+}
+
+static int test_random_sequence_matches_reference(void)
+{
+  enum { CAPACITY = 6, STEPS = 30000 };
+  ftun_budget_t *budget;
+  ftun_recovery_scheduler_t *s;
+  model_entity_t entities[CAPACITY + 2];
+  model_entity_t *owner[CAPACITY] = {0};
+  uint64_t rng = UINT64_C(0x2545F4914F6CDD1D);
+  size_t step;
+  size_t slot;
+  if (make(&budget, &s, CAPACITY, 150u)) return 1;
+  memset(entities, 0, sizeof(entities));
+  model_now = 1000u;
+  for (step = 0u; step < STEPS; step++) {
+    uint32_t op = model_random(&rng) % 8u;
+    bool present;
+    bool expected_present;
+    uint64_t deadline;
+    uint64_t expected;
+    size_t work = 99u;
+    int attempts_before = 0;
+    size_t index;
+    switch (op) {
+      case 0: { /* 注册 */
+        model_entity_t *e = NULL;
+        ftun_recovery_spec_t sp;
+        for (index = 0u; index < CAPACITY + 2u; index++) {
+          if (!entities[index].live) { e = &entities[index]; break; }
+        }
+        if (e != NULL) {
+          static const uint64_t timeouts[] = {0u, 400u, 2500u};
+          memset(&sp, 0, sizeof(sp));
+          memset(e, 0, sizeof(*e));
+          e->kind = 1u << (model_random(&rng) % 3u);
+          e->timeout = timeouts[model_random(&rng) % 3u];
+          e->deadline = UINT64_MAX;
+          sp.kind = e->kind;
+          sp.attempt_timeout_ms = e->timeout;
+          sp.attempt = model_attempt;
+          sp.cancel = model_cancel;
+          sp.user = e;
+          if (ftun_recovery_entity_register(s, &sp, model_now, &e->id) == FTUN_OK) {
+            e->live = true;
+            owner[e->id.slot] = e;
+          }
+        }
+        break;
+      }
+      case 1: /* 注销 */
+        slot = model_random(&rng) % CAPACITY;
+        if (owner[slot] != NULL) (void)ftun_recovery_entity_unregister(s, owner[slot]->id);
+        break;
+      case 2: /* 报告失败：AVAILABLE 才生效，其余被忽略 */
+        slot = model_random(&rng) % CAPACITY;
+        if (owner[slot] != NULL) {
+          (void)ftun_recovery_report_failure(s, owner[slot]->id, model_now,
+            model_random(&rng) % 4u == 0u ? FTUN_RECOVERY_FAULT_AUTH : FTUN_RECOVERY_FAULT_NETWORK);
+        }
+        break;
+      case 3: { /* 结束尝试 */
+        ftun_recovery_info_t info;
+        slot = model_random(&rng) % CAPACITY;
+        if (owner[slot] != NULL && ftun_recovery_query(s, slot, &info) == FTUN_OK &&
+            info.in_use && info.state == FTUN_RECOVERY_ATTEMPTING) {
+          (void)ftun_recovery_attempt_finish(s, owner[slot]->id, model_now,
+            model_random(&rng) % 2u == 0u ? FTUN_OK : FTUN_E_IO, FTUN_RECOVERY_FAULT_NETWORK);
+        }
+        break;
+      }
+      case 4:
+        ftun_recovery_trigger_kind(s, 1u << (model_random(&rng) % 3u), model_now);
+        break;
+      case 5:
+        model_now += model_random(&rng) % 1800u;
+        break;
+      default: /* 运行 */
+        CHECK(ftun_recovery_run(s, model_now, 1u + model_random(&rng) % 3u, &work) == FTUN_OK);
+        break;
+    }
+    /* 注销/结束可能释放了槽：先让参照模型回收归属，再核对。 */
+    for (slot = 0u; slot < CAPACITY; slot++) {
+      ftun_recovery_info_t info;
+      CHECK(ftun_recovery_query(s, slot, &info) == FTUN_OK);
+      if (!info.in_use && owner[slot] != NULL) {
+        owner[slot]->live = false;
+        owner[slot] = NULL;
+      }
+    }
+    CHECK(model_expected(s, owner, CAPACITY, &expected_present, &expected) == 0);
+    CHECK(ftun_recovery_next_deadline(s, &deadline, &present) == FTUN_OK);
+    CHECK(present == expected_present);
+    CHECK(!present || deadline == expected);
+    /* 期望值尚未到期：run 必须空转，不产生新尝试也不取消。 */
+    if (!expected_present || model_now < expected) {
+      for (index = 0u; index < CAPACITY + 2u; index++) attempts_before += entities[index].attempts;
+      CHECK(ftun_recovery_run(s, model_now, 4u, &work) == FTUN_OK && work == 0u);
+      for (index = 0u; index < CAPACITY + 2u; index++) attempts_before -= entities[index].attempts;
+      CHECK(attempts_before == 0);
+    }
+  }
+  /* 清理：结束所有尝试，注销所有实体，计费归零。 */
+  for (slot = 0u; slot < CAPACITY; slot++) {
+    ftun_recovery_info_t info;
+    CHECK(ftun_recovery_query(s, slot, &info) == FTUN_OK);
+    if (info.in_use && info.state == FTUN_RECOVERY_ATTEMPTING) {
+      CHECK(ftun_recovery_attempt_finish(s, info.id, model_now, FTUN_OK,
+            FTUN_RECOVERY_FAULT_NETWORK) == FTUN_OK);
+    }
+  }
+  for (slot = 0u; slot < CAPACITY; slot++) {
+    ftun_recovery_info_t info;
+    CHECK(ftun_recovery_query(s, slot, &info) == FTUN_OK);
+    if (info.in_use) CHECK(ftun_recovery_entity_unregister(s, info.id) == FTUN_OK);
+  }
+  return finish(&budget, &s);
+}
+
 int main(void)
 {
   if (test_backoff_and_stable_window()) return 1;
@@ -303,6 +492,7 @@ int main(void)
   if (test_trigger_and_quota()) return 1;
   if (test_timeout_and_retire()) return 1;
   if (test_stop_and_invalid()) return 1;
+  if (test_random_sequence_matches_reference()) return 1;
   puts("recovery contract passed");
   return 0;
 }

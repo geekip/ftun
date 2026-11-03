@@ -337,11 +337,128 @@ static int cleanup_and_guarantees(void)
   return 0;
 }
 
+/* 资源组合与长序列搅动：请求量为 0 的维度不得改变任何计数。每一步核对根与两个
+ * 子域的已用量，序列结束后逐维填满并确认上限仍精确（原子额度没有漂移）。 */
+static int zero_resource_mixes(void)
+{
+  enum { HELD = 12, STEPS = 6000 };
+  ftun_budget_options_t root_options = {.limit = {64u, 4u, 4u}};
+  ftun_budget_options_t child_options = {.limit = {64u, 4u, 4u}, .guarantee = {16u, 1u, 1u}};
+  ftun_budget_t *root = NULL, *left = NULL, *right = NULL;
+  ftun_budget_t *targets[3];
+  ftun_reservation_t held[HELD];
+  ftun_budget_resources_t amount[HELD];
+  size_t owner[HELD];
+  uint64_t rng = UINT64_C(0x9E3779B97F4A7C15);
+  size_t step, i, mask;
+  memset(held, 0, sizeof(held));
+  memset(amount, 0, sizeof(amount));
+  CHECK(ftun_budget_create_resources(NULL, &root_options, &root) == FTUN_OK);
+  CHECK(ftun_budget_create_resources(root, &child_options, &left) == FTUN_OK);
+  CHECK(ftun_budget_create_resources(root, &child_options, &right) == FTUN_OK);
+  targets[0] = root; targets[1] = left; targets[2] = right;
+  /* 每个非空维度组合在每个预算上预留、核对、释放。 */
+  for (mask = 1u; mask < 8u; mask++) {
+    for (i = 0u; i < 3u; i++) {
+      ftun_budget_resources_t want = {(mask & 1u) ? 8u : 0u, (mask & 2u) ? 1u : 0u, (mask & 4u) ? 1u : 0u};
+      ftun_reservation_t r = {0};
+      ftun_budget_usage_t usage;
+      CHECK(ftun_budget_reserve_resources(targets[i], want, &r) == FTUN_OK);
+      CHECK(ftun_budget_get_usage(targets[i], &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == want.memory_bytes);
+      CHECK(usage.used_resources.descriptors == want.descriptors);
+      CHECK(usage.used_resources.queue_slots == want.queue_slots);
+      CHECK(usage.high_watermarks.memory_bytes >= want.memory_bytes);
+      ftun_reservation_release(&r);
+      CHECK(ftun_budget_get_usage(targets[i], &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == 0u && usage.used_resources.descriptors == 0u &&
+            usage.used_resources.queue_slots == 0u);
+    }
+  }
+  /* 长序列：随机预留（含零维）、调整、释放。 */
+  for (step = 0u; step < STEPS; step++) {
+    uint64_t x = rng; x ^= x << 13; x ^= x >> 7; x ^= x << 17; rng = x;
+    i = (size_t)((x >> 8) % HELD);
+    if (held[i].budget == NULL) {
+      ftun_budget_resources_t want = {(size_t)((x >> 20) % 5u) * 4u, (size_t)((x >> 28) % 3u) == 0u ? 1u : 0u,
+                                      (size_t)((x >> 32) % 3u) == 0u ? 1u : 0u};
+      size_t which = (size_t)((x >> 40) % 3u);
+      if (want.memory_bytes == 0u && want.descriptors == 0u && want.queue_slots == 0u) want.memory_bytes = 4u;
+      if (ftun_budget_reserve_resources(targets[which], want, &held[i]) == FTUN_OK) {
+        amount[i] = want; owner[i] = which;
+      } else {
+        CHECK(held[i].budget == NULL);
+      }
+    } else if ((x >> 44) % 4u == 0u) {
+      ftun_budget_resources_t want = {(size_t)((x >> 20) % 5u) * 4u, (size_t)((x >> 28) % 2u), (size_t)((x >> 32) % 2u)};
+      if (want.memory_bytes == 0u && want.descriptors == 0u && want.queue_slots == 0u) want.memory_bytes = 4u;
+      if (ftun_reservation_resize(&held[i], want) == FTUN_OK) amount[i] = want;
+    } else {
+      ftun_reservation_release(&held[i]);
+      memset(&amount[i], 0, sizeof(amount[i]));
+    }
+    {
+      ftun_budget_resources_t sum[3] = {{0u, 0u, 0u}, {0u, 0u, 0u}, {0u, 0u, 0u}};
+      ftun_budget_usage_t usage;
+      for (i = 0u; i < HELD; i++) {
+        if (held[i].budget == NULL) continue;
+        sum[owner[i]].memory_bytes += amount[i].memory_bytes;
+        sum[owner[i]].descriptors += amount[i].descriptors;
+        sum[owner[i]].queue_slots += amount[i].queue_slots;
+      }
+      CHECK(ftun_budget_get_usage(left, &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == sum[1].memory_bytes &&
+            usage.used_resources.descriptors == sum[1].descriptors &&
+            usage.used_resources.queue_slots == sum[1].queue_slots);
+      CHECK(ftun_budget_get_usage(right, &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == sum[2].memory_bytes &&
+            usage.used_resources.descriptors == sum[2].descriptors &&
+            usage.used_resources.queue_slots == sum[2].queue_slots);
+      CHECK(ftun_budget_get_usage(root, &usage) == FTUN_OK);
+      CHECK(usage.used_resources.memory_bytes == sum[0].memory_bytes + sum[1].memory_bytes + sum[2].memory_bytes);
+      CHECK(usage.used_resources.descriptors == sum[0].descriptors + sum[1].descriptors + sum[2].descriptors);
+      CHECK(usage.used_resources.queue_slots == sum[0].queue_slots + sum[1].queue_slots + sum[2].queue_slots);
+    }
+  }
+  for (i = 0u; i < HELD; i++) ftun_reservation_release(&held[i]);
+  /* 搅动之后，每个预算的每一维都能按其报告的 normal 可用量精确填满，再多一个单位被拒绝；
+   * 释放后可用量恢复（原子额度没有漂移）。 */
+  for (i = 0u; i < 3u; i++) {
+    size_t dimension;
+    for (dimension = 0u; dimension < 3u; dimension++) {
+      ftun_budget_usage_t before, after;
+      ftun_reservation_t fill = {0}, extra = {0};
+      ftun_budget_resources_t all = {0u, 0u, 0u}, one = {0u, 0u, 0u};
+      size_t available;
+      CHECK(ftun_budget_get_usage(targets[i], &before) == FTUN_OK);
+      available = dimension == 0u ? before.normal_available_resources.memory_bytes :
+                  dimension == 1u ? before.normal_available_resources.descriptors :
+                                    before.normal_available_resources.queue_slots;
+      CHECK(available > 0u);
+      if (dimension == 0u) { all.memory_bytes = available; one.memory_bytes = 1u; }
+      else if (dimension == 1u) { all.descriptors = available; one.descriptors = 1u; }
+      else { all.queue_slots = available; one.queue_slots = 1u; }
+      CHECK(ftun_budget_reserve_resources(targets[i], all, &fill) == FTUN_OK);
+      CHECK(ftun_budget_reserve_resources(targets[i], one, &extra) == FTUN_E_LIMIT && extra.budget == NULL);
+      ftun_reservation_release(&fill);
+      CHECK(ftun_budget_get_usage(targets[i], &after) == FTUN_OK);
+      CHECK(memcmp(&before.normal_available_resources, &after.normal_available_resources,
+                   sizeof(before.normal_available_resources)) == 0);
+      CHECK(memcmp(&before.used_resources, &after.used_resources, sizeof(before.used_resources)) == 0);
+    }
+  }
+  CHECK(ftun_budget_destroy(&right) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&left) == FTUN_OK);
+  CHECK(ftun_budget_destroy(&root) == FTUN_OK);
+  return 0;
+}
+
 int main(void)
 {
   CHECK(cleanup_and_guarantees() == 0);
   CHECK(reservation_resize() == 0);
   CHECK(independent_dimensions() == 0);
+  CHECK(zero_resource_mixes() == 0);
   ftun_budget_t *global = (ftun_budget_t *)(uintptr_t)1;
   ftun_budget_t *module = (ftun_budget_t *)(uintptr_t)1;
   ftun_budget_t *nested = (ftun_budget_t *)(uintptr_t)1;

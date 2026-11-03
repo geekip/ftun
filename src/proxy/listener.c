@@ -60,8 +60,13 @@ ftun_status_t ftun_proxy_runtime_listener_bind(
 {
   ftun_handle_t descriptor;
   ftun_handle_t udp_descriptor = -1;
-  ftun_status_t status = ftun_socket_listen(&listener->address, FTUN_DIAL_TCP,
-    128, &descriptor, &listener->bind_issue);
+  bool inherited = false;
+  /* 存活参数先于 listen 设在监听套接字上，接入连接继承（省掉逐连接 4 次 setsockopt）。 */
+  ftun_status_t status = listener->engine != NULL
+    ? ftun_socket_listen_liveness(&listener->address, FTUN_DIAL_TCP, 128,
+        &listener->engine->liveness, &descriptor, &listener->bind_issue, &inherited)
+    : ftun_socket_listen(&listener->address, FTUN_DIAL_TCP, 128, &descriptor,
+        &listener->bind_issue);
   if (status != FTUN_OK) return status;
   if (listener->udp) {
     status = ftun_socket_listen(&listener->address, FTUN_DIAL_UDP,
@@ -73,6 +78,7 @@ ftun_status_t ftun_proxy_runtime_listener_bind(
   }
   listener->descriptor = descriptor;
   listener->udp_descriptor = udp_descriptor;
+  listener->liveness_inherited = inherited;
   return FTUN_OK;
 }
 
@@ -105,6 +111,7 @@ ftun_status_t ftun_proxy_runtime_listener_close(
   if (listener->udp_descriptor >= 0) (void)ftun_socket_close((ftun_native_socket_t)listener->udp_descriptor);
   listener->descriptor = -1;
   listener->udp_descriptor = -1;
+  listener->liveness_inherited = false;
   return FTUN_OK;
 }
 
@@ -200,9 +207,11 @@ ftun_status_t ftun_proxy_runtime_accept(ftun_proxy_runtime_t *engine,
           return status;
       }
     }
-    /* 接入的 TCP 连接设置存活探测与确认期限；设置失败只丢弃这一条连接。 */
+    /* 接入的 TCP 连接设置存活探测与确认期限；设置失败只丢弃这一条连接。
+     * 监听套接字已设好并确认继承时，连接已带着这些参数，不再逐连接设置。 */
     if (listener->log_waiting) ftun_proxy_runtime_listener_log(listener, false);
-    if (ftun_socket_apply_liveness(descriptor, &engine->liveness) != FTUN_OK) {
+    if (!listener->liveness_inherited &&
+        ftun_socket_apply_liveness(descriptor, &engine->liveness) != FTUN_OK) {
       (void)ftun_socket_close((ftun_native_socket_t)descriptor);
       continue;
     }

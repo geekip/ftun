@@ -622,6 +622,18 @@ ftun_status_t ftun_proxy_runtime_reload_commit_owned(
     engine->pending_tun_inbound_id = 0u;
   }
 #endif
+  if (!ftun_proxy_runtime_liveness_equal(&engine->liveness, &engine->pending_timeouts.liveness)) {
+    /* 存活参数变了：已 bind 的监听套接字上还是旧值，退回逐连接设置，保证新连接立即用新值。 */
+    size_t listener_index;
+    for (listener_index = 0u; listener_index < engine->listener_count; listener_index++) {
+      ftun_proxy_runtime_listener_t *listener = &engine->listeners[listener_index];
+      /* 只靠逐连接设置关不掉已继承的保活，所以先把监听套接字上的清掉。 */
+      if (listener->liveness_inherited && listener->descriptor >= 0) {
+        (void)ftun_socket_clear_liveness(listener->descriptor);
+      }
+      listener->liveness_inherited = false;
+    }
+  }
   engine->liveness = engine->pending_timeouts.liveness;
   engine->handshake_ms = engine->pending_timeouts.handshake_ms;
   engine->connect_ms = engine->pending_timeouts.connect_ms;

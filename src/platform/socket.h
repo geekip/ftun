@@ -71,6 +71,24 @@ typedef enum {
 ftun_status_t ftun_socket_listen(const ftun_endpoint_t *address,
   ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
   ftun_socket_bind_issue_t *bind_issue);
+/* accept 出来的 TCP 连接是否继承监听套接字上的存活参数（SO_KEEPALIVE 与
+ * TCP_KEEPIDLE/INTVL/CNT）。首次调用在回环上做一次探测并缓存，不靠内核版本猜测；
+ * 探测失败（没有回环、描述符不足、平台不支持相关选项）一律按“不继承”处理。 */
+bool ftun_socket_accept_inherits_liveness(void);
+/* 与 ftun_socket_listen 相同，但对 TCP 先于 listen 把存活参数设到监听套接字上，
+ * 接入连接直接继承，省掉每条连接 4 次 setsockopt；先于 listen 设置才不会漏掉
+ * listen 与设置之间已完成握手的连接。
+ * *inherited 为 true 仅当参数已设置成功且 ftun_socket_accept_inherits_liveness()
+ * 为真；此时调用方可以不再对接入连接调用 ftun_socket_apply_liveness。
+ * 为 false 时监听套接字照常可用，调用方必须继续逐连接设置。liveness 为空、未启用
+ * 保活或 user_timeout_ms 非零（确认期限不走继承路径）时恒为 false，且不改动套接字。 */
+ftun_status_t ftun_socket_listen_liveness(const ftun_endpoint_t *address,
+  ftun_dial_transport_t transport, int backlog, const ftun_socket_liveness_t *liveness,
+  ftun_handle_t *out, ftun_socket_bind_issue_t *bind_issue, bool *inherited);
+/* 撤销 ftun_socket_listen_liveness 设在监听套接字上的存活参数（SO_KEEPALIVE 置 0），
+ * 此后接入的连接不再从监听套接字得到保活，由调用方按当前策略逐连接设置。
+ * 用于存活策略在运行中改变：只靠逐连接设置无法“关闭”已被继承的保活。 */
+ftun_status_t ftun_socket_clear_liveness(ftun_handle_t descriptor);
 /* peer可为空：调用方不需要保存对端地址。 */
 ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out, ftun_endpoint_t *peer,
   ftun_socket_accept_disposition_t *disposition);

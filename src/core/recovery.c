@@ -1,4 +1,5 @@
 #include "core/recovery.h"
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -28,6 +29,12 @@ struct ftun_recovery_scheduler {
   size_t cursor;
   uint64_t random;
   bool stopped;
+  /* 最早到期时间的缓存。任何改变槽的使用、状态、重试时间或期限的入口都置 due_dirty；
+   * run 在脏时重算。缓存干净时，没到 due_ms 就没有可做的事，run/next_deadline
+   * 不必逐槽扫描（每次事件循环迭代都会调用，槽位很多时曾是热点）。 */
+  uint64_t due_ms;
+  bool due_present;
+  bool due_dirty;
 };
 
 static uint64_t ftun_recovery_add(uint64_t left, uint64_t right)
@@ -50,6 +57,39 @@ static bool ftun_recovery_slow_fault(ftun_recovery_fault_t fault)
   return fault == FTUN_RECOVERY_FAULT_AUTH ||
          fault == FTUN_RECOVERY_FAULT_CONFIG;
 }
+
+/* 逐槽求最早需要调用 run 的时刻：权威定义，缓存只是它的结果。 */
+static void ftun_recovery_scan_due(const ftun_recovery_scheduler_t *scheduler,
+  bool *present, uint64_t *due)
+{
+  size_t index;
+  uint64_t best = UINT64_MAX;
+  *present = false;
+  for (index = 0u; index < scheduler->capacity; index++) {
+    const ftun_recovery_slot_t *slot = &scheduler->slots[index];
+    uint64_t when;
+    if (!slot->in_use || slot->retiring) continue;
+    if (slot->state == FTUN_RECOVERY_WAITING) when = slot->next_ms;
+    else if (slot->state == FTUN_RECOVERY_ATTEMPTING && !slot->timed_out &&
+             slot->deadline_ms != UINT64_MAX) when = slot->deadline_ms;
+    else continue;
+    if (!*present || when < best) { best = when; *present = true; }
+  }
+  *due = *present ? best : 0u;
+}
+
+#ifndef NDEBUG
+/* 调试构建：每次依赖干净缓存时都与逐槽扫描对账，漏置脏标记会在测试中立即暴露。 */
+static void ftun_recovery_audit_cache(const ftun_recovery_scheduler_t *scheduler)
+{
+  bool present;
+  uint64_t due;
+  assert(!scheduler->due_dirty);
+  ftun_recovery_scan_due(scheduler, &present, &due);
+  assert(present == scheduler->due_present);
+  assert(!present || due == scheduler->due_ms);
+}
+#endif
 
 static ftun_recovery_slot_t *ftun_recovery_find(
   const ftun_recovery_scheduler_t *scheduler, ftun_recovery_id_t id)
@@ -146,6 +186,7 @@ ftun_status_t ftun_recovery_scheduler_create(ftun_budget_t *budget,
   scheduler->reservation = reservation;
   scheduler->policy = *policy;
   scheduler->capacity = capacity;
+  scheduler->due_dirty = true;
   scheduler->random = policy->seed != 0u ? policy->seed
                                          : FTUN_RECOVERY_DEFAULT_SEED;
   *out = scheduler;
@@ -157,6 +198,7 @@ void ftun_recovery_scheduler_stop(ftun_recovery_scheduler_t *scheduler)
   size_t index;
   if (scheduler == NULL || scheduler->stopped) return;
   scheduler->stopped = true;
+  scheduler->due_dirty = true;
   for (index = 0u; index < scheduler->capacity; index++) {
     ftun_recovery_slot_t *slot = &scheduler->slots[index];
     if (slot->in_use && slot->state == FTUN_RECOVERY_ATTEMPTING) {
@@ -217,6 +259,7 @@ ftun_status_t ftun_recovery_entity_unregister(
   if (scheduler == NULL) return FTUN_E_INVALID;
   slot = ftun_recovery_find(scheduler, id);
   if (slot == NULL || slot->retiring) return FTUN_E_STALE;
+  scheduler->due_dirty = true;
   if (slot->state != FTUN_RECOVERY_ATTEMPTING) {
     ftun_recovery_free(slot);
     return FTUN_OK;
@@ -239,6 +282,7 @@ ftun_status_t ftun_recovery_report_failure(
   if (slot->state != FTUN_RECOVERY_AVAILABLE) return FTUN_OK;
   ftun_recovery_note_failure(scheduler, slot, fault, now_ms);
   slot->state = FTUN_RECOVERY_WAITING;
+  scheduler->due_dirty = true;
   return FTUN_OK;
 }
 
@@ -250,6 +294,7 @@ ftun_status_t ftun_recovery_attempt_finish(
   if (scheduler == NULL) return FTUN_E_INVALID;
   slot = ftun_recovery_find(scheduler, id);
   if (slot == NULL || slot->state != FTUN_RECOVERY_ATTEMPTING) return FTUN_E_STALE;
+  scheduler->due_dirty = true;
   if (slot->retiring) {
     ftun_recovery_free(slot);
     return FTUN_OK;
@@ -286,6 +331,7 @@ void ftun_recovery_trigger_kind(ftun_recovery_scheduler_t *scheduler,
         (slot->spec.kind & kind_mask) != 0u && !ftun_recovery_slow_fault(slot->fault) &&
         slot->next_ms > now_ms) {
       slot->next_ms = now_ms;
+      scheduler->due_dirty = true;
     }
   }
 }
@@ -298,6 +344,12 @@ ftun_status_t ftun_recovery_run(ftun_recovery_scheduler_t *scheduler,
   if (out_work != NULL) *out_work = 0u;
   if (scheduler == NULL || out_work == NULL || quota == 0u) return FTUN_E_INVALID;
   if (scheduler->stopped) return FTUN_OK;
+  if (!scheduler->due_dirty && (!scheduler->due_present || now_ms < scheduler->due_ms)) {
+#ifndef NDEBUG
+    ftun_recovery_audit_cache(scheduler);
+#endif
+    return FTUN_OK;
+  }
   for (visited = 0u; visited < scheduler->capacity && work < quota; visited++) {
     ftun_recovery_slot_t *slot = &scheduler->slots[scheduler->cursor];
     scheduler->cursor = (scheduler->cursor + 1u) % scheduler->capacity;
@@ -328,29 +380,29 @@ ftun_status_t ftun_recovery_run(ftun_recovery_scheduler_t *scheduler,
     }
   }
   *out_work = work;
+  /* 回调可能同步改过槽（attempt_finish、注销），统一在扫描结束后重算缓存。 */
+  ftun_recovery_scan_due(scheduler, &scheduler->due_present, &scheduler->due_ms);
+  scheduler->due_dirty = false;
   return FTUN_OK;
 }
 
 ftun_status_t ftun_recovery_next_deadline(
   const ftun_recovery_scheduler_t *scheduler, uint64_t *out, bool *present)
 {
-  size_t index;
-  uint64_t best = UINT64_MAX;
   if (present != NULL) *present = false;
   if (scheduler == NULL || out == NULL || present == NULL) return FTUN_E_INVALID;
   *out = 0u;
   if (scheduler->stopped) return FTUN_OK;
-  for (index = 0u; index < scheduler->capacity; index++) {
-    const ftun_recovery_slot_t *slot = &scheduler->slots[index];
-    uint64_t when;
-    if (!slot->in_use || slot->retiring) continue;
-    if (slot->state == FTUN_RECOVERY_WAITING) when = slot->next_ms;
-    else if (slot->state == FTUN_RECOVERY_ATTEMPTING && !slot->timed_out &&
-             slot->deadline_ms != UINT64_MAX) when = slot->deadline_ms;
-    else continue;
-    if (!*present || when < best) { best = when; *present = true; }
+  if (!scheduler->due_dirty) {
+#ifndef NDEBUG
+    ftun_recovery_audit_cache(scheduler);
+#endif
+    *present = scheduler->due_present;
+    *out = scheduler->due_ms;
+    return FTUN_OK;
   }
-  if (*present) *out = best;
+  /* 缓存失效（刚有改动、尚未经过 run）：公开接口保持 const，所以只扫描，不写缓存。 */
+  ftun_recovery_scan_due(scheduler, present, out);
   return FTUN_OK;
 }
 

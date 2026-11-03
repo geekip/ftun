@@ -325,9 +325,21 @@ struct ftun_proxy_runtime_listener {
   uint32_t tcp_idle_ms;
   bool waiting;
   bool paused;
+  /* 监听套接字已按当前 engine->liveness 在 listen 之前设好存活参数，且平台确认接入连接
+   * 继承：接入时不再逐连接 setsockopt。reload 改变存活参数时清除（见 reload 提交），
+   * 此后回退为逐连接设置，直到该监听重新 bind。 */
+  bool liveness_inherited;
   ftun_socket_bind_issue_t bind_issue;
   ftun_recovery_id_t recovery;
 };
+
+static inline bool ftun_proxy_runtime_liveness_equal(
+  const ftun_socket_liveness_t *left, const ftun_socket_liveness_t *right)
+{
+  return left->keepalive_enabled == right->keepalive_enabled &&
+    left->idle_s == right->idle_s && left->interval_s == right->interval_s &&
+    left->count == right->count && left->user_timeout_ms == right->user_timeout_ms;
+}
 
 struct ftun_proxy_runtime_flow {
   uint64_t sid, log_generation, log_started_ms;

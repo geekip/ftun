@@ -237,9 +237,14 @@ static void ftun_budget_add(ftun_budget_t *leaf,
   ftun_budget_t *budget;
   struct ftun_budget_root *root = leaf->root;
   size_t index;
+  /* 请求量为 0 的维度对所有计数都是空操作；常见的预留只涉及内存，跳过它们
+   * 可以省掉每次预留/释放里多个带锁前缀的原子运算（建连路径上反复发生）。 */
   for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
-    size_t borrowed = ftun_budget_borrow_increase(leaf, index, resources[index]);
-    size_t committed = ftun_atomic_fetch_add(&root->committed[index], resources[index]) + resources[index];
+    size_t borrowed;
+    size_t committed;
+    if (resources[index] == 0u) continue;
+    borrowed = ftun_budget_borrow_increase(leaf, index, resources[index]);
+    committed = ftun_atomic_fetch_add(&root->committed[index], resources[index]) + resources[index];
     size_t high = ftun_atomic_load(&root->high[index]);
     (void)ftun_atomic_fetch_add(&root->covered[index], resources[index] - borrowed);
     while (high < committed && !ftun_atomic_compare_exchange_strong(&root->high[index], &high, committed)) { }
@@ -249,6 +254,7 @@ static void ftun_budget_add(ftun_budget_t *leaf,
   }
   for (budget = leaf; budget->parent != NULL; budget = budget->parent) {
     for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
+      if (resources[index] == 0u) continue;
       budget->used[index] += resources[index];
       if (budget->used[index] > budget->high_watermark[index]) budget->high_watermark[index] = budget->used[index];
     }
@@ -279,7 +285,9 @@ static void ftun_budget_subtract(ftun_budget_t *leaf,
   struct ftun_budget_root *root = leaf->root;
   size_t index;
   for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
-    size_t borrowed = ftun_budget_borrow_decrease(leaf, index, resources[index]);
+    size_t borrowed;
+    if (resources[index] == 0u) continue;
+    borrowed = ftun_budget_borrow_decrease(leaf, index, resources[index]);
     (void)ftun_atomic_fetch_sub_explicit(&root->committed[index], resources[index], FTUN_MEMORY_SEQ_CST);
     (void)ftun_atomic_fetch_sub_explicit(&root->covered[index], resources[index] - borrowed, FTUN_MEMORY_SEQ_CST);
     (void)ftun_atomic_fetch_sub_explicit(&root->borrowed[index], borrowed, FTUN_MEMORY_SEQ_CST);
@@ -289,7 +297,9 @@ static void ftun_budget_subtract(ftun_budget_t *leaf,
     for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) root->own_used[index] -= resources[index];
   }
   for (budget = leaf; budget->parent != NULL; budget = budget->parent) {
-    for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) budget->used[index] -= resources[index];
+    for (index = 0u; index < FTUN_BUDGET_RESOURCE_COUNT; index++) {
+      if (resources[index] != 0u) budget->used[index] -= resources[index];
+    }
   }
 }
 

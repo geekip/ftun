@@ -56,6 +56,22 @@ def keepalive_sockets(local_port=None, remote_port=None):
     return count
 
 
+def keepalive_timer_max(local_port):
+    """入站端口上带 keepalive 定时器的连接中，剩余时间最长的那个（秒）；没有则为 0。"""
+    output = subprocess.run(['ss', '-tno', 'state', 'established'], capture_output=True,
+                            text=True, check=True).stdout
+    best = 0.0
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 4 or not fields[2].endswith(f':{local_port}'):
+            continue
+        match = re.search(r'timer:\(keepalive,([0-9.]+)(ms|sec|min)', line)
+        if match:
+            value = float(match.group(1))
+            best = max(best, value / 1000 if match.group(2) == 'ms' else value * 60 if match.group(2) == 'min' else value)
+    return best
+
+
 def closed(client):
     """对端是否已关闭连接（EOF 或复位）。"""
     client.setblocking(False)
@@ -124,13 +140,35 @@ def main():
             assert not closed(second)
             # 被回收的连接，其拨出侧也一并关闭。
             assert keepalive_sockets(remote_port=sink_port) == 1
+            # reload 改变存活参数：监听套接字上的旧值必须被清掉，新接入的连接按新配置，
+            # 不能因为继承而保留旧的探测设置。先关闭探测：新连接两侧都不应有 keepalive。
+            config['base']['timeouts']['tcp-keepalive'] = False
+            config_path.write_text(json.dumps(config))
+            subprocess.run([binary, 'reload', '-p', str(config_path) + '.pid'], check=True,
+                           stdout=subprocess.DEVNULL, timeout=30)
+            third = socks_connect(long_port, sink_port)
+            third.sendall(b'x')
+            time.sleep(1.0)
+            assert keepalive_sockets(local_port=long_port) == 1, keepalive_sockets(local_port=long_port)
+            assert keepalive_sockets(remote_port=sink_port) == 1, keepalive_sockets(remote_port=sink_port)
+            # 再开启并换一个更长的空闲期（9 秒，探测总时长须小于 write-progress）：新连接带新值，
+            # 剩余时间超过旧配置的 7 秒上限。
+            config['base']['timeouts']['tcp-keepalive'] = {'idle': '9s', 'interval': '3s', 'count': 2}
+            config_path.write_text(json.dumps(config))
+            subprocess.run([binary, 'reload', '-p', str(config_path) + '.pid'], check=True,
+                           stdout=subprocess.DEVNULL, timeout=30)
+            fourth = socks_connect(long_port, sink_port)
+            fourth.sendall(b'x')
+            wait_for(process, lambda: keepalive_timer_max(long_port) > 7.5, seconds=3)
+            assert keepalive_sockets(local_port=long_port) == 2, keepalive_sockets(local_port=long_port)
             process.send_signal(signal.SIGTERM)
             assert process.wait(timeout=15) == 0
         finally:
             if process.poll() is None:
                 process.kill()
                 process.wait()
-    print('PASS liveness: keepalive on accepted and dialed sockets, idle reclaim with inbound override')
+    print('PASS liveness: keepalive on accepted and dialed sockets, idle reclaim with inbound override, '
+          'reload changes apply to new connections')
 
 
 if __name__ == '__main__':

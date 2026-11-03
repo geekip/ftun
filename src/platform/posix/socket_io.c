@@ -356,9 +356,9 @@ ftun_status_t ftun_socket_name(ftun_handle_t descriptor, ftun_endpoint_t *out)
   return ftun_socket_endpoint(&address, length, out);
 }
 
-ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
-  ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
-  ftun_socket_bind_issue_t *issue)
+static ftun_status_t ftun_socket_listen_internal(const ftun_endpoint_t *endpoint,
+  ftun_dial_transport_t transport, int backlog, const ftun_socket_liveness_t *liveness,
+  ftun_handle_t *out, ftun_socket_bind_issue_t *issue, bool *inherited)
 {
   struct sockaddr_storage address;
   int descriptor;
@@ -366,6 +366,7 @@ ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
   int error;
   *out = -1;
   *issue = FTUN_SOCKET_BIND_OTHER;
+  if (inherited != NULL) *inherited = false;
   if (!ftun_endpoint_is_ip(endpoint) ||
       (transport != FTUN_DIAL_TCP && transport != FTUN_DIAL_UDP)) return FTUN_E_INVALID;
   descriptor = ftun_posix_socket(endpoint->kind == FTUN_ADDRESS_IPV6 ? AF_INET6 : AF_INET,
@@ -373,16 +374,46 @@ ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
   if (descriptor < 0) return ftun_blocking_socket_status(errno);
   (void)setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
   socklen_t length = ftun_socket_address(endpoint, &address);
-  if (bind(descriptor, (const struct sockaddr *)&address, length) != 0 ||
-      (transport == FTUN_DIAL_TCP && listen(descriptor, backlog) != 0)) {
+  if (bind(descriptor, (const struct sockaddr *)&address, length) != 0) {
     error = errno;
-    if (error == EADDRNOTAVAIL) *issue = FTUN_SOCKET_BIND_ADDRESS_UNAVAILABLE;
-    if (error == EACCES || error == EPERM) *issue = FTUN_SOCKET_BIND_PERMISSION;
-    (void)close(descriptor);
-    return ftun_blocking_socket_status(error);
+    goto failed;
+  }
+  /* 先于 listen 设置：握手在 listen 之后才可能完成，所以不会有连接漏掉这些参数。
+   * 设置失败时可能已部分生效，但 inherited 保持 false，调用方会对每条连接完整重设。 */
+  if (inherited != NULL && liveness != NULL && transport == FTUN_DIAL_TCP &&
+      liveness->keepalive_enabled && liveness->user_timeout_ms == 0u &&
+      ftun_socket_accept_inherits_liveness() &&
+      ftun_socket_apply_liveness((ftun_handle_t)descriptor, liveness) == FTUN_OK) {
+    *inherited = true;
+  }
+  if (transport == FTUN_DIAL_TCP && listen(descriptor, backlog) != 0) {
+    error = errno;
+    goto failed;
   }
   *out = descriptor;
   return FTUN_OK;
+failed:
+  if (inherited != NULL) *inherited = false;
+  if (error == EADDRNOTAVAIL) *issue = FTUN_SOCKET_BIND_ADDRESS_UNAVAILABLE;
+  if (error == EACCES || error == EPERM) *issue = FTUN_SOCKET_BIND_PERMISSION;
+  (void)close(descriptor);
+  return ftun_blocking_socket_status(error);
+}
+
+ftun_status_t ftun_socket_listen(const ftun_endpoint_t *endpoint,
+  ftun_dial_transport_t transport, int backlog, ftun_handle_t *out,
+  ftun_socket_bind_issue_t *issue)
+{
+  return ftun_socket_listen_internal(endpoint, transport, backlog, NULL, out, issue, NULL);
+}
+
+ftun_status_t ftun_socket_listen_liveness(const ftun_endpoint_t *endpoint,
+  ftun_dial_transport_t transport, int backlog, const ftun_socket_liveness_t *liveness,
+  ftun_handle_t *out, ftun_socket_bind_issue_t *issue, bool *inherited)
+{
+  bool unused = false;
+  return ftun_socket_listen_internal(endpoint, transport, backlog, liveness, out, issue,
+                                     inherited != NULL ? inherited : &unused);
 }
 
 ftun_status_t ftun_socket_accept(ftun_handle_t listener, ftun_handle_t *out, ftun_endpoint_t *peer,
