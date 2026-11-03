@@ -220,12 +220,31 @@ def main():
                         os.close(read_fd)
                     os.close(write_fd)
 
+            # 前台stderr不使用默认日志路径；后台启用文件时才要求HOME。
+            path, pid, log, port, document = fixture('no-home')
+            del document['log']['file']
+            path.write_text(json.dumps(document))
+            no_home = dict(os.environ)
+            no_home.pop('HOME', None)
+            invoke([binary, 'check', '-c', str(path)], env=no_home)
+            invoke([binary, 'run', '-b', '-c', str(path), '-p', str(pid)], env=no_home, code=1)
+            assert not pid.exists()
+            assert reap() == [1]
+            document['log']['level'] = 'silent'
+            path.write_text(json.dumps(document))
+            invoke([binary, 'run', '-b', '-c', str(path), '-p', str(pid)], env=no_home)
+            assert status(pid)['logs']['output'] == 'disabled'
+            stop(pid)
+
             home = root / 'default-home'
             home.mkdir()
             pid = root / 'default.pid'
             result = invoke([binary, 'run', '-b', '-p', str(pid)], env=dict(os.environ, HOME=str(home)))
             assert b'created default configuration:' in result.stderr and b'ftun: ready' in result.stderr, result
             assert (home / '.ftun' / 'config.json').exists() and (home / '.ftun' / 'ftun.log').exists()
+            assert status(pid)['logs']['file'] == str(home / '.ftun' / 'ftun.log')
+            invoke([binary, 'reload', '-p', str(pid)])
+            assert status(pid)['logs']['file'] == str(home / '.ftun' / 'ftun.log')
             stop(pid)
     finally:
         for child in children():

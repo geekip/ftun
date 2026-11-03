@@ -11,8 +11,7 @@ static ftun_status_t ftun_core_state_lock_create(const ftun_config_t *config,
   ftun_status_t status;
   *out = NULL;
   if (pool == NULL) return FTUN_OK;
-  if (!config->base.proxy.state_cache &&
-      !((config->plan->prepare & FTUN_PLAN_FAKE_IP) != 0u && config->dns.fake_ip.persist)) return FTUN_OK;
+  if (!ftun_config_uses_cache_file(config)) return FTUN_OK;
   status = ftun_core_prepare_parent(config->base.proxy.cache_file);
   if (status == FTUN_OK && !config->base.proxy.state_cache) return FTUN_OK;
   if (status == FTUN_OK) {
@@ -86,7 +85,7 @@ static ftun_status_t ftun_core_reload_compatible(const ftun_config_t *active,
   if (!ftun_core_fakeip_range_equal(active->dns.fake_ip.range, next->dns.fake_ip.range))
     return ftun_config_error_set(error, FTUN_E_RESTART_REQUIRED, "/dns/fake-ip/range",
       "FakeIP range change requires restart");
-  if ((active->dns.fake_ip.persist || next->dns.fake_ip.persist) &&
+  if (ftun_config_uses_fakeip_state(active) && ftun_config_uses_fakeip_state(next) &&
       !ftun_core_string_equal(active->base.proxy.cache_file, next->base.proxy.cache_file))
     return ftun_config_error_set(error, FTUN_E_RESTART_REQUIRED, "/base/cache-file",
       "persistent state path change requires restart");

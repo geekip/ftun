@@ -239,7 +239,7 @@ ftun_status_t ftun_core_owned_path_copy(ftun_budget_t *budget,
   const char *value, ftun_core_owned_path_t *out);
 ftun_status_t ftun_core_owned_path_destroy(ftun_core_owned_path_t *path);
 ftun_status_t ftun_core_prepare_parent(const char *path);
-ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
+ftun_status_t ftun_core_logger_create(ftun_config_t *config,
   ftun_log_ledger_t *ledger, bool no_color, bool file_only, ftun_log_level_t level_override,
   ftun_logger_t **out, char *file_error);
 ftun_status_t ftun_core_logger_reap(ftun_core_control_t *control,

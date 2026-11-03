@@ -148,6 +148,13 @@ def correlation_and_control(binary, root, level):
                 assert running.call('reload', boot='ffffffffffffffff')['result'] == 'rejected'
             wait(lambda: lines(log, 'request rejected (first)'), lambda: text(log))
             assert len(lines(log, 'request rejected (first)')) == 1
+            with running.connect() as stream:
+                stream.sendall(b'{}\n')
+                assert json.loads(stream.makefile('rb').readline())['result'] == 'invalid-request'
+            wait(lambda: len(lines(log, 'request rejected (first)')) == 2, lambda: text(log))
+            rejected_lines = lines(log, 'request rejected (first)')
+            assert any('result=invalid-request' in line and f'uid={os.geteuid()}' in line for line in rejected_lines)
+            assert any('result=boot-mismatch' in line and f'uid={os.geteuid()}' in line for line in rejected_lines)
         stopped = running.call('stop', timeout_ms=5000)
         assert stopped['result'] == 'stopped', stopped
         assert running.process.wait(timeout=5) == 0
@@ -169,22 +176,23 @@ def health(binary, root):
     try:
         running, log, listener = instance(binary, root, 'info', [primary, standby], False)
         query(listener, 1)
-        wait(lambda: lines(log, 'upstream failures (first)'), lambda: text(log))
-        assert lines(log, 'response invalid (first)') and lines(log, 'upstream unhealthy'), text(log)
+        wait(lambda: lines(log, 'response invalid (first)'), lambda: text(log))
+        assert not lines(log, 'upstream failures (first)'), text(log)
+        assert running.call('status')['logs']['aggregation']['failures'] == 1
         for ident in range(2, 22):
             query(listener, ident)
-        assert len(lines(log, 'upstream failures (first)')) == 1, text(log)
-        assert len(lines(log, 'upstream unhealthy')) == 1, text(log)
+        assert not lines(log, 'upstream failures (first)'), text(log)
         primary.invalid.clear()
         deadline = time.monotonic() + 8
         ident = 30
-        while not lines(log, 'upstream healthy'):
+        while not lines(log, 'response valid'):
             assert time.monotonic() < deadline, text(log)
             query(listener, ident)
             ident += 1
             time.sleep(.05)
         wait(lambda: lines(log, 'group switched'), lambda: text(log))
-        assert any('duration_ms=' in line and 'count=' in line for line in lines(log, 'upstream healthy')), text(log)
+        assert any('duration_ms=' in line and 'count=1' in line for line in lines(log, 'response valid')), text(log)
+        assert not lines(log, 'upstream healthy'), text(log)
         time.sleep(.1)
         before = text(log)
         for ident in range(100, 140):

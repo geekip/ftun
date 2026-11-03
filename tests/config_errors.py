@@ -33,7 +33,7 @@ def main():
                                  {'type': 'udp', 'name': 'b', 'address': ['bad_domain:53']}]}},
              'validate', '/dns/servers/1/address/0', 'dns.servers[1].address[0]'),
             ({'base': {'cache-file': '~someone/state'}}, 'paths', '/base/cache-file', 'base.cache-file'),
-            ({'log': {'file': '~someone/log'}}, 'paths', '/log/file', 'log.file'),
+            ({'log': {'output': 'file', 'file': '~someone/log'}}, 'paths', '/log/file', 'log.file'),
             ({'outbounds': [{'type': 'select', 'name': 'g', 'outbounds': ['DIRECT', 'missing'], 'default': 'DIRECT'}]},
              'validate', '/outbounds/0/outbounds/1', 'outbounds[0].outbounds[1]'),
             ({'rules': ['MATCH,DIRECT', 'MATCH,missing']}, 'validate', '/rules/1', 'rules[1]'),

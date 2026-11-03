@@ -1,6 +1,8 @@
 #!/bin/sh /etc/rc.common
 # OpenWrt procd 样例。procd 没有 sd_notify，由 respawn 在进程退出（含退出码 3、4）后拉起；
 # 参数依次为 阈值秒数、重试间隔秒数、最大重试次数（0 为不限）。
+# 服务可能没有HOME；在/etc/ftun/config.json中合入以下绝对路径：
+# {"base":{"cache-file":"/tmp/ftun.cache"},"log":{"output":"stderr","file":"/tmp/ftun.log"}}
 START=95
 USE_PROCD=1
 

@@ -20,6 +20,8 @@ typedef ftun_file_handle_t ftun_platform_file_lock_t;
  * write 返回实际写入字节数，失败也报告已写前缀，不重发已交付的数据。 */
 /* 只读终端能力查询，不拥有或改变句柄。 */
 bool ftun_file_is_terminal(ftun_handle_t descriptor);
+/* JOURNAL_STREAM必须与该句柄的设备及inode一致；只读、不分配。 */
+bool ftun_file_is_journal(ftun_handle_t descriptor);
 /* 终端颜色能力：Windows启用VT显示并保留其余模式位，失败返回false。 */
 bool ftun_file_enable_ansi(ftun_handle_t descriptor);
 bool ftun_platform_file_is_open(const ftun_file_handle_t *file);

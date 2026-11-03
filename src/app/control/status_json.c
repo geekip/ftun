@@ -23,15 +23,22 @@ static void append(writer_t *writer, const char *format, ...)
   else writer->used += (size_t)count;
 }
 
-static void quote(writer_t *writer, const char *text)
+size_t ftun_ctl_json_quote(const char *text, char *out, size_t capacity)
 {
   cJSON value = {0};
-  if (!writer->ok) return;
   value.type = cJSON_String;
   value.valuestring = (char *)text;
-  if (!cJSON_PrintPreallocated(&value, writer->data + writer->used,
-      (int)(writer->capacity - writer->used), false)) writer->ok = false;
-  else writer->used += strlen(writer->data + writer->used);
+  if (!cJSON_PrintPreallocated(&value, out, (int)capacity, false)) return 0u;
+  return strlen(out);
+}
+
+static void quote(writer_t *writer, const char *text)
+{
+  if (!writer->ok) return;
+  size_t length = ftun_ctl_json_quote(text, writer->data + writer->used,
+    writer->capacity - writer->used);
+  if (length == 0u) writer->ok = false;
+  else writer->used += length;
 }
 
 #if defined(FTUN_HAVE_MODULE_DNS) || defined(FTUN_HAVE_MODULE_PROXY)

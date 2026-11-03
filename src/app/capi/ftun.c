@@ -213,7 +213,7 @@ ftun_status_t ftun_app_control_set_ready(ftun_core_t *core,
   return status;
 }
 
-ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
+ftun_status_t ftun_core_logger_create(ftun_config_t *config,
                                               ftun_log_ledger_t *ledger, bool no_color, bool file_only, ftun_log_level_t level_override,
                                               ftun_logger_t **out, char *file_error)
 {
@@ -226,8 +226,10 @@ ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
   if (status != FTUN_OK) return status;
   if (level_override != FTUN_LOG_SILENT) level = level_override;
   if (level == FTUN_LOG_SILENT) return FTUN_OK;
-  if (file_only || strcmp(config->log.output, "stderr") != 0) {
-    status = ftun_core_prepare_parent(config->log.file);
+  if (ftun_config_uses_log_file(config, file_only)) {
+    if (file_only && strcmp(config->log.output, "stderr") == 0)
+      status = ftun_config_resolve_log_file(config);
+    if (status == FTUN_OK) status = ftun_core_prepare_parent(config->log.file);
     if (status != FTUN_OK) {
       (void)snprintf(file_error, FTUN_APP_CONTROL_PATH_CAPACITY, "%s", config->log.file);
       return status;
@@ -237,7 +239,7 @@ ftun_status_t ftun_core_logger_create(const ftun_config_t *config,
   options.level = level;
   options.no_color = no_color;
   options.stderr_output = !file_only && strcmp(config->log.output, "file") != 0;
-  if (file_only || strcmp(config->log.output, "stderr") != 0) {
+  if (ftun_config_uses_log_file(config, file_only)) {
     options.path = config->log.file;
     options.max_size = config->log.max_size;
     options.max_files = config->log.max_files;

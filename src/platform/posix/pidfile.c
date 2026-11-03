@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "platform/pidfile.h"
 #include "platform/process.h"
+#include "platform/thread.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -20,7 +21,7 @@ ftun_status_t ftun_pidfile_probe(const char *path, uint32_t *pid)
     status = FTUN_E_IO;
   } else if (!S_ISREG(info.st_mode)) {
     status = FTUN_E_INVALID;
-  } else if (flock(descriptor, LOCK_EX | LOCK_NB) == 0) {
+  } else if (flock(descriptor, LOCK_SH | LOCK_NB) == 0) {
     status = FTUN_E_EOF;
   } else if (errno == EWOULDBLOCK || errno == EAGAIN) {
     status = ftun_pidfile_read(descriptor, pid);
@@ -47,23 +48,36 @@ ftun_status_t ftun_pidfile_acquire(const char *path, ftun_pidfile_t *out,
   uint32_t *holder)
 {
   ftun_status_t status;
-  struct stat info;
+  struct stat info, current;
+  unsigned int attempt;
   *out = (ftun_pidfile_t)FTUN_PIDFILE_INVALID;
   *holder = 0u;
-  status = ftun_platform_file_lock_acquire(path, &out->file);
-  if (status != FTUN_OK) {
-    if (status == FTUN_E_AGAIN) (void)ftun_pidfile_probe(path, holder);
-    return status;
+  /* 探测共享锁与unlink窗口最多复核8次，间隔1ms；真实持锁实例立即拒绝。 */
+  for (attempt = 0u; attempt < 8u; attempt++) {
+    status = ftun_platform_file_lock_acquire(path, &out->file);
+    if (status != FTUN_OK) {
+      if (status != FTUN_E_AGAIN || ftun_pidfile_probe(path, holder) != FTUN_E_EOF) return status;
+    } else {
+      out->path = path;
+      if (fstat((int)out->file.descriptor, &info) != 0) {
+        (void)ftun_pidfile_discard(out);
+        return FTUN_E_IO;
+      }
+      if (!S_ISREG(info.st_mode)) {
+        (void)ftun_pidfile_discard(out);
+        return FTUN_E_INVALID;
+      }
+      if (lstat(path, &current) == 0) {
+        if (info.st_dev == current.st_dev && info.st_ino == current.st_ino) break;
+      } else if (errno != ENOENT) {
+        (void)ftun_pidfile_discard(out);
+        return FTUN_E_IO;
+      }
+      (void)ftun_pidfile_discard(out);
+    }
+    if (attempt + 1u < 8u) ftun_thread_pause(1u);
   }
-  out->path = path;
-  if (fstat((int)out->file.descriptor, &info) != 0) {
-    (void)ftun_pidfile_discard(out);
-    return FTUN_E_IO;
-  }
-  if (!S_ISREG(info.st_mode)) {
-    (void)ftun_pidfile_discard(out);
-    return FTUN_E_INVALID;
-  }
+  if (attempt == 8u) return FTUN_E_AGAIN;
   if (fchmod((int)out->file.descriptor, 0600) != 0) {
     status = FTUN_E_IO;
   } else {

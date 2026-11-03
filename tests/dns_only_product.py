@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 import time
+from cli_results_product import reserve_dns_sockets
 
 
 def fail(message: str) -> None:
@@ -124,7 +125,9 @@ def main() -> None:
     executable = Path(sys.argv[1]).resolve()
     if not executable.is_file():
         fail(f"missing executable: {executable}")
-    upstream_port, replacement_port, listener_port = reserve_udp_ports(3)
+    upstream_port, replacement_port = reserve_udp_ports(2)
+    listener_udp, listener_tcp = reserve_dns_sockets()
+    listener_port = int(listener_udp.getsockname()[1])
     ready = threading.Event()
     done = threading.Event()
     old_request_blocked = threading.Event()
@@ -143,10 +146,6 @@ def main() -> None:
               replacement_ready, replacement_done),
         daemon=True,
     )
-    thread.start()
-    replacement_thread.start()
-    if not ready.wait(2.0) or not replacement_ready.wait(2.0):
-        fail("upstream fixture did not start")
     with tempfile.TemporaryDirectory(prefix="ftun-dns-only-") as directory:
         config_path = Path(directory) / "dns-only.json"
         config = {
@@ -183,6 +182,12 @@ def main() -> None:
         )
         if checked.returncode != 0:
             fail(f"configuration check failed: {checked.stderr.strip()}")
+        thread.start()
+        replacement_thread.start()
+        if not ready.wait(2.0) or not replacement_ready.wait(2.0):
+            fail("upstream fixture did not start")
+        listener_udp.close()
+        listener_tcp.close()
         process = subprocess.Popen(
             [str(executable), "run", "-c", str(config_path), "-p", str(config_path) + ".pid"],
             text=True,
@@ -190,6 +195,7 @@ def main() -> None:
             stderr=subprocess.PIPE,
         )
         try:
+            wait_for_stderr(process, "ftun: ready")
             response = dns_query(listener_port)
             if socket.inet_aton("203.0.113.7") not in response:
                 fail("listener response did not contain the fixture address")
@@ -255,6 +261,12 @@ def main() -> None:
             if process.poll() is None:
                 process.kill()
                 process.wait(timeout=5)
+            if process.returncode != 0:
+                stdout, stderr = process.communicate(timeout=5)
+                print(f"run exit={process.returncode}: stdout={stdout!r} stderr={stderr!r}", file=sys.stderr)
+                log = Path(directory) / "ftun.log"
+                if log.exists():
+                    print(log.read_text(), file=sys.stderr)
     thread.join(timeout=1.0)
     replacement_thread.join(timeout=1.0)
     print("dns-only product: ok")

@@ -87,7 +87,8 @@ static int ftun_cli_reply_code(const cJSON *root, const char *operation, bool no
 {
   const char *result = ftun_cli_reply_string(root, "result");
   if ((ftun_cli_is_query(operation) && strcmp(result, "ok") == 0) ||
-      (strcmp(operation, "reload") == 0 && strcmp(result, "committed") == 0) ||
+      (strcmp(operation, "reload") == 0 &&
+        (strcmp(result, "committed") == 0 || strcmp(result, "merged") == 0)) ||
       (strcmp(operation, "stop") == 0 && strcmp(result, "stopped") == 0) ||
       (no_wait && strcmp(result, "accepted") == 0)) return FTUN_EXIT_OK;
   if (strcmp(result, "timeout") == 0) return FTUN_EXIT_UNKNOWN;
@@ -127,10 +128,11 @@ static int ftun_cli_print_reply(const ftun_cli_args_t *args, const char *operati
       return FTUN_EXIT_FAIL;
     }
     written = snprintf(text, sizeof(text),
-      "ftun: %s: %s (pid=%.0f, boot=%s, op_id=%.0f, generation=%.0f, previous_generation=%.0f, stage=%.0f, status=%s, file=%s, phase=%s, field=%s, message=%s, elapsed_ms=%llu)\n",
+      "ftun: %s: %s (pid=%.0f, boot=%s, op_id=%.0f, generation=%.0f, previous_generation=%.0f, merged=%s, stage=%.0f, status=%s, file=%s, phase=%s, field=%s, message=%s, elapsed_ms=%llu)\n",
       operation, ftun_cli_reply_string(root, "result"), ftun_cli_reply_number(root, "pid"),
       ftun_cli_reply_string(root, "boot"), ftun_cli_reply_number(root, "op_id"),
       ftun_cli_reply_number(root, "generation"), ftun_cli_reply_number(root, "previous_generation"),
+      cJSON_IsTrue(cJSON_GetObjectItemCaseSensitive(root, "merged")) ? "true" : "false",
       ftun_cli_reply_number(root, "stage"), ftun_cli_reply_string(root, "status"),
       file, ftun_cli_reply_string(root, "phase"), ftun_cli_reply_string(root, "field"),
       ftun_cli_reply_string(root, "message"), (unsigned long long)(now - started));

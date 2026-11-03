@@ -391,7 +391,7 @@ static bool ftun_dns_server_failover(ftun_dns_exchange_context_t *context, ftun_
 {
   ftun_dns_server_t *server = context->server;
   size_t next = 0u;
-  ftun_dns_server_failure(context, reason);
+  if (!context->failure_logged) ftun_dns_server_failure(context, reason);
   if (server->upstream_set == NULL) return false;
   uint64_t now;
   ftun_status_t status = server->now(server->now_user, &now);
@@ -455,6 +455,7 @@ static void ftun_dns_server_transport_completed(
   if (transport != context->current_transport ||
       response.data == NULL || response.length > server->max_response_bytes) {
     server->invalid[context->upstream_index] = true;
+    context->failure_logged = true;
     (void)ftun_log_failure(context->core, &(ftun_log_record_t){.event = &invalid_event,
       .error = {FTUN_E_PROTOCOL, FTUN_DNS_SERVER_STAGE_RESPONSE, 0}, .sid = context->query.sid,
       .generation = context->query.generation}, server->entities[context->upstream_index],
@@ -471,6 +472,7 @@ static void ftun_dns_server_transport_completed(
   }
   if (status != FTUN_OK || !matches) {
     server->invalid[context->upstream_index] = true;
+    context->failure_logged = true;
     (void)ftun_log_failure(context->core, &(ftun_log_record_t){.event = &invalid_event,
       .error = {status == FTUN_OK ? FTUN_E_PROTOCOL : status, FTUN_DNS_SERVER_STAGE_RESPONSE, 0},
       .sid = context->query.sid, .generation = context->query.generation}, server->entities[context->upstream_index],

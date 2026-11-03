@@ -78,13 +78,16 @@ typedef struct {
   char *path;
   uint64_t max_size;
   size_t max_files;
+  size_t rotation_next;
   uint64_t size;
+  uint64_t rotation_retry_at;
   ftun_atomic_u64_t rotations;
   ftun_atomic_u64_t reopens;
   ftun_atomic_u64_t rotate_errors;
   ftun_status_t rotation_error;
   int write_native_error;
   bool rotation_recovered;
+  bool rotation_suspended;
 } ftun_log_file_t;
 
 struct ftun_logger {
@@ -274,6 +277,7 @@ ftun_status_t ftun_log_level_parse(const char *name, ftun_log_level_t *out)
 }
 
 #define FTUN_LOG_PATH_MAX 4096u
+#define FTUN_LOG_ROTATE_RETRY_MS 1000u
 
 static ftun_status_t ftun_log_file_open(ftun_log_file_t *file, bool truncate)
 {
@@ -314,21 +318,32 @@ static ftun_status_t ftun_log_file_replace(ftun_log_file_t *file, bool truncate)
 static void ftun_log_file_rotate(ftun_log_file_t *file)
 {
   char from[FTUN_LOG_PATH_MAX + 16u], to[FTUN_LOG_PATH_MAX + 16u];
-  size_t index;
   ftun_status_t status = FTUN_OK;
-  for (index = file->max_files; index > 1u && status == FTUN_OK; index--) {
+  if (file->rotation_suspended) {
+    /* 先恢复原路径。已完成的改名不重做，不能把旧FD对应的.1再移走。 */
+    status = ftun_log_file_replace(file, false);
+    if (status != FTUN_OK || (file->rotation_next <= 1u && file->max_files > 1u)) goto completed;
+  } else file->rotation_next = file->max_files;
+  while (file->rotation_next > 1u && status == FTUN_OK) {
+    size_t index = file->rotation_next;
     if (index == 2u) (void)snprintf(from, sizeof(from), "%s", file->path);
     else (void)snprintf(from, sizeof(from), "%s.%zu", file->path, index - 2u);
     (void)snprintf(to, sizeof(to), "%s.%zu", file->path, index - 1u);
     status = ftun_platform_file_rename_if_exists(from, to);
+    if (status == FTUN_OK) file->rotation_next--;
   }
   if (status == FTUN_OK) status = ftun_log_file_replace(file, file->max_files <= 1u);
+completed:
   if (status != FTUN_OK) {
+    file->rotation_suspended = true;
+    (void)ftun_monotonic_now(&file->rotation_retry_at);
+    file->rotation_retry_at += FTUN_LOG_ROTATE_RETRY_MS;
     file->rotation_error = status;
     file->rotation_recovered = false;
     ftun_log_file_count(file, FTUN_LOG_FILE_FAILED);
   }
   else {
+    file->rotation_suspended = false;
     file->rotation_recovered = true;
     ftun_log_file_count(file, FTUN_LOG_FILE_ROTATED);
   }
@@ -343,6 +358,7 @@ static void ftun_log_file_reopen(ftun_log_file_t *file)
     ftun_log_file_count(file, FTUN_LOG_FILE_FAILED);
   }
   else {
+    file->rotation_suspended = false;
     file->rotation_recovered = true;
     ftun_log_file_count(file, FTUN_LOG_FILE_REOPENED);
   }
@@ -353,7 +369,11 @@ static ftun_status_t ftun_logger_file_write(void *user, ftun_bytes_t line)
   ftun_log_file_t *file = (ftun_log_file_t *)user;
   size_t written;
   ftun_status_t status;
-  if (file->max_size != 0u && file->size != 0u &&
+  if (file->rotation_suspended) {
+    uint64_t now;
+    if (ftun_monotonic_now(&now) == FTUN_OK && now >= file->rotation_retry_at)
+      ftun_log_file_rotate(file);
+  } else if (file->max_size != 0u && file->size != 0u &&
       file->size + line.length > file->max_size) {
     ftun_log_file_rotate(file);
   }
@@ -583,7 +603,7 @@ ftun_status_t ftun_logger_create(const ftun_logger_options_t *options,
   logger->line_capacity = line_capacity;
   ftun_atomic_init(&logger->level, (size_t)options->level);
   logger->stderr_output = options->stderr_output;
-  logger->journal = getenv("JOURNAL_STREAM") != NULL;
+  logger->journal = ftun_file_is_journal(ftun_file_standard_error());
   logger->stamp = options->stamp;
   logger->writer = options->writer;
   logger->writer_user = options->writer_user;

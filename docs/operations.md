@@ -71,7 +71,7 @@ ftun stop -p /run/ftun/edge.pid --timeout 15
 
 `check` 的失败输出包含字段路径、阶段和原因；成功列出启用模块以及只在启动时才能验证的端口、权限、状态锁等条件。`check` 成功不保证网络可达。`run` 独立输出 `ready` 或 `ready (degraded: ...)`，即使日志设为 silent 也保留必要结果。`-b` 在 POSIX 上等待子进程完成就绪交接，启动期限为 60 秒；后台自动使用文件日志，输出实际文件位置。Windows 当前不支持 `-b` 和本机管理 IPC，直接前台运行；平台边界见[构建说明](building.md)。
 
-省略定位参数时查询默认 PID 文件；`-p` 定位指定实例；数字 `PID` 与 `-p` 互斥。正常控制先检查 PID 文件锁，再核对控制端点的 PID/boot 身份。重载等待 `committed`、`rejected` 或 `restart-required`；准备失败保留旧配置，已建立连接保持旧代次。停止等待实际运行资源收尾。默认 stop 等待 15 秒、reload 等待 30 秒，`--timeout` 范围 1～3600 秒。
+省略定位参数时查询默认 PID 文件；`-p` 定位指定实例；数字 `PID` 与 `-p` 互斥。正常控制先检查 PID 文件锁，再核对控制端点的 PID/boot 身份。重载等待 `committed`、`merged`、`rejected` 或 `restart-required`；准备失败保留旧配置，已建立连接保持旧代次。在途重载期间到达的请求合并到唯一一批后续重载，在上一事务结束后重新读取配置；这批请求共享新的 `op_id`，成功回复 `merged` 并设置 `merged=true`，退出码为 0。排队批次未能提交时，`AGAIN`/`LIMIT` 回复 `busy` 并计入拒绝数。停止前尚未提交的请求回复 `rejected`、`status=not-executed`，CLI 退出 1；已在途但没有终态回调的请求仍报告结果未知（退出 5）。停止等待实际运行资源收尾。默认 stop 等待 15 秒、reload 等待 30 秒，`--timeout` 范围 1～3600 秒。
 
 `--no-wait` 只取得接纳回执，不代表操作完成。命令带 `--json` 时 stdout 是单个 JSON 对象；操作的 `result`、`via`、`pid`、`op`、`generation`、`elapsed_ms` 等字段用于自动化。查询输出有数量和行数上限，超出标记 `truncated` 并保留总数；计数和模块状态来自同次 owner 快照。`status` 给出实例、配置代次、资源和日志账本；`dns status` 给出监听、上游、缓存与查询结果；`proxy status` 给出监听、组选择、出口计数及 FRS 状态。
 
@@ -96,6 +96,8 @@ ftun stop -p /run/ftun/edge.pid --timeout 15
 - [OpenWrt procd 样例](../packaging/openwrt/ftun.procd)：前台进程监督与 respawn。
 - [Padavan 启停样例](../packaging/padavan/ftun.sh)：通过 `-b` 启动，使用同一 PID 文件查询和控制。
 
+服务环境可能没有 `HOME`。三份样例头部均提供可合入配置的绝对缓存与日志路径；systemd 同时创建状态及日志目录。只在启用状态缓存、持久 FakeIP 或文件日志时需要相应路径，未使用的 `~` 默认值不会阻止启动。Padavan 的旧内核若不支持 `renameat2(RENAME_NOREPLACE)`，持久 FakeIP 首次创建会明确失败；可使用 `dns.fake-ip.persist=false` 的内存模式。
+
 ## 6. 日志
 
 `log.level` 可选 silent、error、warn、info（默认）、debug、trace；`log.output` 可选 stderr（默认）、file、both。`-v` 覆盖为 debug、`-vv` 覆盖为 trace，并在重载后保留。后台将 stderr/both 改为 file；silent 保持静默。终端 stderr 可给级别着色，`--no-color` 或 `NO_COLOR` 关闭颜色，文件永不带颜色码。
@@ -106,11 +108,11 @@ ftun stop -p /run/ftun/edge.pid --timeout 15
 [2026-11-02 10:01:03.123 +0800][proxy ][INFO ] dial recovered: gen=1 entity=DIRECT count=40 duration_ms=63000
 ```
 
-每行是本地毫秒时间、UTC 偏移、模块、级别和事件短语，随后是键值字段。`boot` 在启动行输出，序号由状态中的日志账本查询，不在每行重复；`sid` 关联 DNS 查询或代理会话，`op` 关联管理操作，`gen` 标识配置代次。对端文本经过控制字符转义和长度限制，密码不进入日志。
+每行是本地毫秒时间、UTC 偏移、模块、级别和事件短语，随后是键值字段。仅当 `JOURNAL_STREAM` 的设备与 inode 匹配实际 stderr 时省略 stderr 时间。`boot` 在启动行输出，序号由状态中的日志账本查询，不在每行重复；`sid` 关联 DNS 查询或代理会话，`op` 关联管理操作，`gen` 标识配置代次。对端文本经过控制字符转义和长度限制，密码不进入日志。
 
 info 记录生命周期、状态变化和故障恢复，正常转发不逐连接输出；debug 可见 DNS query/answer/cache hit 及 Proxy connect/rule matched/closed。详细日志可能因队列压力丢弃，应查看 `status --json` 中日志计数。重复故障按配置实体聚合：首次告警、60 秒窗口汇总、真实恢复后记录次数与持续时间；停止或实体退休时汇总未完成窗口，不伪报恢复。聚合表有固定容量，溢出使用模块计数，不按任意域名或客户端创建无限标签。
 
-文件轮转由 `log.max-size`（默认 10 MiB，0 不轮转，否则至少 64 KiB）和 `log.max-files`（含当前文件，默认 3，范围 1～32）控制。超限前依次移动到 `.1`、`.2` 等；只保留一个文件时截断重写。外部 logrotate 移走文件后发送 `SIGUSR1` 重开。writer 的丢弃、轮转和写入失败通过独立诊断报告，不递归入日志队列；计数仍可查询。文件写入的系统调用失败时，`native` 保留实际 POSIX errno 或 Windows 错误码，例如 Linux 的 `native=28` 表示 ENOSPC。日志写入成功不等同于文件已耐久落盘。
+文件轮转由 `log.max-size`（默认 10 MiB，0 不轮转，否则至少 64 KiB）和 `log.max-files`（含当前文件，默认 3，范围 1～32）控制。超限前依次移动到 `.1`、`.2` 等；只保留一个文件时截断重写。轮转失败后继续写原文件句柄，后续写入每隔至少 1 秒尝试自动恢复；先重开原路径，再继续未完成的改名，不重做已完成步骤，避免反复移动或覆盖历史文件。外部 logrotate 移走文件后发送 `SIGUSR1` 重开。writer 的丢弃、轮转和写入失败通过独立诊断报告，不递归入日志队列；计数仍可查询。文件写入的系统调用失败时，`native` 保留实际 POSIX errno 或 Windows 错误码，例如 Linux 的 `native=28` 表示 ENOSPC。日志写入成功不等同于文件已耐久落盘。
 
 ## 7. 断网、网络恢复与降级
 

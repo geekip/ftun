@@ -810,6 +810,13 @@ static int test_core_gate(void)
 
 static const char *full_alias;
 static const char *fail_open_path;
+static const char *fail_rename_path;
+ftun_status_t __real_ftun_platform_file_rename_if_exists(const char *, const char *);
+ftun_status_t __wrap_ftun_platform_file_rename_if_exists(const char *from, const char *to)
+{
+  if (fail_rename_path != NULL && strcmp(from, fail_rename_path) == 0) return FTUN_E_IO;
+  return __real_ftun_platform_file_rename_if_exists(from, to);
+}
 ftun_status_t __real_ftun_platform_file_open_append(const char *, bool, ftun_file_handle_t *, uint64_t *);
 ftun_status_t __wrap_ftun_platform_file_open_append(const char *path, bool truncate,
   ftun_file_handle_t *out, uint64_t *size)
@@ -1065,6 +1072,9 @@ static int test_rotation_and_reopen(void)
   CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
     usage.io_errors == 0u && usage.rotate_errors == 1u);
   CHECK(ftun_logger_destroy(&logger) == FTUN_OK && rmdir(older) == 0 && unlink(path) == 0);
+  options.max_files = 3u;
+  FILE *history = fopen(older, "w");
+  CHECK(history != NULL && fputs("retained-history\n", history) >= 0 && fclose(history) == 0);
   CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
   item = diagnostic("/before-open", "first");
   CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
@@ -1076,13 +1086,28 @@ static int test_rotation_and_reopen(void)
   CHECK(file_has(older, "/before-open") && file_has(older, "/open-failed"));
   CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK &&
     usage.io_errors == 0u && usage.rotate_errors == 1u);
+  /* 连续写入不得再次移动历史文件；1秒重试期限前不再轮转。 */
+  for (index = 0u; index < 4u; index++) {
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  }
+  CHECK(file_has(older, "/before-open"));
+  CHECK(file_has(oldest, "retained-history"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.rotate_errors == 1u);
+
   CHECK(ftun_logger_reopen(logger) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK);
   item = diagnostic("/reopen-failed", "retained");
   CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
   CHECK(ftun_logger_flush(logger) == FTUN_OK && file_has(older, "/reopen-failed"));
   fail_open_path = NULL;
-  CHECK(ftun_logger_destroy(&logger) == FTUN_OK && unlink(older) == 0);
+  CHECK(ftun_logger_reopen(logger) == FTUN_OK);
+  item = diagnostic("/reopen-recovered", "fresh");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(file_has(path, "/reopen-recovered") && file_has(older, "/before-open"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.rotate_errors == 2u && usage.reopens == 1u);
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK && unlink(older) == 0 && unlink(oldest) == 0 && unlink(path) == 0);
   options.max_size = 600u;
 
   /* max_files 为 1：超限直接截断重写，不产生其他文件。 */
@@ -1116,8 +1141,65 @@ static int test_rotation_and_reopen(void)
   return 0;
 }
 
-int main(void)
+static int test_rotation_auto_recover(int mode)
 {
+  char directory[] = "/tmp/ftun-log-auto-XXXXXX", path[256], older[300], oldest[300];
+  ftun_logger_t *logger = NULL;
+  ftun_logger_usage_t usage;
+  ftun_logger_options_t options = {.level = FTUN_LOG_ERROR, .max_size = 1u,
+    .max_files = mode == 2 ? 1u : 3u};
+  ftun_diagnostic_t item = diagnostic("/before-auto", "first");
+  CHECK(mkdtemp(directory) != NULL);
+  CHECK(snprintf(path, sizeof(path), "%s/log", directory) > 0);
+  CHECK(snprintf(older, sizeof(older), "%s.1", path) > 0);
+  CHECK(snprintf(oldest, sizeof(oldest), "%s.2", path) > 0);
+  if (mode != 2) {
+    FILE *history = fopen(older, "w");
+    CHECK(history != NULL && fputs("retained-history\n", history) >= 0 && fclose(history) == 0);
+  }
+  options.path = path;
+  CHECK(ftun_logger_create(&options, &logger) == FTUN_OK);
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  if (mode == 0) CHECK(mkdir(oldest, 0700) == 0);
+  else if (mode == 3) fail_rename_path = path;
+  else fail_open_path = path;
+  for (size_t i = 0u; i < 5u; i++) {
+    CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+    CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  }
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.rotate_errors == 1u);
+  if (mode == 1) {
+    ftun_atomic_fetch_add(&notice_clock_offset, 1001u);
+    for (size_t i = 0u; i < 5u; i++) {
+      CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+      CHECK(ftun_logger_flush(logger) == FTUN_OK);
+    }
+    CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.rotate_errors == 2u);
+  }
+  if (mode == 0) CHECK(rmdir(oldest) == 0);
+  else { fail_open_path = NULL; fail_rename_path = NULL; }
+  ftun_atomic_fetch_add(&notice_clock_offset, 1001u);
+  item = diagnostic("/auto-recovered", "fresh");
+  CHECK(ftun_logger_write(logger, FTUN_LOG_ERROR, &item) == FTUN_OK);
+  CHECK(ftun_logger_flush(logger) == FTUN_OK);
+  CHECK(file_has(path, "/auto-recovered"));
+  CHECK(ftun_logger_get_usage(logger, &usage) == FTUN_OK && usage.rotations == 1u &&
+    usage.rotate_errors == (mode == 1 ? 2u : 1u) && usage.reopens == 0u);
+  if (mode != 2) {
+    CHECK(file_has(older, "/before-auto") && file_has(oldest, "retained-history"));
+    CHECK(!file_has(older, "/auto-recovered"));
+  } else CHECK(!file_has(path, "/before-auto"));
+  CHECK(ftun_logger_destroy(&logger) == FTUN_OK);
+  CHECK(unlink(path) == 0);
+  if (mode != 2) CHECK(unlink(older) == 0 && unlink(oldest) == 0);
+  CHECK(remove_log_lock(path) == 0 && rmdir(directory) == 0);
+  return 0;
+}
+
+int main(int argc, char **argv)
+{
+  if (argc == 2) return test_rotation_auto_recover(atoi(argv[1]));
   CHECK(test_core_gate() == 0);
   CHECK(test_rotation_and_reopen() == 0);
   CHECK(test_basic() == 0);

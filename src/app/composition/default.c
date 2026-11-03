@@ -376,8 +376,8 @@ static ftun_status_t ftun_default_prepare(
   status = ftun_event_loop_create_with_budget(
     core, budget, source_capacity, &runtime->loop);
   if (status == FTUN_OK) status = ftun_event_backend_attach(runtime->loop);
-  if (status == FTUN_OK) status = ftun_log_aggregate_attach(core, runtime->loop);
   if (status == FTUN_OK && runtime->ctl_server != NULL) status = ftun_ctl_server_attach(runtime->ctl_server, runtime->loop);
+  if (status == FTUN_OK) status = ftun_log_aggregate_attach(core, runtime->loop);
   if (status == FTUN_OK) status = ftun_app_egress_prepare(budget, config,
     ftun_platform_tun_auto_route_supported() && (config->plan->modules.required_modules & FTUN_BUILD_MODULE_TUN) != 0u
       ? config->base.proxy.routing_mark : 0u, &runtime->egress);

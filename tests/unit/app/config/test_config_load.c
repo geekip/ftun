@@ -52,7 +52,7 @@ int main(void)
 {
   static const char valid[] =
     "{\"dns\":{\"enable\":false},\"base\":{\"cache-file\":\"../state/cache\"},"
-    "\"log\":{\"file\":\"logs/ftun.log\"},\"frs\":{"
+    "\"log\":{\"output\":\"file\",\"file\":\"logs/ftun.log\"},\"frs\":{"
     "\"path\":\"./data/rules.frs\"},\"rules\":[\"FRS-IP,CN,DIRECT\"],"
     "\"outbounds\":[{\"name\":\"unused\","
     "\"type\":\"socks5\",\"server\":\"unused.example:1080\"}]}";
@@ -145,9 +145,9 @@ int main(void)
   CHECK(ftun_config_load_traced(semantic_path, &config, &trace) == FTUN_E_INVALID && config == NULL);
   CHECK(trace.completed == FTUN_CONFIG_STEP_PATHS && trace.failed == FTUN_CONFIG_STEP_VALIDATE);
   CHECK(write_file(bad_tilde_path,
-                   "{\"dns\":{\"enable\":false},\"log\":{\"file\":\"~other/x\"}}",
+                   "{\"dns\":{\"enable\":false},\"log\":{\"output\":\"file\",\"file\":\"~other/x\"}}",
                    strlen("{\"dns\":{\"enable\":false},\"log\":{"
-                          "\"file\":\"~other/x\"}}")));
+                          "\"output\":\"file\",\"file\":\"~other/x\"}}")));
   CHECK(ftun_config_load_traced(bad_tilde_path, &config, &trace) == FTUN_E_INVALID &&
         config == NULL);
   CHECK(trace.completed == FTUN_CONFIG_STEP_PARSE && trace.failed == FTUN_CONFIG_STEP_PATHS);
@@ -165,6 +165,33 @@ int main(void)
   CHECK(ftun_config_load(NULL, NULL, &config) == FTUN_E_INVALID && config == NULL);
   CHECK(ftun_config_load(NULL, config_path, NULL) == FTUN_E_INVALID);
 
+  /* 无HOME时，未启用的默认路径不阻止加载，真正使用时则明确失败。 */
+  CHECK(unsetenv("HOME") == 0);
+  {
+    const char *unused = "{\"base\":{\"state-cache\":false},\"dns\":{\"enable\":false}}";
+    CHECK(write_file(config_path, unused, strlen(unused)));
+    CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_OK);
+    CHECK(ftun_config_destroy(&config) == FTUN_OK);
+    const char *unused_dns = "{\"base\":{\"state-cache\":false}}";
+    CHECK(write_file(config_path, unused_dns, strlen(unused_dns)));
+    CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_OK);
+    CHECK(ftun_config_destroy(&config) == FTUN_OK);
+    const char *persistent = "{\"base\":{\"state-cache\":false},\"dns\":{\"default-server\":\"fake\","
+      "\"listeners\":[{\"listen\":\"127.0.0.1:1053\",\"server\":\"fake\"}],"
+      "\"servers\":[{\"name\":\"fake\",\"type\":\"udp\",\"address\":[\"127.0.0.1:53\"],\"fake-ip\":true,\"outbound\":\"DIRECT\"}]}}";
+    CHECK(write_file(config_path, persistent, strlen(persistent)));
+    CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_E_IO);
+    CHECK(trace.completed < trace.failed && trace.failed == FTUN_CONFIG_STEP_COMPILE &&
+      strcmp(trace.error.pointer, "/base/cache-file") == 0);
+    const char *cache = "{\"dns\":{\"enable\":false}}";
+    CHECK(write_file(config_path, cache, strlen(cache)));
+    CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_E_IO);
+    CHECK(strcmp(trace.error.pointer, "/base/cache-file") == 0);
+    const char *log = "{\"base\":{\"state-cache\":false},\"log\":{\"output\":\"file\"},\"dns\":{\"enable\":false}}";
+    CHECK(write_file(config_path, log, strlen(log)));
+    CHECK(ftun_config_load_traced(config_path, &config, &trace) == FTUN_E_IO);
+    CHECK(strcmp(trace.error.pointer, "/log/file") == 0);
+  }
   CHECK(unlink(config_path) == 0);
   CHECK(unlink(invalid_path) == 0);
   CHECK(unlink(default_path) == 0);

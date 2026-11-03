@@ -31,7 +31,7 @@ def read_pty(descriptor):
     return result.decode().replace('\r\n', '\n')
 
 
-def scenario(binary, root, output, *, tty=False, journal=False, no_color=False,
+def scenario(binary, root, output, *, tty=False, journal=False, journal_value=None, no_color=False,
              zone='CST-8', offset='+0800', silent=False, cli_no_color=False):
     log = root.parent / (root.name + '.log')
     config = {'file': str(log)}
@@ -42,8 +42,6 @@ def scenario(binary, root, output, *, tty=False, journal=False, no_color=False,
     env = dict(os.environ, TZ=zone)
     env.pop('JOURNAL_STREAM', None)
     env.pop('NO_COLOR', None)
-    if journal:
-        env['JOURNAL_STREAM'] = '1:2'
     if no_color:
         env['NO_COLOR'] = ''  # Presence disables color, including an empty value.
     with ExitStack() as stack:
@@ -52,15 +50,25 @@ def scenario(binary, root, output, *, tty=False, journal=False, no_color=False,
             master, slave = os.openpty()
             stack.callback(os.close, master)
             os.set_blocking(master, False)
+        journal_output = None
+        if journal and not tty:
+            journal_output = stack.enter_context((root.parent / (root.name + '.stderr')).open('w+'))
+            slave = journal_output.fileno()
+        if journal:
+            metadata = os.fstat(slave)
+            env['JOURNAL_STREAM'] = f'{metadata.st_dev}:{metadata.st_ino}'
+        if journal_value is not None:
+            env['JOURNAL_STREAM'] = journal_value
         app = Instance(binary, root, initial={'log': config}, env=env, stderr=slave,
                        extra_args=['--no-color'] if cli_no_color else ())
-        if slave is not None:
+        if tty:
             os.close(slave)
         try:
             captured = read_pty(master) if tty else ''
             state = app.call('status')
             assert state['logs']['level'] == ('silent' if silent else 'info'), state
             assert state['logs']['output'] == ('disabled' if silent else output or 'stderr'), state
+            assert state['logs']['file'] == (str(log) if not silent and output in ('file', 'both') else ''), state
             if not silent:
                 assert state['logs']['sequence'] >= state['logs']['accepted'] > 0, state
             if cli_no_color:
@@ -70,7 +78,9 @@ def scenario(binary, root, output, *, tty=False, journal=False, no_color=False,
             result = app.call('stop', boot=app.boot, timeout_ms=3000)
             assert result['result'] == 'stopped', result
             assert app.process.wait(timeout=5) == 0, app.output.read_text()
-            errors = captured + read_pty(master) if tty else app.output.read_text()
+            if journal_output is not None:
+                journal_output.seek(0)
+            errors = captured + read_pty(master) if tty else journal_output.read() if journal_output else app.output.read_text()
             assert errors.count('ftun: ready\n') == 1, errors
             errors = errors.replace('ftun: ready\n', '')
             file = log.read_text() if log.exists() else ''
@@ -114,6 +124,8 @@ def main():
             ('file', {}),
             ('both', {}),
             ('both', {'journal': True}),
+            ('both', {'journal_value': '1:2'}),
+            ('stderr', {'journal_value': 'invalid'}),
             ('stderr', {'tty': True}),
             ('both', {'tty': True, 'journal': True}),
             ('stderr', {'tty': True, 'no_color': True}),

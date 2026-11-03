@@ -187,8 +187,7 @@ int ftun_cli_check(const char *path, bool json)
   else (void)ftun_config_error_set(&checked.error, status, "",
     "cannot resolve default configuration path; use -c FILE");
   bool first_fakeip = false;
-  if (status == FTUN_OK && (checked.config->plan->prepare & FTUN_PLAN_FAKE_IP) != 0u &&
-      checked.config->dns.fake_ip.persist) {
+  if (status == FTUN_OK && ftun_config_uses_fakeip_state(checked.config)) {
     char directory[4097];
     ftun_file_info_t info;
     int length = snprintf(directory, sizeof(directory), "%s.fakeip", checked.config->base.proxy.cache_file);

@@ -95,9 +95,12 @@ def main():
                 assert unknown.get('merged') is True or unknown.get('via') == 'socket', unknown
                 app.probe()
             finally:
+                app.config['base'] = {'state-cache': False}
+                app.write()
                 app.release_fifo(fifo)
                 assert response(pending)['result'] == 'committed'
                 pending.close()
+            wait(lambda: app.call('status')['generation'] == 5, app.output.read_text)
             app.config['base'] = {'state-cache': False}
             app.write()
             # 预拒绝发生在客户端send之前，不能越过busy改发信号。
@@ -200,6 +203,7 @@ def main():
         terminal = dict(identity, result='committed', op_id=18446744073709551615, generation=7)
         value, requests = peer_case(binary, root, [identity, terminal], 0, 'committed')
         assert value['op_id'] == 18446744073709551615  # JSON原始整数不经double重印。
+        peer_case(binary, root, [identity, dict(terminal, result='merged', merged=True)], 0, 'merged')
         print('CLI control terminal, no-wait, identity, deadline, framing and signal cases passed')
 
 

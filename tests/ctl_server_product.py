@@ -191,13 +191,21 @@ def main():
                 assert json.loads(denied.stdout)['result'] == 'permission-denied', denied.stdout
                 os.chmod(app.endpoint, 0o600)
             fifo, first = app.blocked_reload('cache-one')
+            # 第一次Worker已读配置并阻塞于缓存打开；随后保存的配置必须再加载。
+            app.config['base'] = {'state-cache': False}
+            app.config['log']['level'] = 'warn'
+            app.write()
             second = app.connect({'op': 'reload', 'timeout_ms': 5000})
-            wait(lambda: app.call('status')['control']['merged'] >= 1, app.output.read_text)
+            third = app.connect({'op': 'reload', 'timeout_ms': 5000})
+            wait(lambda: app.call('status')['control']['merged'] >= 2, app.output.read_text)
             app.release_fifo(fifo)
-            with first, second:
-                a, b = response(first), response(second)
-            assert a['result'] == b['result'] == 'committed' and a['op_id'] == b['op_id'], (a, b)
-            assert not a['merged'] and b['merged'] and a['generation'] == b['generation'] == 3
+            with first, second, third:
+                a, b, c = response(first), response(second), response(third)
+            assert a['result'] == 'committed' and b['result'] == c['result'] == 'merged', (a, b, c)
+            assert a['op_id'] != b['op_id'] == c['op_id'], (a, b, c)
+            assert not a['merged'] and b['merged'] and c['merged']
+            assert a['generation'] == 3 and b['generation'] == c['generation'] == 4, (a, b, c)
+            assert app.call('status')['logs']['level'] == 'warn'
             fifo, expired = app.blocked_reload('cache-two', timeout=100)
             with expired:
                 timeout = response(expired)
@@ -205,14 +213,16 @@ def main():
             disconnected = app.connect({'op': 'reload', 'timeout_ms': 5000})
             disconnected.close()
             survivor = app.connect({'op': 'reload', 'timeout_ms': 5000})
-            wait(lambda: app.call('status')['control']['merged'] >= 3, app.output.read_text)
+            app.config['base'] = {'state-cache': False}
+            app.write()
+            wait(lambda: app.call('status')['control']['merged'] >= 4, app.output.read_text)
             app.release_fifo(fifo)
             with survivor:
                 terminal = response(survivor)
-            assert terminal['result'] == 'committed' and terminal['generation'] == 4, terminal
+            assert terminal['result'] == 'merged' and terminal['generation'] == 6, terminal
             app.probe()
             stopped = app.call('stop')
-            assert stopped['result'] == 'stopped' and stopped['generation'] == 4, stopped
+            assert stopped['result'] == 'stopped' and stopped['generation'] == 6, stopped
             assert app.process.wait(timeout=5) == 0, app.output.read_text()
             assert not app.endpoint.exists() and not app.pid.exists()
             # 普通文件不能作为残留socket删除；启动失败仍须归还PID锁并说明路径。

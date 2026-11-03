@@ -28,7 +28,7 @@ ftun_status_t ftun_ctl_status_fill(ftun_core_t *core, ftun_ctl_status_t *out)
     (void)snprintf(out->log_level, sizeof(out->log_level), "%s", level);
     (void)snprintf(out->log_output, sizeof(out->log_output), "%s", !out->host.logger_present ? "disabled" :
       control->log_file_only ? "file" : control->active_config->log.output);
-    if (control->active_config->log.file != NULL)
+    if (out->host.logger_present && ftun_config_uses_log_file(control->active_config, control->log_file_only))
       (void)snprintf(out->log_file, sizeof(out->log_file), "%s", control->active_config->log.file);
   }
   return ftun_app_default_status_fill(core, out);

@@ -194,6 +194,27 @@ static ftun_status_t ftun_config_resolve_one(ftun_config_t *config, const char *
   return FTUN_OK;
 }
 
+ftun_status_t ftun_config_resolve_log_file(ftun_config_t *config)
+{
+  return ftun_config_resolve_one(config, config->base_directory, &config->log.file);
+}
+
+bool ftun_config_uses_fakeip_state(const ftun_config_t *config)
+{
+  return config->plan != NULL && (config->plan->prepare & FTUN_PLAN_FAKE_IP) != 0u &&
+    config->dns.fake_ip.persist;
+}
+
+bool ftun_config_uses_cache_file(const ftun_config_t *config)
+{
+  return config->base.proxy.state_cache || ftun_config_uses_fakeip_state(config);
+}
+
+bool ftun_config_uses_log_file(const ftun_config_t *config, bool file_only)
+{
+  return file_only || strcmp(config->log.output, "file") == 0 || strcmp(config->log.output, "both") == 0;
+}
+
 static ftun_status_t ftun_config_default_frs_path(ftun_config_t *config, char **out)
 {
   char executable[FTUN_CONFIG_MAX_PATH_BYTES + 1u];
@@ -223,11 +244,14 @@ static ftun_status_t ftun_config_resolve_paths(ftun_config_t *config,
   if (config->source_path == NULL) return FTUN_E_LIMIT;
   config->base_directory = ftun_config_directory(config, source_path);
   if (config->base_directory == NULL) return FTUN_E_LIMIT;
-  status = ftun_config_resolve_one(config, config->base_directory,
-                                   &config->base.proxy.cache_file);
-  if (status != FTUN_OK) return ftun_config_error_set(error, status, "/base/cache-file", "cannot resolve cache path");
-  if (status == FTUN_OK) {
-    status = ftun_config_resolve_one(config, config->base_directory, &config->log.file);
+  status = FTUN_OK;
+  if (ftun_config_uses_cache_file(config)) {
+    status = ftun_config_resolve_one(config, config->base_directory,
+      &config->base.proxy.cache_file);
+    if (status != FTUN_OK) return ftun_config_error_set(error, status, "/base/cache-file", "cannot resolve cache path");
+  }
+  if (ftun_config_uses_log_file(config, false)) {
+    status = ftun_config_resolve_log_file(config);
     if (status != FTUN_OK) return ftun_config_error_set(error, status, "/log/file", "cannot resolve log path");
   }
   if (status == FTUN_OK && config->frs.active) {
@@ -290,9 +314,17 @@ ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   ftun_config_error_begin(&result.error, step);
   status = ftun_config_compile(config, &plan);
   if (status != FTUN_OK) goto done;
-  result.completed = FTUN_CONFIG_STEP_COMPILE;
   ftun_config_bind_plan(config, plan);
   plan = NULL;
+  /* FakeIP是否使用状态目录由可达计划决定，不能仅看未使用的默认开关。 */
+  if (!config->base.proxy.state_cache && ftun_config_uses_cache_file(config)) {
+    status = ftun_config_resolve_one(config, config->base_directory, &config->base.proxy.cache_file);
+    if (status != FTUN_OK) {
+      (void)ftun_config_error_set(&result.error, status, "/base/cache-file", "cannot resolve cache path");
+      goto done;
+    }
+  }
+  result.completed = FTUN_CONFIG_STEP_COMPILE;
   *out = config;
   config = NULL;
 done:

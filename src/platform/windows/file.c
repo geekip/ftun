@@ -562,6 +562,12 @@ const char *ftun_file_system_ca(void)
   return configured != NULL && configured[0] != '\0' ? configured : NULL;
 }
 
+bool ftun_file_is_journal(ftun_handle_t descriptor)
+{
+  (void)descriptor;
+  return false;
+}
+
 bool ftun_file_is_terminal(ftun_handle_t descriptor)
 {
   DWORD mode;

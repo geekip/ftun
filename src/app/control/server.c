@@ -12,7 +12,6 @@
 #include "platform/ipc.h"
 #include "platform/process.h"
 #include "platform/socket.h"
-#include "cJSON.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -46,11 +45,11 @@ struct ftun_ctl_server {
   ftun_event_loop_t *loop;
   ftun_event_source_t *accept, *timer;
   ftun_status_t error;
-  uint64_t boot, operation, reload_operation, reload_generation, accept_after;
+  uint64_t boot, operation, reload_operation, accept_after;
   uint64_t timer_deadline;
   uint64_t accepted, rejected, merged, timeouts, write_failed;
-  uint64_t entity, stop_operation;
-  uint64_t reload_uid, stop_uid;
+  uint64_t reject_entities[7], stop_operation;
+  uint64_t reload_uid, stop_uid, queued_reload, queued_uid, queued_at;
   bool reload_pending;
   connection_t connections[FTUN_CTL_CONNECTIONS];
   ftun_ctl_status_t snapshot;
@@ -75,8 +74,15 @@ static void control_log(ftun_ctl_server_t *server, const ftun_log_event_t *event
     };
     ftun_log_record_t record = {.event = event, .operation = operation, .generation = generation,
       .error = error, .fields = fields, .field_count = uid == UINT64_MAX ? 2u : 3u};
-    if (event->level <= FTUN_LOG_WARN) (void)ftun_log_failure(server->core, &record,
-      server->entity, (ftun_string_t){"local-control", 13u}, clock_now());
+    if (event->level <= FTUN_LOG_WARN) {
+      size_t reason = strcmp(result, "invalid-request") == 0 ? 0u :
+        strcmp(result, "boot-mismatch") == 0 ? 1u :
+        strcmp(result, "peer-credentials") == 0 ? 2u :
+        strcmp(result, "connections-full") == 0 ? 3u :
+        error.status == FTUN_E_AGAIN ? 4u : error.status == FTUN_E_LIMIT ? 5u : 6u;
+      (void)ftun_log_failure(server->core, &record, server->reject_entities[reason],
+        (ftun_string_t){result, strlen(result)}, clock_now());
+    }
     else (void)ftun_log_record(server->core, &record);
   }
 }
@@ -98,17 +104,6 @@ static void close_connection(connection_t *connection)
   connection->phase = FREE;
 }
 
-static bool quote(connection_t *connection, const char *text)
-{
-  cJSON value = {0};
-  value.type = cJSON_String;
-  value.valuestring = (char *)text;
-  if (!cJSON_PrintPreallocated(&value, connection->response + connection->length,
-      (int)(sizeof(connection->response) - connection->length), 0)) return false;
-  connection->length += strlen(connection->response + connection->length);
-  return true;
-}
-
 /* 常量字段直接格式化，外部字符串由cJSON转义到固定缓冲，不创建JSON堆对象。 */
 static void reply(connection_t *connection, const char *result, const char *reason,
   uint32_t stage, uint64_t generation, const char *file)
@@ -124,7 +119,10 @@ static void reply(connection_t *connection, const char *result, const char *reas
     reason, stage);
   if (length <= 0 || (size_t)length >= sizeof(connection->response)) goto invalid;
   connection->length = (size_t)length;
-  if (!quote(connection, file == NULL ? "" : file)) goto invalid;
+  size_t quoted = ftun_ctl_json_quote(file == NULL ? "" : file,
+    connection->response + connection->length, sizeof(connection->response) - connection->length);
+  if (quoted == 0u) goto invalid;
+  connection->length += quoted;
   if (connection->length + 3u >= sizeof(connection->response)) goto invalid;
   memcpy(connection->response + connection->length, "}\n", 3u);
   connection->length += 2u;
@@ -197,26 +195,88 @@ static void status_reply(connection_t *connection, ftun_ctl_operation_t operatio
 }
 
 static void arm(ftun_ctl_server_t *server);
-static void reload_done(ftun_operation_t *operation, ftun_app_command_result_t result, void *user)
+static void reload_done(ftun_operation_t *operation, ftun_app_command_result_t result, void *user);
+static void start_queued_reload(ftun_ctl_server_t *server);
+
+static ftun_status_t submit_reload(ftun_ctl_server_t *server, uint64_t generation)
 {
-  ftun_ctl_server_t *server = user;
+  ftun_app_control_snapshot_t snapshot;
+  ftun_app_command_t command = {0};
+  ftun_operation_t *operation = NULL;
+  ftun_status_t status = ftun_app_control_query(server->core, &snapshot);
+  if (status != FTUN_OK) return status;
+  command.kind = FTUN_APP_COMMAND_RELOAD;
+  command.first = snapshot.config_path;
+  command.expected = (ftun_app_generation_guard_t){true, generation};
+  status = ftun_app_control_submit(server->core, &command, reload_done, server, &operation);
+  server->reload_pending = status == FTUN_OK;
+  return status;
+}
+
+/* admission为真表示后续批次未能提交：每个仍在等待的请求收到busy/rejected并计入rejected；
+ * 已超时或--no-wait已得到回执的请求不重复计数，失败只出现在日志。 */
+static void reply_reload(ftun_ctl_server_t *server, ftun_app_command_result_t result, bool admission)
+{
   size_t i;
-  (void)operation;
-  server->reload_pending = false;
-  control_log(server, &result_event, server->reload_operation, result.generation, result.error,
-    result.error.status == FTUN_OK ? "committed" : result.error.status == FTUN_E_RESTART_REQUIRED ? "restart-required" : "rejected", server->reload_uid);
+  bool busy = admission && (result.error.status == FTUN_E_AGAIN || result.error.status == FTUN_E_LIMIT);
+  const char *outcome = busy ? "busy" : result.error.status == FTUN_OK ? "committed" :
+    result.error.status == FTUN_E_RESTART_REQUIRED ? "restart-required" : "rejected";
+  const char *reason = admission && result.error.status == FTUN_E_CANCELLED ?
+    "not-executed" : ftun_status_name(result.error.status);
+  control_log(server, admission ? (busy ? &busy_event : &rejected_event) : &result_event,
+    server->reload_operation, result.generation, result.error,
+    admission && result.error.status == FTUN_E_CANCELLED ? "not-executed" : outcome, server->reload_uid);
   for (i = 0u; i < FTUN_CTL_CONNECTIONS; i++) {
     connection_t *connection = &server->connections[i];
     if (connection->phase == RELOADING && connection->operation == server->reload_operation) {
       bool expired = clock_now() >= connection->deadline;
       if (expired) server->timeouts++;
-      reply(connection, expired ? "timeout" : result.error.status == FTUN_OK ? "committed" :
-        result.error.status == FTUN_E_RESTART_REQUIRED ? "restart-required" : "rejected",
-        ftun_status_name(result.error.status), result.error.stage, result.generation, result.file_error);
+      else if (admission) server->rejected++;
+      reply(connection, expired ? "timeout" : result.error.status == FTUN_OK ?
+        (connection->merged ? "merged" : "committed") :
+        outcome, reason, result.error.stage, result.generation, result.file_error);
       if (!expired) reply_config_error(connection, &result.config_error);
     }
   }
+}
+
+static void reload_done(ftun_operation_t *operation, ftun_app_command_result_t result, void *user)
+{
+  ftun_ctl_server_t *server = user;
+  (void)operation;
+  server->reload_pending = false;
+  reply_reload(server, result, false);
+  if (server->queued_reload != 0u) {
+    ftun_core_info_t info = {0};
+    /* 停止期间事件循环不会再轮到定时器：立即判定后续批次，日志此时仍可写。 */
+    bool closing = ftun_core_get_info(server->core, &info) == FTUN_OK &&
+      (info.state == FTUN_CORE_STOPPING || info.state == FTUN_CORE_STOPPED);
+    server->queued_at = closing ? 0u : clock_now() + 2u;
+    if (closing) start_queued_reload(server);
+  }
   arm(server);
+}
+
+static void start_queued_reload(ftun_ctl_server_t *server)
+{
+  if (!server->reload_pending && server->queued_reload != 0u && clock_now() >= server->queued_at) {
+    ftun_core_info_t info = {0};
+    server->reload_operation = server->queued_reload;
+    server->queued_reload = 0u;
+    server->reload_uid = server->queued_uid;
+    ftun_status_t status = ftun_core_get_info(server->core, &info);
+    if (status == FTUN_OK && (info.state == FTUN_CORE_STOPPING || info.state == FTUN_CORE_STOPPED))
+      status = FTUN_E_CANCELLED;
+    for (size_t i = 0u; i < FTUN_CTL_CONNECTIONS; i++) {
+      if (server->connections[i].phase == RELOADING &&
+          server->connections[i].operation == server->reload_operation)
+        server->connections[i].previous_generation = info.generation;
+    }
+    /* 在后续owner轮提交：上一事务的完成回调及Worker槽此时已释放。 */
+    if (status == FTUN_OK) status = submit_reload(server, info.generation);
+    if (status != FTUN_OK) reply_reload(server, (ftun_app_command_result_t){
+      .error = {status, 0u, 0}, .generation = info.generation}, true);
+  }
 }
 
 static void dispatch(connection_t *connection)
@@ -261,20 +321,16 @@ static void dispatch(connection_t *connection)
     if (request.timeout_ms == 0u) reply(connection, "accepted", "ok", 0u, info.generation, NULL);
     else connection->phase = STOPPING;
   } else {
-    if (server->reload_pending) {
+    if (server->reload_pending || server->queued_reload != 0u) {
       connection->merged = true;
       server->merged++;
-    } else {
-      ftun_app_control_snapshot_t snapshot;
-      ftun_app_command_t command = {0};
-      ftun_operation_t *operation = NULL;
-      status = ftun_app_control_query(server->core, &snapshot);
-      if (status == FTUN_OK) {
-        command.kind = FTUN_APP_COMMAND_RELOAD;
-        command.first = snapshot.config_path;
-        command.expected = (ftun_app_generation_guard_t){true, info.generation};
-        status = ftun_app_control_submit(server->core, &command, reload_done, server, &operation);
+      if (server->queued_reload == 0u) {
+        server->queued_reload = ++server->operation;
+        server->queued_uid = connection->uid;
       }
+      connection->operation = server->queued_reload;
+    } else {
+      status = submit_reload(server, info.generation);
       if (status != FTUN_OK) {
         server->rejected++;
         control_log(server, status == FTUN_E_AGAIN || status == FTUN_E_LIMIT ? &busy_event : &rejected_event,
@@ -284,13 +340,11 @@ static void dispatch(connection_t *connection)
         return;
       }
       server->reload_operation = ++server->operation;
-      server->reload_generation = info.generation;
-      server->reload_pending = true;
       server->reload_uid = connection->uid;
+      connection->operation = server->reload_operation;
     }
-    connection->operation = server->reload_operation;
     control_log(server, &reload_event, connection->operation, info.generation, (ftun_error_t){0}, connection->merged ? "merged" : "requested", connection->uid);
-    connection->previous_generation = server->reload_generation;
+    connection->previous_generation = info.generation;
     if (request.timeout_ms == 0u) reply(connection, "accepted", "ok", 0u, info.generation, NULL);
     else connection->phase = RELOADING;
   }
@@ -349,9 +403,6 @@ static void connection_ready(ftun_event_source_t *source, uint32_t events, void 
           connection->phase = PARSING;
           if (ftun_event_io_update(connection->io, FTUN_EVENT_ERROR) != FTUN_OK) fault(connection->server, FTUN_E_STATE_CORRUPT);
           dispatch(connection);
-          if (connection->phase == RELOADING || connection->phase == STOPPING) {
-            if (ftun_event_io_update(connection->io, FTUN_EVENT_READ) != FTUN_OK) fault(connection->server, FTUN_E_STATE_CORRUPT);
-          }
         }
       } else if (connection->received == sizeof(connection->request)) reply(connection, "invalid-request", "too-large", 0u, 0u, NULL);
     } else if (received == 0 || status != FTUN_E_AGAIN) close_connection(connection);
@@ -370,6 +421,7 @@ static void timer_ready(ftun_event_source_t *source, uint32_t events, void *user
   size_t i;
   (void)source; (void)events;
   fault(server, ftun_event_source_cancel(&server->timer));
+  start_queued_reload(server);
   if (server->accept_after != 0u && now >= server->accept_after) {
     server->accept_after = 0u;
     fault(server, ftun_event_io_update(server->accept, FTUN_EVENT_READ));
@@ -391,6 +443,8 @@ static void arm(ftun_ctl_server_t *server)
   uint64_t deadline = server->accept_after == 0u ? UINT64_MAX : server->accept_after;
   size_t i;
   if (server->loop == NULL) return;
+  if (!server->reload_pending && server->queued_reload != 0u && server->queued_at < deadline)
+    deadline = server->queued_at;
   for (i = 0u; i < FTUN_CTL_CONNECTIONS; i++) {
     connection_t *connection = &server->connections[i];
     uint64_t next = connection->deadline;
@@ -481,7 +535,7 @@ ftun_status_t ftun_ctl_server_create(ftun_core_t *core, const char *path, ftun_c
   server->budget = budget;
   server->reservation = reservation;
   server->boot = ftun_log_boot_id();
-  server->entity = ftun_correlation_next();
+  for (size_t i = 0u; i < 7u; i++) server->reject_entities[i] = ftun_correlation_next();
   memcpy(server->path, path, strlen(path) + 1u);
   status = ftun_ipc_listen(server->path, &server->listener);
   if (status != FTUN_OK) {
@@ -544,7 +598,12 @@ ftun_status_t ftun_ctl_server_finish(ftun_ctl_server_t *server, ftun_status_t re
     if (connection->phase == STOPPING) {
       reply(connection, result == FTUN_OK && info.state == FTUN_CORE_STOPPED && server->error == FTUN_OK ? "stopped" :
         result == FTUN_E_TIMEOUT ? "timeout" : "failed", ftun_status_name(result), 0u, info.generation, NULL);
-    } else if (connection->phase == RELOADING) reply(connection, "timeout", "result-unknown", 0u, info.generation, NULL);
+    } else if (connection->phase == RELOADING) {
+      bool queued = server->queued_reload != 0u && connection->operation == server->queued_reload;
+      if (queued) server->rejected++;
+      reply(connection, queued ? "rejected" : "timeout", queued ? "not-executed" : "result-unknown",
+        0u, info.generation, NULL);
+    }
     while (connection->phase == WRITING) {
       write_connection(connection);
       if (connection->phase == WRITING && !ftun_blocking_socket_wait(connection->socket, FTUN_POLLER_WRITE, deadline)) {
@@ -553,11 +612,17 @@ ftun_status_t ftun_ctl_server_finish(ftun_ctl_server_t *server, ftun_status_t re
       }
     }
   }
+  server->queued_reload = 0u;
   return server->error;
 }
 
 void ftun_ctl_server_runtime_stopped(ftun_ctl_server_t *server, ftun_error_t error, uint64_t generation)
 {
+  /* 日志在finish之前已关闭；停止时未提交的后续批次在此留下确定未执行的记录。 */
+  if (server != NULL && server->queued_reload != 0u) {
+    control_log(server, &rejected_event, server->queued_reload, generation,
+      (ftun_error_t){FTUN_E_CANCELLED, 0u, 0}, "not-executed", server->queued_uid);
+  }
   if (server != NULL && server->stop_operation != 0u) {
     control_log(server, &result_event, server->stop_operation, generation, error, "runtime-stopped", server->stop_uid);
     server->stop_operation = 0u;

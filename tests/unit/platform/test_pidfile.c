@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -18,6 +19,33 @@
 } } while (0)
 
 static bool fail_write;
+static const char *probe_path, *replace_path, *moved_path;
+static bool probe_shared, transient_probe;
+static ftun_platform_file_lock_t replacement = FTUN_FILE_INVALID;
+int __real_flock(int descriptor, int operation);
+int __wrap_flock(int descriptor, int operation)
+{
+  int result = __real_flock(descriptor, operation);
+  if (probe_path != NULL && result == 0) {
+    int other = open(probe_path, O_RDONLY);
+    probe_shared = other >= 0 && __real_flock(other, LOCK_SH | LOCK_NB) == 0;
+    if (other >= 0) (void)close(other);
+  }
+  return result;
+}
+ftun_status_t __real_ftun_platform_file_lock_acquire(const char *, ftun_platform_file_lock_t *);
+ftun_status_t __wrap_ftun_platform_file_lock_acquire(const char *path, ftun_platform_file_lock_t *out)
+{
+  if (transient_probe) { transient_probe = false; return FTUN_E_AGAIN; }
+  ftun_status_t status = __real_ftun_platform_file_lock_acquire(path, out);
+  if (status == FTUN_OK && replace_path != NULL) {
+    const char *target = replace_path;
+    replace_path = NULL;
+    if (rename(target, moved_path) != 0 ||
+        __real_ftun_platform_file_lock_acquire(target, &replacement) != FTUN_OK) abort();
+  }
+  return status;
+}
 ssize_t __real_write(int descriptor, const void *data, size_t length);
 ssize_t __wrap_write(int descriptor, const void *data, size_t length)
 {
@@ -109,6 +137,34 @@ static int test_fork_inheritance(const char *path)
   return 0;
 }
 
+static int test_probe_start(const char *path)
+{
+  pid_t children[3];
+  CHECK(write_text(path, "1234\n") == 0);
+  for (size_t i = 0u; i < 3u; i++) {
+    children[i] = fork();
+    CHECK(children[i] >= 0);
+    if (children[i] == 0) {
+      for (size_t n = 0u; n < 1000u; n++) {
+        uint32_t holder;
+        (void)ftun_pidfile_probe(path, &holder);
+      }
+      _exit(0);
+    }
+  }
+  for (size_t n = 0u; n < 100u; n++) {
+    ftun_pidfile_t instance = FTUN_PIDFILE_INVALID;
+    uint32_t holder;
+    CHECK(ftun_pidfile_acquire(path, &instance, &holder) == FTUN_OK);
+    CHECK(ftun_pidfile_release(&instance) == FTUN_OK);
+  }
+  for (size_t i = 0u; i < 3u; i++) {
+    int status;
+    CHECK(waitpid(children[i], &status, 0) == children[i] && status == 0);
+  }
+  return 0;
+}
+
 int main(void)
 {
   char directory[] = "/tmp/ftun-pidfile.XXXXXX";
@@ -122,7 +178,11 @@ int main(void)
   CHECK(snprintf(previous, sizeof(previous), "%s/previous", directory) > 0);
   CHECK(ftun_pidfile_probe(path, &pid) == FTUN_E_EOF && pid == 0u);
   CHECK(write_text(path, "2147483647\n") == 0);
+  probe_path = path;
   CHECK(ftun_pidfile_probe(path, &pid) == FTUN_E_EOF && pid == 0u);
+  probe_path = NULL;
+  CHECK(probe_shared);
+  transient_probe = true;
   CHECK(ftun_pidfile_acquire(path, &owned, &pid) == FTUN_OK);
   CHECK(stat(path, &info) == 0 && (info.st_mode & 0777u) == 0600u);
   CHECK(ftun_pidfile_probe(path, &pid) == FTUN_OK && pid == ftun_process_id());
@@ -131,6 +191,14 @@ int main(void)
   CHECK(ftun_pidfile_release(&owned) == FTUN_OK && access(path, F_OK) != 0);
   CHECK(ftun_pidfile_release(&owned) == FTUN_OK);
   CHECK(test_fork_inheritance(path) == 0);
+  CHECK(test_probe_start(path) == 0);
+  /* 旧锁刚释放且路径被替换，拿到已移走inode的锁不能成为第二个实例。 */
+  replace_path = path;
+  moved_path = previous;
+  CHECK(ftun_pidfile_acquire(path, &owned, &pid) == FTUN_E_AGAIN);
+  CHECK(!ftun_platform_file_is_open(&owned.file));
+  CHECK(ftun_platform_file_lock_release(&replacement) == FTUN_OK);
+  CHECK(unlink(path) == 0 && unlink(previous) == 0);
   CHECK(ftun_pidfile_acquire(path, &owned, &pid) == FTUN_OK);
   CHECK(rename(path, previous) == 0 && write_text(path, "1234\n") == 0);
   CHECK(ftun_pidfile_release(&owned) == FTUN_OK);

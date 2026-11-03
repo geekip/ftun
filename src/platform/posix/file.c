@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <inttypes.h>
 #include <sys/mman.h>
 #include <poll.h>
 #include <stdio.h>
@@ -417,6 +418,17 @@ const char *ftun_file_system_ca(void)
     if (ftun_file_inspect_path(candidates[i], &info) == FTUN_OK && info.regular) return candidates[i];
   }
   return NULL;
+}
+
+bool ftun_file_is_journal(ftun_handle_t descriptor)
+{
+  const char *stream = getenv("JOURNAL_STREAM");
+  struct stat info;
+  char identity[64];
+  if (stream == NULL || fstat((int)descriptor, &info) != 0) return false;
+  (void)snprintf(identity, sizeof(identity), "%ju:%ju",
+    (uintmax_t)info.st_dev, (uintmax_t)info.st_ino);
+  return strcmp(stream, identity) == 0;
 }
 
 bool ftun_file_is_terminal(ftun_handle_t descriptor)

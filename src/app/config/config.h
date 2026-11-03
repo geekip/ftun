@@ -17,6 +17,12 @@ ftun_status_t ftun_config_load_traced(const char *path, ftun_config_t **out,
 /* budget借用到最后配置/计划引用释放，构造临时存储也在此预算准入。 */
 ftun_status_t ftun_config_load_budget_traced(ftun_budget_t *budget,
   const char *path, ftun_config_t **out, ftun_config_trace_t *trace);
+/* 仅在独占的候选构造期调用；后台实际启用文件sink时也复用此路径解析。 */
+ftun_status_t ftun_config_resolve_log_file(ftun_config_t *config);
+/* 按已编译可达计划查询实际文件用途；未编译时只识别显式状态缓存。 */
+bool ftun_config_uses_fakeip_state(const ftun_config_t *config);
+bool ftun_config_uses_cache_file(const ftun_config_t *config);
+bool ftun_config_uses_log_file(const ftun_config_t *config, bool file_only);
 const char *ftun_config_step_name(ftun_config_step_t step);
 void ftun_config_trace_emit(ftun_core_t *core, const ftun_config_trace_t *trace,
   uint64_t generation);

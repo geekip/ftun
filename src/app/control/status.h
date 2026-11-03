@@ -42,4 +42,6 @@ ftun_status_t ftun_app_default_status_fill(ftun_core_t *core, ftun_ctl_status_t 
 /* 追加以逗号开头的正文并关闭已有JSON对象；不分配，明细按字节/项数截断。 */
 ftun_status_t ftun_ctl_status_json(const ftun_ctl_status_t *snapshot, ftun_ctl_operation_t operation,
   char *out, size_t capacity, size_t *length);
+/* 外部字符串转义到调用方缓冲；0表示容量不足，无分配。 */
+size_t ftun_ctl_json_quote(const char *text, char *out, size_t capacity);
 #endif
